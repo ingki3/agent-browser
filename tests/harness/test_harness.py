@@ -241,7 +241,15 @@ def test_recall_without_engine_exits_2_not_0():
     assert "error" in payload
 
 
-def test_egress_without_security_module_exits_2():
+def test_egress_measures_zero_leaks_now_that_security_exists():
+    """WS-4 구현 이후에는 실제 측정이 이뤄져야 한다.
+
+    WS-6 단계에서는 security 모듈이 없어 exit 2(측정 불가)였고,
+    WS-4 완료로 exit 0(유출 0건)으로 전환되는 것이 정상이다.
+    """
     proc = _run_module("harness.egress_test")
-    assert proc.returncode == 2
-    assert "error" in json.loads(proc.stdout.strip())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout.strip())
+    assert payload["passed"] is True
+    assert payload["value"] == 0.0
+    assert "error" not in payload
