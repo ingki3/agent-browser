@@ -35,6 +35,9 @@ python -c "import playwright, pydantic, textual, mcp, cryptography; print('Depen
 
 # 5. 문서 및 스펙 무결성 선행 검증 (Exit Code 0 확인)
 python check_docs.py
+
+# 6. 게이트 명령어 구문 검증 (본 문서 §5의 명령어가 실제 실행 가능한지 확인)
+python scripts/check_gate_commands.py
 ```
 
 ---
@@ -51,7 +54,8 @@ agent-browser/
 ├── README.md                   # [사람/오케스트레이터 소유] 프로젝트 개요 문서
 ├── .gitignore                  # [사람/오케스트레이터 소유] 비밀값/임시파일 격리
 ├── scripts/                    # [사람/오케스트레이터 소유] 게이트 검증 스크립트 모음
-│   └── check_auth_perms.py     # [Gate 1] 세션 스토리지 파일 권한 검증기
+│   ├── check_auth_perms.py     # [Gate 1] 세션 스토리지 파일 권한 검증기
+│   └── check_gate_commands.py  # [CI] 본 문서 §5 게이트 명령어 구문 검증기
 ├── src/
 │   ├── contracts/              # [WS-0] 인터페이스 모델, Pydantic 스키마, Protocol 클래스 (Stage 0 이후 동결)
 │   ├── browser/                # [WS-1] Playwright CDP 코어, BrowserContext 풀, 세션 관리자 (AES-256-GCM)
