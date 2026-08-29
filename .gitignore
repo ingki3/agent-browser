@@ -70,6 +70,9 @@ auth/
 # PRD specs & review documents (local only, not tracked)
 /prd/
 
+# Benchmark / spike reports (재현 가능한 산출물, 추적 대상 아님)
+/artifacts/
+
 # IDE & OS
 .DS_Store
 .idea/
