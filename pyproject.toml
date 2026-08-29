@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-browser"
+version = "1.0.0"
+description = "Agent-Native Headless Browsing Engine & MCP Server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "playwright>=1.48.0",
+    "pydantic>=2.10.0",
+    "textual>=0.80.0",
+    "rich>=13.9.0",
+    "cryptography>=44.0.0",
+    "keyring>=25.5.0",
+    "mcp>=1.1.0",
+    "tiktoken>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/contracts",
+    "src/browser",
+    "src/perception",
+    "src/actions",
+    "src/security",
+    "src/interface",
+    "src/harness",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
