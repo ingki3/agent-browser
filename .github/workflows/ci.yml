@@ -1,0 +1,112 @@
+name: CI
+
+# 게이트 검증 파이프라인 (src/AGENTS.md §5 기준)
+# - dev 대상 PR : 무결성 + 단위 테스트 (빠른 피드백)
+# - main 대상 PR: 위 항목 + 전체 회귀 (릴리스 게이트)
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integrity:
+    name: 문서·스크립트 무결성 (check_docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 게이트 스크립트 자체의 문법 오류를 먼저 잡는다.
+      # (AGENTS_REVIEW_02 P0-1: 인라인 one-liner가 SyntaxError로 깨진 사례 재발 방지)
+      - name: 검증 스크립트 문법 검사 (py_compile)
+        run: |
+          python -m py_compile check_docs.py
+          find scripts -name '*.py' -print0 2>/dev/null | xargs -0 -r python -m py_compile
+          echo "OK: 모든 검증 스크립트 컴파일 통과"
+
+      - name: 문서 무결성 검사 (제어문자 / 표 정합성)
+        run: python check_docs.py
+
+  unit-tests:
+    name: 단위 테스트 (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: 의존성 동기화 (dev extras 포함)
+        run: |
+          uv sync --extra dev
+          uv pip install -e .
+
+      - name: pytest 실행
+        run: |
+          set +e
+          uv run pytest tests -q
+          code=$?
+          # exit 5 = 수집된 테스트 없음. Stage 0 착수 전에는 정상 상태로 간주한다.
+          if [ $code -eq 5 ]; then
+            echo "::notice::수집된 테스트가 없습니다 (Stage 0 착수 전 정상)."
+            exit 0
+          fi
+          exit $code
+
+  release-gate:
+    name: 릴리스 게이트 (main 대상 PR 전용)
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [integrity, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: 의존성 동기화
+        run: |
+          uv sync --extra dev
+          uv pip install -e .
+
+      # Stage 진행에 따라 아래 게이트를 순차적으로 활성화한다.
+      # (src/AGENTS.md §5의 Gate 0 ~ Gate 3-B 명령어와 1:1 대응)
+      - name: Gate 0 — 계약 동결 검증
+        run: |
+          if [ -d src/contracts ]; then
+            uv run python -c "import contracts; assert len([m for m in dir(contracts) if m.endswith('Input')]) == 19"
+            uv run python -c "from contracts import ErrorCode; assert len(ErrorCode) >= 20"
+            uv run pytest tests/contracts -q
+          else
+            echo "::notice::src/contracts 미존재 — Stage 0 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: 전체 회귀 테스트
+        run: |
+          set +e
+          uv run pytest tests -q
+          code=$?
+          if [ $code -eq 5 ]; then
+            echo "::notice::수집된 테스트가 없습니다 (Stage 0 착수 전 정상)."
+            exit 0
+          fi
+          exit $code
