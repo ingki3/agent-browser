@@ -232,11 +232,33 @@ def test_golden_recall_is_exactly_one():
     assert payload["passed"] is True
 
 
+def _chromium_available() -> bool:
+    """Chromium 바이너리 가용 여부. 서브프로세스 하네스 검증에 사용한다."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            browser.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+requires_chromium = pytest.mark.skipif(
+    not _chromium_available(), reason="Chromium 바이너리 없음"
+)
+
+
+@requires_chromium
 def test_recall_measures_engine_now_that_perception_exists():
     """WS-2 구현 이후에는 실제 Recall 측정이 이뤄져야 한다.
 
     WS-6 단계에서는 perception 모듈이 없어 exit 2(측정 불가)였고,
     WS-2 완료로 exit 0(실측)으로 전환되는 것이 정상이다.
+    실브라우저가 필요하므로 Chromium 부재 환경에서는 skip한다.
     """
     proc = _run_module("harness.recall", "--pages", "10", "--top-n", "20")
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -247,6 +269,20 @@ def test_recall_measures_engine_now_that_perception_exists():
     # 예산 판정 필드가 함께 보고되어야 한다.
     assert "p50_tokens" in payload
     assert "p50_latency_ms" in payload
+
+
+def test_recall_reports_error_when_browser_unavailable():
+    """브라우저가 없으면 exit 2(측정 불가)로 명확히 구분되어야 한다.
+
+    0.0을 반환해 '측정했으나 미달'로 위장하면 게이트 판정이 왜곡된다.
+    """
+    if _chromium_available():
+        pytest.skip("Chromium이 존재하는 환경에서는 해당 경로를 재현할 수 없음")
+    proc = _run_module("harness.recall", "--pages", "10", "--top-n", "20")
+    assert proc.returncode == 2
+    payload = json.loads(proc.stdout.strip())
+    assert payload["passed"] is False
+    assert "error" in payload
 
 
 def test_egress_measures_zero_leaks_now_that_security_exists():
