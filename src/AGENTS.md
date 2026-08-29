@@ -84,7 +84,7 @@ agent-browser/
 | 워크스트림 | 담당 모듈 | PRD.md 필독 스펙 섹션 |
 | :--- | :--- | :--- |
 | **WS-0** | `contracts/` | §4 (모델 전체), §4.1 (19종 액션 표), §4.2 (`ObserveResult` 스키마), §6.1 (`ConfirmDialog` 스키마), §7.2 (Protocol 클래스) |
-| **WS-1** | `browser/` | §5.1 (스토리지 암호화, 세션 만료 프로브 3종), §5.2 (오리진 격리), §3.4 (리소스/메모리 1.5GB 상한) |
+| **WS-1** | `browser/` | §5.1 (스토리지 암호화, 세션 만료 프로브 3종), §5.2 (오리진 격리), §3.4 (리소스/메모리 1.5GB 상한), §1.5 (지연 KPI — 엔진 스파이크 측정 기준) |
 | **WS-2** | `perception/` | §3.1 (Tier-1 텍스트 파이프라인), §3.2 (Top-N 복구 사다리), §4.2 (에포크/Staleness), §4.3 (Closed Shadow DOM CDP pierce 순회) |
 | **WS-3** | `actions/` | §4.1 (19종 액션 툴 전수 명세), §4.3 (단계 인식 자가 치유 및 사후조건 검증), §4.2 (에포크 무효화 트리거) |
 | **WS-4** | `security/` | §5.3 (3중 가드레일, `page.route` Egress 제어 및 기술적 한계), §3.3 (무인/대화형 실행 모드 정책) |
@@ -119,7 +119,7 @@ flowchart TD
 
     subgraph Stage1 ["Stage 1: 하네스 최우선 구축 & 인프라 코어 (병렬)"]
         WS6["`WS-6 harness/` (최우선 병렬)<br/>• Mock 사이트 20종 구축 (13대 필수 시나리오)<br/>• Recall@20 평가 파이프라인 (골든셋 10종)<br/>• WebArena Lite 100 하네스"]
-        WS1["`WS-1 browser/`<br/>• Playwright CDP 코어<br/>• Session Manager (AES-256-GCM)"]
+        WS1["`WS-1 browser/`<br/>• Playwright CDP 코어<br/>• Session Manager (AES-256-GCM)<br/>• 엔진 지연 실측 스파이크"]
         WS4["`WS-4 security/`<br/>• Allowlist & Route 인터셉션<br/>• PII 마스킹 & HITL 게이트"]
         Gate1{"[Gate 1: Phase 1 Exit]<br/>기계 검증 + 하네스 골든셋 통과"}
         WS6 --> Gate1
@@ -203,7 +203,29 @@ python -m harness.selfcheck --mock-sites 20
 
 # 7. 하네스 골든셋 정합성 검증 (정답 10종 완벽 일치: recall == 1.0)
 python -m harness.recall --golden
+
+# 8. [성능 스파이크] 엔진 지연 실측 리포트 제출 (판정 아님 — 수치 확보가 목적)
+python -m harness.engine_spike --sites 20 --report artifacts/engine_spike.json
 ```
+
+#### ⏱️ Stage 1 성능 스파이크 (Engine Latency Spike) — WS-1 & WS-6 공동 산출물
+
+**배경**: Playwright Python은 Node 드라이버를 서브프로세스로 구동하므로 IPC 오버헤드가 존재합니다. 그러나 실제 스텝 지연의 지배 요인은 LLM 추론(1,500~3,000ms)이며, IPC는 호출당 0.1~1ms 수준으로 추정됩니다. **추정을 근거로 아키텍처를 바꾸지 않기 위해, Stage 1에서 실측 수치를 확보합니다.**
+
+`harness.engine_spike`는 Mock 사이트 20종에 대해 아래 4개 지표를 측정하고 JSON 리포트를 남깁니다. **본 항목은 임계값 판정 게이트가 아니며, 리포트 산출 및 제출 여부만 확인합니다.**
+
+| 측정 항목 | 측정 방법 | 참고 기준 (판정 아님) |
+| :--- | :--- | :--- |
+| **AxTree 추출 단독 지연** | `Accessibility.getFullAXTree` 호출 전후 시각 차 (p50 / p95) | 관찰 예산 300ms 대비 비중 확인 |
+| **CDP 왕복 오버헤드** | 무연산 CDP 호출(`Runtime.evaluate("1")`) 1,000회 평균 | 호출당 1ms 초과 시 배치 설계 재검토 |
+| **Actionability 대기 지연** | 200ms 광고 로테이션 페이지에서 `click` 대기 시간 (p50 / p95) | `stable` 판정이 동적 노드에서 지연되는지 확인 |
+| **관찰 파이프라인 총 지연** | AxTree 추출 + 살균 + 프루닝 전 구간 (p50 / p95) | §1.5 관찰 예산 300ms 대비 여유 판단 |
+
+**리포트 활용 규칙**:
+* AxTree 추출만으로 관찰 예산(300ms)의 50%를 초과하면 **Stage 2 착수 전 사람 감독자에게 보고**하고, 예산 재조정 또는 프루닝 전략 변경을 논의합니다.
+* CDP 왕복이 호출당 1ms를 초과하면 Prune4Web 스코어러를 **요소별 호출이 아닌 단일 `Runtime.evaluate` 일괄 처리**로 설계해야 합니다 (WS-2 필수 준수 사항).
+* Actionability 대기가 광고 로테이션 페이지에서 p95 1,000ms를 초과하면, §4.2 자체 staleness 검증을 통과한 요소에 한해 `force=True` 경로를 허용할지 사람 감독자가 판단합니다.
+* 본 리포트는 Stage 3의 `harness.latency_test`(실제 판정 게이트) 임계값 타당성을 검토하는 근거 자료로 사용됩니다.
 
 #### 🎪 Mock 사이트 20종 필수 커버리지 기준 (WS-6 수용 기준)
 * 13대 필수 시나리오(로그인 폼/2FA, 다단계 폼+파일 업로드, CSV 다운로드, 중첩 iframe, Open Shadow DOM, Closed Shadow DOM, 무한 스크롤, 200ms 광고 로테이션 동적 노드, 네이티브 Dialog, 팝업 새 탭, 세션 만료 리다이렉트 HTTP 401, SPA 클라이언트 라우팅, 지연 로딩 노드)가 20종 사이트에 분산 배치되어 전수 커버되어야 합니다.
