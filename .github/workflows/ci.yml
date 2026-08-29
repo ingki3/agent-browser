@@ -36,6 +36,12 @@ jobs:
       - name: 문서 무결성 검사 (제어문자 / 표 정합성)
         run: python check_docs.py
 
+      # 문서에 적힌 게이트 명령어 자체가 실행 가능한지 검증한다.
+      # (AGENTS_REVIEW_02 P0-1: Gate 1 인라인 명령어가 SyntaxError로 깨져
+      #  게이트를 영구히 통과할 수 없던 사례 재발 방지)
+      - name: 게이트 명령어 구문 검증
+        run: python scripts/check_gate_commands.py
+
   unit-tests:
     name: 단위 테스트 (pytest)
     runs-on: ubuntu-latest
