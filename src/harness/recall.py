@@ -14,8 +14,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import re
+import statistics
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -108,6 +111,85 @@ def evaluate_golden(top_n: int) -> List[CaseOutcome]:
     return outcomes
 
 
+def _percentile(values: List[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(int(len(ordered) * pct), len(ordered) - 1)
+    return ordered[idx]
+
+
+async def _evaluate_engine(extractor, pages: int, top_n: int) -> dict:
+    """실브라우저로 인지 엔진의 Recall@N / 토큰 / 지연을 실측한다.
+
+    골든셋 정답을 정답 레이블로 사용하되, 사이트를 반복 순회해
+    요청된 페이지 수만큼 표본을 채운다.
+    """
+    from playwright.async_api import async_playwright
+
+    hits = 0
+    total = 0
+    misses: List[str] = []
+    token_counts: List[float] = []
+    latencies: List[float] = []
+
+    with MockServer() as server:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(viewport={"width": 1280, "height": 720})
+            page = await context.new_page()
+
+            idx = 0
+            while total < pages:
+                case = GOLDEN_SET[idx % len(GOLDEN_SET)]
+                idx += 1
+
+                await page.goto(
+                    server.site_url(case.site_id), wait_until="domcontentloaded"
+                )
+                # 지연 로딩 시나리오를 위해 짧게 안정화 대기
+                await page.wait_for_timeout(350)
+
+                started = time.perf_counter()
+                candidates = await extractor(page, top_n)
+                latencies.append((time.perf_counter() - started) * 1000)
+
+                summary = "\n".join(f"{r} {n}" for r, n in candidates)
+                token_counts.append(float(_estimate_tokens(summary)))
+
+                found = any(
+                    role == case.expected_role and name == case.expected_name
+                    for role, name in candidates
+                )
+                total += 1
+                if found:
+                    hits += 1
+                elif case.site_id not in misses:
+                    misses.append(case.site_id)
+
+            await context.close()
+            await browser.close()
+
+    return {
+        "recall": round(hits / total, 4) if total else 0.0,
+        "samples": total,
+        "misses": misses,
+        "p50_tokens": round(statistics.median(token_counts), 1) if token_counts else 0.0,
+        "p95_tokens": round(_percentile(token_counts, 0.95), 1),
+        "p50_latency_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
+        "p95_latency_ms": round(_percentile(latencies, 0.95), 2),
+    }
+
+
+def _estimate_tokens(text: str) -> int:
+    try:
+        from perception import estimate_tokens
+
+        return estimate_tokens(text)
+    except ImportError:
+        return max(1, len(text) // 3)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Recall@20 평가 파이프라인")
     parser.add_argument("--golden", action="store_true", help="골든셋 자체 검증 모드")
@@ -164,11 +246,49 @@ def main() -> None:
             )
         )
 
-    # Stage 2에서 엔진이 준비되면 아래 경로로 실측한다.
-    extractor: ExtractorFn = build_extractor()  # pragma: no cover
-    raise NotImplementedError(  # pragma: no cover
-        "Stage 2에서 perception 엔진 연동 후 구현 예정"
+    try:
+        metrics = asyncio.run(_evaluate_engine(build_extractor(), args.pages, args.top_n))
+    except ImportError:
+        sys.exit(
+            int(
+                emit_error(
+                    "element_recall_at_20",
+                    "playwright 미설치. 'uv sync --extra dev' 및 "
+                    "'playwright install chromium' 실행 필요.",
+                )
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(
+            int(emit_error("element_recall_at_20", f"{type(exc).__name__}: {exc}"))
+        )
+
+    if metrics["misses"]:
+        for site_id in metrics["misses"]:
+            print(f"[-] 정답 미검출: {site_id}", file=sys.stderr)
+
+    result = MetricResult(
+        metric="element_recall_at_20",
+        value=metrics["recall"],
+        threshold=thresholds.RECALL_AT_20,
+        samples=metrics["samples"],
+        comparison="gte",
+        extra={
+            "top_n": args.top_n,
+            "misses": metrics["misses"] or None,
+            "p50_tokens": metrics["p50_tokens"],
+            "p95_tokens": metrics["p95_tokens"],
+            "p50_latency_ms": metrics["p50_latency_ms"],
+            "p95_latency_ms": metrics["p95_latency_ms"],
+            "token_threshold_p50": thresholds.OBSERVATION_TOKENS_P50,
+            "latency_threshold_p50": thresholds.OBSERVE_LATENCY_MS_P50,
+            "token_budget_ok": metrics["p50_tokens"] <= thresholds.OBSERVATION_TOKENS_P50,
+            "latency_budget_ok": (
+                metrics["p50_latency_ms"] <= thresholds.OBSERVE_LATENCY_MS_P50
+            ),
+        },
     )
+    sys.exit(int(emit(result)))
 
 
 if __name__ == "__main__":

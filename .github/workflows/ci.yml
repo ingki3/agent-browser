@@ -69,6 +69,10 @@ jobs:
           uv sync --extra dev
           uv pip install -e .
 
+      # 실브라우저 테스트가 CI에서 조용히 skip되면 Gate를 독립 검증할 수 없다.
+      - name: Chromium 설치
+        run: uv run playwright install --with-deps chromium
+
       - name: pytest 실행
         run: |
           set +e
@@ -102,6 +106,9 @@ jobs:
           uv sync --extra dev
           uv pip install -e .
 
+      - name: Chromium 설치
+        run: uv run playwright install --with-deps chromium
+
       # Stage 진행에 따라 아래 게이트를 순차적으로 활성화한다.
       # (src/AGENTS.md §5의 Gate 0 ~ Gate 3-B 명령어와 1:1 대응)
       - name: Gate 0 — 계약 동결 검증
@@ -112,6 +119,24 @@ jobs:
             uv run pytest tests/contracts -q
           else
             echo "::notice::src/contracts 미존재 — Stage 0 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: Gate 1 — 하네스 자체 검증
+        run: |
+          if [ -d src/harness ]; then
+            uv run python -m harness.contract_selftest
+            uv run python -m harness.selfcheck --mock-sites 20
+            uv run python -m harness.recall --golden
+          else
+            echo "::notice::src/harness 미존재 — Stage 1 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: Gate 2 — 인지 엔진 실측
+        run: |
+          if [ -d src/perception ]; then
+            uv run python -m harness.recall --pages 100 --top-n 20
+          else
+            echo "::notice::src/perception 미존재 — Stage 2 착수 전이므로 건너뜁니다."
           fi
 
       - name: 전체 회귀 테스트
