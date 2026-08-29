@@ -77,15 +77,39 @@ def check_prd_spec() -> bool:
     return passed
 
 def check_contracts_input_models() -> bool:
-    # If src/contracts/inputs.py exists, verify it has 19 Input models
+    """
+    contracts/inputs.py의 액션 입력 모델 수를 검증한다.
+
+    언더스코어로 시작하는 내부 베이스 클래스(_ElementTargetInput 등)는
+    ActionType에 대응하지 않는 공통 상속 기반이므로 집계에서 제외한다.
+    ACTION_INPUT_MAP 항목 수와의 일치는 tests/contracts에서 별도 검증한다.
+    """
     inputs_file = os.path.join("src", "contracts", "inputs.py")
-    if os.path.exists(inputs_file):
-        with open(inputs_file, "r", encoding="utf-8") as f:
-            content = f.read()
-        input_classes = re.findall(r"class\s+([A-Za-z0-9_]+Input)\s*\(", content)
-        if len(input_classes) != 19:
-            print(f"[-] {inputs_file} has {len(input_classes)} Input classes, expected 19!")
-            return False
+    if not os.path.exists(inputs_file):
+        return True
+
+    with open(inputs_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # 공개 액션 입력 모델만 집계 (선행 언더스코어 제외)
+    input_classes = re.findall(r"^class\s+([A-Za-z][A-Za-z0-9_]*Input)\s*\(", content, re.M)
+    if len(input_classes) != 19:
+        print(
+            f"[-] {inputs_file} has {len(input_classes)} public Input classes, expected 19!"
+        )
+        print(f"    found: {sorted(input_classes)}")
+        return False
+
+    # ACTION_INPUT_MAP 엔트리 수도 함께 확인
+    map_match = re.search(r"ACTION_INPUT_MAP[^=]*=\s*\{(.*?)\n\}", content, re.DOTALL)
+    if not map_match:
+        print(f"[-] {inputs_file}: ACTION_INPUT_MAP 정의를 찾을 수 없습니다!")
+        return False
+    entries = re.findall(r"ActionType\.[A-Z_]+\s*:", map_match.group(1))
+    if len(entries) != 19:
+        print(f"[-] {inputs_file}: ACTION_INPUT_MAP has {len(entries)} entries, expected 19!")
+        return False
+
     return True
 
 def main():
