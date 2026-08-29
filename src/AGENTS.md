@@ -55,7 +55,8 @@ agent-browser/
 ├── .gitignore                  # [사람/오케스트레이터 소유] 비밀값/임시파일 격리
 ├── scripts/                    # [사람/오케스트레이터 소유] 게이트 검증 스크립트 모음
 │   ├── check_auth_perms.py     # [Gate 1] 세션 스토리지 파일 권한 검증기
-│   └── check_gate_commands.py  # [CI] 본 문서 §5 게이트 명령어 구문 검증기
+│   ├── check_gate_commands.py  # [CI] 본 문서 §5 게이트 명령어 구문 검증기
+│   └── check_contracts_freeze.py # [CI] Stage 0 계약 동결 상태 검증기
 ├── src/
 │   ├── contracts/              # [WS-0] 인터페이스 모델, Pydantic 스키마, Protocol 클래스 (Stage 0 이후 동결)
 │   ├── browser/                # [WS-1] Playwright CDP 코어, BrowserContext 풀, 세션 관리자 (AES-256-GCM)
@@ -100,10 +101,29 @@ agent-browser/
 2. **커밋 메시지 컨벤션**:
    - `[WS-<번호>] <간결한 작업 요약>` (예: `[WS-0] Define Pydantic V2 models and Protocol classes`)
 3. **PR 및 머지 규칙**:
-   - PR 대상 브랜치는 항상 `main`입니다.
+   - 워크스트림 브랜치의 PR 대상은 항상 `dev`입니다. `main`은 릴리스 시점에 `dev → main` PR로만 갱신됩니다.
+   - `dev` / `main` 양쪽 모두 **직접 push가 차단**되어 있으며, 관리자에게도 동일하게 적용됩니다.
    - **머지 권한**: 해당 스테이지의 Gate 기계 검증이 100% 통과한 것을 확인한 후 **통합 오케스트레이터(또는 사람 감독자)만 머지를 승인**합니다.
 4. **공용 픽스처 격리**:
    - 루트 `tests/conftest.py`는 오케스트레이터 소유입니다. 각 워크스트림은 `tests/<모듈>/conftest.py` 내에 독립 픽스처를 정의합니다.
+
+### 🔒 계약 동결 상태 (Contract Freeze Status)
+
+| 항목 | 내용 |
+| :--- | :--- |
+| **동결 태그** | `contracts-v1.0-frozen` |
+| **승인 커밋** | `db5d49b` ([WS-0] Stage 0 계약 패키지 구현 및 동결) |
+| **승인 일자** | 2026-08-29 (사람 감독자 Gate 0 승인 완료) |
+| **동결 범위** | `src/contracts/**` (읽기 전용) |
+| **자동 검증** | `python scripts/check_contracts_freeze.py` — CI 필수 통과 |
+
+**Gate 0 통과 기록**: Input 모델 19종 / `ErrorCode` 27종 / KPI 상수 정합성 / `pytest tests/contracts` 31 passed
+
+**계약 변경이 필요한 경우 (Stage 0 재동결 절차)**:
+1. 에이전트는 계약 파일을 직접 수정하지 않고, **변경 필요 사유와 영향 범위를 사람 감독자에게 보고**합니다.
+2. 사람 감독자가 재동결을 승인하면 변경을 반영하고 새 동결 태그(예: `contracts-v1.1-frozen`)를 생성합니다.
+3. 오케스트레이터가 `scripts/check_contracts_freeze.py`의 `FREEZE_TAG` 상수를 갱신합니다.
+4. 계약 변경은 **모든 워크스트림에 파급**되므로, 이미 완료된 스테이지의 회귀 테스트를 재실행해야 합니다.
 
 ---
 

@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 계약 동결 검증에 동결 태그가 필요하므로 전체 히스토리를 가져온다.
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -41,6 +44,11 @@ jobs:
       #  게이트를 영구히 통과할 수 없던 사례 재발 방지)
       - name: 게이트 명령어 구문 검증
         run: python scripts/check_gate_commands.py
+
+      # Gate 0 승인 이후 src/contracts/** 는 읽기 전용이다 (AGENTS.md §3-2).
+      # 동결 태그 대비 변경이 있으면 실패시켜 무단 계약 수정을 차단한다.
+      - name: 계약 동결 검증
+        run: python scripts/check_contracts_freeze.py
 
   unit-tests:
     name: 단위 테스트 (pytest)
