@@ -1,0 +1,245 @@
+"""Prune4Web 스코어러 (PRD §3.1, Gate 2 Recall@20 >= 95%).
+
+수백 개 후보 요소에서 상위 N개만 남겨 관찰 토큰을 p50 2,500 이하로
+억제하면서도 정답 요소를 놓치지 않아야 한다.
+
+스코어링 원칙:
+* **재현율 우선** — 애매하면 남긴다. Top-20 밖으로 밀려난 정답은 복구
+  사다리(§3.2)를 타야 하므로 비용이 크다.
+* **결정론적** — 동일 입력에 항상 동일 순위. LLM이나 난수를 쓰지 않는다.
+  플레이키율 <= 2% KPI에 직결된다.
+* **CPU 오프로딩** — Levenshtein 등 무거운 연산은 `asyncio.to_thread`로
+  이벤트 루프에서 분리한다 (PRD §5.2).
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from perception.sanitizer import RawElement
+
+# --- 가중치 (합이 1.0이 되도록 정규화하지 않고 가산 점수로 사용) ----------
+
+#: role별 기본 가중치. 클릭 대상이 될 확률이 높은 순.
+ROLE_WEIGHTS: Dict[str, float] = {
+    "button": 1.00,
+    "link": 0.95,
+    "textbox": 0.90,
+    "searchbox": 0.90,
+    "combobox": 0.85,
+    "checkbox": 0.80,
+    "radio": 0.80,
+    "switch": 0.75,
+    "tab": 0.70,
+    "menuitem": 0.70,
+    "option": 0.55,
+    "slider": 0.50,
+    "spinbutton": 0.50,
+    "generic": 0.20,
+}
+
+W_ROLE = 3.0
+W_NAME = 2.5
+W_VIEWPORT = 1.2
+W_TESTID = 0.8
+W_SIZE = 0.6
+W_KEYWORD = 4.0  # 목표 키워드 일치는 가장 강한 신호
+W_SHADOW = 0.3  # shadow 내부 요소는 놓치기 쉬우므로 소폭 가산
+
+#: 비활성 요소 감점 (제거하지 않고 순위만 낮춘다)
+P_DISABLED = -1.5
+
+#: 이름이 없는 요소 감점
+P_NO_NAME = -1.0
+
+
+@dataclass
+class ScoredElement:
+    """스코어링된 요소."""
+
+    element: RawElement
+    score: float
+    reasons: Tuple[str, ...] = ()
+
+    @property
+    def role(self) -> str:
+        return self.element.role
+
+    @property
+    def name(self) -> str:
+        return self.element.name
+
+
+def _normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def levenshtein(a: str, b: str) -> int:
+    """편집 거리. 자가 치유 사다리 3단계에서도 재사용한다."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def similarity(a: str, b: str) -> float:
+    """0.0~1.0 정규화 유사도."""
+    a, b = _normalize(a), _normalize(b)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    longest = max(len(a), len(b))
+    return 1.0 - (levenshtein(a, b) / longest)
+
+
+def _name_quality(name: str) -> float:
+    """이름의 정보량을 0.0~1.0으로 평가한다.
+
+    너무 짧으면 식별력이 낮고, 너무 길면 본문 덩어리일 가능성이 높다.
+    """
+    text = _normalize(name)
+    if not text:
+        return 0.0
+    length = len(text)
+    if length <= 2:
+        return 0.3
+    if length <= 40:
+        return 1.0
+    if length <= 100:
+        return 0.6
+    return 0.25
+
+
+def _size_score(bbox: Dict[str, int]) -> float:
+    """클릭 타깃 크기를 로그 스케일로 평가한다."""
+    area = max(0, bbox.get("width", 0)) * max(0, bbox.get("height", 0))
+    if area <= 0:
+        return 0.0
+    # 44x44(권장 최소 터치 타깃) 부근에서 1.0에 근접하도록 정규화
+    return min(1.0, math.log10(area + 1) / math.log10(44 * 44 + 1))
+
+
+def score_element(
+    element: RawElement, goal_keywords: Sequence[str] = ()
+) -> ScoredElement:
+    """단일 요소의 점수를 계산한다."""
+    reasons: List[str] = []
+    score = 0.0
+
+    role_w = ROLE_WEIGHTS.get(element.role, ROLE_WEIGHTS["generic"])
+    score += W_ROLE * role_w
+    reasons.append(f"role={element.role}({role_w:.2f})")
+
+    name_q = _name_quality(element.name)
+    score += W_NAME * name_q
+    if name_q == 0.0:
+        score += P_NO_NAME
+        reasons.append("no_name")
+
+    if element.in_viewport:
+        score += W_VIEWPORT
+        reasons.append("in_viewport")
+
+    if element.testid:
+        score += W_TESTID
+        reasons.append("has_testid")
+
+    size_s = _size_score(element.bbox)
+    score += W_SIZE * size_s
+
+    if element.is_shadow:
+        score += W_SHADOW
+        reasons.append("shadow")
+
+    if element.disabled:
+        score += P_DISABLED
+        reasons.append("disabled")
+
+    # 목표 키워드 일치는 가장 강한 신호
+    if goal_keywords:
+        best = 0.0
+        matched = ""
+        haystack = _normalize(f"{element.name} {element.testid or ''} {element.href or ''}")
+        for kw in goal_keywords:
+            k = _normalize(kw)
+            if not k:
+                continue
+            if k in haystack:
+                best = max(best, 1.0)
+                matched = kw
+            else:
+                sim = similarity(k, _normalize(element.name))
+                if sim > best:
+                    best, matched = sim, kw
+        if best >= 0.6:
+            score += W_KEYWORD * best
+            reasons.append(f"keyword~{matched}({best:.2f})")
+
+    return ScoredElement(element=element, score=round(score, 4), reasons=tuple(reasons))
+
+
+def prune(
+    elements: Iterable[RawElement],
+    top_n: int = 20,
+    goal_keywords: Sequence[str] = (),
+) -> List[ScoredElement]:
+    """상위 N개 후보를 결정론적으로 선별한다.
+
+    동점자는 원본 DOM 순서(seq)로 안정 정렬해 실행마다 순위가 흔들리지
+    않게 한다 (플레이키율 KPI).
+    """
+    scored = [score_element(e, goal_keywords) for e in elements]
+    scored.sort(key=lambda s: (-s.score, s.element.seq))
+    return scored[:top_n]
+
+
+async def prune_async(
+    elements: Sequence[RawElement],
+    top_n: int = 20,
+    goal_keywords: Sequence[str] = (),
+) -> List[ScoredElement]:
+    """스코어링을 별도 스레드로 오프로딩한다 (이벤트 루프 블로킹 방지).
+
+    요소가 적을 때는 스레드 전환 비용이 더 크므로 인라인 처리한다.
+    """
+    import asyncio
+
+    if len(elements) < 200:
+        return prune(elements, top_n, goal_keywords)
+    return await asyncio.to_thread(prune, elements, top_n, goal_keywords)
+
+
+def expand_top_n(current: int) -> int:
+    """복구 사다리 1단계: N 확장 (PRD §3.2)."""
+    return 50 if current < 50 else current * 2
+
+
+def filter_by_keywords(
+    elements: Iterable[RawElement], keywords: Sequence[str], threshold: float = 0.55
+) -> List[RawElement]:
+    """복구 사다리 2단계: 시맨틱 키워드 정밀 매칭 (PRD §3.2)."""
+    if not keywords:
+        return list(elements)
+    matched: List[RawElement] = []
+    for el in elements:
+        haystack = _normalize(f"{el.name} {el.testid or ''} {el.href or ''}")
+        for kw in keywords:
+            k = _normalize(kw)
+            if not k:
+                continue
+            if k in haystack or similarity(k, _normalize(el.name)) >= threshold:
+                matched.append(el)
+                break
+    return matched

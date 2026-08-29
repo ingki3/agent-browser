@@ -232,13 +232,21 @@ def test_golden_recall_is_exactly_one():
     assert payload["passed"] is True
 
 
-def test_recall_without_engine_exits_2_not_0():
-    """미구현을 '통과'나 '0점 미달'이 아닌 '측정 불가'로 구분해야 한다."""
-    proc = _run_module("harness.recall", "--pages", "10")
-    assert proc.returncode == 2
+def test_recall_measures_engine_now_that_perception_exists():
+    """WS-2 구현 이후에는 실제 Recall 측정이 이뤄져야 한다.
+
+    WS-6 단계에서는 perception 모듈이 없어 exit 2(측정 불가)였고,
+    WS-2 완료로 exit 0(실측)으로 전환되는 것이 정상이다.
+    """
+    proc = _run_module("harness.recall", "--pages", "10", "--top-n", "20")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout.strip())
-    assert payload["passed"] is False
-    assert "error" in payload
+    assert payload["metric"] == "element_recall_at_20"
+    assert payload["samples"] == 10
+    assert "error" not in payload
+    # 예산 판정 필드가 함께 보고되어야 한다.
+    assert "p50_tokens" in payload
+    assert "p50_latency_ms" in payload
 
 
 def test_egress_measures_zero_leaks_now_that_security_exists():
