@@ -540,6 +540,41 @@ def _build_sites() -> List[MockSite]:
         )
     )
 
+    # 22. 고밀도 노이즈 사이트 (Recall@20 프루닝 실효 검증용)
+    #     후보 요소가 20개를 크게 넘어야 Top-N 프루닝이 실제로 동작한다.
+    #     정답 버튼은 노이즈 한가운데(DOM 순서상 뒤쪽)에 배치한다.
+    _noise_links = "".join(
+        f'<li><a href="/s22_dense/item{i}">관련 상품 {i}</a></li>' for i in range(40)
+    )
+    _noise_buttons = "".join(
+        f'<button id="nb{i}">더보기 {i}</button>' for i in range(25)
+    )
+    sites.append(
+        MockSite(
+            site_id="s22_dense",
+            title="고밀도 목록",
+            scenarios=(Scenario.INFINITE_SCROLL, Scenario.LAZY_LOADING),
+            golden_target="주문 결제하기",
+            golden_role="button",
+            html=_page(
+                "고밀도 목록",
+                f"""
+                <h1>상품 상세</h1>
+                <nav><ul>{_noise_links}</ul></nav>
+                <section>{_noise_buttons}</section>
+                <div class="cta">
+                  <button id="checkout">주문 결제하기</button>
+                </div>
+                <footer>
+                  <a href="/s22_dense/terms">약관</a>
+                  <a href="/s22_dense/privacy">개인정보</a>
+                  <a href="/s22_dense/help">고객센터</a>
+                </footer>
+                """,
+            ),
+        )
+    )
+
     return sites
 
 

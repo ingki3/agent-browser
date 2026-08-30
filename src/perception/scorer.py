@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -47,6 +48,18 @@ W_TESTID = 0.8
 W_SIZE = 0.6
 W_KEYWORD = 4.0  # 목표 키워드 일치는 가장 강한 신호
 W_SHADOW = 0.3  # shadow 내부 요소는 놓치기 쉬우므로 소폭 가산
+
+#: 반복 패턴 감점.
+#: 목록형 페이지에서 '관련 상품 0~39' 같은 동형 링크가 수십 개 쌓이면,
+#: 각 항목이 개별로는 평범한 점수를 받아도 Top-N을 통째로 점유해
+#: 정작 핵심 CTA(결제/제출 버튼)를 밀어낸다. 실측에서 정답 버튼이
+#: 69개 중 35위로 밀려 Recall@20이 0.91로 떨어졌다.
+#:
+#: 이름에서 숫자를 제거한 형태가 동일한 요소를 '반복 패턴'으로 보고,
+#: 같은 그룹의 3번째부터 점진 감점한다. 그룹의 대표 몇 개는 남으므로
+#: 목록 자체를 못 보는 문제는 생기지 않는다.
+W_REPEAT_PENALTY = 1.6
+REPEAT_GROUP_FREE = 2  # 그룹당 감점 없이 통과시킬 개수
 
 #: 비활성 요소 감점 (제거하지 않고 순위만 낮춘다)
 P_DISABLED = -1.5
@@ -235,6 +248,17 @@ def score_element(
     return ScoredElement(element=element, score=round(score, 4), reasons=tuple(reasons))
 
 
+_DIGITS = re.compile(r"\d+")
+
+
+def repeat_key(element: RawElement) -> str:
+    """반복 패턴 그룹 키. 이름의 숫자를 제거한 형태로 묶는다.
+
+    '관련 상품 12'와 '관련 상품 37'은 같은 그룹이 된다.
+    """
+    return f"{element.role}|{_DIGITS.sub('#', _normalize(element.name))}"
+
+
 def prune(
     elements: Iterable[RawElement],
     top_n: int = 20,
@@ -244,10 +268,39 @@ def prune(
 
     동점자는 원본 DOM 순서(seq)로 안정 정렬해 실행마다 순위가 흔들리지
     않게 한다 (플레이키율 KPI).
+
+    반복 패턴(동형 목록 항목)은 그룹당 상위 몇 개만 온전한 점수를 받고
+    나머지는 감점된다. 목록이 Top-N을 통째로 점유해 핵심 액션 요소를
+    밀어내는 것을 막기 위함이다.
     """
-    scored = [score_element(e, goal_keywords) for e in elements]
-    scored.sort(key=lambda s: (-s.score, s.element.seq))
-    return scored[:top_n]
+    items = list(elements)
+    scored = [score_element(e, goal_keywords) for e in items]
+
+    # 반복 그룹별로 DOM 순서상 뒤쪽 항목에 점진 감점을 적용한다.
+    seen: Dict[str, int] = {}
+    adjusted: List[ScoredElement] = []
+    for item in scored:
+        key = repeat_key(item.element)
+        rank_in_group = seen.get(key, 0)
+        seen[key] = rank_in_group + 1
+
+        if rank_in_group < REPEAT_GROUP_FREE:
+            adjusted.append(item)
+            continue
+
+        # 3번째부터 감점. 그룹이 커질수록 감점 폭이 커진다.
+        depth = rank_in_group - REPEAT_GROUP_FREE + 1
+        penalty = W_REPEAT_PENALTY * min(1.0, depth / 3.0)
+        adjusted.append(
+            ScoredElement(
+                element=item.element,
+                score=round(item.score - penalty, 4),
+                reasons=item.reasons + (f"repeat_penalty(-{penalty:.2f})",),
+            )
+        )
+
+    adjusted.sort(key=lambda s: (-s.score, s.element.seq))
+    return adjusted[:top_n]
 
 
 async def prune_async(

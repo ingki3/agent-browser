@@ -89,7 +89,7 @@ def test_exit_codes_are_distinct():
 
 
 def test_mock_site_count_matches_selfcheck():
-    assert len(MOCK_SITES) == 21
+    assert len(MOCK_SITES) == 22
 
 
 def test_site_ids_are_unique():
@@ -170,8 +170,27 @@ def test_unknown_path_returns_404(server):
 # ---------------------------------------------------------------------------
 
 
-def test_golden_set_has_10_cases():
-    assert len(GOLDEN_SET) == 10
+def test_golden_set_size():
+    """골든셋은 최소 10종이며 고밀도 케이스를 포함해야 한다."""
+    from harness import DENSE_CASE_SITE_ID
+
+    assert len(GOLDEN_SET) >= 10
+    assert any(c.site_id == DENSE_CASE_SITE_ID for c in GOLDEN_SET)
+
+
+def test_golden_set_includes_high_density_page():
+    """후보가 Top-N보다 적은 페이지만 모으면 프루닝이 검증되지 않는다.
+
+    사보타주 실험에서 스코어러를 무력화해도 recall 1.0이 나왔던 원인이
+    바로 이것이다. 고밀도 케이스는 후보가 Top-20을 크게 넘어야 한다.
+    """
+    from harness import DENSE_CASE_SITE_ID
+    from harness.mock_sites import SITE_INDEX
+
+    site = SITE_INDEX[DENSE_CASE_SITE_ID]
+    # 링크/버튼 태그 수로 대략적 후보 밀도를 확인한다.
+    density = site.html.count("<a ") + site.html.count("<button")
+    assert density > 20, f"고밀도 케이스의 후보가 부족함: {density}개"
 
 
 def test_golden_set_matches_site_definitions():
@@ -185,10 +204,15 @@ def test_golden_targets_exist_in_site_html():
 
 
 def test_reference_extractor_finds_every_golden_target():
-    """참조 추출기가 골든 정답을 모두 찾아야 recall 1.0이 성립한다."""
+    """참조 추출기가 골든 정답을 모두 찾아야 recall 1.0이 성립한다.
+
+    고밀도 케이스는 후보가 Top-N을 넘으므로 프루닝 전 전체 후보에서
+    확인한다. Top-N 안에 드는지는 `harness.recall --golden`이 실제
+    스코어러로 검증한다.
+    """
     for case in GOLDEN_SET:
         site = SITE_INDEX[case.site_id]
-        found = reference_extractor(site.html, thresholds.DEFAULT_PRUNE_TOP_N)
+        found = reference_extractor(site.html, 10_000)
         assert (case.expected_role, case.expected_name) in found, case.site_id
 
 
@@ -210,7 +234,7 @@ def test_contract_selftest_passes():
 
 
 def test_selfcheck_passes_with_20_sites():
-    proc = _run_module("harness.selfcheck", "--mock-sites", "21")
+    proc = _run_module("harness.selfcheck", "--mock-sites", "22")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout.strip())
     assert payload["passed"] is True
@@ -260,11 +284,15 @@ def test_recall_measures_engine_now_that_perception_exists():
     WS-2 완료로 exit 0(실측)으로 전환되는 것이 정상이다.
     실브라우저가 필요하므로 Chromium 부재 환경에서는 skip한다.
     """
-    proc = _run_module("harness.recall", "--pages", "10", "--top-n", "20")
+    # 골든셋 전체를 최소 1회 순회해야 고밀도 케이스가 표본에 포함된다.
+    pages = len(GOLDEN_SET)
+    proc = _run_module("harness.recall", "--pages", str(pages), "--top-n", "20")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout.strip())
     assert payload["metric"] == "element_recall_at_20"
-    assert payload["samples"] == 10
+    assert payload["samples"] == pages
+    # 프루닝이 실제로 동작한 페이지가 있어야 지표가 유효하다.
+    assert payload["pruning_effective_pages"] > 0
     assert "error" not in payload
     # 예산 판정 필드가 함께 보고되어야 한다.
     assert "p50_tokens" in payload

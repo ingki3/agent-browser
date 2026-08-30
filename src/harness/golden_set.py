@@ -26,7 +26,12 @@ class GoldenCase:
     note: str = ""
 
 
-#: 사람이 검수한 정답 10종. 각 항목은 mock_sites의 golden_target과 일치해야 한다.
+#: 사람이 검수한 정답. 각 항목은 mock_sites의 golden_target과 일치해야 한다.
+#:
+#: **밀도 요건 (중요)**: 후보 요소가 Top-N보다 적은 페이지만 모으면
+#: 프루닝이 한 번도 동작하지 않은 채 recall 1.0이 나온다(사보타주 실험에서
+#: 스코어러를 무력화해도 통과했다). `s22_dense`는 후보가 60개를 넘어
+#: Top-20 프루닝을 강제하며, 스코어링이 깨지면 즉시 recall이 떨어진다.
 GOLDEN_SET: Tuple[GoldenCase, ...] = (
     GoldenCase("s01_login", "button", "로그인", "기본 폼 제출 버튼"),
     GoldenCase("s02_twofactor", "button", "인증 확인", "OTP 확인 버튼 (재전송과 구분)"),
@@ -38,7 +43,17 @@ GOLDEN_SET: Tuple[GoldenCase, ...] = (
     GoldenCase("s13_spa", "button", "설정으로 이동", "SPA 라우팅 트리거"),
     GoldenCase("s14_lazy", "button", "지연 로딩 버튼", "300ms 후 삽입되는 노드"),
     GoldenCase("s19_checkout", "button", "결제 진행", "결제 확인 다이얼로그 트리거"),
+    GoldenCase(
+        "s22_dense",
+        "button",
+        "주문 결제하기",
+        "노이즈 60개 이상 — Top-20 프루닝이 실제로 동작해야 검출됨",
+    ),
 )
+
+#: 프루닝 실효성을 보장해야 하는 케이스. 이 사이트에서 정답을 놓치면
+#: 스코어링이 무의미하다는 뜻이다.
+DENSE_CASE_SITE_ID = "s22_dense"
 
 
 def validate_golden_set() -> list[str]:

@@ -24,7 +24,12 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from contracts import thresholds
 
-from harness.golden_set import GOLDEN_SET, GoldenCase, validate_golden_set
+from harness.golden_set import (
+    DENSE_CASE_SITE_ID,
+    GOLDEN_SET,
+    GoldenCase,
+    validate_golden_set,
+)
 from harness.mock_sites import SITE_INDEX, MockServer
 from harness.result import MetricResult, emit, emit_error
 
@@ -91,7 +96,16 @@ def reference_extractor(html: str, top_n: int) -> List[Tuple[str, str]]:
 
 
 def evaluate_golden(top_n: int) -> List[CaseOutcome]:
-    """골든셋 10종에 대해 정답 요소가 Top-N에 남는지 확인한다."""
+    """골든셋에 대해 정답 요소가 Top-N에 남는지 확인한다.
+
+    정적 HTML 정규식 추출기는 프루닝을 거치지 않아, 후보가 top_n을
+    넘는 고밀도 페이지에서 실제 엔진과 결과가 갈린다. 따라서 후보가
+    많은 경우에는 실제 스코어러(`prune`)를 태워 순위를 매긴다.
+    그래야 골든 모드가 '하네스 + 스코어러' 양쪽을 함께 검증한다.
+    """
+    from perception import prune
+    from perception.sanitizer import RawElement
+
     outcomes: List[CaseOutcome] = []
     with MockServer() as server:
         import urllib.request
@@ -101,7 +115,25 @@ def evaluate_golden(top_n: int) -> List[CaseOutcome]:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
 
-            candidates = reference_extractor(html, top_n)
+            raw = reference_extractor(html, 10_000)
+
+            if len(raw) > top_n:
+                # 고밀도 페이지: 실제 스코어러로 프루닝한다.
+                elements = [
+                    RawElement(
+                        seq=i,
+                        role=role,
+                        name=name,
+                        tag="button" if role == "button" else "a",
+                        css_path=f"#{i}",
+                        bbox={"x": 0, "y": 0, "width": 100, "height": 30},
+                    )
+                    for i, (role, name) in enumerate(raw)
+                ]
+                candidates = [(s.role, s.name) for s in prune(elements, top_n)]
+            else:
+                candidates = list(raw[:top_n])
+
             rank: Optional[int] = None
             for idx, (role, name) in enumerate(candidates, start=1):
                 if role == case.expected_role and name == case.expected_name:
@@ -124,14 +156,25 @@ async def _evaluate_engine(extractor, pages: int, top_n: int) -> dict:
 
     골든셋 정답을 정답 레이블로 사용하되, 사이트를 반복 순회해
     요청된 페이지 수만큼 표본을 채운다.
+
+    **프루닝 실효성 검증**: 후보 수가 top_n 이하인 페이지에서는 프루닝이
+    동작하지 않으므로 recall이 스코어링 품질을 반영하지 못한다. 밀도가
+    충분한 페이지가 최소 1건은 포함되어야 한다.
     """
     from playwright.async_api import async_playwright
+
+    from perception import PerceptionEngine
 
     hits = 0
     total = 0
     misses: List[str] = []
     token_counts: List[float] = []
     latencies: List[float] = []
+    pruning_effective = 0  # 후보 > top_n 이었던 페이지 수
+    dense_checked = 0
+    dense_hits = 0
+
+    probe = PerceptionEngine()  # 프루닝 전 후보 수 측정용
 
     with MockServer() as server:
         async with async_playwright() as pw:
@@ -150,6 +193,10 @@ async def _evaluate_engine(extractor, pages: int, top_n: int) -> dict:
                 # 지연 로딩 시나리오를 위해 짧게 안정화 대기
                 await page.wait_for_timeout(350)
 
+                # 프루닝 전 전체 후보 수 (top_n 초과 여부 판정)
+                full = await probe.observe_page(page=page, prune_top_n=10_000)
+                candidate_count = len(full.elements)
+
                 started = time.perf_counter()
                 candidates = await extractor(page, top_n)
                 latencies.append((time.perf_counter() - started) * 1000)
@@ -162,6 +209,12 @@ async def _evaluate_engine(extractor, pages: int, top_n: int) -> dict:
                     for role, name in candidates
                 )
                 total += 1
+                if candidate_count > top_n:
+                    pruning_effective += 1
+                if case.site_id == DENSE_CASE_SITE_ID:
+                    dense_checked += 1
+                    if found:
+                        dense_hits += 1
                 if found:
                     hits += 1
                 elif case.site_id not in misses:
@@ -178,6 +231,9 @@ async def _evaluate_engine(extractor, pages: int, top_n: int) -> dict:
         "p95_tokens": round(_percentile(token_counts, 0.95), 1),
         "p50_latency_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
         "p95_latency_ms": round(_percentile(latencies, 0.95), 2),
+        "pruning_effective_pages": pruning_effective,
+        "dense_checked": dense_checked,
+        "dense_hits": dense_hits,
     }
 
 
@@ -267,6 +323,33 @@ def main() -> None:
         for site_id in metrics["misses"]:
             print(f"[-] 정답 미검출: {site_id}", file=sys.stderr)
 
+    # --- 프루닝 실효성 검증 ---------------------------------------------
+    # 후보가 top_n 이하인 페이지만 측정하면 프루닝이 한 번도 동작하지
+    # 않은 채 recall 1.0이 나온다. 스코어러를 무력화해도 통과하므로
+    # 지표를 신뢰할 수 없다.
+    if metrics["pruning_effective_pages"] == 0:
+        sys.exit(
+            int(
+                emit_error(
+                    "element_recall_at_20",
+                    f"측정한 {metrics['samples']}개 페이지 모두 후보 수가 "
+                    f"top_n({args.top_n}) 이하여서 프루닝이 동작하지 않았습니다. "
+                    "스코어링 품질이 반영되지 않은 수치이므로 신뢰할 수 없습니다.",
+                )
+            )
+        )
+
+    if metrics["dense_checked"] == 0:
+        sys.exit(
+            int(
+                emit_error(
+                    "element_recall_at_20",
+                    f"고밀도 케이스({DENSE_CASE_SITE_ID})가 표본에 포함되지 "
+                    "않았습니다. --pages를 골든셋 크기 이상으로 지정하십시오.",
+                )
+            )
+        )
+
     result = MetricResult(
         metric="element_recall_at_20",
         value=metrics["recall"],
@@ -286,6 +369,8 @@ def main() -> None:
             "latency_budget_ok": (
                 metrics["p50_latency_ms"] <= thresholds.OBSERVE_LATENCY_MS_P50
             ),
+            "pruning_effective_pages": metrics["pruning_effective_pages"],
+            "dense_case_hits": f"{metrics['dense_hits']}/{metrics['dense_checked']}",
         },
     )
     sys.exit(int(emit(result)))
