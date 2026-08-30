@@ -68,10 +68,14 @@ TASKS: Tuple[RealTask, ...] = (
         max_steps=4,
     ),
     RealTask(
-        "iana-reserved",
-        "https://www.iana.org/domains/reserved",
-        "페이지 상단의 'Domains' 링크를 클릭해 도메인 목록 페이지로 이동하기",
-        "location.pathname.includes('/domains')",
+        "iana-example",
+        "https://www.iana.org/help/example-domains",
+        "'IANA-managed Reserved Domains' 링크를 클릭해 예약 도메인 목록으로 이동하기",
+        # 시작 URL(/help/example-domains)에서는 거짓이어야 한다.
+        # 실측 — 이전 정의는 시작 URL이 이미 /domains/reserved라
+        # includes('/domains')가 초기부터 참이었다(무의미한 검증식).
+        "location.pathname.includes('/domains') && "
+        "!location.pathname.includes('/help')",
         difficulty="easy",
         capability="단순 네비게이션",
         max_steps=4,
@@ -152,10 +156,70 @@ TASKS: Tuple[RealTask, ...] = (
         capability="반복 목록에서 특정 위치 요소 선택",
         max_steps=6,
     ),
+    # --- multistep: 5스텝 이상, 상태를 누적해야 완료 ---
+    #
+    # 기존 태스크는 최대 4스텝이라 긴 호흡의 실패 모드(중간 상태 소실,
+    # 에포크 갱신 후 요소 참조, 반복 액션 누적)를 관측할 수 없었다.
+    # 아래 태스크들은 이전 스텝의 결과 위에 다음 액션을 쌓아야 한다.
+    RealTask(
+        "todo-add-two",
+        "https://demo.playwright.dev/todomvc/",
+        "할 일 목록에 'buy milk'를 추가하고, 이어서 'walk dog'도 추가하기",
+        "document.querySelectorAll('.todo-list li').length === 2",
+        difficulty="multistep",
+        capability="같은 입력창에 반복 입력 (상태 누적)",
+        max_steps=10,
+    ),
+    RealTask(
+        "todo-add-complete",
+        "https://demo.playwright.dev/todomvc/",
+        "할 일에 'write report'를 추가한 뒤, 그 항목의 완료 체크박스를 눌러 완료 처리하기",
+        "document.querySelectorAll('.todo-list li.completed').length >= 1",
+        difficulty="multistep",
+        capability="생성 -> 생성된 요소 조작 (신규 요소 참조)",
+        max_steps=10,
+    ),
+    RealTask(
+        "todo-add-three",
+        "https://demo.playwright.dev/todomvc/",
+        "할 일 목록에 'task one', 'task two', 'task three'를 차례로 모두 추가하기",
+        "document.querySelectorAll('.todo-list li').length === 3",
+        difficulty="multistep",
+        capability="동일 입력창 3회 반복 (긴 호흡의 상태 누적)",
+        max_steps=12,
+    ),
+    RealTask(
+        "internet-login",
+        "https://the-internet.herokuapp.com/login",
+        "사용자명에 'tomsmith', 비밀번호에 'SuperSecretPassword!'를 입력하고 Login 버튼 누르기",
+        "location.pathname.includes('/secure')",
+        difficulty="multistep",
+        capability="다중 필드 입력 후 제출 (공식 테스트 계정)",
+        max_steps=8,
+    ),
+    RealTask(
+        "internet-checkbox-both",
+        "https://the-internet.herokuapp.com/checkboxes",
+        "페이지의 체크박스 두 개를 모두 체크된 상태로 만들기",
+        "[...document.querySelectorAll('input[type=checkbox]')]"
+        ".every(c => c.checked)",
+        difficulty="multistep",
+        capability="여러 요소를 순회하며 상태 통일 (초기 상태 상이)",
+        max_steps=8,
+    ),
+    RealTask(
+        "internet-dropdown-two",
+        "https://the-internet.herokuapp.com/dropdown",
+        "드롭다운에서 'Option 1'을 선택한 뒤, 다시 'Option 2'로 변경하기",
+        "document.querySelector('#dropdown')?.value === '2'",
+        difficulty="multistep",
+        capability="같은 요소에 연속 조작 (마지막 상태가 정답)",
+        max_steps=8,
+    ),
 )
 
 #: 난이도별 태스크 수 (커버리지 검증용)
-DIFFICULTY_LEVELS: Tuple[str, ...] = ("easy", "medium", "hard")
+DIFFICULTY_LEVELS: Tuple[str, ...] = ("easy", "medium", "hard", "multistep")
 
 
 def tasks_by_difficulty() -> Dict[str, int]:

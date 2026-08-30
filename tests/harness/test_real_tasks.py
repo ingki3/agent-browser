@@ -33,6 +33,40 @@ def test_every_difficulty_has_multiple_tasks():
         assert counts.get(level, 0) >= 2, f"난이도 {level}가 부족: {counts}"
 
 
+def test_multistep_tier_exists():
+    """2~4스텝 태스크만으로는 긴 호흡의 실패 모드를 관측할 수 없다."""
+    assert "multistep" in DIFFICULTY_LEVELS
+    multistep = [t for t in TASKS if t.difficulty == "multistep"]
+    assert len(multistep) >= 4, f"멀티스텝 태스크가 {len(multistep)}개뿐"
+
+
+def test_multistep_tasks_allow_enough_steps():
+    """상태를 누적하려면 스텝 여유가 필요하다."""
+    for task in TASKS:
+        if task.difficulty == "multistep":
+            assert task.max_steps >= 8, f"{task.task_id}: {task.max_steps}스텝"
+
+
+def test_multistep_goals_require_multiple_actions():
+    """단일 액션으로 끝나는 목표는 멀티스텝이 아니다.
+
+    순차 표현('이어서', '뒤')이 있거나, 조작 대상이 2개 이상이어야 한다.
+    'A와 B를 입력하고 버튼 누르기'처럼 순차어 없이도 다단계인 경우가 있다.
+    """
+    sequence_markers = ("이어서", "뒤", "다시", "차례로", "모두", "그 ")
+    action_verbs = ("입력", "클릭", "선택", "체크", "누르", "추가", "변경", "이동")
+
+    for task in TASKS:
+        if task.difficulty != "multistep":
+            continue
+        goal = task.goal
+        has_sequence = any(m in goal for m in sequence_markers)
+        verb_count = sum(goal.count(v) for v in action_verbs)
+        assert has_sequence or verb_count >= 2, (
+            f"{task.task_id}: 단일 액션으로 보임 — {goal}"
+        )
+
+
 def test_every_task_has_independent_success_check():
     """성공 판정은 에이전트 자기 보고와 분리되어야 한다."""
     for task in TASKS:

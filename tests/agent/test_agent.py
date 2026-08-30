@@ -238,3 +238,55 @@ def test_history_is_included_when_present():
         history=["click @e1 -> OK"],
     )
     assert "click @e1 -> OK" in msgs[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 5. 필드 혼동 보정 (WS-10 실측)
+#     모델이 press_key의 키 이름을 `key`가 아닌 `text`에 담아 보내
+#     빈 키로 디스패치되어 3회 연속 실패했다. 프롬프트로 형식을
+#     지시해도 100% 지켜지지 않으므로 변환 단계에서 보정한다.
+# ---------------------------------------------------------------------------
+
+
+def test_press_key_recovers_key_from_text_field():
+    """모델이 key 대신 text에 키 이름을 넣어도 동작해야 한다."""
+    params = decision_to_params(
+        Decision(action="press_key", element_id="@e4", text="Enter")
+    )
+    assert params.get("key") == "Enter"
+
+
+def test_press_key_prefers_explicit_key_field():
+    params = decision_to_params(
+        Decision(action="press_key", key="Escape", text="Enter")
+    )
+    assert params["key"] == "Escape"
+
+
+def test_press_key_never_dispatches_empty_key():
+    """빈 키로 디스패치하면 Playwright가 Unknown key로 실패한다."""
+    params = decision_to_params(Decision(action="press_key", element_id="@e1"))
+    assert "key" not in params or params["key"]
+
+
+def test_type_text_does_not_leak_into_key():
+    params = decision_to_params(
+        Decision(action="type_text", element_id="@e1", text="hello")
+    )
+    assert params["text"] == "hello"
+    assert "key" not in params
+
+
+def test_select_option_recovers_value_from_text():
+    params = decision_to_params(
+        Decision(action="select_option", element_id="@e1", text="Option 2")
+    )
+    assert params.get("value") == "Option 2"
+
+
+def test_system_prompt_documents_key_field():
+    """프롬프트에 key 필드 사용법이 없으면 모델이 text에 넣는다."""
+    from agent import SYSTEM_PROMPT
+
+    assert '"key"' in SYSTEM_PROMPT
+    assert "press_key" in SYSTEM_PROMPT

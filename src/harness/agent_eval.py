@@ -69,6 +69,12 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
         await page.goto(task.url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(900)
 
+        # --- 검증식 사전 점검 ---
+        # 아무 액션도 하지 않은 초기 상태에서 이미 참이면 그 검증식은
+        # 무의미하다(무엇을 해도 통과한다). 실측에서 실제로 발생했다.
+        baseline, _ = await _verify_success(page, task)
+        record["baseline_already_true"] = baseline
+
         cdp = await context.new_cdp_session(page)
         engine = PerceptionEngine()
         dispatcher = ActionDispatcher(
@@ -253,7 +259,28 @@ def main() -> None:
 
     summary = _summarize(records)
 
-    # --- 커버리지: 난이도 3단계가 모두 실행되었는가 ---
+    # --- 검증식 유효성: 초기 상태에서 이미 참인 태스크가 있으면 무효 ---
+    # 그런 태스크는 에이전트가 아무것도 하지 않아도 성공으로 집계되어
+    # 완수율을 부풀린다.
+    trivial = sorted(
+        {r["task_id"] for r in records if r.get("baseline_already_true")}
+    )
+    if trivial:
+        for task_id in trivial:
+            print(
+                f"[-] 검증식이 초기 상태에서 이미 참: {task_id}", file=sys.stderr
+            )
+        sys.exit(
+            int(
+                emit_error(
+                    "agent_completion_rate",
+                    f"무의미한 검증식 {len(trivial)}건({', '.join(trivial)}). "
+                    "아무 액션 없이도 통과하므로 완수율이 부풀려집니다.",
+                )
+            )
+        )
+
+    # --- 커버리지: 난이도 전 단계가 실행되었는가 ---
     covered = set(summary["by_difficulty"])
     if not args.task and covered != set(DIFFICULTY_LEVELS):
         missing = sorted(set(DIFFICULTY_LEVELS) - covered)

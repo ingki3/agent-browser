@@ -53,7 +53,14 @@ SYSTEM_PROMPT = """당신은 웹 브라우저를 제어하는 자율 에이전�
 
 출력 형식:
 {"action": "액션명", "element_id": "@eN 또는 null", "text": "입력값 또는 null",
- "url": "이동할 URL 또는 null", "reason": "선택 이유 한 줄"}"""
+ "key": "키 이름 또는 null", "value": "선택값 또는 null",
+ "url": "이동할 URL 또는 null", "reason": "선택 이유 한 줄"}
+
+필드 사용법:
+- type_text는 text에 입력할 문자열을 넣습니다.
+- press_key는 key에 키 이름을 넣습니다 (Enter, Escape, Tab, ArrowDown 등).
+  text가 아니라 key입니다.
+- select_option은 value에 선택할 값을 넣습니다."""
 
 
 @dataclass
@@ -184,22 +191,41 @@ def parse_decision(payload: Any) -> Decision:
 
 
 def decision_to_params(decision: Decision) -> Dict[str, Any]:
-    """Decision을 디스패처 인자로 변환한다."""
+    """Decision을 디스패처 인자로 변환한다.
+
+    모델이 필드를 혼동하는 경우를 보정한다. 프롬프트로 형식을 지시해도
+    100% 지켜지지 않으므로, 상위에서 한 번 더 정규화한다.
+    실측 — press_key인데 키 이름을 `key`가 아닌 `text`에 담아 보내
+    빈 키로 디스패치되어 3회 연속 실패했다.
+    """
+    action = decision.action_type
     params: Dict[str, Any] = {}
+
     if decision.element_id:
         params["element_id"] = decision.element_id
-    if decision.text is not None:
-        params["text"] = decision.text
     if decision.url:
         params["url"] = decision.url
-    if decision.value is not None:
-        params["value"] = decision.value
-    if decision.key:
-        params["key"] = decision.key
     if decision.selector:
         params["selector"] = decision.selector
 
-    action = decision.action_type
+    if action is ActionType.PRESS_KEY:
+        # key가 비었으면 text/value에서 회수한다.
+        key = decision.key or decision.text or decision.value
+        if key:
+            params["key"] = key
+    elif action is ActionType.SELECT_OPTION:
+        # value가 비었으면 text에서 회수한다.
+        value = decision.value if decision.value is not None else decision.text
+        if value is not None:
+            params["value"] = value
+    else:
+        if decision.text is not None:
+            params["text"] = decision.text
+        if decision.value is not None:
+            params["value"] = decision.value
+        if decision.key:
+            params["key"] = decision.key
+
     if action is ActionType.SCROLL:
         params["direction"] = decision.direction or "down"
         params.setdefault("amount", 500)
