@@ -330,3 +330,26 @@ def test_copied_example_file_is_not_treated_as_configured(tmp_path: Path):
     copied = tmp_path / ".env"
     copied.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
     assert load_config(copied).configured is False
+
+
+# ---------------------------------------------------------------------------
+# 7. reasoning 계열 모델 대응
+#     실측: z-ai/glm-5.3-flash는 content 앞에 reasoning 토큰을 먼저 쓴다.
+#     max_tokens가 작으면 content가 빈 채 finish_reason='length'가 되는데,
+#     이를 조용히 빈 문자열로 넘기면 "연결 성공, 응답 없음"으로 오인된다.
+# ---------------------------------------------------------------------------
+
+
+def test_truncated_flag_detects_length_finish():
+    assert LLMResponse("", "m", 1, 1, 0.0, finish_reason="length").truncated is True
+    assert LLMResponse("ok", "m", 1, 1, 0.0, finish_reason="stop").truncated is False
+
+
+def test_reasoning_field_is_preserved():
+    """reasoning은 과금에 포함되므로 관측 가능해야 한다."""
+    res = LLMResponse("답", "m", 10, 200, 0.0, reasoning="사고 과정...")
+    assert res.reasoning == "사고 과정..."
+
+
+def test_reasoning_defaults_to_empty_for_plain_models():
+    assert LLMResponse("답", "m", 1, 1, 0.0).reasoning == ""

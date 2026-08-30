@@ -42,11 +42,19 @@ class LLMResponse:
     completion_tokens: int
     cost_usd: float
     finish_reason: str = ""
+    #: reasoning 계열 모델이 노출하는 사고 과정. 과금에는 포함되지만
+    #: 액션 판단에는 사용하지 않는다(프롬프트 인젝션 표면을 늘리지 않기 위해).
+    reasoning: str = ""
     raw: Optional[Dict[str, Any]] = None
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def truncated(self) -> bool:
+        """max_tokens 소진으로 응답이 잘렸는가."""
+        return self.finish_reason == "length"
 
     def parse_json(self) -> Any:
         """응답 본문을 JSON으로 파싱한다.
@@ -153,10 +161,22 @@ class OpenRouterClient:
 
         try:
             choice = data["choices"][0]
-            content = choice["message"].get("content") or ""
+            message = choice["message"]
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning") or ""
             finish = choice.get("finish_reason", "")
         except (KeyError, IndexError) as exc:
             raise LLMError(f"응답 형식이 예상과 다릅니다: {exc}") from None
+
+        # reasoning 계열 모델은 사고 토큰을 먼저 소비하므로, max_tokens가
+        # 작으면 content가 빈 채로 finish_reason='length'가 된다.
+        # 조용히 빈 문자열을 반환하면 상위 단계에서 원인 파악이 어렵다.
+        if not content and finish == "length":
+            raise LLMError(
+                f"max_tokens({max_tokens}) 소진으로 응답 본문이 비었습니다. "
+                f"{target_model}은(는) reasoning 토큰을 먼저 사용하므로 "
+                "max_tokens를 늘리십시오."
+            )
 
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens", 0))
@@ -179,6 +199,7 @@ class OpenRouterClient:
             completion_tokens=completion_tokens,
             cost_usd=cost,
             finish_reason=finish,
+            reasoning=reasoning,
             raw=data,
         )
 
@@ -244,9 +265,11 @@ async def probe_connection(config: Optional[LLMConfig] = None) -> Dict[str, Any]
 
     try:
         async with OpenRouterClient(cfg) as client:
+            # reasoning 계열 모델은 사고 토큰을 먼저 쓰므로 여유를 둔다.
+            # 8토큰으로는 content가 비어 연결 성공을 실패로 오인한다.
             response = await client.complete(
                 [{"role": "user", "content": "Reply with exactly: OK"}],
-                max_tokens=8,
+                max_tokens=256,
             )
         return {
             "ok": True,
@@ -255,6 +278,7 @@ async def probe_connection(config: Optional[LLMConfig] = None) -> Dict[str, Any]
             "prompt_tokens": response.prompt_tokens,
             "completion_tokens": response.completion_tokens,
             "cost_usd": round(response.cost_usd, 6),
+            "reasoning_model": bool(response.reasoning),
         }
     except LLMError as exc:
         return {"ok": False, "reason": str(exc)[:200], "model": cfg.model}
