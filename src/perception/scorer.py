@@ -61,6 +61,14 @@ W_SHADOW = 0.3  # shadow 내부 요소는 놓치기 쉬우므로 소폭 가산
 W_REPEAT_PENALTY = 1.6
 REPEAT_GROUP_FREE = 2  # 그룹당 감점 없이 통과시킬 개수
 
+#: 페이지 내부 앵커('#section') 감점.
+#: 실환경 검증에서 Wikipedia 목차 링크 14개가 Top-20을 점유해
+#: 'Log in'(51위), 'Create account'(31위) 같은 실제 액션 요소를 밀어냈다.
+#: 목차·각주 앵커는 페이지 내 스크롤일 뿐 상태를 바꾸지 않으므로,
+#: 같은 조건이면 실제 네비게이션/제출 요소가 우선해야 한다.
+#: 완전히 제거하지는 않는다. '목차에서 X 절로 이동' 같은 목표도 있기 때문이다.
+W_INPAGE_ANCHOR_PENALTY = 1.2
+
 #: 비활성 요소 감점 (제거하지 않고 순위만 낮춘다)
 P_DISABLED = -1.5
 
@@ -189,6 +197,19 @@ def _size_score(bbox: Dict[str, int]) -> float:
     return min(1.0, math.log10(area + 1) / math.log10(44 * 44 + 1))
 
 
+def _is_inpage_anchor(element: RawElement) -> bool:
+    """페이지 내부 앵커인가 (목차·각주 링크).
+
+    `href="#section"`처럼 프래그먼트만 있는 링크는 클릭해도 스크롤만
+    발생하고 페이지 상태가 바뀌지 않는다. `href="#"`(JS 핸들러용)은
+    실제 동작을 가질 수 있으므로 제외한다.
+    """
+    if element.role != "link":
+        return False
+    href = (element.href or "").strip()
+    return href.startswith("#") and len(href) > 1
+
+
 def score_element(
     element: RawElement, goal_keywords: Sequence[str] = ()
 ) -> ScoredElement:
@@ -224,6 +245,11 @@ def score_element(
     if element.disabled:
         score += P_DISABLED
         reasons.append("disabled")
+
+    # 페이지 내부 앵커는 상태를 바꾸지 않으므로 실제 액션 요소보다 낮게 둔다.
+    if _is_inpage_anchor(element):
+        score -= W_INPAGE_ANCHOR_PENALTY
+        reasons.append("inpage_anchor")
 
     # 목표 키워드 일치는 가장 강한 신호
     if goal_keywords:
