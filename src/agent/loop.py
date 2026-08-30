@@ -55,6 +55,11 @@ DEFAULT_MAX_TOKENS = 4096
 #: 예산만 소진하는 상황을 막는다.
 MAX_CONSECUTIVE_FAILURES = 3
 
+#: 네비게이션 안정화 대기. 액션이 페이지 전환을 유발하면 실행 컨텍스트가
+#: 교체되어 관찰이 실패하므로, 전환 완료를 기다린 뒤 재관찰한다.
+SETTLE_TIMEOUT_MS = 8000
+SETTLE_EXTRA_MS = 600
+
 
 @dataclass
 class StepOutcome:
@@ -216,6 +221,23 @@ class AgentLoop:
             run.final_url = ""
         return run
 
+    async def _settle(self) -> None:
+        """네비게이션이 진행 중이면 안정될 때까지 잠시 기다린다.
+
+        액션이 페이지 전환을 유발한 직후에는 실행 컨텍스트가 교체되어
+        관찰이 실패한다. 실패로 처리하지 말고 전환 완료를 기다린다.
+        """
+        try:
+            await self.page.wait_for_load_state(
+                "domcontentloaded", timeout=SETTLE_TIMEOUT_MS
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await self.page.wait_for_timeout(SETTLE_EXTRA_MS)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _run_step(
         self,
         client: OpenRouterClient,
@@ -228,9 +250,29 @@ class AgentLoop:
 
         # --- 관찰: 목표 키워드를 주입한다 (핵심) ---
         keywords = keywords_for_step(goal, failures)
-        observation: ObserveResult = await self.engine.observe_page(
-            page=self.page, prune_top_n=self.top_n, goal_keywords=keywords
-        )
+        try:
+            observation: ObserveResult = await self.engine.observe_page(
+                page=self.page, prune_top_n=self.top_n, goal_keywords=keywords
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 액션이 네비게이션을 유발하면 관찰 도중 실행 컨텍스트가
+            # 파괴된다("Execution context was destroyed"). 이는 정상적인
+            # 페이지 전환이므로 실패가 아니라 재시도 대상이다.
+            # 실측 — MDN 검색이 성공해 결과 페이지로 이동하는 순간 발생했다.
+            await self._settle()
+            try:
+                observation = await self.engine.observe_page(
+                    page=self.page, prune_top_n=self.top_n, goal_keywords=keywords
+                )
+            except Exception as retry_exc:  # noqa: BLE001
+                return StepOutcome(
+                    step=step,
+                    decision=Decision(
+                        action=GIVE_UP, reason=f"관찰 실패: {retry_exc}"
+                    ),
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    note=f"{type(exc).__name__} 후 재관찰도 실패",
+                )
 
         # --- 판단 ---
         messages = build_messages(

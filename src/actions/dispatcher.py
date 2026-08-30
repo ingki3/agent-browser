@@ -399,54 +399,81 @@ class ActionDispatcher:
 
     # -- 실행 ---------------------------------------------------------------
 
+    def _locator_for(self, handle: ElementHandle) -> Any:
+        """요소를 지목하는 Playwright 로케이터를 만든다.
+
+        shadow DOM 요소는 CSS 경로로 안정적으로 지목할 수 없다.
+        Playwright의 CSS 엔진이 shadow 경계를 자동 관통하므로, shadow
+        내부에서 고유한 경로도 document 전체에서는 여러 요소에 매칭된다.
+        실측 — MDN에서 shadow 내부 'button' 경로가 18개 요소에 매칭되어
+        항상 첫 번째(display:none) 요소가 잡히고 클릭이 실패했다.
+
+        따라서 shadow 요소는 접근성 role+name으로 지목한다. 이것이
+        shadow 경계와 무관하게 동작하는 유일한 안정적 수단이다.
+        """
+        page = self.ctx.page
+        selector = handle.css_path or ""
+
+        if getattr(handle, "is_shadow", False) and handle.name:
+            role = (handle.role or "").strip()
+            try:
+                if role and role not in ("generic", "none"):
+                    loc = page.get_by_role(role, name=handle.name, exact=True)
+                else:
+                    loc = page.get_by_text(handle.name, exact=True)
+                return loc.first
+            except Exception:  # noqa: BLE001
+                pass
+
+        return page.locator(selector).first
+
     async def _execute_element_action(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]
     ) -> None:
         """요소 대상 액션을 실제로 발송한다."""
-        page = self.ctx.page
-        selector = handle.css_path
+        target = self._locator_for(handle)
 
         if action is ActionType.CLICK:
-            await page.click(selector, button=params.get("button", "left"), timeout=5000)
+            await target.click(button=params.get("button", "left"), timeout=5000)
 
         elif action is ActionType.TYPE_TEXT:
             if params.get("clear_before", True):
-                await page.fill(selector, "", timeout=5000)
-            await page.type(selector, params.get("text", ""), timeout=5000)
+                await target.fill("", timeout=5000)
+            await target.type(params.get("text", ""), timeout=5000)
             if params.get("press_enter"):
-                await page.press(selector, "Enter", timeout=5000)
+                await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
             if params.get("value") is not None:
-                await page.select_option(selector, value=params["value"], timeout=5000)
+                await target.select_option(value=params["value"], timeout=5000)
             else:
-                await page.select_option(
-                    selector, index=params.get("index", 0), timeout=5000
+                await target.select_option(
+                    index=params.get("index", 0), timeout=5000
                 )
 
         elif action is ActionType.CHECK_BOX:
             if params.get("checked", True):
-                await page.check(selector, timeout=5000)
+                await target.check(timeout=5000)
             else:
-                await page.uncheck(selector, timeout=5000)
+                await target.uncheck(timeout=5000)
 
         elif action is ActionType.HOVER:
-            await page.hover(selector, timeout=5000)
+            await target.hover(timeout=5000)
 
         elif action is ActionType.UPLOAD_FILE:
-            await page.set_input_files(
-                selector, params.get("file_paths", []), timeout=5000
+            await target.set_input_files(
+                params.get("file_paths", []), timeout=5000
             )
 
         elif action is ActionType.DOWNLOAD_FILE:
-            async with page.expect_download(
+            async with self.ctx.page.expect_download(
                 timeout=params.get("timeout_ms", 30000)
             ) as dl:
-                await page.click(selector, timeout=5000)
+                await target.click(timeout=5000)
             download = await dl.value
-            target = f"{params.get('save_dir', '.')}/{download.suggested_filename}"
-            await download.save_as(target)
-            params["_downloaded_path"] = target
+            save_path = f"{params.get('save_dir', '.')}/{download.suggested_filename}"
+            await download.save_as(save_path)
+            params["_downloaded_path"] = save_path
 
         else:
             raise ValueError(f"요소 대상 액션이 아닙니다: {action.value}")

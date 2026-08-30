@@ -153,26 +153,89 @@ COLLECT_SCRIPT = """
   }
 
   function cssPath(el) {
-    const parts = [];
-    let node = el;
-    let depth = 0;
-    while (node && node.nodeType === 1 && depth < 6) {
-      let part = node.tagName.toLowerCase();
-      if (node.id) { parts.unshift(part + '#' + CSS.escape(node.id)); break; }
-      const parent = node.parentElement;
-      if (parent) {
-        const siblings = Array.from(parent.children).filter(
-          (c) => c.tagName === node.tagName
-        );
-        if (siblings.length > 1) {
-          part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
-        }
+    // 생성한 셀렉터는 **자신의 루트 안에서 고유해야 한다.**
+    //
+    // 이전 구현은 depth<6에서 무조건 중단해, 깊은 DOM에서는 상위가
+    // 잘린 조각(예: 'button')만 남았다. 그 셀렉터는 문서의 모든 버튼에
+    // 매칭되어 항상 첫 번째(대개 화면 밖/display:none) 요소가 잡히고
+    // 클릭이 E_ELEMENT_NOT_INTERACTABLE로 실패했다.
+    // 실측 — MDN 상위 20개 중 4개가 비고유 셀렉터였고, 'button' 하나가
+    // 9개 요소에 매칭됐다.
+    //
+    // shadow root 내부 요소는 document 기준으로 조회할 수 없다.
+    // 따라서 고유성 판정은 **자신의 루트(getRootNode)** 기준으로 하고,
+    // shadow 요소에는 host 경로를 접두어로 붙여 경계를 표시한다.
+    const MAX_DEPTH = 12;
+    const root = el.getRootNode();
+    const isShadow = root !== document && root.host;
+
+    function uniqueIn(scope, sel) {
+      try {
+        return scope.querySelectorAll(sel).length === 1;
+      } catch (e) {
+        return false;
       }
-      parts.unshift(part);
-      node = node.parentElement;
-      depth++;
     }
-    return parts.join(' > ');
+
+    function pathWithin(node, scope) {
+      const parts = [];
+      let cur = node;
+      let depth = 0;
+      while (cur && cur.nodeType === 1 && depth < MAX_DEPTH) {
+        let part = cur.tagName.toLowerCase();
+
+        if (cur.id) {
+          const withId = [part + '#' + CSS.escape(cur.id)]
+            .concat(parts).join(' > ');
+          if (uniqueIn(scope, withId)) return withId;
+        }
+
+        const parent = cur.parentElement;
+        if (parent) {
+          const sameTag = Array.from(parent.children).filter(
+            (c) => c.tagName === cur.tagName
+          );
+          if (sameTag.length > 1) {
+            part += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
+          }
+        }
+        parts.unshift(part);
+        const candidate = parts.join(' > ');
+        if (uniqueIn(scope, candidate)) return candidate;
+
+        if (!parent) break;
+        cur = parent;
+        depth++;
+      }
+
+      // 상위를 다 올라가도 고유하지 않으면 nth-child 절대 경로로 만든다.
+      const abs = [];
+      let node2 = node;
+      while (node2 && node2.nodeType === 1) {
+        const parent = node2.parentElement;
+        if (!parent) break;
+        const idx = Array.prototype.indexOf.call(parent.children, node2) + 1;
+        abs.unshift(node2.tagName.toLowerCase() + ':nth-child(' + idx + ')');
+        node2 = parent;
+      }
+      const absolute = abs.join(' > ');
+      if (absolute && uniqueIn(scope, absolute)) return absolute;
+      return parts.join(' > ');
+    }
+
+    if (isShadow) {
+      // Playwright의 CSS 엔진은 shadow DOM을 자동으로 관통한다.
+      // 따라서 '>>>' 같은 비표준 결합자를 넣으면 오히려 조회가 깨진다.
+      // shadow 내부 경로만 반환하되, 그 경로가 document 전체에서도
+      // 고유해야 오작동이 없다. 고유하지 않으면 host 경로를 앞에 붙여
+      // 범위를 좁힌다.
+      const inner = pathWithin(el, root);
+      if (uniqueIn(document, inner)) return inner;
+      const hostPath = cssPath(root.host);
+      const scoped = hostPath + ' ' + inner;
+      return uniqueIn(document, scoped) ? scoped : inner;
+    }
+    return pathWithin(el, document);
   }
 
   function walk(root, isShadow, framePath) {
