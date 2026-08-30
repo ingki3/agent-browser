@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode, thresholds
 
@@ -238,6 +238,22 @@ class BrowserCore:
     def list_tabs(self) -> Dict[str, str]:
         """tab_id → profile_name 매핑을 반환한다."""
         return {tid: tab.profile_name for tid, tab in self._tab_index.items()}
+
+    def get_tab(self, tab_id: Optional[str]) -> Optional["ManagedTab"]:
+        """tab_id로 관리 탭을 조회한다. 없으면 None."""
+        if not tab_id:
+            return None
+        return self._tab_index.get(tab_id)
+
+    def tabs(self) -> List["ManagedTab"]:
+        """생성 순서대로 관리 탭 목록을 반환한다."""
+        return list(self._tab_index.values())
+
+    @property
+    def active_profile(self) -> Optional[str]:
+        """활성 탭이 속한 프로파일 이름."""
+        tab = self.get_tab(self._active_tab_id)
+        return tab.profile_name if tab else None
 
     # -- CDP ----------------------------------------------------------------
 

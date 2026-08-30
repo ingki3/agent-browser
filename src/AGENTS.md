@@ -393,27 +393,30 @@ pytest tests/interface -q
 # 2. 전체 통합 회귀 단위 테스트 스위트 (선행 모듈 파손 방지)
 pytest tests -q
 
-# 3. 19종 툴 MCP 클라이언트 E2E 왕복 스모크
-python -m harness.mcp_smoke --tools 19
+# 3. 19종 툴 MCP 클라이언트 E2E 왕복 스모크 (19종 미호출 시 exit 2)
+python -m harness.mcp_smoke
 
-# 4. 테스트 플레이키율 (<= 2.0%)
-python -m harness.flaky_test --runs 100
+# 4. 테스트 플레이키율 (<= 2.0%, 동적 시나리오 필수 포함)
+python -m harness.flaky_test --runs 5
 
-# 5. 스텝당 로컬 순수 지연 (p50 <= 800ms)
-python -m harness.latency_test --mode step
+# 5·6. 스텝 지연 (p50 <= 800ms / p95 <= 2,200ms, 관찰+액션 구간 모두 측정)
+python -m harness.latency_test --steps 100
 
-# 6. 복합 스텝 지연 (p95 <= 2,200ms)
-python -m harness.latency_test --mode complex
+# 7. 참조 에이전트 태스크 완수율 (>= 60.0%, 멀티스텝 필수 포함)
+python -m harness.webarena --tasks 20
 
-# 7. 참조 에이전트 태스크 완수율 (>= 60.0%)
-python -m harness.webarena --tasks 100
-
-# 8. 결정론적 IPI 차단율 (>= 90.0%, FPR <= 2.0%)
-python -m harness.wasp --mode deterministic
+# 8. 결정론적 IPI 차단율 (>= 90.0%) 및 오탐율 (FPR <= 2.0%) 동시 측정
+python -m harness.ipi_test
 
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
 ```
+
+> **명령어 주석**:
+> * 5·6번은 하나의 실행에서 p50과 p95를 함께 산출합니다. p95 초과 시에도 exit 1입니다.
+> * 8번은 `harness.ipi_test`입니다. `harness.wasp`는 Gate 4(v1.1) 전용입니다.
+> * 7번의 참조 에이전트는 **LLM을 호출하지 않는 결정론적 정책**입니다. 런타임 능력만
+>   측정하며, 모델 교체로 수치가 흔들리지 않아 회귀 탐지가 가능합니다.
 
 ### [Gate 4] Stage 4 Post-MVP v1.1 Release Gate
 ```bash

@@ -38,9 +38,17 @@ JUDGMENT_HARNESSES: List[Tuple[str, str]] = [
     ("staleness", "미탐(제거된 요소를 fresh로 판정) 검사"),
     ("session_probe", "미탐(만료 미검출) 검사"),
     ("contract_selftest", "규약 키 및 exit code 분기 검증"),
+    # --- Gate 3-B ---
+    ("mcp_smoke", "19종 툴 전수 왕복 호출"),
+    ("flaky_test", "동적 시나리오 포함 및 관찰 오류 구분"),
+    ("latency_test", "관찰+액션 구간 모두 측정"),
+    ("ipi_test", "정상 표본 대비 오탐율 동시 측정"),
+    ("webarena", "멀티스텝 태스크 포함"),
 ]
 
-#: 커버리지 보고를 나타내는 식별자 조각
+#: 커버리지 보고를 나타내는 식별자 조각.
+#: 새 하네스가 다른 이름을 쓰면 여기에 추가한다. 단, "이름만 맞추면
+#: 통과"하는 검사이므로 실제 탐지 능력은 규칙 5의 사보타주로 확인해야 한다.
 COVERAGE_HINTS = (
     "covered",
     "required",
@@ -53,6 +61,11 @@ COVERAGE_HINTS = (
     "false_positives",
     "over_blocked",
     "authorized",
+    "actions_measured",  # latency_test: 측정된 액션 종류 수
+    "multistep_run",  # webarena: 멀티스텝 태스크 실행 수
+    "observation_errors",  # flaky_test: 관찰 오류 구분
+    "tools_called",  # mcp_smoke: 호출된 툴 수
+    "benign_samples",  # ipi_test: 정상 표본 수
 )
 
 

@@ -34,6 +34,8 @@ from security.masking import (
     mask_text,
 )
 from security.prompt_isolation import (
+    InjectionVerdict,
+    detect_injection,
     SYSTEM_CLOSE,
     SYSTEM_OPEN,
     UNTRUSTED_CLOSE,
@@ -75,6 +77,8 @@ __all__ = [
     "wrap_untrusted",
     "neutralize_delimiters",
     "detect_injection_markers",
+    "detect_injection",
+    "InjectionVerdict",
     "SanitizeReport",
     "SYSTEM_OPEN",
     "SYSTEM_CLOSE",
