@@ -50,6 +50,11 @@ jobs:
       - name: 계약 동결 검증
         run: python scripts/check_contracts_freeze.py
 
+      # 판정형 하네스가 커버리지 자기검증을 갖췄는지 확인한다.
+      # (AGENTS.md §5 규칙 1 — 미측정 경로가 게이트를 통과하던 사고 재발 방지)
+      - name: 하네스 커버리지 자기검증
+        run: python scripts/check_harness_coverage.py
+
   unit-tests:
     name: 단위 테스트 (pytest)
     runs-on: ubuntu-latest
