@@ -44,6 +44,8 @@ JUDGMENT_HARNESSES: List[Tuple[str, str]] = [
     ("latency_test", "관찰+액션 구간 모두 측정"),
     ("ipi_test", "정상 표본 대비 오탐율 동시 측정"),
     ("webarena", "멀티스텝 태스크 포함"),
+    # --- WS-9 실환경 ---
+    ("agent_eval", "난이도 3단계 전수 실행 + 자기보고와 독립 검증 분리"),
 ]
 
 #: 커버리지 보고를 나타내는 식별자 조각.
@@ -66,6 +68,8 @@ COVERAGE_HINTS = (
     "observation_errors",  # flaky_test: 관찰 오류 구분
     "tools_called",  # mcp_smoke: 호출된 툴 수
     "benign_samples",  # ipi_test: 정상 표본 수
+    "difficulties_covered",  # agent_eval: 난이도 커버리지
+    "verified_success",  # agent_eval: 독립 검증 성공 수
 )
 
 
