@@ -94,7 +94,11 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def similarity(a: str, b: str) -> float:
-    """0.0~1.0 정규화 유사도."""
+    """0.0~1.0 정규화 유사도 (순수 편집 거리 기반).
+
+    스코어링의 키워드 매칭에 사용한다. UI 라벨 비교에는
+    `label_similarity`를 사용하십시오.
+    """
     a, b = _normalize(a), _normalize(b)
     if not a and not b:
         return 1.0
@@ -102,6 +106,47 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     longest = max(len(a), len(b))
     return 1.0 - (levenshtein(a, b) / longest)
+
+
+#: 접두 확장에 적용할 감점 계수. 추가된 길이 비율에 곱해 감점한다.
+_PREFIX_EXTENSION_PENALTY = 0.35
+
+
+def label_similarity(a: str, b: str) -> float:
+    """UI 라벨 비교 전용 유사도 (자가 치유 3단계용).
+
+    순수 편집 거리 비율은 짧은 라벨의 **접두 확장**에 지나치게 가혹하다.
+    실측값을 보면 문제가 분명하다:
+
+        '로그인'  -> '로그인하기'    0.60
+        '저장'    -> '저장하기'      0.50
+        'Save'    -> 'Save Changes'  0.33
+
+    셋 다 같은 버튼의 문구 변경(A/B 테스트, i18n, 카피 수정)이며 치유
+    대상이 되어야 하지만 임계값 0.75에 한참 못 미친다.
+
+    따라서 **짧은 쪽이 긴 쪽의 접두사인 경우에만** 별도 점수를 계산해
+    최댓값을 취한다. 접두사 조건은 의미 보존의 대리 지표다:
+
+    * 접미 확장('삭제' -> '삭제하기')은 활용형이라 의미가 유지된다.
+    * 접두 추가('삭제' -> '전체 삭제')는 한정어가 붙어 의미가 바뀐다.
+      이 경우는 접두사가 아니므로 보너스를 받지 못하고 기각된다.
+
+    남은 위험: '삭제' -> '삭제 취소'처럼 접두사이면서 의미가 반대인
+    경우는 이 함수만으로 구분할 수 없다. `heal()`의 모호성 가드가
+    이를 담당한다.
+    """
+    base = similarity(a, b)
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb:
+        return base
+
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if shorter != longer and longer.startswith(shorter):
+        extra_ratio = (len(longer) - len(shorter)) / len(longer)
+        prefix_score = 1.0 - _PREFIX_EXTENSION_PENALTY * extra_ratio
+        return max(base, prefix_score)
+    return base
 
 
 def _name_quality(name: str) -> float:

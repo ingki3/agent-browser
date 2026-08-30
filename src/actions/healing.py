@@ -24,13 +24,17 @@ from enum import Enum
 from typing import Callable, List, Optional, Sequence
 
 from contracts import ActionType
-from perception import similarity
+from perception import label_similarity
 from perception.engine import ElementHandle
 
 logger = logging.getLogger(__name__)
 
 #: 텍스트 유사도 치유의 최소 임계값. 이보다 낮으면 다른 요소로 간주한다.
 TEXT_SIMILARITY_THRESHOLD = 0.75
+
+#: 상위 두 후보의 점수 차가 이 값보다 작으면 '모호'로 보고 치유를 포기한다.
+#: 잘못된 요소를 클릭하는 것보다 실패를 보고하는 편이 안전하다.
+AMBIGUITY_MARGIN = 0.05
 
 
 class HealingStrategy(str, Enum):
@@ -116,16 +120,32 @@ def heal(
                         return HealingResult(True, strategy, c, attempts, "testid 일치")
 
         elif strategy is HealingStrategy.TEXT_SIMILARITY:
-            best: Optional[HealingCandidate] = None
-            best_score = 0.0
-            for c in candidates:
-                # role이 다르면 의미가 다른 요소이므로 제외한다.
-                if c.role != target.role:
-                    continue
-                score = similarity(target.name, c.name)
-                if score > best_score:
-                    best, best_score = c, score
-            if best is not None and best_score >= similarity_threshold:
+            # role이 다르면 의미가 다른 요소이므로 제외한다.
+            scored = sorted(
+                (
+                    (label_similarity(target.name, c.name), c)
+                    for c in candidates
+                    if c.role == target.role
+                ),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+            passing = [(s, c) for s, c in scored if s >= similarity_threshold]
+
+            if len(passing) >= 2 and (passing[0][0] - passing[1][0]) < AMBIGUITY_MARGIN:
+                # 예: '삭제'가 사라진 자리에 '삭제 취소'와 '삭제 확인'이 함께
+                # 남은 경우. 어느 쪽을 눌러도 부작용이 크므로 치유하지 않고
+                # 다음 단계로 넘긴다. 잘못 치유하는 것보다 실패가 안전하다.
+                logger.debug(
+                    "텍스트 유사도 모호: %r vs %r (%.3f, %.3f)",
+                    passing[0][1].name,
+                    passing[1][1].name,
+                    passing[0][0],
+                    passing[1][0],
+                )
+                attempts[-1] = f"{strategy.value}(ambiguous)"
+            elif passing:
+                best_score, best = passing[0]
                 return HealingResult(
                     True,
                     strategy,
