@@ -52,17 +52,30 @@ function() {
     else if (tag === 'select') role = 'combobox';
     else if (tag === 'textarea') role = 'textbox';
     else if (tag === 'input') {
+      // sanitizer(inferRole)와 동일한 표를 사용해야 한다. 두 곳이 갈라지면
+      // 관찰 role과 검증 role이 불일치해 ROLE_CHANGED로 오판된다.
+      // 실제 피해 — 위키백과 검색창(input[type=search])을 sanitizer는
+      // 'searchbox'로, 검증기는 'textbox'로 계산해 액션이 3회 연속 차단됐다.
       const t = (el.type || 'text').toLowerCase();
       role = (t === 'checkbox') ? 'checkbox'
            : (t === 'radio') ? 'radio'
-           : (t === 'submit' || t === 'button') ? 'button'
+           : (t === 'submit' || t === 'button' || t === 'reset') ? 'button'
+           : (t === 'search') ? 'searchbox'
+           : (t === 'range') ? 'slider'
+           : (t === 'number') ? 'spinbutton'
+           : (t === 'hidden') ? 'none'
            : 'textbox';
     } else role = 'generic';
   }
-  const name = (el.getAttribute('aria-label') ||
-                el.getAttribute('placeholder') ||
-                el.getAttribute('title') ||
-                (el.innerText || el.textContent || '')).trim().slice(0, 200);
+  // W3C accname 순서: aria-label > 콘텐츠 텍스트 > placeholder > title.
+  // sanitizer / verification과 동일 규칙을 유지해야 한다. 세 곳이
+  // 갈라지면 관찰 이름과 검증 이름이 불일치해 TOCTOU 오탐이 난다.
+  const ariaName = el.getAttribute('aria-label');
+  const textName = (el.innerText || el.textContent || '').trim();
+  const name = (ariaName && ariaName.trim() ? ariaName
+                : textName ? textName
+                : (el.getAttribute('placeholder') ||
+                   el.getAttribute('title') || '')).trim().slice(0, 200);
   return {
     tag: tag,
     role: String(role).toLowerCase(),

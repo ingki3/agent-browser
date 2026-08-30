@@ -470,3 +470,67 @@ async def test_observation_meets_gate2_budgets(mock_server):
 
     assert result.token_count <= thresholds.OBSERVATION_TOKENS_P50
     assert engine.last_latency_ms <= thresholds.OBSERVE_LATENCY_MS_P50
+
+
+# ---------------------------------------------------------------------------
+# accessible name / role 계산 일관성 (WS-8 실환경 검증에서 발견)
+#
+# sanitizer, verification, shadow_dom 세 곳이 각자 name/role을 계산한다.
+# 규칙이 갈라지면 관찰 시점과 검증 시점의 값이 달라져 TOCTOU 오탐이 난다.
+#
+# 실제 피해:
+#   - title이 텍스트보다 앞섬     -> 'Log in'이 72자 툴팁으로 계산 -> NAME_CHANGED
+#   - input[type=search] 처리 누락 -> 'searchbox' vs 'textbox'     -> ROLE_CHANGED
+# 둘 다 요소는 전혀 바뀌지 않았는데 액션이 연속 차단됐다.
+# ---------------------------------------------------------------------------
+
+import re as _re
+from pathlib import Path as _Path
+
+_JS_SOURCES = {
+    "sanitizer": _Path("src/perception/sanitizer.py"),
+    "verification": _Path("src/actions/verification.py"),
+    "shadow_dom": _Path("src/perception/shadow_dom.py"),
+}
+
+
+@pytest.mark.parametrize("name,path", list(_JS_SOURCES.items()))
+def test_content_text_precedes_title_in_name_computation(name, path):
+    """W3C accname 순서: 콘텐츠 텍스트가 title보다 앞선다."""
+    if not path.exists():
+        pytest.skip(f"{path} 없음")
+    src = path.read_text(encoding="utf-8")
+    title_pos = src.find("getAttribute('title')")
+    if title_pos < 0:
+        pytest.skip("title 폴백 없음")
+    text_pos = min(
+        (p for p in (src.find("innerText"), src.find("textContent")) if p >= 0),
+        default=-1,
+    )
+    assert text_pos >= 0, f"{name}: 텍스트 폴백이 없음"
+    assert text_pos < title_pos, (
+        f"{name}: title이 콘텐츠 텍스트보다 먼저 평가됨. "
+        "링크/버튼 이름이 툴팁으로 계산되어 TOCTOU 오탐이 발생한다."
+    )
+
+
+@pytest.mark.parametrize("name,path", list(_JS_SOURCES.items()))
+def test_search_input_maps_to_searchbox_everywhere(name, path):
+    """input[type=search]를 한 곳만 searchbox로 처리하면 role이 갈린다."""
+    if not path.exists():
+        pytest.skip(f"{path} 없음")
+    src = path.read_text(encoding="utf-8")
+    if "'textbox'" not in src:
+        pytest.skip("input role 추론 없음")
+
+    # 주석이나 다른 위치의 'searchbox' 언급으로는 통과하면 안 된다.
+    # type === 'search' 분기가 실제로 존재하는지 확인한다.
+    has_branch = bool(
+        _re.search(r"===\s*'search'[^\n]*searchbox", src)
+        or _re.search(r"t === 'search'\)\s*\?\s*'searchbox'", src)
+    )
+    assert has_branch, (
+        f"{name}: input[type=search] -> searchbox 분기가 없어 'textbox'로 "
+        "계산된다. 관찰(searchbox)과 검증(textbox)이 불일치해 "
+        "ROLE_CHANGED 오탐이 난다."
+    )
