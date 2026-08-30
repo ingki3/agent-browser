@@ -65,7 +65,15 @@ COLLECT_SCRIPT = """
       if (el.value) return el.value.trim();
     }
     const text = (el.innerText || el.textContent || '').trim();
-    return text.slice(0, 200);
+    if (text) return text.slice(0, 200);
+
+    // 접근성 이름이 전혀 없는 입력 요소는 식별 불가능해진다.
+    // name/id 속성을 최후 폴백으로 사용해 에이전트가 지목할 수 있게 한다.
+    // (실제 웹에는 라벨 없는 인풋이 흔하므로 재현율을 위해 필요하다.)
+    const nameAttr = el.getAttribute('name');
+    if (nameAttr && nameAttr.trim()) return nameAttr.trim();
+    if (el.id) return el.id;
+    return '';
   }
 
   function inferRole(el) {
