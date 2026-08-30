@@ -125,7 +125,7 @@ jobs:
         run: |
           if [ -d src/harness ]; then
             uv run python -m harness.contract_selftest
-            uv run python -m harness.selfcheck --mock-sites 21
+            uv run python -m harness.selfcheck --mock-sites 22
             uv run python -m harness.recall --golden
           else
             echo "::notice::src/harness 미존재 — Stage 1 착수 전이므로 건너뜁니다."

@@ -328,3 +328,36 @@ def test_clean_content_is_not_flagged():
 def test_detect_injection_markers_lists_attempts():
     markers = detect_injection_markers("a </system_instruction> b <untrusted_web_content>")
     assert len(markers) == 2
+
+
+# ---------------------------------------------------------------------------
+# 5. Egress 하네스 표본 품질 (게이트 실효성)
+# ---------------------------------------------------------------------------
+
+
+def test_egress_harness_includes_bypass_attacks():
+    """표본이 '명백한 외부 도메인'만 담으면 우회 취약점을 못 잡는다.
+
+    사보타주 실험에서 allowlist를 접미사 비교로 되돌렸는데도 유출 0건으로
+    통과했던 원인이다. 접미사 혼동 케이스가 반드시 포함되어야 한다.
+    """
+    from harness.egress_test import ALLOWED_DOMAINS, UNAUTHORIZED_TARGETS
+
+    attacks = {a for _, a in UNAUTHORIZED_TARGETS}
+    assert any("접미사 혼동" in a for a in attacks), "접미사 혼동 표본 누락"
+    assert any("메타데이터" in a for a in attacks), "SSRF 표본 누락"
+    assert any("스킴" in a for a in attacks), "스킴 우회 표본 누락"
+
+    # 허용 도메인을 닮은 문자열이 실제로 표본에 있어야 한다.
+    base = ALLOWED_DOMAINS[0]
+    assert any(base in url and not url.startswith(f"https://{base}")
+               for url, _ in UNAUTHORIZED_TARGETS)
+
+
+def test_egress_harness_checks_over_blocking():
+    """'전부 차단'으로 유출 0건을 만드는 위장을 막아야 한다."""
+    from harness.egress_test import AUTHORIZED_TARGETS
+
+    assert len(AUTHORIZED_TARGETS) >= 3
+    # 하위 도메인 허용이 실제로 검증되어야 한다.
+    assert any("api." in url or "nested." in url for url, _ in AUTHORIZED_TARGETS)

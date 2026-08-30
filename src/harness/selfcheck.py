@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from typing import List
 
-from harness.golden_set import GOLDEN_SET, validate_golden_set
+from harness.golden_set import DENSE_CASE_SITE_ID, GOLDEN_SET, validate_golden_set
 from harness.mock_sites import (
     MOCK_SITES,
     Scenario,
@@ -60,8 +60,13 @@ def run_checks(expected_sites: int) -> List[str]:
 
     # 4. 골든셋 정합성
     problems.extend(f"골든셋: {p}" for p in validate_golden_set())
-    if len(GOLDEN_SET) != 10:
-        problems.append(f"골든셋이 10종이 아님: {len(GOLDEN_SET)}종")
+    if len(GOLDEN_SET) < 10:
+        problems.append(f"골든셋이 10종 미만: {len(GOLDEN_SET)}종")
+    if not any(c.site_id == DENSE_CASE_SITE_ID for c in GOLDEN_SET):
+        problems.append(
+            f"골든셋에 고밀도 케이스({DENSE_CASE_SITE_ID})가 없음 "
+            "— Top-N 프루닝이 검증되지 않는다"
+        )
 
     # 5. 실제 기동 검증
     with MockServer() as server:

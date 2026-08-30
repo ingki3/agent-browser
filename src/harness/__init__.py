@@ -11,7 +11,12 @@ Gate 1 대응 모듈:
 * `harness.engine_spike`      — 엔진 지연 실측 리포트
 """
 
-from harness.golden_set import GOLDEN_SET, GoldenCase, validate_golden_set
+from harness.golden_set import (
+    DENSE_CASE_SITE_ID,
+    GOLDEN_SET,
+    GoldenCase,
+    validate_golden_set,
+)
 from harness.mock_sites import (
     MOCK_SITES,
     SITE_INDEX,
@@ -47,5 +52,6 @@ __all__ = [
     # 골든셋
     "GOLDEN_SET",
     "GoldenCase",
+    "DENSE_CASE_SITE_ID",
     "validate_golden_set",
 ]
