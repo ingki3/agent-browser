@@ -64,6 +64,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="JSON 스키마 전문을 출력합니다."
     )
 
+    # --- llm-check ---
+    llm = sub.add_parser(
+        "llm-check",
+        help="OpenRouter 설정과 자격증명을 확인합니다 (최소 비용 호출).",
+    )
+    llm.add_argument(
+        "--model", default=None, help="확인할 모델 (미지정 시 .env의 OPENROUTER_MODEL)"
+    )
+    llm.add_argument(
+        "--no-call",
+        action="store_true",
+        help="실제 API를 호출하지 않고 설정만 확인합니다 (비용 0).",
+    )
+
     return parser
 
 
@@ -107,6 +121,48 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_llm_check(args: argparse.Namespace) -> int:
+    """OpenRouter 설정과 자격증명을 확인한다.
+
+    실환경 검증 전에 키가 유효한지 먼저 알아야 한다. 태스크를 다 돌린 뒤
+    401을 받으면 시간과 비용을 낭비한다.
+    """
+    from llm import load_config, probe_connection
+
+    config = load_config(model_override=args.model)
+    print(f"설정: {config.summary()}")
+
+    if not config.configured:
+        print()
+        if config.has_placeholder_key:
+            print("[-] .env의 OPENROUTER_API_KEY가 아직 플레이스홀더입니다.")
+            print("    .env를 열어 실제 키로 교체하십시오.")
+            print("    키 발급: https://openrouter.ai/keys")
+        else:
+            print("[-] OPENROUTER_API_KEY가 없습니다.")
+            print("    1) cp .env.example .env")
+            print("    2) .env를 열어 OPENROUTER_API_KEY를 채우십시오.")
+            print("    또는: export OPENROUTER_API_KEY='sk-or-v1-...'")
+        return 1
+
+    if args.no_call:
+        print("[+] 키가 설정되어 있습니다 (--no-call: 실제 호출은 생략).")
+        return 0
+
+    result = asyncio.run(probe_connection(config))
+    if result["ok"]:
+        print(f"[+] 연결 성공  model={result['model']}")
+        print(
+            f"    응답={result['reply']!r}  "
+            f"토큰={result['prompt_tokens']}+{result['completion_tokens']}  "
+            f"비용=${result['cost_usd']:.6f}"
+        )
+        return 0
+
+    print(f"[-] 연결 실패: {result['reason']}")
+    return 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -117,6 +173,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_serve(args)
     if args.command == "tui":
         return _cmd_tui(args)
+    if args.command == "llm-check":
+        return _cmd_llm_check(args)
 
     parser.error(f"알 수 없는 명령: {args.command}")
     return 2
