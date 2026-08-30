@@ -44,35 +44,54 @@ COLLECT_SCRIPT = """
   let seq = 0;
 
   function accessibleName(el) {
-    // 우선순위: aria-label > aria-labelledby > label > placeholder > title > 텍스트
+    // W3C Accessible Name Computation 순서를 따른다:
+    //   aria-label > aria-labelledby > <label> > 콘텐츠 텍스트 > placeholder > title
+    //
+    // 주의: title은 **가장 마지막**이다. 실환경 검증에서 Wikipedia의
+    // 'Log in' 링크가 72자짜리 title 툴팁("You're encouraged to log in;
+    // however, it's not mandatory...")으로 이름이 잡혀 검색이 불가능했다.
+    // title은 보조 설명이지 요소의 이름이 아니다.
     const aria = el.getAttribute('aria-label');
     if (aria && aria.trim()) return aria.trim();
 
-    const labelledBy = el.getAttribute('aria-labelledby');
-    if (labelledBy) {
-      const ref = document.getElementById(labelledBy);
+    const labelledby = el.getAttribute('aria-labelledby');
+    if (labelledby) {
+      const ref = document.getElementById(labelledby);
       if (ref && ref.textContent.trim()) return ref.textContent.trim();
     }
     if (el.id) {
-      const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
     }
-    const ph = el.getAttribute('placeholder');
-    if (ph && ph.trim()) return ph.trim();
-    const title = el.getAttribute('title');
-    if (title && title.trim()) return title.trim();
+
+    // 콘텐츠 텍스트 (링크/버튼의 실제 라벨)
+    // input[type=submit|button]은 텍스트 노드가 없고 value가 라벨이다.
     if (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) {
-      if (el.value) return el.value.trim();
+      if (el.value && el.value.trim()) return el.value.trim();
     }
     const text = (el.innerText || el.textContent || '').trim();
-    if (text) return text.slice(0, 200);
+    if (text) return text.slice(0, 120);
 
-    // 접근성 이름이 전혀 없는 입력 요소는 식별 불가능해진다.
-    // name/id 속성을 최후 폴백으로 사용해 에이전트가 지목할 수 있게 한다.
-    // (실제 웹에는 라벨 없는 인풋이 흔하므로 재현율을 위해 필요하다.)
-    const nameAttr = el.getAttribute('name');
-    if (nameAttr && nameAttr.trim()) return nameAttr.trim();
+    // 텍스트가 없는 경우에만 보조 속성으로 폴백한다.
+    const ph = el.getAttribute('placeholder');
+    if (ph && ph.trim()) return ph.trim();
+
+    const title = el.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+
+    const alt = el.getAttribute('alt');
+    if (alt && alt.trim()) return alt.trim();
+
+    const value = el.getAttribute('value');
+    if (value && value.trim()) return value.trim();
+
+    // 라벨이 전혀 없는 인풋은 name/id를 폴백으로 쓴다.
+    // 접근성상 결함이지만 실제 웹에 흔하며, 이름이 비면 에이전트가
+    // 해당 요소를 지목할 방법이 없다.
+    const nm = el.getAttribute('name');
+    if (nm && nm.trim()) return nm.trim();
     if (el.id) return el.id;
+
     return '';
   }
 
