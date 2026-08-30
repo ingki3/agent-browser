@@ -96,6 +96,81 @@ def test_stage3_text_similarity_for_minor_change():
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
 
 
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("로그인", "로그인하기"),
+        ("저장", "저장하기"),
+        ("확인", "확인하기"),
+        ("Save", "Save Changes"),
+        ("Delete", "Delete Item"),
+    ],
+)
+def test_stage3_handles_short_label_suffix_extension(before, after):
+    """짧은 라벨의 접미 확장은 A/B 테스트·i18n에서 흔하다.
+
+    순수 편집 거리는 '저장'->'저장하기'를 0.50으로 평가해 3단계가
+    통째로 무력해졌다. label_similarity가 이를 교정해야 한다.
+    """
+    target = make_handle(name=before)
+    candidate = make_candidate(name=after, css_path="다름")
+    result = heal(target, [candidate])
+    assert result.healed is True, f"{before!r} -> {after!r} 치유 실패"
+    assert result.strategy is HealingStrategy.TEXT_SIMILARITY
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("삭제", "전체 삭제"),   # 한정어가 붙어 대상 범위가 달라짐
+        ("저장", "취소"),
+        ("결제 진행", "회원 탈퇴"),
+    ],
+)
+def test_stage3_rejects_semantic_change(before, after):
+    """접두 추가는 의미가 바뀌므로 치유하면 안 된다."""
+    target = make_handle(name=before)
+    candidate = make_candidate(name=after, css_path="다름")
+    result = heal(target, [candidate])
+    assert result.healed is False, f"{before!r} -> {after!r}를 잘못 치유함"
+
+
+def test_stage3_refuses_when_candidates_are_ambiguous():
+    """유사한 후보가 둘이면 잘못 누르느니 포기해야 한다.
+
+    '삭제' 버튼이 사라진 자리에 '삭제하기'와 '삭제하기2'가 함께 있으면
+    어느 쪽을 눌러도 부작용이 크다.
+    """
+    target = make_handle(name="삭제")
+    candidates = [
+        make_candidate(element_id="@e1", name="삭제하기", css_path="a"),
+        make_candidate(element_id="@e2", name="삭제하기2", css_path="b"),
+    ]
+    result = heal(target, candidates)
+    assert result.strategy is not HealingStrategy.TEXT_SIMILARITY
+    assert any("ambiguous" in a for a in result.attempts)
+
+
+def test_stage3_proceeds_when_one_candidate_is_clearly_better():
+    """모호성 가드가 정상 케이스를 막으면 안 된다."""
+    target = make_handle(name="로그인")
+    candidates = [
+        make_candidate(element_id="@e1", name="로그인하기", css_path="a"),
+        make_candidate(element_id="@e2", name="회원가입", css_path="b"),
+    ]
+    result = heal(target, candidates)
+    assert result.healed is True
+    assert result.strategy is HealingStrategy.TEXT_SIMILARITY
+    assert result.candidate is not None
+    assert result.candidate.element_id == "@e1"
+
+
+def test_label_similarity_is_symmetric():
+    from perception import label_similarity
+
+    assert label_similarity("저장", "저장하기") == label_similarity("저장하기", "저장")
+
+
 def test_stage4_css_path_last_resort():
     """role/name/testid가 모두 달라도 CSS 경로가 같으면 4단계로 치유한다."""
     target = make_handle(role="button", name="확인", css_path="form > button#go")

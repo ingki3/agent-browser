@@ -30,6 +30,7 @@ from perception.scorer import (
     ScoredElement,
     expand_top_n,
     filter_by_keywords,
+    label_similarity,
     levenshtein,
     prune,
     prune_async,
@@ -83,6 +84,7 @@ __all__ = [
     "ROLE_WEIGHTS",
     "levenshtein",
     "similarity",
+    "label_similarity",
     "expand_top_n",
     "filter_by_keywords",
     # Shadow DOM

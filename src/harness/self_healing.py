@@ -87,18 +87,33 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "testid",
     ),
     # --- 3단계: 문구만 미세하게 변경 (A/B 테스트 모사) ---
+    #     CSS 경로도 함께 바꿔야 4단계로 새지 않고 3단계에서 해결된다.
     MutationCase(
         "s09_ad_rotation",
         "장바구니 담기",
-        "document.getElementById('cart').textContent = '장바구니에 담기';",
+        """
+        const el = document.getElementById('cart');
+        el.textContent = '장바구니에 담기';
+        el.removeAttribute('id');
+        const wrap = document.createElement('section');
+        el.parentNode.insertBefore(wrap, el);
+        wrap.appendChild(el);
+        """,
         "문구 미세 변경 (A/B 테스트)",
         "text_similarity",
     ),
     MutationCase(
         "s01_login",
         "로그인",
-        "document.getElementById('submit').textContent = '로그인하기';",
-        "버튼 문구 변경",
+        """
+        const el = document.getElementById('submit');
+        el.textContent = '로그인하기';
+        el.removeAttribute('id');
+        const wrap = document.createElement('section');
+        el.parentNode.insertBefore(wrap, el);
+        wrap.appendChild(el);
+        """,
+        "버튼 문구 변경 (짧은 라벨 접미 확장)",
         "text_similarity",
     ),
     # --- 4단계: role과 name이 모두 바뀌고 CSS 경로만 남음 ---
@@ -264,7 +279,7 @@ def main() -> None:
     for failure in metrics["failures"][:10]:
         print(f"[-] {failure}", file=sys.stderr)
     for note in metrics["stage_mismatch"]:
-        print(f"[!] 단계 불일치: {note}", file=sys.stderr)
+        print(f"[-] 단계 불일치: {note}", file=sys.stderr)
 
     # --- 사다리 커버리지 검증 -------------------------------------------
     # 한 단계라도 사용되지 않았다면 그 단계가 파손돼 있어도 성공률은
@@ -281,6 +296,22 @@ def main() -> None:
                     f"치유 사다리 {len(unused)}개 단계({', '.join(unused)})가 "
                     "한 번도 사용되지 않았습니다. 해당 단계가 파손돼도 지표가 "
                     "1.0을 보고하므로 측정을 신뢰할 수 없습니다.",
+                )
+            )
+        )
+
+    # --- 단계 정합성 검증 -------------------------------------------------
+    # 시나리오가 의도한 단계가 아닌 다른 단계로 해결되면, 그 단계는
+    # '측정된 것처럼 보이지만' 실제로는 검증되지 않은 상태다.
+    # (예: 3단계를 노린 시나리오가 4단계로 해결되면 3단계는 미검증)
+    if metrics["stage_mismatch"] and not args.allow_partial_stages:
+        sys.exit(
+            int(
+                emit_error(
+                    "self_healing_rate",
+                    f"시나리오 {len(metrics['stage_mismatch'])}건이 의도한 단계가 "
+                    "아닌 다른 단계로 해결됐습니다. 해당 단계는 실제로 검증되지 "
+                    "않았으므로 시나리오를 교정해야 합니다.",
                 )
             )
         )
