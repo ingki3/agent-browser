@@ -151,6 +151,29 @@ def test_normal_ladder_uses_css_path():
     assert ladder_for(make_handle(is_shadow=False)) == DEFAULT_LADDER
 
 
+def test_harness_requires_all_ladder_stages():
+    """하네스 시나리오가 4단계를 모두 유발하도록 배치되어야 한다.
+
+    초기 하네스는 모든 시나리오가 role+name을 유지해 1단계에서만
+    해결됐고, 그 상태에서는 2~4단계를 통째로 무력화해도 성공률이
+    1.0으로 보고됐다(사보타주 실험으로 확인). 시나리오가 다시
+    1단계로 쏠리면 이 테스트가 실패한다.
+    """
+    from harness.self_healing import MUTATION_CASES, REQUIRED_STAGES
+
+    declared = {case.expected_stage for case in MUTATION_CASES}
+    missing = [s for s in REQUIRED_STAGES if s not in declared]
+    assert not missing, f"하네스가 유발하지 않는 치유 단계: {missing}"
+
+
+def test_harness_required_stages_match_ladder():
+    """REQUIRED_STAGES가 실제 사다리 정의와 어긋나면 안 된다."""
+    from harness.self_healing import REQUIRED_STAGES
+
+    ladder_values = {s.value for s in DEFAULT_LADDER}
+    assert set(REQUIRED_STAGES) == ladder_values
+
+
 # ---------------------------------------------------------------------------
 # 2. retry_safe 판정 (PRD §4.1) — 가장 중요
 # ---------------------------------------------------------------------------
