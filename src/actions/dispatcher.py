@@ -80,6 +80,9 @@ class DispatchContext:
     tab_id: str = "tab-1"
     #: BrowserCore 인스턴스. tab_control에 필요하며 미주입 시 해당 액션만 제한된다.
     core: Any = None
+    #: switch_frame으로 프레임에 진입했을 때의 원래 메인 페이지.
+    #: 프레임 안에서도 메인 기준으로 다른 프레임을 찾거나 복귀할 수 있어야 한다.
+    root_page: Any = None
 
 
 #: Playwright 키 이름 별칭.
@@ -789,7 +792,20 @@ class ActionDispatcher:
 
     async def _extract(self, params: Dict[str, Any]) -> ActionResult:
         page = self.ctx.page
-        selector = params["selector"]
+        # 필수 인자 누락은 KeyError 예외가 아니라 명확한 실패로 보고한다.
+        # 예외로 터지면 상위에서 원인을 알 수 없고 스텝만 낭비된다.
+        # 실측 — LLM이 selector 없이 extract를 호출해 KeyError가 났다.
+        selector = params.get("selector")
+        if not selector:
+            # 계약에 INVALID_SELECTOR가 없다(동결). 셀렉터가 없으면
+            # 요소를 특정할 수 없으므로 ELEMENT_NOT_FOUND로 매핑한다.
+            return self._result(
+                success=False,
+                action=ActionType.EXTRACT,
+                retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_FOUND,
+                error_message="extract에는 selector가 필요합니다 (CSS 선택자).",
+            )
         attributes: Sequence[str] = params.get("attributes", [])
         extract_all = params.get("extract_all", False)
 
@@ -827,7 +843,11 @@ class ActionDispatcher:
         page = self.ctx.page
         frame_selector = params.get("frame_selector")
         if frame_selector:
-            element = await page.query_selector(frame_selector)
+            # 이미 프레임 안이라면 메인 페이지 기준으로 다시 찾는다.
+            root = self.ctx.root_page or page
+            element = await root.query_selector(frame_selector)
+            if element is None and root is not page:
+                element = await page.query_selector(frame_selector)
             frame = await element.content_frame() if element else None
             if frame is None:
                 return self._result(
@@ -837,12 +857,32 @@ class ActionDispatcher:
                     error_code=ErrorCode.FRAME_NOT_FOUND,
                     error_message=f"프레임을 찾을 수 없습니다: {frame_selector}",
                 )
+
+            # **전환한 프레임을 실제 활성 컨텍스트로 만든다.**
+            # epoch만 올리고 프레임을 저장하지 않으면 이후 관찰이 계속
+            # 메인 문서를 본다(실측 — switch_frame 성공 후에도 관찰
+            # 결과가 전환 전과 동일했다).
+            if self.ctx.root_page is None:
+                self.ctx.root_page = page
+            self.ctx.page = frame
             self.ctx.engine.bump_epoch("switch_frame")
             return self._result(
                 success=True,
                 action=ActionType.SWITCH_FRAME,
                 retry_safe=True,
                 data={"frame_url": frame.url},
+            )
+
+        # frame_selector가 없으면 메인 문서로 복귀한다.
+        if params.get("to_main") and self.ctx.root_page is not None:
+            self.ctx.page = self.ctx.root_page
+            self.ctx.root_page = None
+            self.ctx.engine.bump_epoch("switch_frame")
+            return self._result(
+                success=True,
+                action=ActionType.SWITCH_FRAME,
+                retry_safe=True,
+                data={"frame_url": self.ctx.page.url},
             )
 
         shadow_selector = params.get("shadow_root_selector")

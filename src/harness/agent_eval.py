@@ -39,14 +39,37 @@ from harness.real_tasks import (
 )
 from harness.result import MetricResult, emit, emit_error
 
+#: 최종 상태 검증 폴링. 비동기 동작(지연 로딩, 활성화)이 반영될 시간을 준다.
+#: baseline(사전) 검사에는 적용하지 않는다 — 초기 판정은 즉시여야 한다.
+VERIFY_TIMEOUT_S = 6.0
+VERIFY_POLL_MS = 400
+
 
 async def _verify_success(page: Any, task: RealTask) -> tuple:
-    """최종 상태를 독립 검증한다. (성공여부, 사유)"""
-    try:
-        ok = await page.evaluate(f"() => !!({task.success_expr})")
-        return bool(ok), "" if ok else "최종 상태가 성공 조건을 만족하지 않음"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"검증식 평가 실패: {type(exc).__name__}"
+    """최종 상태를 독립 검증한다. (성공여부, 사유)
+
+    비동기 동작(지연 로딩, 활성화 애니메이션)은 액션 직후에 아직
+    반영되지 않을 수 있다. 짧게 폴링해 타이밍 때문에 성공을 실패로
+    오판하지 않도록 한다.
+    실측 — dynamic_controls의 Enable은 비동기라 즉시 검증하면
+    disabled=true로 읽혀 실패로 집계됐다(단독 실행 시에는 성공).
+    """
+    deadline = time.perf_counter() + VERIFY_TIMEOUT_S
+    last_error = ""
+    while True:
+        try:
+            ok = await page.evaluate(f"() => !!({task.success_expr})")
+            if ok:
+                return True, ""
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"검증식 평가 실패: {type(exc).__name__}"
+        if time.perf_counter() >= deadline:
+            break
+        try:
+            await page.wait_for_timeout(VERIFY_POLL_MS)
+        except Exception:  # noqa: BLE001
+            break
+    return False, last_error or "최종 상태가 성공 조건을 만족하지 않음"
 
 
 async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]:
@@ -72,7 +95,12 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
         # --- 검증식 사전 점검 ---
         # 아무 액션도 하지 않은 초기 상태에서 이미 참이면 그 검증식은
         # 무의미하다(무엇을 해도 통과한다). 실측에서 실제로 발생했다.
-        baseline, _ = await _verify_success(page, task)
+        try:
+            baseline = bool(
+                await page.evaluate(f"() => !!({task.success_expr})")
+            )
+        except Exception:  # noqa: BLE001
+            baseline = False
         record["baseline_already_true"] = baseline
 
         cdp = await context.new_cdp_session(page)

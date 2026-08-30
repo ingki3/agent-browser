@@ -49,7 +49,11 @@ logger = logging.getLogger(__name__)
 #: 멀티스텝 태스크는 히스토리가 누적되어 프롬프트와 사고량이 함께 늘어난다.
 #: 실측 — TodoMVC 3스텝 태스크에서 2048이 소진되어 루프가 give_up으로
 #: 조기 종료됐다. 실패가 아니라 예산 부족이었다.
-DEFAULT_MAX_TOKENS = 4096
+#:
+#: 23태스크 측정에서 스텝당 실사용은 448~2,880토큰이었다(dyn-loading-wait
+#: 최대). 4096에서도 소진이 2건 발생했고, 둘 다 **이미 목표를 달성한 뒤**
+#: 종료 선언을 못 해 silent_win으로 집계됐다. 상한을 넉넉히 둔다.
+DEFAULT_MAX_TOKENS = 8192
 
 #: 연속 실패 허용 횟수. 초과하면 루프를 끊는다. 같은 실패를 반복하며
 #: 예산만 소진하는 상황을 막는다.
@@ -247,6 +251,13 @@ class AgentLoop:
         failures: Sequence[str],
     ) -> StepOutcome:
         started = time.perf_counter()
+
+        # switch_frame 등으로 활성 컨텍스트가 바뀌었으면 따라간다.
+        # 디스패처가 프레임에 진입했는데 루프가 메인 페이지를 계속
+        # 관찰하면, 전환 자체가 무의미해진다.
+        active = getattr(self.dispatcher, "ctx", None)
+        if active is not None and getattr(active, "page", None) is not None:
+            self.page = active.page
 
         # --- 관찰: 목표 키워드를 주입한다 (핵심) ---
         keywords = keywords_for_step(goal, failures)

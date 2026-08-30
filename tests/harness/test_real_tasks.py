@@ -106,3 +106,33 @@ def test_goal_is_actionable(task):
 
     keywords = extract_keywords(task.goal)
     assert len(keywords) >= 2, f"{task.task_id}: 키워드 부족 {keywords}"
+
+
+# ---------------------------------------------------------------------------
+# dynamic 티어 (WS-12)
+#     기존 태스크는 모두 '이미 존재하는 요소'를 다뤘다. 실제 웹에서는
+#     클릭 후에야 요소가 생기거나, 비활성이 풀리거나, 스크롤해야 나타난다.
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_tier_exists():
+    assert "dynamic" in DIFFICULTY_LEVELS
+    dynamic = [t for t in TASKS if t.difficulty == "dynamic"]
+    assert len(dynamic) >= 4, f"dynamic 태스크가 {len(dynamic)}개뿐"
+
+
+def test_dynamic_tasks_cover_distinct_capabilities():
+    """같은 능력을 반복 측정하면 커버리지가 늘지 않는다."""
+    caps = [t.capability for t in TASKS if t.difficulty == "dynamic"]
+    assert len(set(caps)) == len(caps), f"중복된 capability: {caps}"
+
+
+def test_taskset_capabilities_are_unique_overall():
+    """전체 태스크셋에서 능력 설명이 중복되면 무엇을 못 하는지 알 수 없다."""
+    from collections import Counter
+
+    counts = Counter(t.capability for t in TASKS)
+    dupes = {c: n for c, n in counts.items() if n > 1}
+    # 의도적 반복 검증은 capability에 '(반복 검증)'을 명시한다.
+    unexpected = {c: n for c, n in dupes.items() if "반복 검증" not in c}
+    assert not unexpected, f"의도치 않은 중복: {unexpected}"
