@@ -216,10 +216,64 @@ TASKS: Tuple[RealTask, ...] = (
         capability="같은 요소에 연속 조작 (마지막 상태가 정답)",
         max_steps=8,
     ),
+    # --- dynamic: 액션 후 DOM이 바뀌거나 지연 로드되는 상황 ---
+    #
+    # 기존 태스크는 모두 '이미 존재하는 요소'를 다뤘다. 실제 웹에서는
+    # 클릭 후에야 요소가 생기거나(비동기 로드), 비활성이 풀리거나,
+    # 스크롤해야 나타난다. 이 구간은 에포크 갱신·재관찰 경로를 검증한다.
+    RealTask(
+        "dyn-loading-wait",
+        "https://the-internet.herokuapp.com/dynamic_loading/2",
+        "Start 버튼을 누르고, 로딩이 끝나 'Hello World!' 문구가 나타날 때까지 기다리기",
+        # #finish는 초기에 DOM에 아예 없다(실측). 존재 자체가 성공 신호다.
+        "!!document.querySelector('#finish') && "
+        "document.querySelector('#finish').innerText.includes('Hello World')",
+        difficulty="dynamic",
+        capability="비동기 로딩 완료 대기 (요소가 나중에 생성됨)",
+        max_steps=8,
+    ),
+    RealTask(
+        "dyn-add-elements",
+        "https://the-internet.herokuapp.com/add_remove_elements/",
+        "'Add Element' 버튼을 두 번 눌러 Delete 버튼을 2개 만들기",
+        "document.querySelectorAll('.added-manually').length === 2",
+        difficulty="dynamic",
+        capability="클릭으로 신규 요소 생성 (반복 시 DOM 증가)",
+        max_steps=8,
+    ),
+    RealTask(
+        "dyn-enable-input",
+        "https://the-internet.herokuapp.com/dynamic_controls",
+        "'Enable' 버튼을 눌러 비활성화된 입력창을 활성화하기",
+        # Enable은 비동기다. 버튼 텍스트가 'Disable'로 바뀌면 완료.
+        "document.querySelector('#input-example input')?.disabled === false",
+        difficulty="dynamic",
+        capability="비활성 요소를 활성화 (초기에 조작 불가한 대상)",
+        max_steps=8,
+    ),
+    RealTask(
+        "dyn-infinite-scroll",
+        "https://the-internet.herokuapp.com/infinite_scroll",
+        "페이지 맨 아래로 스크롤해서 새로운 문단이 추가로 로드되게 하기",
+        # 초기 2개, 스크롤 시 증가(실측).
+        "document.querySelectorAll('.jscroll-added').length >= 3",
+        difficulty="dynamic",
+        capability="스크롤 기반 지연 로딩 (뷰포트 밖 콘텐츠)",
+        max_steps=8,
+    ),
+    RealTask(
+        "dyn-frame-navigate",
+        "https://the-internet.herokuapp.com/frames",
+        "'iFrame' 링크를 클릭해 iframe 예제 페이지로 이동하기",
+        "location.pathname.includes('/iframe')",
+        difficulty="dynamic",
+        capability="프레임 예제 페이지 네비게이션",
+        max_steps=6,
+    ),
 )
 
 #: 난이도별 태스크 수 (커버리지 검증용)
-DIFFICULTY_LEVELS: Tuple[str, ...] = ("easy", "medium", "hard", "multistep")
+DIFFICULTY_LEVELS: Tuple[str, ...] = ("easy", "medium", "hard", "multistep", "dynamic")
 
 
 def tasks_by_difficulty() -> Dict[str, int]:
