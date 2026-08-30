@@ -78,6 +78,8 @@ class DispatchContext:
     engine: PerceptionEngine
     cdp: Any = None
     tab_id: str = "tab-1"
+    #: BrowserCore 인스턴스. tab_control에 필요하며 미주입 시 해당 액션만 제한된다.
+    core: Any = None
 
 
 class ActionDispatcher:
@@ -543,16 +545,131 @@ class ActionDispatcher:
             )
 
         if action is ActionType.TAB_CONTROL:
+            return await self._dispatch_tab_control(action, params)
+
+    async def _dispatch_tab_control(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> ActionResult:
+        """탭 생성/전환/종료/목록 (PRD §4.1 tab_control 4서브커맨드).
+
+        `BrowserCore`가 주입되지 않은 경우(단위 테스트 등)에는 페이지의
+        컨텍스트를 직접 사용해 최소 동작을 제공한다.
+        """
+        command = str(params.get("command", "")).lower()
+        core = self.ctx.core
+
+        if core is None:
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
-                error_message=(
-                    "tab_control은 WS-5 인터페이스 통합에서 BrowserCore와 연결됩니다."
-                ),
+                error_message="tab_control에는 BrowserCore 주입이 필요합니다.",
             )
 
+        try:
+            if command == "list":
+                tabs = core.tabs()
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=True,
+                    data={
+                        "tabs": [
+                            {"tab_id": t.tab_id, "url": t.page.url} for t in tabs
+                        ],
+                        "count": len(tabs),
+                        "active": core.active_tab_id,
+                    },
+                )
+
+            if command == "new":
+                tab = await core.new_tab(
+                    core.active_profile, url=params.get("url")
+                )
+                # 새 탭이 활성 대상이 되도록 디스패처 컨텍스트를 갱신한다.
+                self.ctx.page = tab.page
+                self.ctx.tab_id = tab.tab_id
+                self.ctx.engine.bump_epoch("tab_new")
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=False,
+                    reobserve_required=True,
+                    data={"tab_id": tab.tab_id, "url": tab.page.url},
+                )
+
+            if command == "switch":
+                tab_id = params.get("tab_id")
+                tab = core.get_tab(tab_id) if tab_id else None
+                if tab is None:
+                    return self._result(
+                        success=False,
+                        action=action,
+                        retry_safe=True,
+                        error_code=ErrorCode.TAB_NOT_FOUND,
+                        error_message=f"탭을 찾을 수 없습니다: {tab_id}",
+                    )
+                core.set_active_tab(tab.tab_id)
+                self.ctx.page = tab.page
+                self.ctx.tab_id = tab.tab_id
+                # 탭 전환은 컨텍스트 전환이므로 에포크를 올린다 (PRD §4.2).
+                self.ctx.engine.bump_epoch("tab_switch")
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=True,
+                    reobserve_required=True,
+                    data={"tab_id": tab.tab_id, "url": tab.page.url},
+                )
+
+            if command == "close":
+                tab_id = params.get("tab_id") or self.ctx.tab_id
+                if core.get_tab(tab_id) is None:
+                    return self._result(
+                        success=False,
+                        action=action,
+                        retry_safe=True,
+                        error_code=ErrorCode.TAB_NOT_FOUND,
+                        error_message=f"탭을 찾을 수 없습니다: {tab_id}",
+                    )
+                await core.close_tab(tab_id)
+                remaining = core.tabs()
+                if remaining:
+                    core.set_active_tab(remaining[0].tab_id)
+                    self.ctx.page = remaining[0].page
+                    self.ctx.tab_id = remaining[0].tab_id
+                self.ctx.engine.bump_epoch("tab_close")
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=False,
+                    reobserve_required=True,
+                    data={"closed": tab_id, "remaining": len(remaining)},
+                )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=False,
+                error_code=ErrorCode.PAGE_CRASHED,
+                error_message=f"탭 제어 실패: {exc}",
+            )
+
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
+            error_message=(
+                f"알 수 없는 서브커맨드: {command!r} "
+                "(new / switch / close / list 중 하나여야 합니다)"
+            ),
+        )
+
+    async def _dispatch_unknown(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> ActionResult:
         return self._result(
             success=False,
             action=action,

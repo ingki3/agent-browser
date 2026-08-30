@@ -144,6 +144,19 @@ jobs:
             echo "::notice::src/perception 미존재 — Stage 2 착수 전이므로 건너뜁니다."
           fi
 
+      - name: Gate 3-B — MVP v1.0 릴리스 게이트
+        run: |
+          if [ -d src/interface ]; then
+            uv run python -m harness.mcp_smoke
+            uv run python -m harness.flaky_test --runs 5
+            uv run python -m harness.latency_test --steps 100
+            uv run python -m harness.webarena --tasks 20
+            uv run python -m harness.ipi_test
+            uv run python -m harness.session_probe --runs 50
+          else
+            echo "::notice::src/interface 미존재 — Stage 3-B 착수 전이므로 건너뜁니다."
+          fi
+
       - name: 전체 회귀 테스트
         run: |
           set +e
