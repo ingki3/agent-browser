@@ -88,8 +88,8 @@ def test_exit_codes_are_distinct():
 # ---------------------------------------------------------------------------
 
 
-def test_exactly_20_mock_sites():
-    assert len(MOCK_SITES) == 20
+def test_mock_site_count_matches_selfcheck():
+    assert len(MOCK_SITES) == 21
 
 
 def test_site_ids_are_unique():
@@ -210,7 +210,7 @@ def test_contract_selftest_passes():
 
 
 def test_selfcheck_passes_with_20_sites():
-    proc = _run_module("harness.selfcheck", "--mock-sites", "20")
+    proc = _run_module("harness.selfcheck", "--mock-sites", "21")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout.strip())
     assert payload["passed"] is True
@@ -219,7 +219,7 @@ def test_selfcheck_passes_with_20_sites():
 
 def test_selfcheck_fails_when_expecting_wrong_count():
     """개수가 어긋나면 반드시 실패해야 한다."""
-    proc = _run_module("harness.selfcheck", "--mock-sites", "25")
+    proc = _run_module("harness.selfcheck", "--mock-sites", "30")
     assert proc.returncode == 1
     assert json.loads(proc.stdout.strip())["passed"] is False
 

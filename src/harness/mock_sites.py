@@ -505,6 +505,41 @@ def _build_sites() -> List[MockSite]:
         )
     )
 
+    # 21. 폼 위젯 모음 (액션 툴 전수 검증용)
+    sites.append(
+        MockSite(
+            site_id="s21_widgets",
+            title="폼 위젯",
+            scenarios=(Scenario.MULTI_STEP_FORM,),
+            html=_page(
+                "폼 위젯",
+                """
+                <h1>배송 정보</h1>
+                <button id="help" title="도움말">도움말</button>
+                <div id="tip" style="display:none">툴팁 내용</div>
+
+                <label for="agree">약관 동의</label>
+                <input type="checkbox" id="agree" aria-label="약관 동의">
+
+                <label for="ship">배송 방법</label>
+                <select id="ship" aria-label="배송 방법">
+                  <option value="standard">일반 배송</option>
+                  <option value="express">특급 배송</option>
+                </select>
+
+                <label for="attach">첨부 파일</label>
+                <input type="file" id="attach" aria-label="첨부 파일">
+
+                <script>
+                  document.getElementById('help').addEventListener('mouseenter', () => {
+                    document.getElementById('tip').style.display = 'block';
+                  });
+                </script>
+                """,
+            ),
+        )
+    )
+
     return sites
 
 

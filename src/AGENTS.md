@@ -219,7 +219,7 @@ python -m harness.egress_test
 pytest tests/harness -q
 
 # 6. Mock 사이트 20종 기동 검증 (13대 필수 시나리오 분산 배치)
-python -m harness.selfcheck --mock-sites 20
+python -m harness.selfcheck --mock-sites 21
 
 # 7. 하네스 골든셋 정합성 검증 (정답 10종 완벽 일치: recall == 1.0)
 python -m harness.recall --golden

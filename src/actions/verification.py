@@ -310,6 +310,18 @@ def verify_post_condition(
     if before.element_signature != after.element_signature:
         signals.append("element_attr_changed")
 
+    # 6) 대상 요소의 value/checked 변화
+    #    select_option, upload_file 등은 페이지 구조를 바꾸지 않고
+    #    요소 자신의 값만 갱신하므로 위 신호로는 잡히지 않는다.
+    if before.element_value != after.element_value:
+        signals.append(
+            f"element_value_changed: {before.element_value!r} -> {after.element_value!r}"
+        )
+    if before.element_checked != after.element_checked:
+        signals.append(
+            f"element_checked_changed: {before.element_checked} -> {after.element_checked}"
+        )
+
     if signals:
         return PostConditionResult(satisfied=True, signals=signals)
 
