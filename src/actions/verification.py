@@ -42,17 +42,35 @@ STALENESS_CHECK_SCRIPT = """
     else if (tag === 'select') role = 'combobox';
     else if (tag === 'textarea') role = 'textbox';
     else if (tag === 'input') {
+      // sanitizer(inferRole)와 동일한 표를 사용해야 한다. 두 곳이 갈라지면
+      // 관찰 role과 검증 role이 불일치해 ROLE_CHANGED로 오판된다.
+      // 실제 피해 — 위키백과 검색창(input[type=search])을 sanitizer는
+      // 'searchbox'로, 검증기는 'textbox'로 계산해 액션이 3회 연속 차단됐다.
       const t = (el.type || 'text').toLowerCase();
       role = (t === 'checkbox') ? 'checkbox'
            : (t === 'radio') ? 'radio'
-           : (t === 'submit' || t === 'button') ? 'button'
+           : (t === 'submit' || t === 'button' || t === 'reset') ? 'button'
+           : (t === 'search') ? 'searchbox'
+           : (t === 'range') ? 'slider'
+           : (t === 'number') ? 'spinbutton'
+           : (t === 'hidden') ? 'none'
            : 'textbox';
     } else role = 'generic';
   }
-  const name = (el.getAttribute('aria-label') ||
-                el.getAttribute('placeholder') ||
-                el.getAttribute('title') ||
-                (el.innerText || el.textContent || '')).trim().slice(0, 200);
+  // W3C Accessible Name Computation 순서를 따른다:
+  //   aria-label > 콘텐츠 텍스트 > placeholder > title
+  //
+  // 주의: title을 텍스트보다 앞에 두면 안 된다. sanitizer(WS-6)에서
+  // 같은 버그를 고쳤는데 검증 경로에 남아 있었다. 실제 피해 —
+  // 위키백과 'Log in' 링크가 72자 title 툴팁으로 계산되어, 관찰 시점
+  // 이름('Log in')과 불일치해 NAME_CHANGED(E_TOCTOU_MISMATCH)로
+  // 오판됐다. 요소는 전혀 바뀌지 않았는데 액션이 2회 연속 차단됐다.
+  const ariaName = el.getAttribute('aria-label');
+  const textName = (el.innerText || el.textContent || '').trim();
+  const name = (ariaName && ariaName.trim() ? ariaName
+                : textName ? textName
+                : (el.getAttribute('placeholder') ||
+                   el.getAttribute('title') || '')).trim().slice(0, 200);
 
   return {
     connected: true,
