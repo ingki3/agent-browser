@@ -644,3 +644,46 @@ async def test_dispatcher_heals_after_dom_mutation(mock_server):
 
     # 치유가 동작했거나, 최소한 재관찰 요구로 안전하게 실패해야 한다.
     assert result.success is True or result.reobserve_required is True
+
+
+# ---------------------------------------------------------------------------
+# 키 이름 정규화 (WS-10 실측)
+#     Playwright는 'Enter'만 받고 'enter'/'Return'은 Unknown key로 거부한다.
+#     LLM은 소문자와 별칭을 자주 쓴다.
+# ---------------------------------------------------------------------------
+
+from actions.dispatcher import _normalize_key
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("enter", "Enter"),
+        ("Enter", "Enter"),
+        ("return", "Enter"),
+        ("Return", "Enter"),
+        ("esc", "Escape"),
+        ("escape", "Escape"),
+        ("tab", "Tab"),
+        ("up", "ArrowUp"),
+        ("arrowdown", "ArrowDown"),
+        ("pageup", "PageUp"),
+    ],
+)
+def test_key_aliases_normalize_to_playwright_names(raw, expected):
+    assert _normalize_key(raw) == expected
+
+
+def test_unknown_key_passes_through():
+    """단일 문자 등 유효한 입력을 막으면 안 된다."""
+    assert _normalize_key("a") == "a"
+    assert _normalize_key("F5") == "F5"
+
+
+def test_combo_keys_normalize_each_part():
+    assert _normalize_key("Control+enter") == "Control+Enter"
+
+
+def test_empty_key_stays_empty():
+    assert _normalize_key("") == ""
+    assert _normalize_key("   ") == ""

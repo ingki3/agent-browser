@@ -82,6 +82,52 @@ class DispatchContext:
     core: Any = None
 
 
+#: Playwright 키 이름 별칭.
+#: Playwright는 'Enter'만 받고 'enter'/'Return'은 Unknown key로 거부한다.
+#: LLM은 소문자나 별칭('return', 'esc')을 자주 쓰므로 정규화한다.
+#: 실측 — TodoMVC에서 LLM이 Enter 입력에 실패해 항목 추가가 무산됐다.
+_KEY_ALIASES: Dict[str, str] = {
+    "enter": "Enter",
+    "return": "Enter",
+    "cr": "Enter",
+    "esc": "Escape",
+    "escape": "Escape",
+    "tab": "Tab",
+    "space": "Space",
+    "spacebar": "Space",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "del": "Delete",
+    "up": "ArrowUp",
+    "down": "ArrowDown",
+    "left": "ArrowLeft",
+    "right": "ArrowRight",
+    "arrowup": "ArrowUp",
+    "arrowdown": "ArrowDown",
+    "arrowleft": "ArrowLeft",
+    "arrowright": "ArrowRight",
+    "pageup": "PageUp",
+    "pagedown": "PageDown",
+    "home": "Home",
+    "end": "End",
+}
+
+
+def _normalize_key(key: str) -> str:
+    """키 이름을 Playwright가 받는 형태로 정규화한다.
+
+    조합 키('Control+A')는 각 파트를 개별 정규화한다.
+    알 수 없는 이름은 그대로 두어 Playwright가 판단하게 한다
+    (단일 문자 'a' 등은 유효한 입력이다).
+    """
+    raw = (key or "").strip()
+    if not raw:
+        return raw
+    if "+" in raw:
+        return "+".join(_normalize_key(part) for part in raw.split("+"))
+    return _KEY_ALIASES.get(raw.lower(), raw)
+
+
 class ActionDispatcher:
     """19종 액션 실행기."""
 
@@ -484,18 +530,20 @@ class ActionDispatcher:
             )
 
         if action is ActionType.PRESS_KEY:
+            raw_key = str(params.get("key", ""))
+            key = _normalize_key(raw_key)
             try:
-                await page.keyboard.press(params["key"])
+                await page.keyboard.press(key)
             except Exception as exc:  # noqa: BLE001
                 return self._result(
                     success=False,
                     action=action,
                     retry_safe=False,  # 키 입력은 발송 후 재시도 위험
                     error_code=ErrorCode.KEY_PRESS_FAILED,
-                    error_message=str(exc),
+                    error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
                 )
             return self._result(
-                success=True, action=action, retry_safe=False, data={"key": params["key"]}
+                success=True, action=action, retry_safe=False, data={"key": key}
             )
 
         if action is ActionType.WAIT_FOR:
