@@ -26,11 +26,41 @@ from typing import Any, Dict, List, Optional
 from contracts import ErrorCode
 from perception.engine import ElementHandle
 
+#: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).
+#: `document.querySelector`는 shadow root 내부를 보지 못한다. 관찰은
+#: shadow를 수집하므로, 검증만 문서 범위로 조회하면 정상 요소를
+#: '사라졌다'(NODE_DETACHED)거나 값이 `None`이라고 오판한다.
+DEEP_QUERY_JS = """
+  function deepQuery(sel) {
+    if (!sel) return null;
+    let found = null;
+    try { found = document.querySelector(sel); } catch (e) { return null; }
+    if (found) return found;
+    const stack = [document];
+    let guard = 0;
+    while (stack.length && guard++ < 500) {
+      const root = stack.pop();
+      let nodes;
+      try { nodes = root.querySelectorAll('*'); } catch (e) { continue; }
+      for (const node of nodes) {
+        if (!node.shadowRoot) continue;
+        try {
+          const hit = node.shadowRoot.querySelector(sel);
+          if (hit) return hit;
+        } catch (e) { /* 무시 */ }
+        stack.push(node.shadowRoot);
+      }
+    }
+    return null;
+  }
+"""
+
 #: 요소가 살아있는지 확인하는 스크립트.
 #: css_path로 재조회해 role/name이 일치하는지 본다.
 STALENESS_CHECK_SCRIPT = """
 (args) => {
-  const el = document.querySelector(args.cssPath);
+  __DEEP_QUERY__
+  const el = deepQuery(args.cssPath);
   if (!el) return { connected: false, reason: 'not_found' };
   if (!el.isConnected) return { connected: false, reason: 'detached' };
 
@@ -80,7 +110,7 @@ STALENESS_CHECK_SCRIPT = """
     value: el.value !== undefined ? String(el.value) : null,
   };
 }
-"""
+""".replace("__DEEP_QUERY__", DEEP_QUERY_JS)
 
 
 class StalenessReason(str, Enum):
@@ -230,11 +260,19 @@ class PostConditionResult:
 async def capture_state(
     page: Any, handle: Optional[ElementHandle] = None
 ) -> PageStateSnapshot:
-    """사후조건 비교용 상태를 캡처한다."""
+    """사후조건 비교용 상태를 캡처한다.
+
+    shadow DOM 요소는 `document.querySelector`로 찾을 수 없다. 값 검증이
+    항상 `None`을 읽어 정상 입력을 Silent Failure로 오판한다.
+    실측 — MDN 검색창(shadow 내부)에 'flexbox'가 정상 입력됐는데
+    "기대값 'flexbox' != 실제 None"으로 E_TIMEOUT 처리됐다.
+    따라서 문서에서 못 찾으면 shadow root를 재귀 탐색한다.
+    """
     payload = await page.evaluate(
         """
         (cssPath) => {
-          const el = cssPath ? document.querySelector(cssPath) : null;
+          __DEEP_QUERY__
+          const el = deepQuery(cssPath);
           const text = (document.body ? document.body.innerText || '' : '');
           // 간이 문자열 해시 (djb2)
           let h = 5381;
@@ -253,7 +291,7 @@ async def capture_state(
             value: el && el.value !== undefined ? String(el.value) : null,
           };
         }
-        """,
+        """.replace("__DEEP_QUERY__", DEEP_QUERY_JS),
         handle.css_path if handle else None,
     )
     return PageStateSnapshot(

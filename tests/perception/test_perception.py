@@ -534,3 +534,102 @@ def test_search_input_maps_to_searchbox_everywhere(name, path):
         "계산된다. 관찰(searchbox)과 검증(textbox)이 불일치해 "
         "ROLE_CHANGED 오탐이 난다."
     )
+
+
+# ---------------------------------------------------------------------------
+# css_path 고유성 (WS-11 실환경 검증에서 발견)
+#
+# 이전 구현은 depth<6에서 무조건 중단해, 깊은 DOM에서 상위가 잘린
+# 조각('button')만 남았다. 그 셀렉터는 문서의 모든 버튼에 매칭되어
+# 항상 첫 번째(display:none) 요소가 잡히고 클릭이 실패했다.
+# 실측 — MDN 상위 20개 중 5개가 비고유였고 'button' 하나가 18개에 매칭.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_chromium
+@pytest.mark.asyncio
+async def test_css_path_is_unique_in_deep_dom():
+    """깊게 중첩된 동일 태그 요소들이 각각 고유한 경로를 가져야 한다."""
+    from playwright.async_api import async_playwright
+
+    html = "<div>" * 7
+    html += "".join(f"<button>btn{i}</button>" for i in range(8))
+    html += "</div>" * 7
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.set_content(html)
+
+        from perception.sanitizer import collect
+
+        snapshot = await collect(page)
+        buttons = [e for e in snapshot.elements if e.role == "button"]
+        assert len(buttons) >= 8
+
+        for element in buttons:
+            count = await page.evaluate(
+                "sel => document.querySelectorAll(sel).length", element.css_path
+            )
+            assert count == 1, (
+                f"{element.name!r}의 경로가 {count}개에 매칭됨: {element.css_path!r}"
+            )
+        await browser.close()
+
+
+@pytest.mark.requires_chromium
+@pytest.mark.asyncio
+async def test_css_path_never_degenerates_to_bare_tag():
+    """상위가 잘려 'button' 같은 조각만 남으면 안 된다."""
+    from playwright.async_api import async_playwright
+
+    deep = "<div>" * 10 + "<button>깊은 버튼</button>" + "</div>" * 10
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.set_content(f"<button>얕은 버튼</button>{deep}")
+
+        from perception.sanitizer import collect
+
+        snapshot = await collect(page)
+        for element in snapshot.elements:
+            if element.role != "button":
+                continue
+            count = await page.evaluate(
+                "sel => document.querySelectorAll(sel).length", element.css_path
+            )
+            assert count == 1, f"비고유 경로: {element.css_path!r} ({count}개)"
+        await browser.close()
+
+
+@pytest.mark.requires_chromium
+@pytest.mark.asyncio
+async def test_shadow_elements_are_flagged_for_role_targeting():
+    """shadow 요소는 is_shadow로 표시되어야 한다.
+
+    디스패처가 이 플래그를 보고 CSS 대신 role+name으로 지목한다.
+    Playwright의 CSS 엔진은 shadow 경계를 관통하므로, shadow 내부에서
+    고유한 경로도 document 전체에서는 여러 요소에 매칭된다.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.set_content(
+            "<button>일반 버튼</button><div id='host'></div>"
+            "<script>"
+            "const r = document.getElementById('host').attachShadow({mode:'open'});"
+            "r.innerHTML = '<button>섀도우 버튼</button>';"
+            "</script>"
+        )
+        await page.wait_for_timeout(150)
+
+        from perception.sanitizer import collect
+
+        snapshot = await collect(page)
+        shadow = [e for e in snapshot.elements if e.is_shadow]
+        assert shadow, "shadow 요소가 수집되지 않음"
+        assert any("섀도우" in e.name for e in shadow)
+        await browser.close()
