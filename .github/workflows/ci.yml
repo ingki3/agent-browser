@@ -130,7 +130,7 @@ jobs:
         run: |
           if [ -d src/harness ]; then
             uv run python -m harness.contract_selftest
-            uv run python -m harness.selfcheck --mock-sites 22
+            uv run python -m harness.selfcheck
             uv run python -m harness.recall --golden
           else
             echo "::notice::src/harness 미존재 — Stage 1 착수 전이므로 건너뜁니다."
@@ -148,6 +148,7 @@ jobs:
         run: |
           if [ -d src/interface ]; then
             uv run python -m harness.mcp_smoke
+          uv run python -m harness.mcp_binding
             uv run python -m harness.flaky_test --runs 5
             uv run python -m harness.latency_test --steps 100
             uv run python -m harness.webarena --tasks 20

@@ -337,25 +337,62 @@ def create_server(
         allowed_domains=allowed_domains,
         pre_approved_actions=pre_approved_actions,
     )
-    server = Server("agent-browser")
 
-    @server.list_tools()  # type: ignore[misc]
-    async def _list_tools() -> List[Tool]:
-        # Tool의 파이썬 필드명은 input_schema (JSON alias는 inputSchema)
-        return [
-            Tool(
-                name=spec["name"],
-                description=spec["description"],
-                input_schema=spec["inputSchema"],
-            )
-            for spec in build_all_tools()
-        ]
+    def _build_tools() -> List[Tool]:
+        """툴 정의를 SDK 타입으로 변환한다.
 
-    @server.call_tool()  # type: ignore[misc]
-    async def _call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+        `Tool`의 스키마 필드는 SDK 메이저에 따라 다르다.
+        - mcp 1.x: `inputSchema`
+        - mcp 2.x: `input_schema` (JSON alias는 inputSchema)
+
+        한쪽만 지원하면 다른 메이저에서 tools/list가 통째로 실패한다.
+        실제 필드를 조회해 맞춘다 — 버전 문자열 분기는 프리릴리스나
+        포크에서 어긋난다.
+        """
+        field = "input_schema" if "input_schema" in Tool.model_fields else "inputSchema"
+        out: List[Tool] = []
+        for spec in build_all_tools():
+            kwargs = {
+                "name": spec["name"],
+                "description": spec["description"],
+                field: spec["inputSchema"],
+            }
+            out.append(Tool(**kwargs))
+        return out
+
+    async def _list_tools_impl() -> List[Tool]:
+        return _build_tools()
+
+    async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         result = await backend.call_tool(name, arguments)
         return [TextContent(type="text", text=result.model_dump_json())]
 
+    # SDK 메이저별 등록 방식이 다르다. 2.x의 lowlevel Server에는
+    # list_tools/call_tool 데코레이터가 없고 생성자 콜백을 받는다.
+    # 실측 — 데코레이터만 쓰면 create_server()가 AttributeError로 즉사해
+    # `agent-browser serve` 경로 전체가 막힌다.
+    if hasattr(Server("__probe__"), "list_tools"):
+        # mcp 1.x — 데코레이터 등록
+        server = Server("agent-browser")
+        server.list_tools()(_list_tools_impl)  # type: ignore[attr-defined]
+        server.call_tool()(_call_tool_impl)  # type: ignore[attr-defined]
+        return server, backend
+
+    # mcp 2.x — 생성자 콜백 등록
+    from mcp import types as mcp_types
+
+    async def _on_list_tools(ctx: Any, params: Any) -> Any:
+        return mcp_types.ListToolsResult(tools=_build_tools())
+
+    async def _on_call_tool(ctx: Any, params: Any) -> Any:
+        content = await _call_tool_impl(params.name, params.arguments or {})
+        return mcp_types.CallToolResult(content=list(content))
+
+    server = Server(
+        "agent-browser",
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+    )
     return server, backend
 
 

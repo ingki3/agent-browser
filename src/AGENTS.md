@@ -609,6 +609,54 @@ reasoning 계열 모델은 특정 스텝에서 사고 토큰이 튑니다. 소�
 > 실패한 대응도 기록합니다. 같은 증상을 다시 만났을 때 이미 검증된
 > 막다른 길을 반복하지 않기 위해서입니다.
 
+#### 게이트 미탐 사례: SDK 바인딩 우회 (WS-14)
+
+외부 사용자 테스트에서 `agent-browser serve`가 실행되지 않는다는 보고를
+받았습니다. Claude Desktop 연동 경로 전체가 막힌 상태였습니다.
+
+```
+AttributeError: 'Server' object has no attribute 'list_tools'
+```
+
+**게이트는 19/19로 통과하고 있었습니다.** `harness.mcp_smoke`가
+`BrowserMCPServer.call_tool`을 직접 호출해 SDK 바인딩 계층을 통째로
+우회했기 때문입니다.
+
+| | mcp_smoke | 실사용 |
+| :--- | :--- | :--- |
+| 호출 경로 | `backend.call_tool()` 직접 | stdio → SDK → backend |
+| 검증 범위 | 툴 로직 | 툴 로직 + SDK 바인딩 |
+| `create_server()` | 미호출 | 필수 |
+
+이것은 규칙 4(측정 대상이 실제 동작하는 조건을 만들 것) 위반입니다.
+`create_server`/`run_stdio`는 tests·harness 어디에서도 호출되지
+않았습니다.
+
+**대응**: `harness.mcp_binding` 신설. 실제 `ClientSession`으로
+`initialize → tools/list → tools/call` 왕복을 검증합니다. SDK를
+우회하지 않습니다.
+
+> **교훈**: 사용자가 실제로 통과하는 경로와 하네스가 통과하는 경로가
+> 다르면, 지표가 만점이어도 제품은 동작하지 않습니다. 어댑터·바인딩
+> 계층은 반드시 바깥에서 안으로 호출해 검증하십시오.
+
+#### SDK 메이저 호환 (WS-14)
+
+MCP SDK는 1.x와 2.x의 API가 다릅니다.
+
+| | mcp 1.x | mcp 2.x |
+| :--- | :--- | :--- |
+| 등록 방식 | `@server.list_tools()` 데코레이터 | 생성자 `on_list_tools=` |
+| 스키마 필드 | `inputSchema` | `input_schema` |
+
+버전 문자열로 분기하면 프리릴리스나 포크에서 어긋납니다. 실제 속성과
+필드를 조회해 맞추십시오.
+
+```python
+field = "input_schema" if "input_schema" in Tool.model_fields else "inputSchema"
+if hasattr(Server("__probe__"), "list_tools"):  # 1.x
+```
+
 #### 프레임 전환 (WS-12)
 
 `switch_frame`은 프레임을 찾아 `snapshot_epoch`만 올리고 **활성 컨텍스트를

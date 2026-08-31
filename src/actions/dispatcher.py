@@ -245,6 +245,41 @@ class ActionDispatcher:
                 reobserve_required=True,
             )
 
+        # --- [0] 호출자가 명시한 epoch 검증 --------------------------------
+        # 계약상 필수 입력인데 검증하지 않으면, 클라이언트가 임의의 값을
+        # 보내도 통과한다. element_id 무효화만으로 보호되므로 실제 사고로는
+        # 이어지지 않지만, "필수 입력"이라는 계약이 지켜지지 않는 상태다.
+        # 실측 — epoch=999, -1, 생략 모두 클릭이 성공했다.
+        #
+        # 관찰 시점의 epoch과 다르면 클라이언트가 오래된 스냅샷을 근거로
+        # 판단하고 있다는 뜻이므로 재관찰을 요구한다.
+        claimed_epoch = params.get("epoch")
+        if claimed_epoch is not None:
+            try:
+                claimed = int(claimed_epoch)
+            except (TypeError, ValueError):
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,
+                    error_code=ErrorCode.TOCTOU_MISMATCH,
+                    error_message=f"epoch 값이 정수가 아닙니다: {claimed_epoch!r}",
+                    reobserve_required=True,
+                )
+            current = self.ctx.engine.epoch
+            if claimed != current:
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,
+                    error_code=ErrorCode.TOCTOU_MISMATCH,
+                    error_message=(
+                        f"epoch 불일치: 요청 {claimed}, 현재 {current}. "
+                        "페이지가 변경되었으므로 재관찰이 필요합니다."
+                    ),
+                    reobserve_required=True,
+                )
+
         # --- [1] dispatch 이전 Staleness 검증 -------------------------------
         staleness = await verify_staleness(
             self.ctx.page,
