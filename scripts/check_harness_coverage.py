@@ -40,6 +40,7 @@ JUDGMENT_HARNESSES: List[Tuple[str, str]] = [
     ("contract_selftest", "규약 키 및 exit code 분기 검증"),
     # --- Gate 3-B ---
     ("mcp_smoke", "19종 툴 전수 왕복 호출"),
+    ("mcp_binding", "SDK 바인딩 실사용 경로 (initialize/list/call)"),
     ("flaky_test", "동적 시나리오 포함 및 관찰 오류 구분"),
     ("latency_test", "관찰+액션 구간 모두 측정"),
     ("ipi_test", "정상 표본 대비 오탐율 동시 측정"),
@@ -67,6 +68,7 @@ COVERAGE_HINTS = (
     "multistep_run",  # webarena: 멀티스텝 태스크 실행 수
     "observation_errors",  # flaky_test: 관찰 오류 구분
     "tools_called",  # mcp_smoke: 호출된 툴 수
+    "tools_listed",  # mcp_binding: SDK가 실제로 노출한 툴 수
     "benign_samples",  # ipi_test: 정상 표본 수
     "difficulties_covered",  # agent_eval: 난이도 커버리지
     "verified_success",  # agent_eval: 독립 검증 성공 수

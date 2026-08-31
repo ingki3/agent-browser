@@ -1,6 +1,6 @@
 """Mock 사이트 기동 및 커버리지 검증 (Gate 1 항목 6).
 
-`python -m harness.selfcheck --mock-sites 20`
+`python -m harness.selfcheck`
 
 개수만 세지 않는다. 다음을 함께 확인한다:
 1. 선언된 사이트 수가 인자와 일치하는가
@@ -106,7 +106,15 @@ def run_checks(expected_sites: int) -> List[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mock 사이트 기동 및 커버리지 검증")
-    parser.add_argument("--mock-sites", type=int, default=20, help="기대 사이트 수")
+    # 기본값은 실제 등록 사이트 수를 따른다. 상수를 두면 사이트를 추가할
+    # 때마다 어긋나 exit 1이 되고, CI에서 --mock-sites로 우회하게 된다.
+    # (실제로 22종이 됐는데 기본값 20이 남아 CI만 우회하던 상태였다)
+    parser.add_argument(
+        "--mock-sites",
+        type=int,
+        default=len(MOCK_SITES),
+        help="기대 사이트 수 (기본: 등록된 전체)",
+    )
     args = parser.parse_args()
 
     try:
