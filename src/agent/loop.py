@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 #: 종료 선언을 못 해 silent_win으로 집계됐다. 상한을 넉넉히 둔다.
 DEFAULT_MAX_TOKENS = 8192
 
+#: max_tokens 소진 시 상한을 늘려 재시도하는 방식은 **기각됐다.**
+#: 실측 — 3배(24,576)로 재시도하니 모델이 더 긴 사고를 이어가 한 태스크에
+#: 1,067초/$0.0089를 쓰고도 실패했다(재시도 없을 때 6스텝/$0.0025).
+#: 소진은 모델 특성이므로 상한 조정이 아니라 모델 교체로 대응한다.
+
 #: 연속 실패 허용 횟수. 초과하면 루프를 끊는다. 같은 실패를 반복하며
 #: 예산만 소진하는 상황을 막는다.
 MAX_CONSECUTIVE_FAILURES = 3
@@ -225,9 +230,20 @@ class AgentLoop:
             run.final_url = ""
         return run
 
+    def _give_up_step(
+        self, step: int, observation: Any, started: float, exc: Exception
+    ) -> StepOutcome:
+        """LLM 오류로 이 스텝을 포기한다."""
+        return StepOutcome(
+            step=step,
+            decision=Decision(action=GIVE_UP, reason=f"LLM 오류: {exc}"),
+            observed=len(observation.elements),
+            latency_ms=(time.perf_counter() - started) * 1000,
+            note=str(exc)[:120],
+        )
+
     async def _settle(self) -> None:
         """네비게이션이 진행 중이면 안정될 때까지 잠시 기다린다.
-
         액션이 페이지 전환을 유발한 직후에는 실행 컨텍스트가 교체되어
         관찰이 실패한다. 실패로 처리하지 말고 전환 완료를 기다린다.
         """
@@ -300,13 +316,7 @@ class AgentLoop:
             )
             decision = parse_decision(response.parse_json())
         except LLMError as exc:
-            return StepOutcome(
-                step=step,
-                decision=Decision(action=GIVE_UP, reason=f"LLM 오류: {exc}"),
-                observed=len(observation.elements),
-                latency_ms=(time.perf_counter() - started) * 1000,
-                note=str(exc)[:120],
-            )
+            return self._give_up_step(step, observation, started, exc)
 
         outcome = StepOutcome(
             step=step,
