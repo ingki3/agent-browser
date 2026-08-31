@@ -270,6 +270,30 @@ TASKS: Tuple[RealTask, ...] = (
         capability="프레임 예제 페이지 네비게이션",
         max_steps=6,
     ),
+    # --- 점수 밀집 회귀 방지 (WS-13) ---
+    #
+    # 해커뉴스 네비게이션은 기사 링크 40개에 밀려 21~54위였다.
+    # 목표 키워드가 없으면 Top-20에 들지 못해 LLM이 선택조차 할 수 없었다.
+    # 상단 근접·짧은 라벨 신호 도입 후 1~8위로 올라왔다.
+    # 이 태스크들이 실패하면 밀집이 재발한 것이다.
+    RealTask(
+        "hn-past",
+        "https://news.ycombinator.com",
+        "'past' 링크를 클릭해 과거 글 목록으로 이동하기",
+        "location.pathname.includes('/front')",
+        difficulty="hard",
+        capability="콘텐츠 링크 다수 속에서 전역 네비게이션 식별",
+        max_steps=5,
+    ),
+    RealTask(
+        "hn-show",
+        "https://news.ycombinator.com",
+        "'show' 링크를 클릭해 Show HN 목록으로 이동하기",
+        "location.pathname.includes('/show')",
+        difficulty="hard",
+        capability="짧은 라벨 네비게이션 식별 (기사 제목과 경쟁)",
+        max_steps=5,
+    ),
 )
 
 #: 난이도별 태스크 수 (커버리지 검증용)

@@ -52,8 +52,23 @@ logger = logging.getLogger(__name__)
 #:
 #: 23태스크 측정에서 스텝당 실사용은 448~2,880토큰이었다(dyn-loading-wait
 #: 최대). 4096에서도 소진이 2건 발생했고, 둘 다 **이미 목표를 달성한 뒤**
-#: 종료 선언을 못 해 silent_win으로 집계됐다. 상한을 넉넉히 둔다.
-DEFAULT_MAX_TOKENS = 8192
+#: 종료 선언을 못 해 silent_win으로 집계됐다.
+#:
+#: 25태스크 측정에서는 8192도 2건 소진됐다. 두 태스크 모두 재실행 시
+#: 성공하므로(2/2) 특정 스텝에서 사고량이 튀는 모델 특성이다.
+#: 소진되면 그 스텝의 작업이 통째로 버려지므로 상한을 넉넉히 둔다.
+#:
+#: 주의: 상한을 늘려도 **평상시 토큰 사용량은 늘지 않는다.** 모델이
+#: 실제 생성한 만큼만 과금되며, 이 값은 절단 지점일 뿐이다. 다만 폭주
+#: 스텝에서는 그만큼 더 소비하므로 태스크 예산(BudgetGuard)이 최종
+#: 방어선 역할을 한다.
+DEFAULT_MAX_TOKENS = 32768
+
+#: max_tokens **소진 후 더 큰 값으로 재시도**하는 방식은 기각됐다.
+#: 실측 — 8192 소진 후 3배(24,576)로 재호출하니 모델이 더 긴 사고를
+#: 이어가 한 태스크에 1,067초/$0.0089를 쓰고도 실패했다.
+#: 같은 프롬프트를 두 번 태우는 것이 문제이지, 상한값 자체가 문제는
+#: 아니다. 처음부터 넉넉히 주는 것(위 32768)과는 다른 이야기다.
 
 #: 연속 실패 허용 횟수. 초과하면 루프를 끊는다. 같은 실패를 반복하며
 #: 예산만 소진하는 상황을 막는다.
@@ -225,9 +240,20 @@ class AgentLoop:
             run.final_url = ""
         return run
 
+    def _give_up_step(
+        self, step: int, observation: Any, started: float, exc: Exception
+    ) -> StepOutcome:
+        """LLM 오류로 이 스텝을 포기한다."""
+        return StepOutcome(
+            step=step,
+            decision=Decision(action=GIVE_UP, reason=f"LLM 오류: {exc}"),
+            observed=len(observation.elements),
+            latency_ms=(time.perf_counter() - started) * 1000,
+            note=str(exc)[:120],
+        )
+
     async def _settle(self) -> None:
         """네비게이션이 진행 중이면 안정될 때까지 잠시 기다린다.
-
         액션이 페이지 전환을 유발한 직후에는 실행 컨텍스트가 교체되어
         관찰이 실패한다. 실패로 처리하지 말고 전환 완료를 기다린다.
         """
@@ -300,13 +326,7 @@ class AgentLoop:
             )
             decision = parse_decision(response.parse_json())
         except LLMError as exc:
-            return StepOutcome(
-                step=step,
-                decision=Decision(action=GIVE_UP, reason=f"LLM 오류: {exc}"),
-                observed=len(observation.elements),
-                latency_ms=(time.perf_counter() - started) * 1000,
-                note=str(exc)[:120],
-            )
+            return self._give_up_step(step, observation, started, exc)
 
         outcome = StepOutcome(
             step=step,

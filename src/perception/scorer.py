@@ -69,6 +69,28 @@ REPEAT_GROUP_FREE = 2  # 그룹당 감점 없이 통과시킬 개수
 #: 완전히 제거하지는 않는다. '목차에서 X 절로 이동' 같은 목표도 있기 때문이다.
 W_INPAGE_ANCHOR_PENALTY = 1.2
 
+#: 페이지 상단 근접 가산.
+#: 실측 — 해커뉴스 네비게이션(new/past/ask/show/submit/login)은 전부
+#: top=12px에 있고, 기사 제목은 top=44~1056px에 분포한다. 그런데
+#: 스코어러가 수직 위치를 보지 않아 네비가 기사 40개에 밀려
+#: 21~54위로 내려갔다(Top-20 밖). 사이트 전역 네비게이션은 거의 항상
+#: 최상단에 있으므로, 이를 변별 축으로 쓴다.
+#:
+#: 주의: 이 신호만으로 '상단이면 무조건 중요'라고 판단하면 안 된다.
+#: 배너·광고도 상단에 있다. 다른 신호와 합산되는 보조 축이다.
+W_TOP_PROXIMITY = 1.0
+
+#: 상단 가산이 적용되는 최대 y좌표(px). 이보다 아래는 가산이 0이다.
+TOP_PROXIMITY_LIMIT_PX = 200.0
+
+#: 짧은 라벨 가산.
+#: 실측 — 네비게이션은 1단어(3~8자), 기사 제목은 8단어(30~79자)다.
+#: 액션 대상(버튼/네비 링크)은 짧고, 콘텐츠 링크는 길다.
+W_SHORT_LABEL = 0.6
+
+#: 짧은 라벨로 간주하는 최대 글자 수
+SHORT_LABEL_MAX_CHARS = 20
+
 #: 비활성 요소 감점 (제거하지 않고 순위만 낮춘다)
 P_DISABLED = -1.5
 
@@ -197,6 +219,37 @@ def _size_score(bbox: Dict[str, int]) -> float:
     return min(1.0, math.log10(area + 1) / math.log10(44 * 44 + 1))
 
 
+def _top_proximity_score(bbox: Dict[str, int]) -> float:
+    """페이지 상단 근접도 (0.0~1.0). 뷰포트 상단일수록 1.0에 가깝다.
+
+    사이트 전역 네비게이션은 거의 항상 최상단에 배치된다. 반면 콘텐츠
+    링크는 아래로 분포한다. 실측(해커뉴스) — 네비 top=12px, 기사
+    top=44~1056px.
+    """
+    y = bbox.get("y", 0)
+    if y < 0:
+        # 스크롤로 위로 밀려난 요소는 상단 가산 대상이 아니다.
+        return 0.0
+    if y >= TOP_PROXIMITY_LIMIT_PX:
+        return 0.0
+    return 1.0 - (y / TOP_PROXIMITY_LIMIT_PX)
+
+
+def _short_label_score(name: str) -> float:
+    """짧은 라벨일수록 1.0에 가깝다.
+
+    액션 대상(버튼, 네비 링크)은 짧고, 콘텐츠 링크(기사 제목)는 길다.
+    이름이 없으면 0.0 — `_name_quality`가 이미 감점하므로 중복 보상하지
+    않는다.
+    """
+    text = (name or "").strip()
+    if not text:
+        return 0.0
+    if len(text) >= SHORT_LABEL_MAX_CHARS:
+        return 0.0
+    return 1.0 - (len(text) / SHORT_LABEL_MAX_CHARS)
+
+
 def _is_inpage_anchor(element: RawElement) -> bool:
     """페이지 내부 앵커인가 (목차·각주 링크).
 
@@ -237,6 +290,18 @@ def score_element(
 
     size_s = _size_score(element.bbox)
     score += W_SIZE * size_s
+
+    # 상단 근접 — 사이트 전역 네비게이션의 위치 신호
+    top_s = _top_proximity_score(element.bbox)
+    if top_s > 0:
+        score += W_TOP_PROXIMITY * top_s
+        reasons.append(f"near_top({top_s:.2f})")
+
+    # 짧은 라벨 — 액션 대상은 짧고 콘텐츠 링크는 길다
+    short_s = _short_label_score(element.name)
+    if short_s > 0:
+        score += W_SHORT_LABEL * short_s
+        reasons.append(f"short_label({short_s:.2f})")
 
     if element.is_shadow:
         score += W_SHADOW

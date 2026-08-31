@@ -290,3 +290,61 @@ def test_system_prompt_documents_key_field():
 
     assert '"key"' in SYSTEM_PROMPT
     assert "press_key" in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# 6. max_tokens 기본값과 계약 예산의 관계 (WS-13 후속)
+#     상한을 늘리면 폭주 스텝에서 태스크 예산이 빨리 소진된다.
+#     BudgetGuard가 최종 방어선으로 실제 차단하는지 확인한다.
+# ---------------------------------------------------------------------------
+
+
+def test_default_max_tokens_covers_observed_spikes():
+    """실측 소진 사례(8192)를 넉넉히 상회해야 한다."""
+    from agent.loop import DEFAULT_MAX_TOKENS
+
+    assert DEFAULT_MAX_TOKENS >= 16384, (
+        f"{DEFAULT_MAX_TOKENS}는 실측 소진값(8192)에 너무 근접"
+    )
+
+
+def test_budget_guard_blocks_runaway_steps():
+    """스텝 상한이 커도 태스크 예산은 계약 범위를 넘지 않는다."""
+    from agent.loop import DEFAULT_MAX_TOKENS
+    from contracts.thresholds import MAX_TOKENS_PER_TASK
+    from llm import BudgetGuard
+    from llm.budget import BudgetExceeded
+
+    guard = BudgetGuard()
+    blocked = False
+    for _ in range(30):
+        try:
+            guard.begin_step()
+            guard.check()
+            guard.record(
+                prompt_tokens=2000,
+                completion_tokens=DEFAULT_MAX_TOKENS,
+                model="test/model",
+                actual_usd=0.006,
+            )
+        except BudgetExceeded:
+            blocked = True
+            break
+    assert blocked, "폭주 스텝이 반복돼도 차단되지 않음"
+    assert guard.used_tokens <= MAX_TOKENS_PER_TASK * 1.1, (
+        f"차단 시점 누적 {guard.used_tokens:,} — 계약 상한을 크게 초과"
+    )
+
+
+def test_retry_on_exhaustion_is_not_reintroduced():
+    """소진 후 더 큰 값으로 재호출하는 방식은 기각됐다 (WS-13 실측).
+
+    1,067초/$0.0089를 쓰고도 실패했다. 같은 프롬프트를 두 번 태우는 것이
+    문제이므로, 처음부터 넉넉히 주는 방식만 유지한다.
+    """
+    import inspect
+
+    from agent.loop import AgentLoop
+
+    src = inspect.getsource(AgentLoop._run_step)
+    assert "RETRY_TOKEN_FACTOR" not in src, "기각된 재시도 로직이 되살아남"
