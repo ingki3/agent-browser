@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-browser"
-version = "1.0.0"
+version = "1.0.1"
 description = "Agent-Native Headless Browsing Engine & MCP Server"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,10 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.scripts]
+# CLI 진입점. 이것이 없으면 `pip install` 후에도 명령이 만들어지지 않는다.
+agent-browser = "interface.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
@@ -28,6 +32,8 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
+# src/ 아래 모든 패키지를 포함해야 한다. 여기서 누락되면 설치는 성공하는데
+# import만 실패해 원인을 찾기 어렵다 — agent/ llm/ 이 실제로 빠져 있었다.
 packages = [
     "src/contracts",
     "src/browser",
@@ -36,6 +42,8 @@ packages = [
     "src/security",
     "src/interface",
     "src/harness",
+    "src/agent",
+    "src/llm",
 ]
 
 [tool.pytest.ini_options]

@@ -167,3 +167,10 @@ jobs:
             exit 0
           fi
           exit $code
+
+      # 설치 안내가 실제와 일치하는지 검증한다.
+      # 문서가 틀리면 외부 사용자가 첫 단계에서 막힌다. README에 적힌
+      # 명령을 실제로 실행하고, 툴 개수·테스트 수·버전을 대조한다.
+      # (Chromium과 CLI 설치가 끝난 릴리스 게이트에서만 실행 가능)
+      - name: README 설치 안내 검증
+        run: uv run python scripts/check_readme.py
