@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 계약 동결 검증에 동결 태그가 필요하므로 전체 히스토리를 가져온다.
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -35,6 +38,22 @@ jobs:
 
       - name: 문서 무결성 검사 (제어문자 / 표 정합성)
         run: python check_docs.py
+
+      # 문서에 적힌 게이트 명령어 자체가 실행 가능한지 검증한다.
+      # (AGENTS_REVIEW_02 P0-1: Gate 1 인라인 명령어가 SyntaxError로 깨져
+      #  게이트를 영구히 통과할 수 없던 사례 재발 방지)
+      - name: 게이트 명령어 구문 검증
+        run: python scripts/check_gate_commands.py
+
+      # Gate 0 승인 이후 src/contracts/** 는 읽기 전용이다 (AGENTS.md §3-2).
+      # 동결 태그 대비 변경이 있으면 실패시켜 무단 계약 수정을 차단한다.
+      - name: 계약 동결 검증
+        run: python scripts/check_contracts_freeze.py
+
+      # 판정형 하네스가 커버리지 자기검증을 갖췄는지 확인한다.
+      # (AGENTS.md §5 규칙 1 — 미측정 경로가 게이트를 통과하던 사고 재발 방지)
+      - name: 하네스 커버리지 자기검증
+        run: python scripts/check_harness_coverage.py
 
   unit-tests:
     name: 단위 테스트 (pytest)
@@ -54,6 +73,10 @@ jobs:
         run: |
           uv sync --extra dev
           uv pip install -e .
+
+      # 실브라우저 테스트가 CI에서 조용히 skip되면 Gate를 독립 검증할 수 없다.
+      - name: Chromium 설치
+        run: uv run playwright install --with-deps chromium
 
       - name: pytest 실행
         run: |
@@ -88,6 +111,9 @@ jobs:
           uv sync --extra dev
           uv pip install -e .
 
+      - name: Chromium 설치
+        run: uv run playwright install --with-deps chromium
+
       # Stage 진행에 따라 아래 게이트를 순차적으로 활성화한다.
       # (src/AGENTS.md §5의 Gate 0 ~ Gate 3-B 명령어와 1:1 대응)
       - name: Gate 0 — 계약 동결 검증
@@ -98,6 +124,37 @@ jobs:
             uv run pytest tests/contracts -q
           else
             echo "::notice::src/contracts 미존재 — Stage 0 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: Gate 1 — 하네스 자체 검증
+        run: |
+          if [ -d src/harness ]; then
+            uv run python -m harness.contract_selftest
+            uv run python -m harness.selfcheck --mock-sites 22
+            uv run python -m harness.recall --golden
+          else
+            echo "::notice::src/harness 미존재 — Stage 1 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: Gate 2 — 인지 엔진 실측
+        run: |
+          if [ -d src/perception ]; then
+            uv run python -m harness.recall --pages 100 --top-n 20
+          else
+            echo "::notice::src/perception 미존재 — Stage 2 착수 전이므로 건너뜁니다."
+          fi
+
+      - name: Gate 3-B — MVP v1.0 릴리스 게이트
+        run: |
+          if [ -d src/interface ]; then
+            uv run python -m harness.mcp_smoke
+            uv run python -m harness.flaky_test --runs 5
+            uv run python -m harness.latency_test --steps 100
+            uv run python -m harness.webarena --tasks 20
+            uv run python -m harness.ipi_test
+            uv run python -m harness.session_probe --runs 50
+          else
+            echo "::notice::src/interface 미존재 — Stage 3-B 착수 전이므로 건너뜁니다."
           fi
 
       - name: 전체 회귀 테스트
