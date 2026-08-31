@@ -51,6 +51,12 @@ class ElementHandle:
     backend_node_id: Optional[int] = None
     host_path: str = ""
     testid: Optional[str] = None
+    #: 링크 목적지. 계약 모델(ObservedElement)은 동결이라 href를 담을 수
+    #: 없으므로 내부 핸들에 보관하고, 프롬프트 구성 시에만 참조한다.
+    #: 실측(hn-comments) — 이름이 둘 다 'comments'인데 하나는
+    #: /newcomments(사이트 전체), 하나는 item?id=(개별 기사)였다.
+    #: 이름만으로는 구분이 불가능해 LLM이 오답을 골랐다.
+    href: Optional[str] = None
 
 
 @dataclass
@@ -250,6 +256,7 @@ class PerceptionEngine:
                 css_path=item.element.css_path,
                 is_shadow=item.element.is_shadow,
                 testid=item.element.testid,
+                href=item.element.href,
             )
 
         summary = _summarize(observed)
