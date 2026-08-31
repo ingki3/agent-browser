@@ -121,19 +121,34 @@ def main() -> int:
 
     # 버전 — CI의 얕은 클론에는 태그가 없을 수 있다. 태그를 못 찾으면
     # 이 검사만 건너뛴다(문서 검증 전체를 실패시키지 않는다).
+    #
+    # 릴리스 준비 중에는 pyproject 버전이 최신 태그보다 앞선다. 태그는
+    # 머지 후에 달기 때문이다. 이 방향은 정상이므로 통과시키고,
+    # 뒤처진 경우(태그가 더 최신)만 실패로 본다 — 버전 갱신 누락이다.
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     m = re.search(r'version = "([\d.]+)"', pyproject)
     version = m.group(1) if m else "?"
     code, out = run("git tag -l 'v*'", timeout=60)
-    tags = sorted(t for t in out.split() if t.startswith("v"))
+    tags = sorted(
+        (t for t in out.split() if re.fullmatch(r"v[\d.]+", t)),
+        key=lambda t: tuple(int(x) for x in t[1:].split(".")),
+    )
     if not tags:
         print(f"  [SKIP] 버전 대조 — 태그 없음 (pyproject {version})")
     else:
         latest = tags[-1]
-        ok = f"v{version}" == latest
+        cur = tuple(int(x) for x in version.split("."))
+        tag = tuple(int(x) for x in latest[1:].split("."))
+        ok = cur >= tag
         if not ok:
-            failures.append(f"버전 불일치: pyproject {version} vs 최신 태그 {latest}")
-        print(f"  [{'OK' if ok else 'FAIL'}] 버전 pyproject {version} = 태그 {latest}")
+            failures.append(
+                f"버전이 태그보다 뒤처짐: pyproject {version} < 태그 {latest}"
+            )
+        state = "일치" if cur == tag else ("릴리스 준비 중" if ok else "갱신 누락")
+        print(
+            f"  [{'OK' if ok else 'FAIL'}] 버전 pyproject {version} "
+            f"vs 태그 {latest} ({state})"
+        )
 
     print("\n" + "=" * 50)
     if failures:
