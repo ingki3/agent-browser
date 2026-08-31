@@ -97,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-427개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+439개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -160,6 +160,14 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 | :--- | :--- |
 | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
+
+연동이 되는지 미리 확인하려면 다음을 실행하십시오. 실제 MCP 클라이언트 세션으로 `initialize → tools/list → tools/call` 왕복을 검증합니다.
+
+```bash
+uv run python -m harness.mcp_binding
+```
 
 노출되는 툴은 `browser_` 접두사를 가집니다.
 
