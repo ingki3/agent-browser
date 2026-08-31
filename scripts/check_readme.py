@@ -150,6 +150,14 @@ def main() -> int:
             f"vs 태그 {latest} ({state})"
         )
 
+    # uv.lock 버전 대조는 이 검사기에 넣을 수 없다.
+    # `uv run`이 실행 시점에 lock을 자동 재동기화하므로, 검사기가
+    # uv를 쓰는 한 lock은 항상 최신 상태로 관측된다(사보타주 무력).
+    # 실측 — lock을 1.0.2로 되돌려도 `uv run` 한 번에 1.0.3으로 복구됐다.
+    #
+    # 대신 커밋 전에 `git status`로 uv.lock 변경 여부를 확인하십시오.
+    # 버전을 올린 커밋에 lock이 빠져 있으면 그 자체가 신호다.
+
     print("\n" + "=" * 50)
     if failures:
         print(f"[FAIL] {len(failures)}건")

@@ -41,6 +41,11 @@ python scripts/check_gate_commands.py
 
 # 7. 하네스 커버리지 자기검증 (§5 규칙 1 준수 여부)
 python scripts/check_harness_coverage.py
+
+# 8. 버전을 올렸다면 uv.lock도 함께 커밋되었는지 확인
+#    `uv run`이 lock을 자동 재동기화하므로 검사 스크립트로는 잡히지 않는다.
+#    (실측 — v1.0.3에서 lock이 1.0.2로 남은 채 릴리스됐다)
+git status --porcelain uv.lock
 ```
 
 ---
