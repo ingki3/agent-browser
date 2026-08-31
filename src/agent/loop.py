@@ -193,6 +193,12 @@ class AgentLoop:
             return run
 
         try:
+            # 실패 직후 완료 선언을 막기 위한 상태.
+            # last_action_failed: 직전에 실행한 실제 액션의 성공 여부
+            # finish_rejected: 이미 한 번 거부했는지 (무한 루프 방지)
+            last_action_failed = False
+            finish_rejected = False
+
             for step in range(1, self.max_steps + 1):
                 try:
                     self.budget.begin_step()
@@ -206,8 +212,29 @@ class AgentLoop:
                 run.steps.append(outcome)
 
                 if outcome.decision.action == FINISH:
-                    run.completed = True
-                    run.terminal_reason = "LLM이 목표 달성을 선언했습니다."
+                    # 직전 액션이 실패했는데 완료를 선언하면 신뢰할 수 없다.
+                    # 실측(hn-comments) — click이 E_TIMEOUT으로 실패한 직후
+                    # finish를 선언했고, 독립 검증에서 false_claim으로 잡혔다.
+                    # 자기 보고가 틀린 것을 사후에 잡기보다 애초에 막는다.
+                    #
+                    # 한 번은 되돌릴 기회를 준다. 계속 우기면 종료하되
+                    # 완료로 집계하지 않는다.
+                    if last_action_failed and not finish_rejected:
+                        finish_rejected = True
+                        history.append(
+                            "[시스템] 직전 액션이 실패했는데 목표 달성을 "
+                            "선언했습니다. 실패한 액션은 아무 효과가 없습니다. "
+                            "페이지를 다시 관찰하고 목표가 정말 달성됐는지 "
+                            "확인하십시오. 달성되지 않았다면 다른 방법을 "
+                            "시도하십시오."
+                        )
+                        continue
+                    run.completed = not last_action_failed
+                    run.terminal_reason = (
+                        "LLM이 목표 달성을 선언했습니다."
+                        if not last_action_failed
+                        else "직전 액션 실패 후 완료를 선언해 거부했습니다."
+                    )
                     break
                 if outcome.decision.action == GIVE_UP:
                     run.terminal_reason = f"LLM 포기: {outcome.decision.reason}"
@@ -215,9 +242,11 @@ class AgentLoop:
 
                 if outcome.succeeded:
                     consecutive_failures = 0
+                    last_action_failed = False
                     history.append(outcome.summary())
                 else:
                     consecutive_failures += 1
+                    last_action_failed = True
                     failures.append(outcome.summary())
                     history.append(outcome.summary())
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -319,6 +348,9 @@ class AgentLoop:
             max_steps=self.max_steps,
             history=history,
             limit=self.top_n,
+            # 링크 목적지 힌트를 위해 핸들을 넘긴다. 계약 모델에는 href가
+            # 없으므로(동결) 내부 핸들에서 읽어 프롬프트에만 반영한다.
+            handles=getattr(self.engine, "_handles", None),
         )
         try:
             response = await client.complete(
