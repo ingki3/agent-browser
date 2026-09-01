@@ -73,6 +73,22 @@ class LLMResponse:
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
+            # 빈 응답은 파싱 오류가 아니라 별개의 원인이다. 실측
+            # (dyn-enable-input) — reasoning 계열 모델이 max_tokens를
+            # 사고 과정에만 쓰고 content를 내지 못한 경우가 있었다.
+            # "JSON 파싱 실패: Expecting value: line 1 column 1"만 보면
+            # 모델이 잘못된 JSON을 냈다고 오해하게 된다.
+            if not text:
+                if self.truncated:
+                    raise LLMError(
+                        "모델이 응답 본문을 내지 못했습니다 "
+                        f"(max_tokens 소진, 사고 {len(self.reasoning)}자). "
+                        "max_tokens를 늘리거나 다른 모델을 사용하십시오."
+                    ) from None
+                raise LLMError(
+                    f"모델이 빈 응답을 반환했습니다 "
+                    f"(finish_reason={self.finish_reason!r})."
+                ) from None
             raise LLMError(f"JSON 파싱 실패: {exc}. 본문 앞부분: {text[:200]!r}") from None
 
 
