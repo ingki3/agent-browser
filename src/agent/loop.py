@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from contracts import ActionResult, ActionType, ObserveResult
+from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
 from llm import BudgetExceeded, BudgetGuard, LLMError, OpenRouterClient
 from llm.config import LLMConfig
 
@@ -200,6 +201,22 @@ class AgentLoop:
             finish_rejected = False
 
             for step in range(1, self.max_steps + 1):
+                # PRD 실행 시간 상한 — 태스크당 Wall-Clock 10분.
+                # 계약에 MAX_WALL_CLOCK_SECONDS가 정의돼 있는데 루프가
+                # 이를 강제하지 않아, 네트워크 대기로 멈추면 무한정
+                # 매달렸다. 실측 — internet-checkbox-both가 13분 넘게
+                # CPU 0.1%로 정지해 통합 측정 전체를 막았다.
+                #
+                # 스텝 수와 예산만으로는 못 막는다. 한 스텝 안에서
+                # 멈추면 스텝 카운터가 올라가지 않기 때문이다.
+                elapsed = time.perf_counter() - started
+                if elapsed >= MAX_WALL_CLOCK_SECONDS:
+                    run.terminal_reason = (
+                        f"실행 시간 상한 초과: {elapsed:.0f}초 "
+                        f"(상한 {MAX_WALL_CLOCK_SECONDS}초)"
+                    )
+                    break
+
                 try:
                     self.budget.begin_step()
                 except BudgetExceeded as exc:

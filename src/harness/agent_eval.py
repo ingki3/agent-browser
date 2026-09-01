@@ -37,10 +37,16 @@ from harness.real_tasks import (
     tasks_by_difficulty,
     validate_taskset,
 )
+from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
 from harness.result import MetricResult, emit, emit_error
 
 #: 최종 상태 검증 폴링. 비동기 동작(지연 로딩, 활성화)이 반영될 시간을 준다.
 #: baseline(사전) 검사에는 적용하지 않는다 — 초기 판정은 즉시여야 한다.
+#: 태스크 단위 시간 상한. 계약의 MAX_WALL_CLOCK_SECONDS(600초)를 따른다.
+#: 루프 자체 상한이 먼저 걸리도록 여유를 둔다. 이 값이 하네스의
+#: 최후 방어선이다 — 루프가 한 스텝 안에서 멈추면 루프 상한은 무력하다.
+TASK_TIMEOUT_MARGIN_S = 60
+
 VERIFY_TIMEOUT_S = 6.0
 VERIFY_POLL_MS = 400
 
@@ -116,7 +122,36 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
             budget=BudgetGuard(),
             max_steps=task.max_steps,
         )
-        run = await loop.run(task.goal)
+        # 루프 내부 상한만으로는 부족하다. 한 스텝 안에서(네트워크 대기 등)
+        # 멈추면 루프의 검사 지점에 도달하지 못한다. 하네스에서 한 번 더
+        # 감싸 확실히 끊는다. 여유를 둬 루프 자체 상한이 먼저 걸리게 한다.
+        try:
+            run = await asyncio.wait_for(
+                loop.run(task.goal),
+                timeout=MAX_WALL_CLOCK_SECONDS + TASK_TIMEOUT_MARGIN_S,
+            )
+        except asyncio.TimeoutError:
+            # 출력부가 참조하는 키를 모두 채워야 한다. 빠뜨리면 측정
+            # 전체가 KeyError로 무효화된다(실제로 겪었다 — 'steps' 누락).
+            record.update(
+                {
+                    "verified_success": False,
+                    "agent_claimed": False,
+                    "steps": 0,
+                    "action_success_rate": 0.0,
+                    "terminal_reason": "하네스 타임아웃",
+                    "tokens": 0,
+                    "usd": 0.0,
+                    "final_url": "",
+                    "trace": [],
+                    "error": (
+                        f"태스크 시간 초과 "
+                        f"({MAX_WALL_CLOCK_SECONDS + TASK_TIMEOUT_MARGIN_S}초)"
+                    ),
+                    "failure_reason": "시간 초과",
+                }
+            )
+            return record
 
         # 에이전트 선언과 무관하게 최종 상태를 독립 검증한다.
         verified, reason = await _verify_success(page, task)
@@ -141,6 +176,12 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
                 "verified_success": False,
                 "agent_claimed": False,
                 "steps": 0,
+                "action_success_rate": 0.0,
+                "terminal_reason": "실행 오류",
+                "tokens": 0,
+                "usd": 0.0,
+                "final_url": "",
+                "trace": [],
                 "error": f"{type(exc).__name__}: {str(exc)[:120]}",
                 "failure_reason": "실행 오류",
             }
