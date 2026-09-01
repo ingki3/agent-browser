@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-browser"
-version = "1.0.3"
+version = "1.1.0"
 description = "Agent-Native Headless Browsing Engine & MCP Server"
 readme = "README.md"
 requires-python = ">=3.11"
