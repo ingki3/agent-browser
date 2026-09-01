@@ -160,16 +160,22 @@ def test_prompt_forbids_finish_after_failure():
 
 
 def test_failed_finish_is_not_counted_as_completed():
-    """거부 후에도 우기면 completed=False로 종료되어야 한다.
+    """가드의 완수 판정 의미론 (WS-18 정밀화 반영).
 
-    자기 보고를 그대로 믿으면 false_claim이 완수율에 섞인다.
+    옛 의미론: 거부 후 재선언도 completed=False.
+    새 의미론: 재확인(새 관찰) 후의 재선언은 수용하되 terminal_reason에
+    흔적을 남긴다. 목표 달성 여부는 루프가 알 수 없으므로 최종 판정은
+    독립 검증/호출자의 몫이다.
+
+    여기서는 소스 수준 불변식만 확인한다. 행동은 아래
+    TestFinishGuardBehavior에서 실제 루프로 검증한다.
     """
     from agent import loop as loop_mod
 
     src = inspect.getsource(loop_mod.AgentLoop.run)
-    assert "run.completed = not last_action_failed" in src, (
-        "실패 후 finish를 완료로 집계하고 있습니다"
-    )
+    assert "guard_active" in src, "가드 발동 조건이 없습니다"
+    assert "last_failure_harmless" in src, "무해 실패 판정이 없습니다"
+    assert "재확인 후" in src, "재확인 수용 경로가 없습니다"
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +365,180 @@ def test_malformed_json_still_reports_parse_error():
 def test_valid_json_unaffected():
     assert _resp('{"action": "finish"}').parse_json() == {"action": "finish"}
     assert _resp('```json\n{"a": 1}\n```').parse_json() == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# 7. finish 가드 행동 검증 (WS-18) — 실제 루프를 스크립트로 구동
+# ---------------------------------------------------------------------------
+
+
+class _FakeClient:
+    """OpenRouterClient 대역. 네트워크를 쓰지 않는다."""
+
+    async def __aenter__(self):
+        return self
+
+    async def close(self):
+        pass
+
+
+def _scripted_loop(monkeypatch, script):
+    """AgentLoop을 만들고 _run_step이 script의 outcome을 순서대로 내게 한다.
+
+    script: [(action, element_id, success, error_code), ...]
+      action이 'finish'/'give_up'이면 terminal decision.
+    """
+    from agent import loop as loop_mod
+    from agent.loop import AgentLoop, StepOutcome
+    from agent.policy import Decision
+    from contracts import ActionResult, ActionType
+    from llm import BudgetGuard
+
+    monkeypatch.setattr(loop_mod, "OpenRouterClient", lambda *a, **k: _FakeClient())
+
+    items = list(script)
+
+    class ScriptedLoop(AgentLoop):
+        async def _run_step(self, client, goal, step, history, failures):
+            action, element_id, success, error_code = items.pop(0)
+            decision = Decision(
+                action=action,
+                element_id=element_id,
+                reason="scripted",
+            )
+            if action in ("finish", "give_up"):
+                return StepOutcome(step=step, decision=decision)
+            result = ActionResult(
+                success=success,
+                action=ActionType.CLICK,
+                current_url="https://example.com/",
+                snapshot_epoch=0,
+                tab_id="tab-0",
+                healed=False,
+                reobserve_required=False,
+                retry_safe=True,
+                error_code=None if success else error_code,
+                error_message=None if success else "scripted failure",
+            )
+            return StepOutcome(step=step, decision=decision, result=result)
+
+    class _Page:
+        url = "https://example.com/"
+
+    return ScriptedLoop(
+        page=_Page(),
+        engine=None,
+        dispatcher=None,
+        config=None,
+        budget=BudgetGuard(),
+        max_steps=10,
+    )
+
+
+def _run(loop):
+    # asyncio.get_event_loop()는 다른 async 테스트가 이벤트 루프를 닫은
+    # 뒤에는 RuntimeError를 낸다(전체 스위트에서만 실패, 단독 통과 —
+    # 실제로 겪었다). asyncio.run()은 매번 새 루프를 만들므로 안전하다.
+    import asyncio
+
+    return asyncio.run(loop.run("목표"))
+
+
+def test_behavior_harmless_stale_ref_allows_finish(monkeypatch):
+    """melon-chart 재현: 같은 요소 성공 -> 같은 요소 NOT_FOUND -> finish.
+
+    구식 참조 실패는 직전 성공의 부산물이므로 가드가 발동하지 않아야
+    한다. 수정 전에는 silent_win으로 집계됐다.
+    """
+    from contracts import ErrorCode
+
+    loop = _scripted_loop(monkeypatch, [
+        ("click", "@e2", True, None),
+        ("click", "@e2", False, ErrorCode.ELEMENT_NOT_FOUND),
+        ("finish", None, True, None),
+    ])
+    run = _run(loop)
+
+    assert run.completed is True
+    assert "무해" in run.terminal_reason
+    assert len(run.steps) == 3, "가드가 불필요하게 거부했습니다"
+
+
+def test_behavior_effect_failure_still_guarded(monkeypatch):
+    """hn-comments 재현: 성공 -> 다른 요소 E_TIMEOUT -> finish.
+
+    효과 실패 직후의 완료 선언은 여전히 1차 거부되어야 한다.
+    """
+    from contracts import ErrorCode
+
+    loop = _scripted_loop(monkeypatch, [
+        ("click", "@e1", True, None),
+        ("click", "@e2", False, ErrorCode.TIMEOUT),
+        ("finish", None, True, None),   # 1차 -> 거부되어야 함
+        ("finish", None, True, None),   # 재확인 후 -> 수용
+    ])
+    run = _run(loop)
+
+    assert run.completed is True
+    assert "재확인 후" in run.terminal_reason, (
+        "1차 거부 없이 통과했거나, 재선언이 수용되지 않았습니다"
+    )
+    assert any("[시스템]" in h for h in []) or len(run.steps) == 4
+
+
+def test_behavior_different_element_not_found_still_guarded(monkeypatch):
+    """다른 요소를 못 찾은 것은 무해하지 않다.
+
+    '다음 단계 요소를 찾다 NOT_FOUND'는 목표 미달성일 수 있으므로
+    가드가 발동해야 한다 (같은 요소 조건의 존재 이유).
+    """
+    from contracts import ErrorCode
+
+    loop = _scripted_loop(monkeypatch, [
+        ("click", "@e1", True, None),
+        ("click", "@e7", False, ErrorCode.ELEMENT_NOT_FOUND),
+        ("finish", None, True, None),   # 1차 -> 거부
+        ("finish", None, True, None),   # 재확인 후 -> 수용
+    ])
+    run = _run(loop)
+
+    assert run.completed is True
+    assert "재확인 후" in run.terminal_reason, (
+        "다른 요소의 NOT_FOUND가 무해로 오판됐습니다"
+    )
+
+
+def test_behavior_clean_finish_unchanged(monkeypatch):
+    """실패 없는 정상 종료는 그대로여야 한다."""
+    loop = _scripted_loop(monkeypatch, [
+        ("click", "@e1", True, None),
+        ("finish", None, True, None),
+    ])
+    run = _run(loop)
+
+    assert run.completed is True
+    assert run.terminal_reason == "LLM이 목표 달성을 선언했습니다."
+
+
+def test_behavior_success_resets_harmless_state(monkeypatch):
+    """성공 -> 무해실패 -> 다른 성공 -> 효과실패 -> finish.
+
+    상태가 스텝마다 올바르게 재계산되는지 (재귀적 오염 방지).
+    마지막 실패는 TIMEOUT이므로 가드가 발동해야 한다.
+    """
+    from contracts import ErrorCode
+
+    loop = _scripted_loop(monkeypatch, [
+        ("click", "@e1", True, None),
+        ("click", "@e1", False, ErrorCode.ELEMENT_NOT_FOUND),  # 무해
+        ("click", "@e3", True, None),
+        ("click", "@e4", False, ErrorCode.TIMEOUT),            # 효과 실패
+        ("finish", None, True, None),   # 1차 -> 거부
+        ("finish", None, True, None),   # 수용
+    ])
+    run = _run(loop)
+
+    assert run.completed is True
+    assert "재확인 후" in run.terminal_reason, (
+        "이전의 무해 판정이 이후 효과 실패에 잘못 이월됐습니다"
+    )

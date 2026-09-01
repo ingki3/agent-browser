@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-from contracts import ActionResult, ActionType, ObserveResult
+from contracts import ActionResult, ActionType, ErrorCode, ObserveResult
 from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
 from llm import BudgetExceeded, BudgetGuard, LLMError, OpenRouterClient
 from llm.config import LLMConfig
@@ -194,11 +194,15 @@ class AgentLoop:
             return run
 
         try:
-            # 실패 직후 완료 선언을 막기 위한 상태.
+            # 실패 직후 완료 선언 가드 상태 (WS-18 정밀화).
             # last_action_failed: 직전에 실행한 실제 액션의 성공 여부
+            # last_failure_harmless: 그 실패가 '구식 참조 실패'인가
             # finish_rejected: 이미 한 번 거부했는지 (무한 루프 방지)
+            # last_success_element: 마지막으로 성공한 액션의 대상 요소
             last_action_failed = False
+            last_failure_harmless = False
             finish_rejected = False
+            last_success_element: Optional[str] = None
 
             for step in range(1, self.max_steps + 1):
                 # PRD 실행 시간 상한 — 태스크당 Wall-Clock 10분.
@@ -229,14 +233,33 @@ class AgentLoop:
                 run.steps.append(outcome)
 
                 if outcome.decision.action == FINISH:
-                    # 직전 액션이 실패했는데 완료를 선언하면 신뢰할 수 없다.
-                    # 실측(hn-comments) — click이 E_TIMEOUT으로 실패한 직후
-                    # finish를 선언했고, 독립 검증에서 false_claim으로 잡혔다.
-                    # 자기 보고가 틀린 것을 사후에 잡기보다 애초에 막는다.
+                    # 실패 직후 완료 선언 가드 (WS-15 도입, WS-18 정밀화).
                     #
-                    # 한 번은 되돌릴 기회를 준다. 계속 우기면 종료하되
-                    # 완료로 집계하지 않는다.
-                    if last_action_failed and not finish_rejected:
+                    # 원조 사례(hn-comments, WS-15 이전) — click이 E_TIMEOUT
+                    # 으로 실패한 직후 finish를 선언했고 독립 검증에서
+                    # false_claim으로 잡혔다. 이를 애초에 막는 것이 목적이다.
+                    #
+                    # 그러나 실측(melon-chart, naver-search)에서 가드가
+                    # **진짜 성공을 두 번 막았다.** 두 사례 모두:
+                    #   같은 요소에 성공 -> 같은 요소에 E_ELEMENT_NOT_FOUND
+                    #   -> finish
+                    # 직전 성공이 페이지를 이동시켜 옛 요소가 사라진 것이다.
+                    # 실패는 성공의 부산물이지 목표 미달성의 증거가 아니다.
+                    #
+                    # 정밀화 두 가지:
+                    # (1) 무해한 실패는 가드를 발동하지 않는다.
+                    #     구식 참조 실패(ELEMENT_NOT_FOUND/TOCTOU_MISMATCH)가
+                    #     '직전에 성공한 바로 그 요소'에 대해 났다면, 액션이
+                    #     시작조차 못 한 것이므로 페이지를 나쁘게 만들 수
+                    #     없다. E_TIMEOUT 등 효과 실패는 여전히 발동한다.
+                    # (2) 재확인 후의 재선언은 수용한다.
+                    #     1차 거부는 새 관찰을 강제하는 장치다. 새 관찰을
+                    #     받고도 완료를 주장하면 그 판단을 존중한다. 목표
+                    #     달성 여부는 루프가 알 수 없고, 최종 판정은 독립
+                    #     검증(하네스)/호출자의 몫이다. 이때 자기 보고가
+                    #     실패 후 재확인을 거쳤음을 terminal_reason에 남긴다.
+                    guard_active = last_action_failed and not last_failure_harmless
+                    if guard_active and not finish_rejected:
                         finish_rejected = True
                         history.append(
                             "[시스템] 직전 액션이 실패했는데 목표 달성을 "
@@ -246,12 +269,20 @@ class AgentLoop:
                             "시도하십시오."
                         )
                         continue
-                    run.completed = not last_action_failed
-                    run.terminal_reason = (
-                        "LLM이 목표 달성을 선언했습니다."
-                        if not last_action_failed
-                        else "직전 액션 실패 후 완료를 선언해 거부했습니다."
-                    )
+
+                    run.completed = True
+                    if finish_rejected:
+                        run.terminal_reason = (
+                            "LLM이 재확인 후 목표 달성을 선언했습니다 "
+                            "(직전 실패로 1차 거부됨)."
+                        )
+                    elif last_action_failed:
+                        run.terminal_reason = (
+                            "LLM이 목표 달성을 선언했습니다 "
+                            "(직전 실패는 구식 참조 — 무해)."
+                        )
+                    else:
+                        run.terminal_reason = "LLM이 목표 달성을 선언했습니다."
                     break
                 if outcome.decision.action == GIVE_UP:
                     run.terminal_reason = f"LLM 포기: {outcome.decision.reason}"
@@ -260,10 +291,35 @@ class AgentLoop:
                 if outcome.succeeded:
                     consecutive_failures = 0
                     last_action_failed = False
+                    last_failure_harmless = False
+                    # 무해 판정용 — 이 요소에 대한 이후의 구식 참조 실패는
+                    # 이 성공의 부산물일 가능성이 높다.
+                    last_success_element = outcome.decision.element_id
                     history.append(outcome.summary())
                 else:
                     consecutive_failures += 1
                     last_action_failed = True
+                    # 구식 참조 실패 판정 (WS-18).
+                    # ELEMENT_NOT_FOUND/TOCTOU_MISMATCH는 액션이 시작조차
+                    # 못 한 실패다. 그것이 '직전에 성공한 바로 그 요소'에
+                    # 대해 났다면, 직전 성공이 페이지를 바꿔 참조가 낡은
+                    # 것이므로 목표 미달성의 증거가 아니다.
+                    # 실측 — melon-chart(@e2 성공 -> @e2 NOT_FOUND),
+                    #        naver-search(@e3 성공 -> @e3 NOT_FOUND).
+                    error_code = (
+                        outcome.result.error_code
+                        if outcome.result and outcome.result.error_code
+                        else None
+                    )
+                    is_stale_ref = error_code in (
+                        ErrorCode.ELEMENT_NOT_FOUND,
+                        ErrorCode.TOCTOU_MISMATCH,
+                    )
+                    same_element = (
+                        outcome.decision.element_id is not None
+                        and outcome.decision.element_id == last_success_element
+                    )
+                    last_failure_harmless = is_stale_ref and same_element
                     failures.append(outcome.summary())
                     history.append(outcome.summary())
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
