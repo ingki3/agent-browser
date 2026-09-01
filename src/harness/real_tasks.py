@@ -294,10 +294,84 @@ TASKS: Tuple[RealTask, ...] = (
         capability="짧은 라벨 네비게이션 식별 (기사 제목과 경쟁)",
         max_steps=5,
     ),
+    # --- commercial 티어 (WS-16) --------------------------------------
+    # 지금까지의 태스크는 전부 영문 테스트 샌드박스였다. 실제 상용
+    # 서비스는 한글 UI, 광고·배너, 수백 개의 링크, 잦은 DOM 개편이라는
+    # 다른 조건을 갖는다.
+    #
+    # 사전 조사에서 제외한 사이트:
+    #   쿠팡    403 Access Denied (Akamai 엣지 차단, UA 변경도 무효)
+    #   구글 검색 /sorry/index CAPTCHA 리다이렉트
+    # 넣으면 100% 실패하는데 원인이 우리 런타임이 아니므로 지표를 오염시킨다.
+    #
+    # 이 티어는 관측용이다. DOM 개편으로 언제든 깨질 수 있으므로
+    # 판정 게이트로 쓰지 않는다.
+    RealTask(
+        "naver-search",
+        "https://www.naver.com",
+        "검색창에 'python'을 입력하고 검색 실행하기",
+        "location.host.includes('search.naver.com') "
+        "&& decodeURIComponent(location.search).includes('python')",
+        difficulty="commercial",
+        capability="포털 검색 (보이는 입력 요소 15개 중 검색창 식별)",
+        max_steps=6,
+    ),
+    RealTask(
+        "daum-search",
+        "https://www.daum.net",
+        "검색창에 'python'을 입력하고 검색 실행하기",
+        "location.host.includes('search.daum.net')",
+        difficulty="commercial",
+        capability="포털 검색 (링크 330개 중 검색 폼 식별)",
+        max_steps=6,
+    ),
+    RealTask(
+        "naver-news-section",
+        "https://news.naver.com",
+        "'정치' 섹션 링크를 클릭해 정치 뉴스 목록으로 이동하기",
+        "location.pathname.includes('/section/')",
+        difficulty="commercial",
+        capability="한글 2자 라벨 식별 (CJK 이름 품질 판정)",
+        max_steps=5,
+    ),
+    RealTask(
+        "melon-chart",
+        "https://www.melon.com",
+        "멜론차트 페이지로 이동하기",
+        "location.pathname.includes('/chart')",
+        difficulty="commercial",
+        capability="한글 메뉴 네비게이션 (링크 352개)",
+        max_steps=5,
+    ),
+    RealTask(
+        "11st-search",
+        "https://www.11st.co.kr",
+        "검색창에 '키보드'를 입력하고 검색 실행하기",
+        "location.host.includes('search.11st.co.kr')",
+        difficulty="commercial",
+        capability="쇼핑몰 검색 (링크 562개, 배너·프로모션과 경쟁)",
+        max_steps=6,
+    ),
+    RealTask(
+        "gmarket-search",
+        "https://www.gmarket.co.kr",
+        "검색창에 '키보드'를 입력하고 검색 실행하기",
+        "location.pathname.includes('/search')",
+        difficulty="commercial",
+        capability="쇼핑몰 검색 (링크 677개, 최고밀도)",
+        max_steps=6,
+    ),
 )
 
 #: 난이도별 태스크 수 (커버리지 검증용)
-DIFFICULTY_LEVELS: Tuple[str, ...] = ("easy", "medium", "hard", "multistep", "dynamic")
+DIFFICULTY_LEVELS: Tuple[str, ...] = (
+    "easy",
+    "medium",
+    "hard",
+    "multistep",
+    "dynamic",
+    "commercial",
+)
 
 
 def tasks_by_difficulty() -> Dict[str, int]:

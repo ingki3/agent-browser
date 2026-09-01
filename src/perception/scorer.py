@@ -192,16 +192,38 @@ def label_similarity(a: str, b: str) -> float:
     return base
 
 
+#: CJK(한중일) 문자 범위. 표의문자·한글은 글자당 정보량이 라틴 문자보다
+#: 훨씬 크다. '정치'(2자)는 완전한 단어지만 'ok'(2자)는 그렇지 않다.
+_CJK_PATTERN = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]"
+)
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(_CJK_PATTERN.search(text))
+
+
 def _name_quality(name: str) -> float:
     """이름의 정보량을 0.0~1.0으로 평가한다.
 
     너무 짧으면 식별력이 낮고, 너무 길면 본문 덩어리일 가능성이 높다.
+
+    단, **짧음의 기준은 문자 체계에 따라 다르다.** 실측(네이버 뉴스) —
+    같은 줄에 나란히 있는 섹션 메뉴인데 순위가 갈렸다.
+
+        '정치'      (2자, CJK)  name_quality 0.30  ->  417위
+        '생활/문화'  (5자)       name_quality 1.00  ->   15위
+
+    한글 2자는 완전한 단어이므로 라틴 2자('ok', 'go')와 같이 취급하면
+    한국어·중국어·일본어 사이트에서 주요 네비게이션이 통째로 밀려난다.
     """
     text = _normalize(name)
     if not text:
         return 0.0
     length = len(text)
-    if length <= 2:
+    # CJK는 1자만 돼도 의미를 갖는 경우가 많다('홈', '검색', '더보기')
+    min_informative = 1 if _has_cjk(text) else 2
+    if length <= min_informative:
         return 0.3
     if length <= 40:
         return 1.0
