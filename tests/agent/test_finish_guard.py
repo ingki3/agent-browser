@@ -289,3 +289,73 @@ def test_all_record_paths_fill_same_keys():
             f"{i}번째 경로에 키가 없습니다: {sorted(missing)} "
             "— 출력부에서 KeyError가 납니다"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. 빈 LLM 응답 진단 (WS-18)
+# ---------------------------------------------------------------------------
+
+
+def _resp(content, finish_reason="stop", reasoning=""):
+    from llm.client import LLMResponse
+
+    return LLMResponse(
+        content=content,
+        model="test",
+        prompt_tokens=10,
+        completion_tokens=0,
+        cost_usd=0.0,
+        finish_reason=finish_reason,
+        reasoning=reasoning,
+        raw={},
+    )
+
+
+def test_empty_response_reports_real_cause():
+    """빈 응답을 'JSON 파싱 실패'로 보고하면 원인을 오해한다.
+
+    실측(dyn-enable-input) — reasoning 계열 모델이 max_tokens를 사고
+    과정에만 쓰고 content를 못 냈다. 로그에는 이렇게만 남았다:
+
+        JSON 파싱 실패: Expecting value: line 1 column 1 (char 0).
+        본문 앞부분: ''
+
+    모델이 잘못된 JSON을 냈다고 오해하게 된다. 실제로는 아무것도
+    내지 못한 것이다.
+    """
+    from llm import LLMError
+
+    with pytest.raises(LLMError) as exc:
+        _resp("", finish_reason="length", reasoning="가" * 500).parse_json()
+
+    msg = str(exc.value)
+    assert "본문을 내지 못했습니다" in msg
+    assert "max_tokens" in msg
+    assert "JSON 파싱 실패" not in msg, "빈 응답을 파싱 오류로 보고합니다"
+
+
+def test_empty_response_without_truncation():
+    """잘림이 아닌 빈 응답도 구분해서 알린다."""
+    from llm import LLMError
+
+    with pytest.raises(LLMError) as exc:
+        _resp("", finish_reason="stop").parse_json()
+
+    msg = str(exc.value)
+    assert "빈 응답" in msg
+    assert "finish_reason" in msg
+
+
+def test_malformed_json_still_reports_parse_error():
+    """실제 파싱 오류는 그대로 보고한다 (과잉 일반화 방지)."""
+    from llm import LLMError
+
+    with pytest.raises(LLMError) as exc:
+        _resp("{not json").parse_json()
+
+    assert "JSON 파싱 실패" in str(exc.value)
+
+
+def test_valid_json_unaffected():
+    assert _resp('{"action": "finish"}').parse_json() == {"action": "finish"}
+    assert _resp('```json\n{"a": 1}\n```').parse_json() == {"a": 1}
