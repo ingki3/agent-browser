@@ -97,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-496개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+525개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -256,6 +256,48 @@ reasoning 계열 모델은 본문보다 사고 토큰을 먼저 소비합니다.
 **모델 판단의 편차** — 실패 사례는 런타임 결함이 아니라 LLM이 실행마다 다른 선택을 하는 경우입니다. `max_tokens` 조정으로 해결되지 않으며, 모델 비교가 다음 과제입니다.
 
 **Tier-2 SoM 미구현** — Canvas 렌더링이나 안티스크래핑 난독화로 텍스트 셀렉터가 통하지 않는 경우의 시각 폴백은 v1.1 대상입니다. `take_screenshot(annotate_som=True)`는 현재 `E_FEATURE_NOT_IMPLEMENTED`를 반환합니다.
+
+**소셜 로그인 자동화는 지원하지 않습니다** — 구글·페이스북 등의 로그인 페이지를 에이전트가 직접 조작하는 것은 **의도적으로 지원 대상이 아닙니다.** 제공자들이 헤드리스 브라우저 지문, WebDriver 플래그, 비정상 로그인 타이밍을 능동적으로 탐지해 차단하기 때문입니다. 실측에서도 구글 검색이 `/sorry/index` CAPTCHA로, 쿠팡이 403으로 막혔습니다.
+
+우회를 시도하면 계정 잠금이나 정지로 이어질 수 있습니다. 대신 아래 방식을 쓰십시오.
+
+```
+1. 사람이 브라우저에서 직접 로그인
+2. storage_state를 SessionStore로 암호화 저장 (AES-256-GCM)
+3. 이후 세션을 복원해 재사용
+```
+
+이는 Playwright의 `storageState`, Browserbase의 Contexts, Steel의 세션 영속화와 같은 접근입니다. 2FA나 매직 링크가 걸린 경우 사람의 개입이 필요하며, 이는 회피 대상이 아니라 정상적인 설계입니다.
+
+### 자격증명 다루기
+
+`--secrets`로 플레이스홀더 치환을 쓰면 **자격증명이 LLM 컨텍스트에 들어가지 않습니다.**
+
+```bash
+cat > secrets.env <<'EOF'
+X-LOGIN=myaccount
+X-PASSWORD=실제비밀번호
+EOF
+chmod 600 secrets.env        # 0600이 아니면 기동을 거부합니다
+
+agent-browser serve --secrets=./secrets.env
+```
+
+에이전트는 키 이름만 사용합니다.
+
+```
+LLM이 보내는 것    type_text(text="X-PASSWORD")
+실제 입력되는 것    실제비밀번호
+트레이스에 남는 것  "X-PASSWORD"
+```
+
+등록되지 않은 키는 **치환하지 않고 그대로 입력**합니다(조용한 실패 방지). 치환 여부는 `ActionResult.data.secret_resolved`로 확인할 수 있습니다.
+
+`secrets.env`는 반드시 `.gitignore`에 넣으십시오.
+
+**한계** — 치환된 값은 페이지 DOM에 존재하므로 이후 관찰이나 스크린샷에 노출될 수 있습니다. 이 기능이 보장하는 것은 "LLM 컨텍스트 유입 차단"뿐이며 종단 간 기밀성이 아닙니다. 볼트 연동(1Password, HashiCorp Vault)은 v1.1 대상입니다.
+
+트레이스 기록에는 비밀번호 필드(`input[type=password]`) 입력값 마스킹이 적용되지만, **이것을 보안 경계로 여기지 마십시오.** 마스킹은 방어의 한 겹일 뿐입니다. 스크린샷, 네트워크 페이로드, DOM 스냅샷 등 다른 경로는 덮지 못합니다. 로그인이 필요한 작업에는 위의 세션 저장 방식을 권장합니다.
 
 ---
 
