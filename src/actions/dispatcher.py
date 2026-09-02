@@ -437,6 +437,33 @@ class ActionDispatcher:
 
     # -- 실행 ---------------------------------------------------------------
 
+    async def is_sensitive_field(self, handle: ElementHandle) -> bool:
+        """이 요소가 비밀번호 입력 필드인가.
+
+        PRD 5.3은 "비밀번호 인풋 필드 자동 마스킹"을 규정하지만, 마스킹기
+        혼자서는 판정할 수 없다:
+
+        - 액션 파라미터의 키는 `text`라는 중립적 이름이라 키 기반 규칙에
+          걸리지 않는다.
+        - 값은 평범한 문자열이라 정규식으로도 잡히지 않는다.
+        - 접근성 role로도 구분되지 않는다. 실측상 `input[type=password]`와
+          일반 텍스트 입력이 **모두 role=textbox**다.
+
+        DOM을 직접 아는 디스패처만이 판정할 수 있다. 실패 시 False를
+        반환하되, 판정 실패가 곧 '안전함'을 뜻하지는 않는다는 점을
+        호출자가 알아야 한다.
+        """
+        try:
+            locator = self._locator_for(handle)
+            return bool(
+                await locator.evaluate(
+                    "el => el.tagName === 'INPUT' "
+                    "&& (el.type || '').toLowerCase() === 'password'"
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 

@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from contracts import ActionResult, ActionType
-from security import mask_mapping
+from security import MASK, mask_mapping
+
+#: 사용자 입력 값을 담는 파라미터 키. 비밀번호 필드를 다룬 스텝에서는
+#: 이 키들의 값을 키 이름과 무관하게 지운다.
+_VALUE_KEYS = frozenset({"text", "value", "keys"})
 
 
 @dataclass
@@ -39,10 +43,26 @@ class StepRecord:
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     healed: bool = False
+    #: 이 스텝이 비밀번호 필드를 다뤘는가. 마스킹기는 키 이름(`password`
+    #: 등)으로 민감 필드를 판정하는데, 액션 파라미터의 키는 `text`라는
+    #: 중립적 이름이라 걸리지 않는다. 값도 평범한 문자열이라 정규식으로
+    #: 잡을 수 없다(실측 — PRD 5.3 규정 미준수).
+    #:
+    #: 접근성 role로도 구분되지 않는다. 실측상 `input[type=password]`와
+    #: 일반 텍스트 입력이 모두 role=textbox다. 따라서 DOM을 직접 아는
+    #: 디스패처가 이 플래그를 세워줘야 한다.
+    sensitive_input: bool = False
     timestamp: float = field(default_factory=time.time)
 
     def to_masked_dict(self) -> Dict[str, Any]:
         """민감정보를 마스킹한 딕셔너리를 반환한다."""
+        action_input = self.action_input
+        if self.sensitive_input and action_input:
+            # 비밀번호 필드에 입력한 값은 키 이름과 무관하게 지운다.
+            action_input = {
+                k: (MASK if k in _VALUE_KEYS else v)
+                for k, v in action_input.items()
+            }
         payload: Dict[str, Any] = {
             "correlation_id": self.correlation_id,
             "step": self.step,
@@ -52,7 +72,7 @@ class StepRecord:
             "latency_ms": round(self.latency_ms, 2),
             "observation_tokens": self.observation_tokens,
             "observation_summary": self.observation_summary,
-            "action_input": self.action_input,
+            "action_input": action_input,
             "error_code": self.error_code,
             "error_message": self.error_message,
             "healed": self.healed,
