@@ -306,3 +306,144 @@ def test_meta_key_is_namespaced():
     """Playwright storage_state 스키마와 충돌하지 않아야 한다."""
     assert META_KEY.startswith("_")
     assert META_KEY not in {"cookies", "origins"}
+
+
+# ---------------------------------------------------------------------------
+# 7. 비대화형 환경 (WS-21 실사용 검증에서 발견)
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_returns_default_when_not_interactive(monkeypatch):
+    """파이프 환경에서 EOFError로 죽지 않아야 한다.
+
+    실측 — CLI를 파이프로 돌렸더니 getpass가 EOFError를 던지고
+    스택트레이스가 그대로 노출됐다.
+    """
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: False)
+    assert session_cli._confirm("삭제할까요? ") is False
+    assert session_cli._confirm("저장할까요? ", default=True) is True
+
+
+def test_confirm_survives_eof(monkeypatch):
+    """대화형이라고 판단됐는데 입력이 끊긴 경우도 방어한다."""
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: True)
+
+    def _raise(_):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _raise)
+    assert session_cli._confirm("계속? ") is False
+
+
+def test_ci_env_used_when_not_interactive(auth_dir, monkeypatch):
+    """비대화형이면 프롬프트 없이 환경변수로 풀려야 한다.
+
+    실측 — AGENT_AUTH_KEY_CI를 설정해뒀는데도 프롬프트가 먼저 떠서
+    무인 실행이 막혔다. PRD 5.1-1 우선순위상 프롬프트가 2순위라
+    CLI가 대화형 여부를 판단해줘야 한다.
+    """
+    from browser import CI_ENV_VAR
+
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: False)
+    monkeypatch.setenv(CI_ENV_VAR, PASS)
+
+    store = SessionStore(auth_dir=auth_dir)
+    store.save("p1", _sample_state(), PASS)
+
+    resolved = session_cli._resolve_for_read("p1")
+    assert resolved == PASS
+
+
+def test_non_interactive_without_key_reports_how_to_fix(
+    auth_dir, monkeypatch
+):
+    """비대화형에서 키가 없으면 원인과 해결책을 알려줘야 한다."""
+    from browser import CI_ENV_VAR
+
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: False)
+    monkeypatch.delenv(CI_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        session_cli, "resolve_passphrase",
+        lambda *a, **k: (_ for _ in ()).throw(
+            __import__("browser").KeyUnavailableError("키 없음")
+        ),
+    )
+
+    with pytest.raises(SessionCLIError) as exc:
+        session_cli._resolve_for_read("p1")
+
+    message = str(exc.value)
+    assert "비대화형" in message
+    assert CI_ENV_VAR in message
+
+
+def test_remove_without_force_is_safe_when_not_interactive(
+    auth_dir, monkeypatch
+):
+    """확인할 수 없으면 삭제하지 않는다 (파괴적 동작의 기본값)."""
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: False)
+    store = SessionStore(auth_dir=auth_dir)
+    store.save("p1", _sample_state(), PASS)
+
+    rc = _run_remove("p1", auth_dir=str(auth_dir), force=False)
+    assert rc == 1
+    assert store.exists("p1"), "확인 없이 삭제됐습니다"
+
+
+def test_is_interactive_reads_actual_tty(monkeypatch):
+    """_is_interactive가 실제 tty 상태를 읽어야 한다.
+
+    monkeypatch로 이 함수를 대체하는 테스트만 있으면 함수 자체가
+    망가져도 드러나지 않는다(사보타주로 확인된 미탐 경로).
+    """
+    import io
+
+    class _FakeStream(io.StringIO):
+        def __init__(self, tty: bool):
+            super().__init__()
+            self._tty = tty
+
+        def isatty(self):
+            return self._tty
+
+    monkeypatch.setattr("sys.stdin", _FakeStream(True))
+    monkeypatch.setattr("sys.stdout", _FakeStream(True))
+    assert session_cli._is_interactive() is True
+
+    monkeypatch.setattr("sys.stdin", _FakeStream(False))
+    assert session_cli._is_interactive() is False, (
+        "stdin이 파이프인데 대화형으로 판단했습니다"
+    )
+
+    monkeypatch.setattr("sys.stdin", _FakeStream(True))
+    monkeypatch.setattr("sys.stdout", _FakeStream(False))
+    assert session_cli._is_interactive() is False
+
+
+def test_resolve_for_read_disables_prompt_when_piped(monkeypatch, auth_dir):
+    """비대화형이면 resolve_passphrase에 프롬프트를 넘기지 않아야 한다.
+
+    넘기면 getpass가 EOFError를 던져 무인 실행이 죽는다.
+    """
+    from browser import CI_ENV_VAR
+
+    captured = {}
+
+    def _spy(profile, *, prompt_fn=None, allow_prompt=True):
+        captured["prompt_fn"] = prompt_fn
+        captured["allow_prompt"] = allow_prompt
+        from browser import KeyResolution
+
+        return KeyResolution(passphrase=PASS, source="ci_env")
+
+    monkeypatch.setattr(session_cli, "resolve_passphrase", _spy)
+    monkeypatch.setattr(session_cli, "_is_interactive", lambda: False)
+
+    session_cli._resolve_for_read("p1")
+
+    assert captured["allow_prompt"] is False, (
+        "비대화형인데 프롬프트를 허용했습니다"
+    )
+    assert captured["prompt_fn"] is None, (
+        "비대화형인데 프롬프트 함수를 넘겼습니다"
+    )
