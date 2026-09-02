@@ -97,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-525개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+553개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -261,11 +261,18 @@ reasoning 계열 모델은 본문보다 사고 토큰을 먼저 소비합니다.
 
 우회를 시도하면 계정 잠금이나 정지로 이어질 수 있습니다. 대신 아래 방식을 쓰십시오.
 
+```bash
+# 브라우저 창이 열립니다. 직접 로그인하십시오 (2FA·CAPTCHA도 여기서).
+agent-browser session login naver --url https://nid.naver.com/nidlogin.login
+
+agent-browser session list                        # 저장된 세션 목록
+agent-browser session check naver --url https://mail.naver.com   # 유효성 확인
+agent-browser session remove naver                # 삭제
 ```
-1. 사람이 브라우저에서 직접 로그인
-2. storage_state를 SessionStore로 암호화 저장 (AES-256-GCM)
-3. 이후 세션을 복원해 재사용
-```
+
+비밀번호는 **어디에도 저장되지 않습니다.** 브라우저 안에서만 쓰이고, 저장되는 것은 로그인 결과물인 쿠키/localStorage입니다. 그마저 AES-256-GCM + Argon2id로 암호화해 `0600` 권한으로 보관합니다.
+
+패스프레이즈는 OS 키체인 → 프롬프트 → `AGENT_AUTH_KEY_CI` 순으로 해석합니다. 무인 실행하려면 키체인에 저장해두면 됩니다(`login` 마지막에 물어봅니다).
 
 이는 Playwright의 `storageState`, Browserbase의 Contexts, Steel의 세션 영속화와 같은 접근입니다. 2FA나 매직 링크가 걸린 경우 사람의 개입이 필요하며, 이는 회피 대상이 아니라 정상적인 설계입니다.
 

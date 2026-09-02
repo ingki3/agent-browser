@@ -3,6 +3,7 @@
     agent-browser serve   [--mode] [--allow-domain] [--secrets]  # MCP 서버 (stdio)
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
+    agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -65,6 +66,61 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[m.value for m in ExecutionMode],
         default=ExecutionMode.INTERACTIVE.value,
         help="실행 모드 (기본: interactive)",
+    )
+
+    # --- session ---
+    session = sub.add_parser(
+        "session",
+        help="로그인 세션을 저장·조회합니다 (비밀번호는 저장하지 않습니다).",
+    )
+    session_sub = session.add_subparsers(dest="session_action", required=True)
+
+    s_login = session_sub.add_parser(
+        "login",
+        help="브라우저를 띄워 사람이 직접 로그인하고 세션을 암호화 저장합니다.",
+    )
+    s_login.add_argument("profile", help="프로파일 이름 (예: naver)")
+    s_login.add_argument(
+        "--url", required=True, metavar="URL", help="로그인 페이지 주소"
+    )
+    s_login.add_argument(
+        "--auth-dir", default=None, metavar="DIR", help="세션 저장 디렉터리"
+    )
+    s_login.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        metavar="SEC",
+        help="로그인 대기 상한 (기본 600초)",
+    )
+
+    s_list = session_sub.add_parser("list", help="저장된 세션 목록을 봅니다.")
+    s_list.add_argument(
+        "--auth-dir", default=None, metavar="DIR", help="세션 저장 디렉터리"
+    )
+    s_list.add_argument("--json", action="store_true", help="JSON으로 출력합니다.")
+
+    s_check = session_sub.add_parser(
+        "check", help="세션이 아직 유효한지 확인합니다."
+    )
+    s_check.add_argument("profile", help="프로파일 이름")
+    s_check.add_argument(
+        "--url",
+        default=None,
+        metavar="URL",
+        help="유효성을 확인할 보호된 페이지 (미지정 시 파일 검사만)",
+    )
+    s_check.add_argument(
+        "--auth-dir", default=None, metavar="DIR", help="세션 저장 디렉터리"
+    )
+
+    s_remove = session_sub.add_parser("remove", help="저장된 세션을 삭제합니다.")
+    s_remove.add_argument("profile", help="프로파일 이름")
+    s_remove.add_argument(
+        "--auth-dir", default=None, metavar="DIR", help="세션 저장 디렉터리"
+    )
+    s_remove.add_argument(
+        "-f", "--force", action="store_true", help="확인 없이 삭제합니다."
     )
 
     # --- tools ---
@@ -185,6 +241,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_tui(args)
     if args.command == "llm-check":
         return _cmd_llm_check(args)
+    if args.command == "session":
+        from interface import session_cli
+
+        return session_cli.run(args)
 
     parser.error(f"알 수 없는 명령: {args.command}")
     return 2
