@@ -28,6 +28,7 @@ import getpass
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,12 +67,62 @@ def _prompt_passphrase(label: str) -> str:
     return getpass.getpass(label)
 
 
-def _resolve_for_read(profile: str) -> str:
-    """기존 프로파일을 열기 위한 패스프레이즈를 얻는다."""
+def _is_interactive() -> bool:
+    """터미널에 붙어 있는가.
+
+    파이프·CI·nohup 환경에서 프롬프트를 시도하면 getpass가 EOFError를
+    던지고 스택트레이스가 그대로 노출된다. 실측 — 무인 실행 중
+    `AGENT_AUTH_KEY_CI`를 설정해뒀는데도 프롬프트가 먼저 떠서 막혔다.
+    """
     try:
-        resolution = resolve_passphrase(profile, prompt_fn=_prompt_passphrase)
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:  # noqa: BLE001 - stdin이 교체된 경우 등
+        return False
+
+
+def _confirm(question: str, *, default: bool = False) -> bool:
+    """예/아니오를 묻는다. 비대화형이면 기본값을 쓴다.
+
+    입력이 불가능한 환경에서 EOFError로 죽지 않게 한다.
+    """
+    if not _is_interactive():
+        return default
+    try:
+        answer = input(question).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+def _resolve_for_read(profile: str) -> str:
+    """기존 프로파일을 열기 위한 패스프레이즈를 얻는다.
+
+    비대화형이면 프롬프트를 시도하지 않는다. keyring이나 환경변수로
+    풀리지 않으면 원인을 알려주고 실패한다.
+    """
+    interactive = _is_interactive()
+    try:
+        resolution = resolve_passphrase(
+            profile,
+            prompt_fn=_prompt_passphrase if interactive else None,
+            allow_prompt=interactive,
+        )
     except KeyUnavailableError as exc:
+        if not interactive:
+            raise SessionCLIError(
+                f"{exc}\n"
+                f"    비대화형 환경입니다. 다음 중 하나가 필요합니다:\n"
+                f"      - OS 키체인에 등록 (service={KEYRING_SERVICE}, "
+                f"account={profile})\n"
+                f"      - 환경변수 {CI_ENV_VAR} 설정"
+            ) from None
         raise SessionCLIError(str(exc)) from None
+    except EOFError:
+        raise SessionCLIError(
+            "패스프레이즈 입력이 중단됐습니다 (비대화형 입력)."
+        ) from None
     if not resolution.passphrase:
         raise SessionCLIError("패스프레이즈를 얻지 못했습니다.")
     return resolution.passphrase
@@ -100,10 +151,22 @@ def _resolve_for_create(profile: str) -> Tuple[str, bool]:
         print(f"  {CI_ENV_VAR} 환경변수를 사용합니다 (보안 등급이 낮습니다).")
         return ci_value, False
 
-    first = _prompt_passphrase(f"[{profile}] 새 마스터 패스프레이즈: ")
-    if not first:
-        raise SessionCLIError("패스프레이즈가 비어 있습니다.")
-    second = _prompt_passphrase(f"[{profile}] 한 번 더 입력: ")
+    if not _is_interactive():
+        raise SessionCLIError(
+            "패스프레이즈를 얻을 수 없습니다.\n"
+            f"    비대화형 환경입니다. 다음 중 하나가 필요합니다:\n"
+            f"      - OS 키체인에 등록 (service={KEYRING_SERVICE}, "
+            f"account={profile})\n"
+            f"      - 환경변수 {CI_ENV_VAR} 설정"
+        )
+
+    try:
+        first = _prompt_passphrase(f"[{profile}] 새 마스터 패스프레이즈: ")
+        if not first:
+            raise SessionCLIError("패스프레이즈가 비어 있습니다.")
+        second = _prompt_passphrase(f"[{profile}] 한 번 더 입력: ")
+    except EOFError:
+        raise SessionCLIError("패스프레이즈 입력이 중단됐습니다.") from None
     if first != second:
         raise SessionCLIError("두 입력이 일치하지 않습니다.")
     return first, True
@@ -117,8 +180,7 @@ def _offer_keyring_save(profile: str, passphrase: str) -> None:
         print("  keyring 미설치 — 다음 실행 때 패스프레이즈를 다시 입력해야 합니다.")
         return
 
-    answer = input("  이 패스프레이즈를 OS 키체인에 저장할까요? [y/N] ").strip().lower()
-    if answer not in {"y", "yes"}:
+    if not _confirm("  이 패스프레이즈를 OS 키체인에 저장할까요? [y/N] "):
         print("  저장하지 않았습니다. 무인 실행 시 매번 입력이 필요합니다.")
         return
     try:
@@ -219,6 +281,12 @@ async def _run_login(
             await browser.close()
             raise SessionCLIError(f"페이지를 열지 못했습니다: {exc}") from None
 
+        if not _is_interactive():
+            await browser.close()
+            raise SessionCLIError(
+                "login은 대화형 터미널에서 실행해야 합니다 "
+                "(사람이 브라우저에서 직접 로그인해야 하기 때문입니다)."
+            )
         try:
             input("  로그인을 마쳤으면 Enter: ")
         except (EOFError, KeyboardInterrupt):
@@ -243,8 +311,7 @@ async def _run_login(
     if probe.expired:
         print()
         print(f"  [경고] 아직 로그인되지 않은 것으로 보입니다 ({probe.reason}).")
-        answer = input("  그래도 저장할까요? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
+        if not _confirm("  그래도 저장할까요? [y/N] "):
             print("  저장하지 않았습니다.")
             return 1
 
@@ -446,9 +513,8 @@ def _run_remove(profile: str, *, auth_dir: Optional[str], force: bool) -> int:
         raise SessionCLIError(f"프로파일이 없습니다: {profile}")
 
     if not force:
-        answer = input(f"  '{profile}' 세션을 삭제할까요? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
-            print("  취소했습니다.")
+        if not _confirm(f"  '{profile}' 세션을 삭제할까요? [y/N] "):
+            print("  취소했습니다. 삭제하려면 --force를 쓰십시오.")
             return 1
 
     store.delete(profile)

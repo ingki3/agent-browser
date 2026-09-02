@@ -97,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-553개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+560개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
