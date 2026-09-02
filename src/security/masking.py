@@ -119,10 +119,15 @@ _CARD_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 
 #: 구조화 로그에서 키 이름만으로 민감 필드를 판정한다.
 #: 값이 평범한 문자열이면 정규식으로 잡히지 않으므로 키 기반 방어가 필요하다.
+#:
+#: `set-cookie`/`cookie`가 포함된 이유 — 헤더 규칙은 `set-cookie: v`
+#: 형태의 **문자열**만 매칭한다. 구조체가 `{"Set-Cookie": "session=..."}`
+#: 처럼 키/값으로 분리돼 있으면 규칙이 걸리지 않아 세션 토큰이
+#: 부분 마스킹만 된 채 남았다(PRD 5.3 규정 미준수, 실측 확인).
 _SENSITIVE_KEY = re.compile(
     r"(?i)(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
     r"|id[_-]?token|authorization|auth[_-]?token|session[_-]?id|private[_-]?key"
-    r"|client[_-]?secret|credential)"
+    r"|client[_-]?secret|credential|set[_-]?cookie|cookie)"
 )
 
 
