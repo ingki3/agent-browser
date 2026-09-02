@@ -64,6 +64,9 @@ screenshots/
 
 # Agent Security & Auth secrets (CRITICAL)
 *.enc
+secrets.env
+*.secrets.env
+.secrets/
 auth/
 .agent-browser/
 

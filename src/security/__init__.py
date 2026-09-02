@@ -24,6 +24,7 @@ from security.hitl import (
     RiskLevel,
     classify_risk,
 )
+from security.secrets import SecretResolution, SecretsError, SecretStore
 from security.masking import (
     MASK,
     MASK_RULES,
@@ -64,6 +65,9 @@ __all__ = [
     "MaskingReport",
     "MASK",
     "MASK_RULES",
+    "SecretStore",
+    "SecretsError",
+    "SecretResolution",
     # HITL
     "HITLGate",
     "HITLDecision",
