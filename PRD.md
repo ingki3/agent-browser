@@ -523,6 +523,14 @@ flowchart LR
   - Correlation ID, 스텝 번호, `snapshot_epoch`, 토큰 수(`tiktoken`), 소요 시간(ms), 관찰 요약, 액션 입출력 기록.
 * **민감정보 마스킹 범위**:
   - 비밀번호 인풋 필드, HTTP `Authorization` 헤더, `Set-Cookie` 헤더, URL 쿼리스트링 내 Access Token 자동 마스킹.
+  - **마스킹은 보안 경계가 아니다.** 기록 경로를 한 겹 덮을 뿐이며, DOM 스냅샷·네트워크 페이로드·스크린샷 등 다른 경로는 덮지 못한다. 자격증명이 LLM 프롬프트에 실려 나가는 것 자체를 막으려면 아래 플레이스홀더 치환을 사용한다.
+
+* **자격증명 플레이스홀더 치환 (Secret Placeholder Resolution)**:
+  - **목적**: 액션 파라미터에 자격증명 평문을 넣지 않고도 로그인 폼을 채운다. LLM은 키 이름만 보고, 실제 값은 런타임에서만 존재한다.
+  - **동작**: `--secrets <path>`로 dotenv 형식 파일을 주입하면, 디스패처가 `type_text`의 `text`가 등록된 키와 일치할 때만 실제 값으로 치환해 `page.fill()`에 전달한다. 관찰 결과·트레이스·프롬프트에는 키 이름만 남는다.
+  - **파일 요건**: 권한 `0600` 강제, `.gitignore` 등록 필수. 미충족 시 기동 거부(`E_UNSUPPORTED`).
+  - **치환 실패 정책**: 등록되지 않은 키는 치환하지 않고 **입력 문자열 그대로** 전달한다(조용한 실패 금지). 치환 여부는 `ActionResult.data.secret_resolved`(불리언)로 보고한다.
+  - **한계 명시**: 치환된 값은 페이지 DOM에 존재하므로 이후 관찰·스크린샷에 노출될 수 있다. 이 기능은 "LLM 컨텍스트 유입 차단"만을 보장하며 종단 간 기밀성을 보장하지 않는다.
 
 ---
 
@@ -733,6 +741,9 @@ class ActionDispatcherProtocol(Protocol):
    - **v1.1 스키마 전환**: 클라이언트 초기 `initialize` 핸드셰이크 시 `capabilities.experimental.som_vision = true` 협상 완료 시에만 `annotate_som` 활성화. 협상 실패(레거시 클라이언트) 시 툴 스키마에서 파라미터를 은닉하거나 인입 시 무시하고 일반 스크린샷만 반환.
 3. **엔터프라이즈 자격증명 볼트 연동 (Credential Vault Injection)**:
    - Persona A의 자동 폼 작성을 위해 1Password / HashiCorp Vault와 연동하여 비밀번호를 안전하게 주입하는 전용 볼트 어댑터 개발 (v1.1).
+   - v1.0의 플레이스홀더 치환(§5.3)이 같은 목적을 dotenv 파일로 달성한다. 볼트 어댑터는 그 해석기(resolver)를 교체하는 형태로 얹으며, 액션 계약과 LLM 프롬프트 표현은 바뀌지 않는다.
+
+   > **소셜 로그인 자동화는 지원 범위 밖이다.** 구글·페이스북 등은 헤드리스 지문, WebDriver 플래그, 비정상 로그인 타이밍을 능동 탐지해 차단하며, 우회 시도는 계정 잠금으로 이어진다. 업계 공통 대응(Playwright `storageState`, Browserbase Contexts, Steel 세션 영속화)과 동일하게 **사람이 1회 로그인 후 세션을 재사용**하는 방식만 지원한다(§2 Persona A). 2FA·매직 링크는 사람 개입이 정상 설계다.
 4. **LLM 공급자 추상화 및 멀티 모델 라우터**:
    - LiteLLM 기반의 멀티 프로바이더(OpenAI, Anthropic, Gemini, 로컬 Ollama) 자동 페일오버 및 실시간 토큰/비용 추적기 (v1.1).
 5. **아티팩트 보존 및 자동 정합성 정책 (Artifact Retention Policy)**:

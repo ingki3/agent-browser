@@ -97,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-505개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+525개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -269,7 +269,33 @@ reasoning 계열 모델은 본문보다 사고 토큰을 먼저 소비합니다.
 
 이는 Playwright의 `storageState`, Browserbase의 Contexts, Steel의 세션 영속화와 같은 접근입니다. 2FA나 매직 링크가 걸린 경우 사람의 개입이 필요하며, 이는 회피 대상이 아니라 정상적인 설계입니다.
 
-**자격증명 주입 경로가 없습니다** — 아이디/비밀번호를 안전하게 주입하는 볼트 연동(1Password, HashiCorp Vault)은 v1.1 대상입니다. 현재 `type_text`에 평문을 넣으면 값이 LLM 프롬프트로 전송됩니다.
+### 자격증명 다루기
+
+`--secrets`로 플레이스홀더 치환을 쓰면 **자격증명이 LLM 컨텍스트에 들어가지 않습니다.**
+
+```bash
+cat > secrets.env <<'EOF'
+X-LOGIN=myaccount
+X-PASSWORD=실제비밀번호
+EOF
+chmod 600 secrets.env        # 0600이 아니면 기동을 거부합니다
+
+agent-browser serve --secrets=./secrets.env
+```
+
+에이전트는 키 이름만 사용합니다.
+
+```
+LLM이 보내는 것    type_text(text="X-PASSWORD")
+실제 입력되는 것    실제비밀번호
+트레이스에 남는 것  "X-PASSWORD"
+```
+
+등록되지 않은 키는 **치환하지 않고 그대로 입력**합니다(조용한 실패 방지). 치환 여부는 `ActionResult.data.secret_resolved`로 확인할 수 있습니다.
+
+`secrets.env`는 반드시 `.gitignore`에 넣으십시오.
+
+**한계** — 치환된 값은 페이지 DOM에 존재하므로 이후 관찰이나 스크린샷에 노출될 수 있습니다. 이 기능이 보장하는 것은 "LLM 컨텍스트 유입 차단"뿐이며 종단 간 기밀성이 아닙니다. 볼트 연동(1Password, HashiCorp Vault)은 v1.1 대상입니다.
 
 트레이스 기록에는 비밀번호 필드(`input[type=password]`) 입력값 마스킹이 적용되지만, **이것을 보안 경계로 여기지 마십시오.** 마스킹은 방어의 한 겹일 뿐입니다. 스크린샷, 네트워크 페이로드, DOM 스냅샷 등 다른 경로는 덮지 못합니다. 로그인이 필요한 작업에는 위의 세션 저장 방식을 권장합니다.
 

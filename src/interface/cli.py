@@ -1,6 +1,6 @@
 """CLI 진입점 (PRD §3.3 실행 모드).
 
-    agent-browser serve   [--mode] [--allow-domain]   # MCP 서버 (stdio)
+    agent-browser serve   [--mode] [--allow-domain] [--secrets]  # MCP 서버 (stdio)
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
 
@@ -47,6 +47,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="ACTION:NAME",
         help="무인 모드에서 사전 승인할 고위험 액션 (예: click:결제 진행).",
+    )
+    serve.add_argument(
+        "--secrets",
+        metavar="PATH",
+        help=(
+            "자격증명 파일 경로 (dotenv 형식, 권한 0600 필수). "
+            "type_text의 text가 등록된 키와 일치하면 실제 값으로 치환한다. "
+            "LLM에는 키 이름만 노출된다."
+        ),
     )
 
     # --- tui ---
@@ -105,6 +114,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             run_stdio(
                 mode=ExecutionMode(args.mode),
                 allowed_domains=tuple(args.allow_domain),
+                secrets_path=args.secrets,
             )
         )
     except KeyboardInterrupt:

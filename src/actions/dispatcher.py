@@ -26,10 +26,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
 from perception.engine import ElementHandle, PerceptionEngine
+from security.secrets import KEY_PATTERN as SECRET_KEY_PATTERN
 
 from actions.healing import (
     FailurePhase,
@@ -83,6 +84,9 @@ class DispatchContext:
     #: switch_frame으로 프레임에 진입했을 때의 원래 메인 페이지.
     #: 프레임 안에서도 메인 기준으로 다른 프레임을 찾거나 복귀할 수 있어야 한다.
     root_page: Any = None
+    #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 미주입 시 치환하지 않는다.
+    #: 주입되면 type_text의 text가 등록된 키일 때만 실제 값으로 바꾼다.
+    secrets: Any = None
 
 
 #: Playwright 키 이름 별칭.
@@ -201,6 +205,7 @@ class ActionDispatcher:
     ) -> ActionResult:
         """액션을 실행하고 `ActionResult`를 반환한다."""
         started = time.perf_counter()
+        params, secret_resolved = self._resolve_secret(action, params)
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
@@ -215,7 +220,45 @@ class ActionDispatcher:
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
+        if secret_resolved is not None:
+            # 호출자가 치환 성공 여부를 알 수 있어야 한다. 조용히 실패하면
+            # 사용자는 키 이름이 그대로 입력된 것을 눈치채지 못한다.
+            result.data["secret_resolved"] = secret_resolved
         return result
+
+    def _resolve_secret(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Optional[bool]]:
+        """자격증명 플레이스홀더를 실제 값으로 바꾼다 (PRD 5.3).
+
+        LLM은 키 이름만 보고, 실제 값은 여기서만 존재한다. 원본 params를
+        변형하지 않고 사본을 만들어 호출자의 기록(트레이스)에는 키 이름이
+        남도록 한다.
+
+        반환값의 두 번째 요소:
+            None   치환 대상 액션이 아니거나 해석기 미주입
+            False  키 형식이지만 등록되지 않음 (원본 그대로 전달)
+            True   치환됨
+        """
+        store = self.ctx.secrets
+        if store is None or action is not ActionType.TYPE_TEXT:
+            return params, None
+
+        text = params.get("text")
+        if not isinstance(text, str) or not text:
+            return params, None
+
+        resolution = store.resolve(text)
+        if not resolution.resolved:
+            # 등록되지 않은 키는 그대로 전달한다(조용한 실패 금지).
+            # 다만 키 형식이었다면 호출자가 오타를 알아챌 수 있도록
+            # False를 보고한다.
+            looks_like_key = bool(SECRET_KEY_PATTERN.match(text))
+            return params, (False if looks_like_key else None)
+
+        resolved_params = dict(params)
+        resolved_params["text"] = resolution.value
+        return resolved_params, True
 
     async def _dispatch_inner(
         self, action: ActionType, params: Dict[str, Any]
@@ -504,6 +547,7 @@ class ActionDispatcher:
         elif action is ActionType.TYPE_TEXT:
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
+            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
             await target.type(params.get("text", ""), timeout=5000)
             if params.get("press_enter"):
                 await target.press("Enter", timeout=5000)
