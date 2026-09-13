@@ -203,8 +203,9 @@ src/
 ├── security/      Egress 차단 · PII 마스킹 · HITL · 프롬프트 격리
 ├── interface/     MCP 서버 · TUI · 관측성 트레이스
 ├── llm/           OpenRouter 어댑터 · 예산 가드
-├── agent/         자율 루프 · 목표 키워드 추출
-└── harness/       판정형 하네스 10종 + 실환경 평가 2종
+├── agent/         자율 루프 · 목표 키워드 추출 · Tier-2 에스컬레이션
+├── vision/        Tier-2 SoM — 태그 후보 · 오버레이 · VLM 그라운더 · @sN 브리지
+└── harness/       판정형 하네스 11종 + 실환경 평가 2종
 ```
 
 `contracts/`는 Gate 0 승인 이후 동결되어 CI가 매 PR마다 변경 여부를 검증합니다.
@@ -255,7 +256,17 @@ reasoning 계열 모델은 본문보다 사고 토큰을 먼저 소비합니다.
 
 **모델 판단의 편차** — 실패 사례는 런타임 결함이 아니라 LLM이 실행마다 다른 선택을 하는 경우입니다. `max_tokens` 조정으로 해결되지 않으며, 모델 비교가 다음 과제입니다.
 
-**Tier-2 SoM 미구현** — Canvas 렌더링이나 안티스크래핑 난독화로 텍스트 셀렉터가 통하지 않는 경우의 시각 폴백은 v1.1 대상입니다. `take_screenshot(annotate_som=True)`는 현재 `E_FEATURE_NOT_IMPLEMENTED`를 반환합니다.
+**Tier-2 시각 폴백은 옵트인입니다** — 텍스트 셀렉터가 2회 연속 실패하면(아이콘 버튼, 난독화 라벨, Canvas UI) 스크린샷에 태그를 얹어 비전 모델에게 묻는 폴백이 있습니다. `serve --som-vision`으로 켭니다. 끄면 `take_screenshot(annotate_som=True)`는 이전처럼 `E_FEATURE_NOT_IMPLEMENTED`를 반환합니다(레거시 클라이언트 보호).
+
+```bash
+agent-browser serve --som-vision          # Tier-2 활성화
+OPENROUTER_VISION_MODEL=...               # 선택. 없으면 OPENROUTER_MODEL 사용
+```
+
+- 발동은 무인 모드 태스크당 3회로 제한되며, 캡처 1장당 1,600토큰이 예산에 합산됩니다.
+- 순수 Canvas는 DOM 대상이 없으므로 좌표 클릭(`click(x, y, epoch)`)으로 처리합니다. 좌표 모드는 클릭만 지원합니다.
+- 이미지 안의 텍스트는 신뢰하지 않는다는 비전 프롬프트 래퍼가 강제됩니다.
+- 비전 모델 지연은 기준(p95 ≤ 3.5초)에 맞는 모델을 골라야 합니다. `python -m harness.tier2_som --vlm live`로 실측합니다.
 
 **소셜 로그인 자동화는 지원하지 않습니다** — 구글·페이스북 등의 로그인 페이지를 에이전트가 직접 조작하는 것은 **의도적으로 지원 대상이 아닙니다.** 제공자들이 헤드리스 브라우저 지문, WebDriver 플래그, 비정상 로그인 타이밍을 능동적으로 탐지해 차단하기 때문입니다. 실측에서도 구글 검색이 `/sorry/index` CAPTCHA로, 쿠팡이 403으로 막혔습니다.
 

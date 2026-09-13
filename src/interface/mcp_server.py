@@ -122,10 +122,14 @@ class BrowserMCPServer:
         pre_approved_actions: tuple = (),
         headless: bool = True,
         secrets: Any = None,
+        som_enabled: bool = False,
     ) -> None:
         #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
         #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
         self.secrets = secrets
+        #: Tier-2 SoM 게이트 (PRD §8-2). 기본 OFF — 레거시 클라이언트는
+        #: annotate_som=True에 E_FEATURE_NOT_IMPLEMENTED를 그대로 받는다.
+        self.som_enabled = som_enabled
         self.mode = mode
         self.allowed_domains = allowed_domains
         self.pre_approved_actions = pre_approved_actions
@@ -167,6 +171,7 @@ class BrowserMCPServer:
                 tab_id=tab.tab_id,
                 core=self._core,  # tab_control이 탭 수명주기에 접근하려면 필요
                 secrets=self.secrets,  # 자격증명 플레이스홀더 해석 (PRD 5.3)
+                som_enabled=self.som_enabled,  # Tier-2 SoM 게이트 (PRD §8-2)
             )
         )
 
@@ -329,6 +334,7 @@ def create_server(
     allowed_domains: tuple = (),
     pre_approved_actions: tuple = (),
     secrets: Any = None,
+    som_enabled: bool = False,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -343,6 +349,7 @@ def create_server(
         allowed_domains=allowed_domains,
         pre_approved_actions=pre_approved_actions,
         secrets=secrets,
+        som_enabled=som_enabled,
     )
 
     def _build_tools() -> List[Tool]:
@@ -408,6 +415,7 @@ async def run_stdio(
     mode: ExecutionMode = ExecutionMode.UNATTENDED,
     allowed_domains: tuple = (),
     secrets_path: Optional[str] = None,
+    som_enabled: bool = False,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다."""
     from mcp.server.stdio import stdio_server
@@ -420,7 +428,10 @@ async def run_stdio(
         secrets = SecretStore.from_file(secrets_path)
 
     server, backend = create_server(
-        mode=mode, allowed_domains=allowed_domains, secrets=secrets
+        mode=mode,
+        allowed_domains=allowed_domains,
+        secrets=secrets,
+        som_enabled=som_enabled,
     )
     try:
         async with stdio_server() as (read_stream, write_stream):
