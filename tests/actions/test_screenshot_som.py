@@ -111,7 +111,7 @@ async def test_gate_on_returns_som_payload(mock_server, page):
     assert data["candidate_count"] == 5
     assert len(data["som_tags"]) == 5
     for entry in data["som_tags"]:
-        assert set(entry) == {"tag", "role", "name", "bbox"}
+        assert set(entry) == {"tag", "role", "name", "bbox", "selector_path"}
         assert set(entry["bbox"]) == {"x", "y", "width", "height"}
     assert [e["tag"] for e in data["som_tags"]] == ["A1", "A2", "A3", "A4", "A5"]
 

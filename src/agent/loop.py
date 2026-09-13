@@ -22,13 +22,18 @@ Top-20에 들지 못하고, LLM은 정확하게 "필요한 요소가 없다"고 
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from contracts import ActionResult, ActionType, ErrorCode, ObserveResult
-from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
+from contracts import ActionResult, ActionType, BBox, ErrorCode, ObserveResult
+from contracts.thresholds import (
+    MAX_WALL_CLOCK_SECONDS,
+    TIER2_MAX_CALLS_INTERACTIVE,
+    TIER2_MAX_CALLS_UNATTENDED,
+)
 from llm import BudgetExceeded, BudgetGuard, LLMError, OpenRouterClient
 from llm.config import LLMConfig
 
@@ -80,6 +85,25 @@ MAX_CONSECUTIVE_FAILURES = 3
 SETTLE_TIMEOUT_MS = 8000
 SETTLE_EXTRA_MS = 600
 
+#: Tier-2 발동 조건 — 같은 목표에 대한 **무해하지 않은** 연속 실패 횟수
+#: (PRD §3.1 사다리: Tier-1 2회 실패 -> SoM). 구식 참조 실패(WS-18)는
+#: 직전 성공의 부산물이므로 세지 않는다.
+TIER2_TRIGGER_FAILURES = 2
+
+#: Tier-2에서 element_id를 바꿔 그대로 재실행할 수 있는 액션. 그 밖의
+#: 액션(navigate, scroll 등)이 마지막 실패였다면 클릭으로 대체한다 —
+#: 시각 폴백이 답할 수 있는 것은 "어느 요소인가"뿐이기 때문이다.
+_TIER2_REPLAYABLE = frozenset(
+    {
+        ActionType.CLICK,
+        ActionType.TYPE_TEXT,
+        ActionType.HOVER,
+        ActionType.SELECT_OPTION,
+        ActionType.CHECK_BOX,
+        ActionType.PRESS_KEY,
+    }
+)
+
 
 @dataclass
 class StepOutcome:
@@ -93,6 +117,8 @@ class StepOutcome:
     llm_tokens: int = 0
     llm_cost: float = 0.0
     note: str = ""
+    #: Tier-2 VLM 왕복 지연 (Gate 4 p95 재료). Tier-1 스텝은 0.
+    vision_latency_ms: float = 0.0
 
     @property
     def succeeded(self) -> bool:
@@ -122,6 +148,8 @@ class TaskRun:
     budget: Dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
     final_url: str = ""
+    #: Tier-2 SoM 발동 횟수 (PRD §3.4 태스크당 상한 대상)
+    tier2_calls: int = 0
 
     @property
     def step_count(self) -> int:
@@ -144,6 +172,7 @@ class TaskRun:
             "elapsed_s": round(self.elapsed_s, 2),
             "final_url": self.final_url,
             "budget": self.budget,
+            "tier2_calls": self.tier2_calls,
             "trace": [s.summary() for s in self.steps],
         }
 
@@ -166,6 +195,9 @@ class AgentLoop:
         max_steps: int = 0,
         top_n: int = 20,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        som_enabled: bool = False,
+        unattended: bool = True,
+        grounder: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.page = page
         self.engine = engine
@@ -175,6 +207,16 @@ class AgentLoop:
         self.max_steps = max_steps or self.budget.max_steps
         self.top_n = top_n
         self.max_tokens = max_tokens
+        # Tier-2 SoM (PRD §3.1). 기본 off — 꺼져 있으면 아래 경로는 전혀
+        # 타지 않으며 기존 동작과 동일하다. `grounder`는 테스트 주입용이며
+        # 기본값은 `vision.grounder.ground`(지연 import).
+        self.som_enabled = som_enabled
+        self.unattended = unattended
+        self._grounder = grounder
+
+    @property
+    def tier2_max_calls(self) -> int:
+        return TIER2_MAX_CALLS_UNATTENDED if self.unattended else TIER2_MAX_CALLS_INTERACTIVE
 
     async def run(self, goal: str) -> TaskRun:
         """목표를 달성할 때까지 루프를 돌린다."""
@@ -203,6 +245,9 @@ class AgentLoop:
             last_failure_harmless = False
             finish_rejected = False
             last_success_element: Optional[str] = None
+            # Tier-2 발동 판정용 — 무해하지 않은 연속 실패 수와 마지막 실패 판단.
+            tier2_pressure = 0
+            last_failed_decision: Optional[Decision] = None
 
             for step in range(1, self.max_steps + 1):
                 # PRD 실행 시간 상한 — 태스크당 Wall-Clock 10분.
@@ -227,9 +272,27 @@ class AgentLoop:
                     run.terminal_reason = str(exc)
                     break
 
-                outcome = await self._run_step(
-                    client, goal, step, history, failures
+                escalate = (
+                    self.som_enabled
+                    and tier2_pressure >= TIER2_TRIGGER_FAILURES
+                    and last_failed_decision is not None
                 )
+                if escalate:
+                    # 태스크당 상한 (PRD §3.4). 무인 3회 / 대화형 5회.
+                    if run.tier2_calls >= self.tier2_max_calls:
+                        run.terminal_reason = (
+                            f"{ErrorCode.TIER2_BUDGET_EXCEEDED.value}: Tier-2 SoM "
+                            f"호출 상한({self.tier2_max_calls}회) 초과"
+                        )
+                        break
+                    run.tier2_calls += 1
+                    outcome = await self._tier2_step(
+                        client, goal, step, failures, last_failed_decision
+                    )
+                else:
+                    outcome = await self._run_step(
+                        client, goal, step, history, failures
+                    )
                 run.steps.append(outcome)
 
                 if outcome.decision.action == FINISH:
@@ -290,6 +353,8 @@ class AgentLoop:
 
                 if outcome.succeeded:
                     consecutive_failures = 0
+                    tier2_pressure = 0
+                    last_failed_decision = None
                     last_action_failed = False
                     last_failure_harmless = False
                     # 무해 판정용 — 이 요소에 대한 이후의 구식 참조 실패는
@@ -320,6 +385,9 @@ class AgentLoop:
                         and outcome.decision.element_id == last_success_element
                     )
                     last_failure_harmless = is_stale_ref and same_element
+                    if not last_failure_harmless:
+                        tier2_pressure += 1
+                        last_failed_decision = outcome.decision
                     failures.append(outcome.summary())
                     history.append(outcome.summary())
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -353,6 +421,107 @@ class AgentLoop:
             latency_ms=(time.perf_counter() - started) * 1000,
             note=str(exc)[:120],
         )
+
+    # -- Tier-2 SoM 시각 폴백 (PRD §3.1) -------------------------------------
+
+    async def _tier2_step(
+        self,
+        client: OpenRouterClient,
+        goal: str,
+        step: int,
+        failures: Sequence[str],
+        last_decision: Decision,
+    ) -> StepOutcome:
+        """SoM 스크린샷 -> VLM 그라운딩 -> 같은 액션 재실행.
+
+        태그 모드: 고른 태그를 `@sN` 핸들로 묶어 마지막 실패 액션을
+        element_id만 바꿔 재디스패치한다(기존 검증·치유·HITL 경로 유지).
+        좌표 모드(후보 0개, Canvas): CLICK {x, y}만 지원한다.
+        """
+        started = time.perf_counter()
+        action = last_decision.action_type
+        if action not in _TIER2_REPLAYABLE:
+            action = ActionType.CLICK
+        decision = Decision(
+            action=action.value,
+            element_id=None,
+            text=last_decision.text,
+            value=last_decision.value,
+            key=last_decision.key,
+            reason="Tier-2 시각 폴백",
+        )
+        outcome = StepOutcome(step=step, decision=decision, note="tier2")
+
+        shot = await self.dispatcher.dispatch(
+            ActionType.TAKE_SCREENSHOT, {"annotate_som": True}
+        )
+        if not shot.success:
+            outcome.result = shot
+            outcome.note = "tier2: 캡처 실패"
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        from vision import SomCandidate, bind_tag
+
+        data = shot.data or {}
+        png = base64.b64decode(data.get("image_b64", "") or "")
+        candidates = [
+            SomCandidate(
+                tag=t["tag"],
+                selector_path=t.get("selector_path", ""),
+                bbox=BBox(**t["bbox"]),
+                role=t.get("role", ""),
+                name=t.get("name", ""),
+            )
+            for t in data.get("som_tags", [])
+        ]
+
+        grounder = self._grounder
+        if grounder is None:
+            from vision import ground as grounder  # noqa: F811 — 지연 import
+
+        try:
+            grounding = await grounder(
+                client,
+                png,
+                candidates,
+                goal,
+                failure_context="\n".join(list(failures)[-3:]),
+            )
+        except (LLMError, BudgetExceeded) as exc:
+            if isinstance(exc, BudgetExceeded):
+                raise
+            outcome.note = f"tier2: VLM 오류 {str(exc)[:100]}"
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        outcome.vision_latency_ms = grounding.latency_ms
+        outcome.llm_tokens = grounding.tokens
+        outcome.llm_cost = grounding.cost_usd
+
+        if grounding.tag is not None:
+            candidate = next(c for c in candidates if c.tag == grounding.tag)
+            try:
+                element_id = await bind_tag(self.engine, self.page, candidate)
+            except LookupError as exc:
+                outcome.note = f"tier2: {exc}"
+                outcome.latency_ms = (time.perf_counter() - started) * 1000
+                return outcome
+            decision.element_id = element_id
+            params = decision_to_params(decision)
+            params["epoch"] = self.engine.epoch
+            outcome.result = await self.dispatcher.dispatch(action, params)
+        elif grounding.point is not None:
+            x, y = grounding.point
+            decision.action = ActionType.CLICK.value
+            outcome.result = await self.dispatcher.dispatch(
+                ActionType.CLICK, {"x": x, "y": y, "epoch": self.engine.epoch}
+            )
+        else:
+            outcome.note = f"tier2: 그라운딩 실패 ({grounding.reason[:80]})"
+
+        outcome.latency_ms = (time.perf_counter() - started) * 1000
+        return outcome
 
     async def _settle(self) -> None:
         """네비게이션이 진행 중이면 안정될 때까지 잠시 기다린다.
