@@ -39,7 +39,10 @@ class FakeClient:
         self.budget = budget or BudgetGuard()
         self.calls: list[dict] = []
 
-    async def complete(self, messages, *, model=None, temperature=0.0, max_tokens=1024, response_format=None):
+    async def complete(
+        self, messages, *, model=None, temperature=0.0, max_tokens=1024,
+        response_format=None, reasoning=None,
+    ):
         self.calls.append(
             {
                 "messages": messages,
@@ -47,6 +50,7 @@ class FakeClient:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 "response_format": response_format,
+                "reasoning": reasoning,
             }
         )
         return LLMResponse(
@@ -72,6 +76,28 @@ async def test_tag_mode_returns_chosen_tag():
     assert result.latency_ms >= 0
 
 
+async def test_tag_answer_with_trailing_role_is_accepted():
+    """실측 — glm-5.3-flash가 'A3 button'처럼 후보 목록의 역할까지 따라 적었다.
+
+    첫 토큰이 유효한 태그면 그 태그로 본다. 'A3'과 'A30'을 혼동하지 않도록
+    공백/구두점 경계로만 자른다.
+    """
+    client = FakeClient(json.dumps({"tag": "A3 button", "reason": "x"}))
+    result = await ground(client, PNG, [_cand("A1"), _cand("A3")], "goal")
+    assert result.tag == "A3"
+
+
+async def test_grounder_requests_minimal_reasoning_and_room_for_it():
+    """실측(glm-5.3-flash, SoM 5후보) — effort 미지정 시 p95 7~15초, 사고 토큰이
+    max_tokens 256을 먹어 본문이 비는 일이 있었다. effort=low에서 1.5초.
+    reasoning을 끌 수는 없는 모델(enabled=false -> 400)이라 effort로 조인다."""
+    client = FakeClient(json.dumps({"tag": "A1", "reason": "x"}))
+    await ground(client, PNG, [_cand("A1")], "goal")
+    call = client.calls[0]
+    assert call["reasoning"] == {"effort": "low"}
+    assert call["max_tokens"] >= 1024
+
+
 async def test_hallucinated_tag_is_rejected():
     client = FakeClient(json.dumps({"tag": "Z9", "reason": "x"}))
     result = await ground(client, PNG, [_cand("A1")], "goal")
@@ -84,7 +110,7 @@ async def test_tag_mode_message_shape():
     await ground(client, PNG, [_cand("A1", name="검색")], "검색하기", failure_context="click @e2 FAIL")
     call = client.calls[0]
     assert call["response_format"] == {"type": "json_object"}
-    assert call["max_tokens"] == 256
+    assert call["max_tokens"] == 4096
     assert call["temperature"] == 0
     system = call["messages"][0]
     assert system["role"] == "system"

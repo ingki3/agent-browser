@@ -154,10 +154,15 @@ class OpenRouterClient:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning: Optional[Dict[str, Any]] = None,
     ) -> LLMResponse:
         """Chat Completion을 호출한다.
 
         호출 **전에** 예산을 확인한다. 응답 후 확인하면 이미 과금된 뒤다.
+
+        `reasoning`은 OpenRouter 통합 reasoning 파라미터(`{"effort": "low"}` 등)를
+        그대로 전달한다. 지정하지 않으면 페이로드에 넣지 않아 기존 호출자의
+        동작이 바뀌지 않는다.
         """
         if self._client is None:
             raise LLMError("클라이언트가 시작되지 않았습니다. async with를 사용하십시오.")
@@ -175,6 +180,8 @@ class OpenRouterClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if reasoning is not None:
+            payload["reasoning"] = reasoning
 
         data = await self._post_with_retry("/chat/completions", payload)
 

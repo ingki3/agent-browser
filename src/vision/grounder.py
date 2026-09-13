@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -28,8 +29,15 @@ from vision.candidates import SomCandidate
 
 logger = logging.getLogger(__name__)
 
-#: 응답은 `{"tag": ..}` 또는 `{"x", "y"}` 한 줄이면 충분하다.
-GROUND_MAX_TOKENS = 256
+#: 응답 본문은 `{"tag": ..}` 한 줄이지만, reasoning 계열 모델은 사고 토큰을
+#: 같은 상한에서 먼저 쓴다. 실측(glm-5.3-flash, 5후보) — 256에서는 사고가
+#: 상한을 먹어 본문이 비는 경우가 있었고, 4096에서 정상.
+GROUND_MAX_TOKENS = 4096
+
+#: 비전 호출의 reasoning 강도. 그림 한 장에서 태그 하나를 고르는 일에 긴
+#: 사고는 지연만 늘린다. 실측(glm-5.3-flash) — 미지정 p95 7~15초,
+#: effort=low 1.5초, 정답 동일. enabled=false는 이 모델에서 400.
+GROUND_REASONING: Dict[str, Any] = {"effort": "low"}
 
 _TAG_INSTRUCTION = (
     "당신은 웹 페이지 스크린샷에서 목표 달성에 필요한 요소 하나를 고르는 시각 "
@@ -132,7 +140,9 @@ def _parse_tag(payload: Any, candidates: Sequence[SomCandidate]) -> Optional[str
     tag = payload.get("tag")
     if not isinstance(tag, str):
         return None
-    tag = tag.strip().upper()
+    # 실측 — glm-5.3-flash가 후보 목록 서식을 따라 "A3 button"으로 답했다.
+    # 첫 토큰만 취하되 공백/구두점 경계로 잘라 "A3"/"A30" 혼동을 막는다.
+    tag = re.split(r"[\s:,;]+", tag.strip().upper(), maxsplit=1)[0]
     valid = {c.tag for c in candidates}
     if tag not in valid:
         logger.debug("VLM이 후보에 없는 태그를 반환: %r", tag)
@@ -177,6 +187,7 @@ async def ground(
         "temperature": 0,
         "max_tokens": GROUND_MAX_TOKENS,
         "response_format": {"type": "json_object"},
+        "reasoning": dict(GROUND_REASONING),
     }
     if model:
         kwargs["model"] = model
