@@ -80,15 +80,29 @@ class ClickInput(BaseModel):
     expected_role: Optional[str] = None
     expected_name: Optional[str] = None
     button: Literal["left", "right", "middle"] = "left"
+    #: v1.1 재동결(contracts-v1.1-frozen): Tier-2 SoM 좌표 클릭.
+    #: Canvas처럼 DOM 대상이 없는 표면용. 뷰포트 CSS 픽셀 기준이며,
+    #: 좌표는 SoM 스크린샷 시점에 종속되므로 epoch가 필수다 (PRD §3.1).
+    x: Optional[int] = Field(default=None, ge=0)
+    y: Optional[int] = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def check_target_and_epoch(self) -> "ClickInput":
-        # 1. element_id와 selector 중 정확히 하나만 지정 강제
-        if bool(self.element_id) == bool(self.selector):
-            raise ValueError("element_id와 selector 중 정확히 하나만 지정해야 합니다.")
-        # 2. element_id 사용 시에만 epoch 필수 검증
-        if self.element_id and self.epoch is None:
-            raise ValueError("element_id를 지정할 경우 snapshot epoch는 필수입니다.")
+        # 0. 좌표는 쌍으로만 온다
+        if (self.x is None) != (self.y is None):
+            raise ValueError("x와 y는 함께 지정해야 합니다.")
+        has_coords = self.x is not None
+        # 1. element_id / selector / (x, y) 중 정확히 하나만 지정 강제
+        targets = sum((bool(self.element_id), bool(self.selector), has_coords))
+        if targets != 1:
+            raise ValueError(
+                "element_id, selector, (x, y) 중 정확히 하나만 지정해야 합니다."
+            )
+        # 2. element_id 또는 좌표 사용 시 epoch 필수 (스냅샷 종속)
+        if (self.element_id or has_coords) and self.epoch is None:
+            raise ValueError(
+                "element_id 또는 좌표를 지정할 경우 snapshot epoch는 필수입니다."
+            )
         return self
 
 

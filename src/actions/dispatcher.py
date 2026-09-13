@@ -268,6 +268,8 @@ class ActionDispatcher:
             return await self._execute_elementless(action, params)
 
         element_id = params.get("element_id")
+        if not element_id and action is ActionType.CLICK and params.get("x") is not None:
+            return await self._click_coordinates(action, params)
         if not element_id:
             return self._result(
                 success=False,
@@ -730,6 +732,72 @@ class ActionDispatcher:
 
         if action is ActionType.TAB_CONTROL:
             return await self._dispatch_tab_control(action, params)
+
+    async def _click_coordinates(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> ActionResult:
+        """뷰포트 좌표 클릭 (v1.1 재동결, Tier-2 SoM / Canvas 폴백).
+
+        DOM 대상이 없으므로 요소 staleness 검증 대신 **epoch 일치**로
+        시점을 검증한다. 좌표는 SoM 스크린샷을 찍은 그 스냅샷에서만
+        의미가 있고, 페이지가 바뀌었다면 같은 좌표가 다른 것을 가리킨다.
+
+        사후조건은 DOM 신호로만 잡을 수 있다. Canvas 클릭은 DOM을 바꾸지
+        않는 것이 정상이므로, 무변화를 실패로 처리하지 않고
+        `data["silent"]=True`로 보고해 호출자(루프/VLM)가 판단하게 한다.
+        """
+        page = self.ctx.page
+        x, y = int(params["x"]), int(params["y"])
+
+        claimed_epoch = params.get("epoch")
+        current = self.ctx.engine.epoch
+        if claimed_epoch is None or int(claimed_epoch) != current:
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.TOCTOU_MISMATCH,
+                error_message=(
+                    f"좌표 클릭 epoch 불일치: 요청 {claimed_epoch}, 현재 {current}. "
+                    "SoM 스크린샷을 다시 찍으십시오."
+                ),
+                reobserve_required=True,
+            )
+
+        viewport = page.viewport_size or {}
+        vw, vh = viewport.get("width", 0), viewport.get("height", 0)
+        if vw and vh and (x >= vw or y >= vh):
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=f"좌표 ({x}, {y})가 뷰포트 {vw}x{vh} 밖입니다.",
+            )
+
+        before = await capture_state(page)
+        try:
+            await page.mouse.click(x, y, button=params.get("button", "left"))
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                error_message=f"좌표 클릭 발송 실패: {exc}",
+            )
+        after = await capture_state(page)
+        post = verify_post_condition(before, after)
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+            data={
+                "coordinates": {"x": x, "y": y},
+                "signals": post.signals,
+                "silent": not post.satisfied,
+            },
+        )
 
     async def _dispatch_tab_control(
         self, action: ActionType, params: Dict[str, Any]
