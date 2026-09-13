@@ -747,7 +747,7 @@ class ActionDispatcherProtocol(Protocol):
    - **Windows 환경 지원**: `asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())` 초기화 강제.
 2. **MCP 툴 스키마 버저닝 정책 (Tool Schema Evolution)**:
    - **MVP v1.0 스키마**: 19종 툴 전수 노출 (`take_screenshot`의 `annotate_som` 파라미터는 `default=False` 고정이며 호출 시 `E_FEATURE_NOT_IMPLEMENTED` 반환).
-   - **v1.1 스키마 전환**: 클라이언트 초기 `initialize` 핸드셰이크 시 `capabilities.experimental.som_vision = true` 협상 완료 시에만 `annotate_som` 활성화. 협상 실패(레거시 클라이언트) 시 툴 스키마에서 파라미터를 은닉하거나 인입 시 무시하고 일반 스크린샷만 반환.
+   - **v1.1 스키마 전환**: 서버 기동 옵션 `serve --som-vision`(`DispatchContext.som_enabled`)으로 활성화한다. 미지정 시 레거시 동작(`E_FEATURE_NOT_IMPLEMENTED`)을 유지해 구 클라이언트를 보호한다. *구현 메모(v13.1)*: 원안의 `initialize` 핸드셰이크 `capabilities.experimental.som_vision` 협상은 MCP SDK 1.x/2.x가 클라이언트 capabilities를 서버 툴 핸들러에 일관되게 노출하지 않아 서버 측 명시 옵션으로 대체했다. 결과는 동일하다 — 켜지 않은 서버는 절대 SoM을 반환하지 않는다.
 3. **엔터프라이즈 자격증명 볼트 연동 (Credential Vault Injection)**:
    - Persona A의 자동 폼 작성을 위해 1Password / HashiCorp Vault와 연동하여 비밀번호를 안전하게 주입하는 전용 볼트 어댑터 개발 (v1.1).
    - v1.0의 플레이스홀더 치환(§5.3)이 같은 목적을 dotenv 파일로 달성한다. 볼트 어댑터는 그 해석기(resolver)를 교체하는 형태로 얹으며, 액션 계약과 LLM 프롬프트 표현은 바뀌지 않는다.

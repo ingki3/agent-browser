@@ -1,6 +1,6 @@
 """CLI 진입점 (PRD §3.3 실행 모드).
 
-    agent-browser serve   [--mode] [--allow-domain] [--secrets]  # MCP 서버 (stdio)
+    agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -56,6 +56,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "자격증명 파일 경로 (dotenv 형식, 권한 0600 필수). "
             "type_text의 text가 등록된 키와 일치하면 실제 값으로 치환한다. "
             "LLM에는 키 이름만 노출된다."
+        ),
+    )
+    serve.add_argument(
+        "--som-vision",
+        action="store_true",
+        help=(
+            "Tier-2 SoM 시각 폴백 활성화 (v1.1). take_screenshot(annotate_som=True)가 "
+            "태그 오버레이 스크린샷을 반환한다. 미지정 시 E_FEATURE_NOT_IMPLEMENTED."
         ),
     )
 
@@ -171,6 +179,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 mode=ExecutionMode(args.mode),
                 allowed_domains=tuple(args.allow_domain),
                 secrets_path=args.secrets,
+                som_enabled=args.som_vision,
             )
         )
     except KeyboardInterrupt:
