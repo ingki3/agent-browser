@@ -47,6 +47,8 @@ JUDGMENT_HARNESSES: List[Tuple[str, str]] = [
     ("webarena", "멀티스텝 태스크 포함"),
     # --- WS-9 실환경 ---
     ("agent_eval", "난이도 3단계 전수 실행 + 자기보고와 독립 검증 분리"),
+    # --- Gate 4 (Stage 4 Tier-2 SoM) ---
+    ("tier2_som", "tier2 발동 런 >= 1 AND 미발동 런 >= 1"),
 ]
 
 #: 커버리지 보고를 나타내는 식별자 조각.
