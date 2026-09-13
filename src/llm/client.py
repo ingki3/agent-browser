@@ -145,7 +145,10 @@ class OpenRouterClient:
 
     async def complete(
         self,
-        messages: List[Dict[str, str]],
+        # 계약 예외 근거 — Tier-2 SoM(PRD §3.1)은 `content`에 텍스트+이미지
+        # 파트 리스트를 담아야 한다(OpenAI 호환 멀티모달 형식). 텍스트 전용
+        # 호출은 str content 그대로이므로 기존 호출자는 영향이 없다.
+        messages: List[Dict[str, Any]],
         *,
         model: Optional[str] = None,
         temperature: float = 0.0,
