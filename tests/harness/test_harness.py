@@ -89,7 +89,31 @@ def test_exit_codes_are_distinct():
 
 
 def test_mock_site_count_matches_selfcheck():
-    assert len(MOCK_SITES) == 22
+    # 22종(v1.0) + Stage 4 Tier-2 실패 유발 페이지 3종
+    assert len(MOCK_SITES) == 25
+
+
+def test_tier2_sites_have_no_golden_target():
+    """Tier-2 페이지는 텍스트 라벨이 없거나 무의미하므로 Recall 골든셋에
+    끼어들면 안 된다 (골든셋은 Tier-1 측정 도구 검증용)."""
+    for sid in ("icon-buttons", "obfuscated-labels", "canvas-ui"):
+        site = SITE_INDEX[sid]
+        assert site.golden_target is None, sid
+        assert site.golden_role is None, sid
+        assert "data-result" in site.html, sid
+
+
+def test_tier2_sites_are_text_blind():
+    """아이콘 버튼에는 접근성 이름이 없고, 난독화 라벨에는 '검색' 문자열이
+    텍스트로 존재하지 않아야 Tier-1 셀렉터가 실제로 실패한다."""
+    icon = SITE_INDEX["icon-buttons"].html
+    assert icon.count("<button") == 5
+    assert "aria-label" not in icon
+    obf = SITE_INDEX["obfuscated-labels"].html
+    assert "x7f2" in obf and "q9zz" in obf
+    assert ">검색<" not in obf
+    canvas = SITE_INDEX["canvas-ui"].html
+    assert "<canvas" in canvas and "<button" not in canvas
 
 
 def test_site_ids_are_unique():
@@ -234,7 +258,7 @@ def test_contract_selftest_passes():
 
 
 def test_selfcheck_passes_with_20_sites():
-    proc = _run_module("harness.selfcheck", "--mock-sites", "22")
+    proc = _run_module("harness.selfcheck", "--mock-sites", "25")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout.strip())
     assert payload["passed"] is True

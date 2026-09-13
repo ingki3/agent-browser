@@ -1,6 +1,7 @@
-"""Mock 사이트 20종 정의 및 정적 서버 (src/AGENTS.md §5 WS-6 수용 기준).
+"""Mock 사이트 25종 정의 및 정적 서버 (src/AGENTS.md §5 WS-6 수용 기준).
 
-13대 필수 시나리오를 20종 사이트에 분산 배치한다. 각 사이트는 단일 HTML
+13대 필수 시나리오를 22종 사이트에 분산 배치하고, Stage 4 Tier-2(SoM)
+실패 유발 페이지 3종(icon-buttons / obfuscated-labels / canvas-ui)을 더한다. 각 사이트는 단일 HTML
 문자열로 생성되며, 외부 네트워크 의존이 전혀 없다(플레이키 방지).
 
 시나리오 커버리지는 `Scenario` Enum과 각 사이트의 `scenarios` 선언으로
@@ -571,6 +572,142 @@ def _build_sites() -> List[MockSite]:
                   <a href="/s22_dense/help">고객센터</a>
                 </footer>
                 """,
+            ),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 4 Tier-2 실패 유발 페이지 3종 (PRD §3.1 SoM 폴백)
+    #
+    # Tier-1 텍스트 파이프라인이 **실제로 실패해야** 발동률 측정이 유형 D(미탐)가
+    # 되지 않는다. 세 페이지 모두 golden_target을 두지 않는다 — 텍스트로
+    # 정답을 지목할 수 없는 페이지라 Recall 골든셋(Tier-1 측정 도구 검증)에
+    # 끼어들면 그 자체가 결함이다. 정답 판정은 클릭 후 body[data-result="ok"].
+    # ------------------------------------------------------------------
+
+    # 23. 아이콘 전용 버튼 — 텍스트/aria-label 없음. 정답은 3번째(장바구니 모양).
+    sites.append(
+        MockSite(
+            site_id="icon-buttons",
+            title="아이콘 툴바",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "아이콘 툴바",
+                """
+                <h1>도구</h1>
+                <div id="toolbar">
+                  <button class="ic" id="ic1"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="M15 15l6 6"/></svg></button>
+                  <button class="ic" id="ic2"><svg viewBox="0 0 24 24"><path d="M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z"/></svg></button>
+                  <button class="ic" id="ic3"><svg viewBox="0 0 24 24"><path d="M3 4h2l3 11h11l3-8H7"/><circle cx="10" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/></svg></button>
+                  <button class="ic" id="ic4"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
+                  <button class="ic" id="ic5"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16"/></svg></button>
+                </div>
+                <script>
+                  document.getElementById('ic3').addEventListener('click', () => {
+                    document.body.setAttribute('data-result', 'ok');
+                  });
+                </script>
+                """,
+                head="""<style>
+                  #toolbar { display: flex; gap: 12px; }
+                  .ic { width: 48px; height: 48px; padding: 8px; border: 1px solid #444;
+                        background: #fafafa; border-radius: 6px; }
+                  .ic svg { width: 100%; height: 100%; fill: none; stroke: #222; stroke-width: 2; }
+                </style>""",
+            ),
+        )
+    )
+
+    # 24. 난독화 라벨 — 텍스트는 해시, 시각 구분은 CSS 배경(스프라이트 모사)뿐.
+    #     정답은 '검색' 스타일(돋보기 그라디언트)이 입혀진 q9zz 버튼.
+    sites.append(
+        MockSite(
+            site_id="obfuscated-labels",
+            title="난독화 라벨",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "난독화 라벨",
+                """
+                <h1>x1a9</h1>
+                <div id="bar">
+                  <button class="k k-home" id="k1">x7f2</button>
+                  <button class="k k-search" id="k2">q9zz</button>
+                  <button class="k k-cart" id="k3">m3ke</button>
+                  <button class="k k-user" id="k4">p0lr</button>
+                </div>
+                <script>
+                  document.getElementById('k2').addEventListener('click', () => {
+                    document.body.setAttribute('data-result', 'ok');
+                  });
+                </script>
+                """,
+                head="""<style>
+                  #bar { display: flex; gap: 10px; }
+                  .k { width: 96px; height: 40px; border: 1px solid #333; color: #333;
+                       font-family: monospace; background-repeat: no-repeat;
+                       background-position: 6px center; background-size: 24px 24px;
+                       padding-left: 34px; text-align: left; }
+                  .k-home { background-color: #e8f0ff; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z' fill='%23335'/></svg>"); }
+                  .k-search { background-color: #fff3d6; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='10' cy='10' r='6' fill='none' stroke='%23a60' stroke-width='2.5'/><path d='M15 15l6 6' stroke='%23a60' stroke-width='2.5'/></svg>"); }
+                  .k-cart { background-color: #e6ffe6; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 4h2l3 11h11l3-8H7' fill='none' stroke='%23262' stroke-width='2'/></svg>"); }
+                  .k-user { background-color: #ffe6f0; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='8' r='4' fill='%23623'/><path d='M4 21c0-4 4-6 8-6s8 2 8 6' fill='%23623'/></svg>"); }
+                </style>""",
+            ),
+        )
+    )
+
+    # 25. 순수 Canvas UI (옵션 B) — DOM 상호작용 요소가 0개.
+    #     후보 수집기가 빈 리스트를 반환해야 하는 페이지이며, 좌표 클릭으로만
+    #     정답(장바구니 사각형: x 220..380, y 100..200)에 도달할 수 있다.
+    sites.append(
+        MockSite(
+            site_id="canvas-ui",
+            title="캔버스 UI",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "캔버스 UI",
+                """
+                <canvas id="ui" width="600" height="300"></canvas>
+                <script>
+                  const RECTS = [
+                    { label: '검색',     x: 20,  y: 100, w: 160, h: 100, color: '#dbe9ff' },
+                    { label: '장바구니', x: 220, y: 100, w: 160, h: 100, color: '#dfffe0' },
+                    { label: '설정',     x: 420, y: 100, w: 160, h: 100, color: '#ffe8d6' },
+                  ];
+                  const cv = document.getElementById('ui');
+                  const ctx = cv.getContext('2d');
+                  ctx.fillStyle = '#fff';
+                  ctx.fillRect(0, 0, cv.width, cv.height);
+                  for (const r of RECTS) {
+                    ctx.fillStyle = r.color;
+                    ctx.fillRect(r.x, r.y, r.w, r.h);
+                    ctx.strokeStyle = '#333';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(r.x, r.y, r.w, r.h);
+                    ctx.fillStyle = '#111';
+                    ctx.font = '24px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(r.label, r.x + r.w / 2, r.y + r.h / 2);
+                  }
+                  cv.addEventListener('click', (ev) => {
+                    const b = cv.getBoundingClientRect();
+                    const x = ev.clientX - b.left;
+                    const y = ev.clientY - b.top;
+                    for (const r of RECTS) {
+                      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+                        document.body.setAttribute('data-result', r.label === '장바구니' ? 'ok' : 'wrong');
+                        return;
+                      }
+                    }
+                  });
+                </script>
+                """,
+                head="<style>body{margin:0} #ui{display:block}</style>",
             ),
         )
     )
