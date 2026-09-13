@@ -491,17 +491,23 @@ def main() -> None:
     args = parser.parse_args()
 
     result = run_harness(runs=args.runs, mode=args.mode, vlm=args.vlm)
+
+    # 리포트는 판정과 무관하게 먼저 쓴다. 실측 — 커버리지 미달(exit 2)로
+    # 끝난 live 런에서 리포트가 안 남아 원인 판독이 불가능했다. 실패한
+    # 런일수록 트레이스가 필요하다.
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as fh:
+            payload = result.to_dict()
+            payload["error"] = result.error
+            payload["records"] = result.records
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+
     if result.error:
         # 실행 불가/커버리지 미달 — 임계값 미달(exit 1)과 구분되는 exit 2.
         if result.extra:
             print(result.to_json(), file=sys.stderr)
         sys.exit(int(emit_error(METRIC, result.error)))
 
-    if args.report:
-        with open(args.report, "w", encoding="utf-8") as fh:
-            payload = result.to_dict()
-            payload["records"] = result.records
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
     if result.fail_reason:
         print(f"[-] {result.fail_reason}", file=sys.stderr)
     sys.exit(int(emit(result)))
