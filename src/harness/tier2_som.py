@@ -370,6 +370,10 @@ class Tier2Result(MetricResult):
 
     error: Optional[str] = None
     fail_reason: Optional[str] = None
+    #: 런별 기록 (--report로만 저장, 한 줄 JSON에는 싣지 않는다).
+    #: 실측 — 첫 live 10런에서 s01_login이 예상 밖 발동했는데 요약 수치만으로는
+    #: 원인(LLM 판단 편차인지 런타임 결함인지)을 가릴 수 없었다.
+    records: Optional[List[Dict[str, Any]]] = None
 
     @property
     def passed(self) -> bool:  # type: ignore[override]
@@ -456,6 +460,7 @@ def run_harness(
         comparison="lte",
         error=error,
         fail_reason=reason,
+        records=records,
         extra={
             "trigger_rate": trigger_rate,
             "p95_latency_ms": p95,
@@ -494,7 +499,9 @@ def main() -> None:
 
     if args.report:
         with open(args.report, "w", encoding="utf-8") as fh:
-            json.dump(result.to_dict(), fh, ensure_ascii=False, indent=2)
+            payload = result.to_dict()
+            payload["records"] = result.records
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
     if result.fail_reason:
         print(f"[-] {result.fail_reason}", file=sys.stderr)
     sys.exit(int(emit(result)))
