@@ -1,8 +1,8 @@
-# AI 에이전트 전용 헤드리스 브라우징 인프라: PRD & 기술 아키텍처 명세서 (v13.0)
+# AI 에이전트 전용 헤드리스 브라우징 인프라: PRD & 기술 아키텍처 명세서 (v13.1)
 
 | 항목 | 내용 |
 | :--- | :--- |
-| **문서 버전** | v13.0 (Ultimate Final Implementation Baseline - Review #01 ~ #12 전건 반영 완결본) |
+| **문서 버전** | v13.1 (v13.0 Baseline + Stage 4 계약 재동결 `contracts-v1.1-frozen`) |
 | **작성일** | 2026-08-29 |
 | **개발 언어 및 런타임** | **Python 3.11+ (`asyncio`, Pydantic V2, `uv`, Playwright CDP)** |
 | **구현 주체 (Implementation)** | **Autonomous AI Coding Agents (6개 배타적 컨텍스트 격리 워크스트림)** |
@@ -15,6 +15,7 @@
 | :--- | :--- | :--- | :--- |
 | **v1.0 ~ v11.0** | 2026-08-29 | 19종 툴, 바이트 무결성(CR/LaTeX/BEL 0개), AI 실행 파이프라인, 기계 검증 체계 수립 | Superseded |
 | **v12.0** | 2026-08-29 | Stage 0 모델 코드화, Protocol 구체 타입 확정, 8M 토큰 예산 배분, Stage 3 분할 | Superseded |
+| **v13.1** | 2026-09-13 | **[Stage 4 재동결 `contracts-v1.1-frozen`] `ClickInput`에 뷰포트 좌표 `x`/`y` 추가 — Tier-2 SoM Canvas 폴백용. `element_id` / `selector` / `(x, y)` 중 정확히 1개, 좌표는 `epoch` 필수(스크린샷 시점 종속). 사람 감독자 승인(2026-09-13). 그 외 명세 변경 없음** | **Approved** |
 | **v13.0** | 2026-08-29 | **[P1-1] `ClickInput` 상호 배타성(`element_id` vs `selector` 정확히 1개) 및 `epoch` 조건부 필수 validator 완성, [P2-3] Gate 0 기계 검증 항목(Input 모델 19종 및 스모크 테스트) 신설, [P2-4] `ACTION_INPUT_MAP` 정의 및 `ActionDispatcherProtocol`의 `params: BaseModel` 타입 바인딩, [P2-5] `NavigateInput.wait_until`에 `"commit"` 복원 및 Checkpoint 3-A(1~4)/3-B(1~8) 번호 독립화, [check_docs] 4대 무결성 검증 및 104개 전수 매트릭스 일치** | **Approved** |
 
 ---
@@ -338,15 +339,23 @@ class ClickInput(BaseModel):
     expected_role: Optional[str] = None
     expected_name: Optional[str] = None
     button: Literal["left", "right", "middle"] = "left"
+    # v1.1 재동결: Tier-2 SoM 좌표 클릭 (Canvas 폴백). 뷰포트 CSS 픽셀.
+    x: Optional[int] = Field(default=None, ge=0)
+    y: Optional[int] = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def check_target_and_epoch(self) -> "ClickInput":
-        # 1. element_id와 selector 중 정확히 하나만 지정 강제
-        if bool(self.element_id) == bool(self.selector):
-            raise ValueError("element_id와 selector 중 정확히 하나만 지정해야 합니다.")
-        # 2. element_id 사용 시에만 epoch 필수 검증
-        if self.element_id and self.epoch is None:
-            raise ValueError("element_id를 지정할 경우 snapshot epoch는 필수입니다.")
+        # 0. 좌표는 쌍으로만 온다
+        if (self.x is None) != (self.y is None):
+            raise ValueError("x와 y는 함께 지정해야 합니다.")
+        has_coords = self.x is not None
+        # 1. element_id / selector / (x, y) 중 정확히 하나만 지정 강제
+        targets = sum((bool(self.element_id), bool(self.selector), has_coords))
+        if targets != 1:
+            raise ValueError("element_id, selector, (x, y) 중 정확히 하나만 지정해야 합니다.")
+        # 2. element_id 또는 좌표 사용 시 epoch 필수 (스냅샷 종속)
+        if (self.element_id or has_coords) and self.epoch is None:
+            raise ValueError("element_id 또는 좌표를 지정할 경우 snapshot epoch는 필수입니다.")
         return self
 
 class TypeTextInput(BaseModel):
@@ -373,7 +382,7 @@ class NavigateInput(BaseModel):
 | `navigate` | `NavigateInput` (`url`, `wait_until`, `timeout_ms`) | **Yes** | 페이지 이동, `snapshot_epoch` 증가 | `E_NAVIGATE_TIMEOUT`, `E_INVALID_URL` |
 | `go_back` | `timeout_ms: int = 10000` | **Yes** | 이전 세션 히스토리로 이동 | `E_NO_HISTORY` |
 | `reload` | `ignore_cache: bool = False` | **Yes** | 현재 페이지 재로딩 | `E_NAVIGATE_TIMEOUT` |
-| `click` | `ClickInput` (`element_id`, `selector`, `epoch`, `expected_role`, `expected_name`, `button`) | **Depends (실패단계 종속)** | 포커스 이동, 페이지 이동, 팝업 탭 생성(`popup_tab_id`) | `E_ELEMENT_NOT_FOUND`, `E_TOCTOU_MISMATCH`, `E_ELEMENT_NOT_INTERACTABLE` |
+| `click` | `ClickInput` (`element_id`, `selector`, `x`, `y`, `epoch`, `expected_role`, `expected_name`, `button`) | **Depends (실패단계 종속)** | 포커스 이동, 페이지 이동, 팝업 탭 생성(`popup_tab_id`) | `E_ELEMENT_NOT_FOUND`, `E_TOCTOU_MISMATCH`, `E_ELEMENT_NOT_INTERACTABLE` |
 | `type_text` | `TypeTextInput` (`element_id`, `text`, `clear_before`, `press_enter`, `epoch`) | **Depends (실패단계 종속)** | 폼 필드 값 갱신, 드롭다운 자동완성 트리거 | `E_ELEMENT_NOT_FOUND`, `E_TOCTOU_MISMATCH` |
 | `select_option` | `element_id: str`, `value: Optional[str]`, `index: Optional[int]`, `epoch: int` | **Yes** | Select 드롭다운 옵션 변경 | `E_OPTION_NOT_FOUND`, `E_ELEMENT_NOT_FOUND` |
 | `check_box` | `element_id: str`, `checked: bool`, `epoch: int` | **Yes** | 체크박스/라디오 버튼 토글 | `E_ELEMENT_NOT_FOUND` |

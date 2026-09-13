@@ -4,7 +4,7 @@
 > 1. **바이트 무결성**: 모든 코드 및 마크다운 생성 시 **Carriage Return (`0x0D`), ASCII Bell (`0x07`), 미처리된 LaTeX 수식(`$...$`)의 삽입을 절대 금지**합니다.
 > 2. **비밀정보 하드코딩 금지**: `*.enc`, `auth/`, `.env`, API 키, 패스워드는 절대 코드/테스트/로그에 하드코딩하지 않으며 `.gitignore` 규칙을 엄격히 준수합니다.
 > 3. **배타적 소유권 준수**: 할당된 워크스트림 디렉터리 외 타 모듈 코드나 루트 공용 파일을 임의로 수정하지 않습니다.
-> 4. **기준 사양서**: [PRD.md](../PRD.md) (v13.0 - Ultimate Final Implementation Baseline). 레포지토리 루트에 위치합니다.
+> 4. **기준 사양서**: [PRD.md](../PRD.md) (v13.1 - v13.0 Baseline + Stage 4 계약 재동결). 레포지토리 루트에 위치합니다.
 
 ---
 
@@ -120,9 +120,9 @@ agent-browser/
 
 | 항목 | 내용 |
 | :--- | :--- |
-| **동결 태그** | `contracts-v1.0-frozen` |
-| **승인 커밋** | `db5d49b` ([WS-0] Stage 0 계약 패키지 구현 및 동결) |
-| **승인 일자** | 2026-08-29 (사람 감독자 Gate 0 승인 완료) |
+| **동결 태그** | `contracts-v1.1-frozen` (이전: `contracts-v1.0-frozen`) |
+| **승인 커밋** | Stage 4 재동결 — `ClickInput`에 좌표 `x`/`y` 추가 (Tier-2 SoM Canvas 폴백) |
+| **승인 일자** | 2026-09-13 (사람 감독자 Stage 4 재동결 승인; 최초 Gate 0 승인 2026-08-29 `db5d49b`) |
 | **동결 범위** | `src/contracts/**` (읽기 전용) |
 | **자동 검증** | `python scripts/check_contracts_freeze.py` — CI 필수 통과 |
 

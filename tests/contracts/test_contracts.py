@@ -132,6 +132,47 @@ def test_click_with_element_id_and_epoch_is_valid():
     assert action.element_id == "@e1"
 
 
+# --- v1.1 재동결: Tier-2 SoM 좌표 클릭 (PRD §3.1, Canvas 폴백) ---
+
+
+def test_click_with_coordinates_only_is_valid():
+    """Canvas처럼 DOM 요소가 없는 표면은 뷰포트 좌표로만 클릭한다."""
+    action = ClickInput(x=300, y=200, epoch=3)
+    assert action.x == 300 and action.y == 200
+    assert action.element_id is None and action.selector is None
+
+
+def test_click_coordinates_require_epoch():
+    """좌표는 SoM 스크린샷 시점에 종속되므로 epoch가 필수다."""
+    with pytest.raises(ValidationError):
+        ClickInput(x=300, y=200)
+
+
+def test_click_coordinates_must_come_in_pair():
+    with pytest.raises(ValidationError):
+        ClickInput(x=300, epoch=1)
+    with pytest.raises(ValidationError):
+        ClickInput(y=200, epoch=1)
+
+
+def test_click_coordinates_exclusive_with_other_targets():
+    with pytest.raises(ValidationError):
+        ClickInput(x=1, y=1, element_id="@e1", epoch=1)
+    with pytest.raises(ValidationError):
+        ClickInput(x=1, y=1, selector="#btn", epoch=1)
+
+
+def test_click_coordinates_must_be_non_negative():
+    with pytest.raises(ValidationError):
+        ClickInput(x=-1, y=5, epoch=1)
+
+
+def test_tier2_error_code_frozen():
+    from contracts.errors import ErrorCode
+
+    assert ErrorCode.TIER2_BUDGET_EXCEEDED.value == "E_TIER2_BUDGET_EXCEEDED"
+
+
 # ---------------------------------------------------------------------------
 # 4. 그 외 입력 모델 validator
 # ---------------------------------------------------------------------------

@@ -430,6 +430,78 @@ async def test_click_succeeds_and_returns_contract_fields(mock_server):
     assert isinstance(result.retry_safe, bool)
 
 
+# --- v1.1 재동결: 좌표 클릭 (Tier-2 SoM / Canvas 폴백) ---
+
+
+@requires_chromium
+async def test_click_by_coordinates_hits_element_under_point(mock_server):
+    """DOM 대상 없이 뷰포트 좌표만으로 클릭하면 그 지점의 요소가 눌려야 한다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(mock_server.site_url("s13_spa"))
+        dispatcher, engine = await _make_dispatcher(page)
+        await engine.observe_page(page=page)
+        box = await page.locator("#go-settings").bounding_box()
+        assert box is not None
+        x = int(box["x"] + box["width"] / 2)
+        y = int(box["y"] + box["height"] / 2)
+
+        result = await dispatcher.dispatch(
+            ActionType.CLICK, {"x": x, "y": y, "epoch": engine.epoch}
+        )
+        url_after = page.url
+        await browser.close()
+
+    assert result.success is True, result.error_message
+    assert result.data.get("coordinates") == {"x": x, "y": y}
+    assert url_after.endswith("/s13_spa/settings")
+
+
+@requires_chromium
+async def test_click_by_coordinates_rejects_stale_epoch(mock_server):
+    """좌표는 스크린샷 시점에 종속되므로 epoch 불일치는 거부한다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(mock_server.site_url("s13_spa"))
+        dispatcher, engine = await _make_dispatcher(page)
+        await engine.observe_page(page=page)
+
+        result = await dispatcher.dispatch(
+            ActionType.CLICK, {"x": 10, "y": 10, "epoch": engine.epoch + 5}
+        )
+        await browser.close()
+
+    assert result.success is False
+    assert result.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert result.reobserve_required is True
+
+
+@requires_chromium
+async def test_click_by_coordinates_outside_viewport_fails(mock_server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(mock_server.site_url("s13_spa"))
+        dispatcher, engine = await _make_dispatcher(page)
+        await engine.observe_page(page=page)
+
+        result = await dispatcher.dispatch(
+            ActionType.CLICK, {"x": 99999, "y": 99999, "epoch": engine.epoch}
+        )
+        await browser.close()
+
+    assert result.success is False
+    assert result.error_code is ErrorCode.ELEMENT_NOT_FOUND
+
+
 @requires_chromium
 async def test_navigate_bumps_epoch(mock_server):
     """네비게이션은 에포크를 올려야 한다 (PRD §4.2)."""

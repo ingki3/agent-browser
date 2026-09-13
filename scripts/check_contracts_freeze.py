@@ -21,7 +21,7 @@ import subprocess
 import sys
 
 #: 현재 유효한 계약 동결 기준점. 재동결 시 사람 감독자가 갱신한다.
-FREEZE_TAG = "contracts-v1.0-frozen"
+FREEZE_TAG = "contracts-v1.1-frozen"
 
 #: 동결 대상 경로
 FROZEN_PATH = "src/contracts"
