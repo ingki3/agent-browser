@@ -87,6 +87,10 @@ class DispatchContext:
     #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 미주입 시 치환하지 않는다.
     #: 주입되면 type_text의 text가 등록된 키일 때만 실제 값으로 바꾼다.
     secrets: Any = None
+    #: Tier-2 SoM 게이트 (PRD §8-2). 기본 OFF — 레거시 클라이언트는
+    #: `annotate_som=True`에 여전히 E_FEATURE_NOT_IMPLEMENTED를 받는다.
+    #: MCP 서버가 `capabilities.experimental.som_vision` 협상 후 켠다.
+    som_enabled: bool = False
 
 
 #: Playwright 키 이름 별칭.
@@ -692,13 +696,17 @@ class ActionDispatcher:
 
         if action is ActionType.TAKE_SCREENSHOT:
             if params.get("annotate_som"):
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,
-                    error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
-                    error_message="SoM 주석은 v1.1에서 활성화됩니다.",
-                )
+                if not self.ctx.som_enabled:
+                    # PRD §8-2: 게이트 OFF면 레거시 클라이언트 보호를 위해
+                    # 미구현 코드를 그대로 반환한다(actions_test/mcp_smoke 의존).
+                    return self._result(
+                        success=False,
+                        action=action,
+                        retry_safe=True,
+                        error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                        error_message="SoM 주석은 som_enabled 게이트가 꺼져 있어 비활성입니다.",
+                    )
+                return await self._screenshot_som(action)
             try:
                 shot = await page.screenshot(full_page=params.get("full_page", False))
             except Exception as exc:  # noqa: BLE001
@@ -1011,6 +1019,58 @@ class ActionDispatcher:
             action=ActionType.EXTRACT,
             retry_safe=True,
             data={"items": payload if extract_all else payload[0]},
+        )
+
+    async def _screenshot_som(self, action: ActionType) -> ActionResult:
+        """Tier-2 SoM 스크린샷 (PRD §3.1, §3.4). `som_enabled` 게이트 통과 후에만 호출.
+
+        반환 data:
+        * som_tags        — [{tag, role, name, bbox}] (프루닝 이전 후보, 최대 60)
+        * image_b64       — 라벨이 얹힌 뷰포트 PNG (1280×720)
+        * image_tokens    — 계약 상수 SOM_IMAGE_TOKENS_PER_CAPTURE (예산 누적용)
+        * candidate_count — 후보 수. 0이면 순수 Canvas 등 DOM 타깃이 없는 페이지이며,
+                            호출자는 이를 좌표 모드 전환 신호로 쓴다(옵션 B).
+                            따라서 0개도 **성공**으로 반환한다.
+
+        vision 패키지는 지연 import — SoM이 꺼진 배포에서 dispatcher가
+        vision 의존을 끌고 들어오지 않게 한다.
+        """
+        import base64
+
+        from contracts import thresholds
+        from vision import collect_candidates, render_som
+
+        try:
+            candidates = await collect_candidates(self.ctx.page)
+            png = await render_som(self.ctx.page, candidates)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.SCREENSHOT_FAILED,
+                error_message=f"SoM 캡처 실패: {exc}",
+            )
+
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=True,
+            data={
+                "bytes": len(png),
+                "som_tags": [
+                    {
+                        "tag": c.tag,
+                        "role": c.role,
+                        "name": c.name,
+                        "bbox": c.bbox.model_dump(),
+                    }
+                    for c in candidates
+                ],
+                "image_b64": base64.b64encode(png).decode("ascii"),
+                "image_tokens": thresholds.SOM_IMAGE_TOKENS_PER_CAPTURE,
+                "candidate_count": len(candidates),
+            },
         )
 
     async def _switch_frame(self, params: Dict[str, Any]) -> ActionResult:
