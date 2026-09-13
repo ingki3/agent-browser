@@ -5,13 +5,19 @@ VLM이 고른 `SomCandidate`를 인지 엔진의 핸들 테이블에 `@sN`으로
 그대로 태운다. 새 액션을 만들지 않는다.
 
 `@s` 접두사는 Tier-1 `@e`와 구분하기 위한 것이다 — 트레이스만 보고도
-시각 폴백이 발동했는지 식별할 수 있다. 카운터는 에포크마다 1부터 다시
-시작한다(핸들 자체가 에포크와 함께 무효화되므로 번호를 이어갈 이유가 없다).
+시각 폴백이 발동했는지 식별할 수 있다. 번호는 **엔진의 현재 핸들 테이블**에서
+유도한다 — 에포크가 바뀌면 테이블이 비워지므로 자연히 1부터 다시 시작한다.
+
+설계 — 전역 카운터를 두지 않는다. 처음 구현은 `id(engine)`를 키로 한
+모듈 전역 dict였는데, 이전 엔진이 회수된 뒤 새 엔진이 같은 주소를 받으면
+죽은 카운터를 물려받았다. 실측 — CI에서만 `@s1` 기대에 `@s2`가 나왔다
+(테스트 실행 순서에 따라 재현). 장기 실행 서버에서는 같은 일이 조용히
+일어난다. 상태의 진실은 엔진 하나뿐이어야 한다.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any
 
 from perception.engine import ElementHandle
 from vision.candidates import SomCandidate
@@ -19,20 +25,17 @@ from vision.candidates import SomCandidate
 #: Tier-2 핸들 접두사
 SOM_ID_PREFIX = "@s"
 
-#: 엔진 객체별 (에포크, 다음 번호). 엔진에 필드를 추가하지 않고 외부에서
-#: 추적한다 — perception 모듈 변경을 1메서드로 제한하기 위해서다.
-_counters: Dict[int, Tuple[int, int]] = {}
-
 
 def _next_id(engine: Any) -> str:
-    key = id(engine)
-    epoch = engine.epoch
-    last_epoch, seq = _counters.get(key, (epoch, 0))
-    if last_epoch != epoch:
-        seq = 0
-    seq += 1
-    _counters[key] = (epoch, seq)
-    return f"{SOM_ID_PREFIX}{seq}"
+    """현재 에포크에 등록된 `@sN` 중 최대 N + 1."""
+    used = 0
+    for element_id in engine.handles.keys():
+        if element_id.startswith(SOM_ID_PREFIX):
+            try:
+                used = max(used, int(element_id[len(SOM_ID_PREFIX):]))
+            except ValueError:
+                continue
+    return f"{SOM_ID_PREFIX}{used + 1}"
 
 
 async def bind_tag(engine: Any, page: Any, candidate: SomCandidate) -> str:
