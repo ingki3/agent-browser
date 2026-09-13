@@ -10,10 +10,13 @@
 """
 
 from vision.candidates import MAX_CANDIDATES, SomCandidate, collect_candidates, make_tag
+from vision.overlay import SOM_ATTR, render_som
 
 __all__ = [
     "MAX_CANDIDATES",
     "SomCandidate",
     "collect_candidates",
     "make_tag",
+    "SOM_ATTR",
+    "render_som",
 ]
