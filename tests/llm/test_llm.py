@@ -353,3 +353,23 @@ def test_reasoning_field_is_preserved():
 
 def test_reasoning_defaults_to_empty_for_plain_models():
     assert LLMResponse("답", "m", 1, 1, 0.0).reasoning == ""
+
+
+def test_vision_model_falls_back_to_model(tmp_path: Path, monkeypatch):
+    """OPENROUTER_VISION_MODEL은 선택 키 — 없으면 model을 그대로 쓴다 (Stage 4)."""
+    from llm.config import load_config
+
+    monkeypatch.delenv("OPENROUTER_VISION_MODEL", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("OPENROUTER_MODEL=file/model\n", encoding="utf-8")
+    cfg = load_config(env)
+    assert cfg.vision_model == ""
+    assert cfg.effective_vision_model == "file/model"
+
+    env.write_text(
+        "OPENROUTER_MODEL=file/model\nOPENROUTER_VISION_MODEL=file/vision\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(env)
+    assert cfg.effective_vision_model == "file/vision"

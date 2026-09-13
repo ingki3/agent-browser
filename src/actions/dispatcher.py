@@ -1025,7 +1025,7 @@ class ActionDispatcher:
         """Tier-2 SoM 스크린샷 (PRD §3.1, §3.4). `som_enabled` 게이트 통과 후에만 호출.
 
         반환 data:
-        * som_tags        — [{tag, role, name, bbox}] (프루닝 이전 후보, 최대 60)
+        * som_tags        — [{tag, role, name, bbox, selector_path}] (프루닝 이전 후보, 최대 60)
         * image_b64       — 라벨이 얹힌 뷰포트 PNG (1280×720)
         * image_tokens    — 계약 상수 SOM_IMAGE_TOKENS_PER_CAPTURE (예산 누적용)
         * candidate_count — 후보 수. 0이면 순수 Canvas 등 DOM 타깃이 없는 페이지이며,
@@ -1064,6 +1064,8 @@ class ActionDispatcher:
                         "role": c.role,
                         "name": c.name,
                         "bbox": c.bbox.model_dump(),
+                        # 루프가 후보를 재구성해 bind_tag에 넘길 때 필요하다.
+                        "selector_path": c.selector_path,
                     }
                     for c in candidates
                 ],
