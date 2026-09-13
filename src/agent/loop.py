@@ -248,6 +248,8 @@ class AgentLoop:
             # Tier-2 발동 판정용 — 무해하지 않은 연속 실패 수와 마지막 실패 판단.
             tier2_pressure = 0
             last_failed_decision: Optional[Decision] = None
+            #: LLM이 직전 스텝에서 request_vision을 골랐으면 그 Decision.
+            vision_requested: Optional[Decision] = None
 
             for step in range(1, self.max_steps + 1):
                 # PRD 실행 시간 상한 — 태스크당 Wall-Clock 10분.
@@ -272,10 +274,14 @@ class AgentLoop:
                     run.terminal_reason = str(exc)
                     break
 
-                escalate = (
-                    self.som_enabled
-                    and tier2_pressure >= TIER2_TRIGGER_FAILURES
-                    and last_failed_decision is not None
+                # 두 발동 경로 (PRD §3.1 + 실측 보강):
+                #  (1) 무해하지 않은 연속 실패 2회 — 원안.
+                #  (2) LLM의 자발 요청(request_vision) — 성공-but-헛수고
+                #      (라벨 없는 아이콘을 순서대로 다 눌러보는) 양상은
+                #      (1)로는 영원히 안 잡힌다. 실측 — icon-buttons live.
+                escalate = self.som_enabled and (
+                    (tier2_pressure >= TIER2_TRIGGER_FAILURES and last_failed_decision is not None)
+                    or vision_requested is not None
                 )
                 if escalate:
                     # 태스크당 상한 (PRD §3.4). 무인 3회 / 대화형 5회.
@@ -286,8 +292,13 @@ class AgentLoop:
                         )
                         break
                     run.tier2_calls += 1
+                    # 자발 요청이면 재실행할 실패 액션이 없다 -> CLICK 기본.
+                    replay = last_failed_decision or Decision(
+                        action=ActionType.CLICK.value, reason=vision_requested.reason
+                    )
+                    vision_requested = None
                     outcome = await self._tier2_step(
-                        client, goal, step, failures, last_failed_decision
+                        client, goal, step, failures, replay
                     )
                 else:
                     outcome = await self._run_step(
@@ -350,6 +361,13 @@ class AgentLoop:
                 if outcome.decision.action == GIVE_UP:
                     run.terminal_reason = f"LLM 포기: {outcome.decision.reason}"
                     break
+
+                if outcome.decision.is_vision_request and self.som_enabled:
+                    # 다음 스텝에서 Tier-2로 간다. 실패로 세지 않는다 —
+                    # 판단이지 액션이 아니다.
+                    vision_requested = outcome.decision
+                    history.append(outcome.summary())
+                    continue
 
                 if outcome.succeeded:
                     consecutive_failures = 0
@@ -593,6 +611,7 @@ class AgentLoop:
             # 링크 목적지 힌트를 위해 핸들을 넘긴다. 계약 모델에는 href가
             # 없으므로(동결) 내부 핸들에서 읽어 프롬프트에만 반영한다.
             handles=getattr(self.engine, "_handles", None),
+            som_enabled=self.som_enabled,
         )
         try:
             response = await client.complete(
@@ -611,6 +630,14 @@ class AgentLoop:
         )
 
         if decision.is_terminal:
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        if decision.is_vision_request:
+            # 액션을 실행하지 않는다. run()이 이 스텝을 보고 Tier-2로 간다.
+            # SoM이 꺼져 있으면 갈 곳이 없으므로 실패 스텝으로 남긴다
+            # (프롬프트에 제안하지 않았는데 모델이 고른 경우).
+            outcome.note = "vision_request" if self.som_enabled else "vision_request: SoM 비활성"
             outcome.latency_ms = (time.perf_counter() - started) * 1000
             return outcome
 

@@ -79,9 +79,13 @@ CANVAS_WRONG_POINT: Tuple[int, int] = (100, 150)
 #: Tier-2 유발 페이지 비율 (10%). 위 모듈 설명 참조.
 TIER2_SHARE = 0.10
 
-#: Tier-2 페이지에서 가짜 Tier-1이 내는 연속 실패 수. 루프의 발동 임계
-#: (agent.loop.TIER2_TRIGGER_FAILURES = 2)와 같다.
-TIER2_BOGUS_CLICKS = 2
+#: Tier-2 페이지에서 가짜 Tier-1이 자발 요청(request_vision) 전에 하는
+#: **성공-but-헛수고** 클릭 수. 실측(glm-5.3-flash, icon-buttons live) —
+#: 실제 모델은 라벨 없는 아이콘을 순서대로 눌러봤고 각 클릭은 성공이었다.
+#: 이전 mock은 "존재하지 않는 id로 2회 실패"를 냈는데, 그건 실제 실패
+#: 양상이 아니라 발동 조건에 맞춘 시나리오였다(유형 D — 실 모델에서
+#: 발동률 0.0으로 드러남). 지금은 실제 양상을 재현한다.
+TIER2_FUTILE_CLICKS = 1
 
 #: 존재하지 않는 element_id — 루프가 디스패치 전에 걸러내며, 이 실패는
 #: 구식 참조(ELEMENT_NOT_FOUND)가 아니므로 Tier-2 압력으로 집계된다.
@@ -130,15 +134,21 @@ def build_task_mix(runs: int) -> List[Task]:
 class _MockTier1Client:
     """`OpenRouterClient` 대역. `complete()`가 루프의 관찰 핸들을 보고 판단한다.
 
-    * 처음 `bogus_clicks`회: 존재하지 않는 element_id 클릭 (실패 유발)
+    * 처음 `bogus_clicks`회: 존재하지 않는 element_id 클릭 (실패 유발; 사보타주용)
+    * Tier-2 페이지: `futile_clicks`회 아무 요소나 클릭(성공-but-헛수고) 후
+      `request_vision` — 실 모델의 양상.
     * 그다음: 목표 이름과 일치하는 요소 클릭 (없으면 give_up)
     * 클릭이 한 번 성공하면 finish
     """
 
-    def __init__(self, engine: Any, task: Task, bogus_clicks: int) -> None:
+    def __init__(
+        self, engine: Any, task: Task, bogus_clicks: int, futile_clicks: int = 0
+    ) -> None:
         self._engine = engine
         self._task = task
         self._bogus_left = bogus_clicks
+        self._futile_left = futile_clicks
+        self._requested = False
         self._clicked = False
         self.calls = 0
 
@@ -157,6 +167,18 @@ class _MockTier1Client:
         elif self._bogus_left > 0:
             self._bogus_left -= 1
             payload = {"action": "click", "element_id": BOGUS_ELEMENT_ID, "reason": "mock: 오답"}
+        elif self._task.tier2 and not self._requested:
+            if self._futile_left > 0:
+                self._futile_left -= 1
+                first = self._first_element()
+                if first is not None:
+                    payload = {"action": "click", "element_id": first, "reason": "mock: 헛수고"}
+                else:
+                    self._requested = True
+                    payload = {"action": "request_vision", "reason": "mock: 요소 없음"}
+            else:
+                self._requested = True
+                payload = {"action": "request_vision", "reason": "mock: 라벨로 구분 불가"}
         else:
             element_id = self._find_target()
             if element_id is None:
@@ -168,6 +190,12 @@ class _MockTier1Client:
             content=json.dumps(payload, ensure_ascii=False),
             model="mock", prompt_tokens=0, completion_tokens=0, cost_usd=0.0,
         )
+
+    def _first_element(self) -> Optional[str]:
+        for element_id, handle in self._engine.handles.items():
+            if handle.epoch == self._engine.epoch and element_id.startswith("@e"):
+                return element_id
+        return None
 
     def _find_target(self) -> Optional[str]:
         name = self._task.target_name
@@ -308,8 +336,10 @@ async def _run_all(
                         DispatchContext(page=page, engine=engine, cdp=cdp, som_enabled=True)
                     )
                     if vlm == "mock":
-                        bogus = TIER2_BOGUS_CLICKS if task.tier2 else ordinary_bogus_clicks
-                        client = _MockTier1Client(engine, task, bogus)
+                        client = _MockTier1Client(
+                            engine, task, ordinary_bogus_clicks,
+                            futile_clicks=TIER2_FUTILE_CLICKS if task.tier2 else 0,
+                        )
                         factory = grounder_factory or correct_grounder
                         loop = AgentLoop(
                             page=page, engine=engine, dispatcher=dispatcher, config=None,

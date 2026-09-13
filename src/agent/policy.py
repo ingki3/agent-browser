@@ -38,6 +38,19 @@ LOOP_ACTIONS: Dict[ActionType, str] = {
 #: 목표 달성/포기를 알리는 의사 액션. 실제 브라우저 액션이 아니다.
 FINISH = "finish"
 GIVE_UP = "give_up"
+#: LLM이 스스로 시각 폴백을 요청하는 판단 (Tier-2, som_enabled일 때만 제안).
+#: 실측 — 라벨 없는 아이콘 버튼 5개를 LLM이 하나씩 다 눌러봤고 각 클릭은
+#: 성공이었다. "2회 연속 실패" 조건은 성공-but-헛수고에는 안 걸린다.
+#: 키워드·휴리스틱이 아니라 모델의 판단으로 발동한다.
+REQUEST_VISION = "request_vision"
+
+#: som_enabled일 때만 시스템 프롬프트에 덧붙인다. 꺼진 서버에서 이 액션을
+#: 제안하면 모델이 골랐을 때 갈 곳이 없다.
+VISION_PROMPT_ADDENDUM = f"""
+7. 관찰 목록의 요소들이 라벨·역할이 없거나 서로 구분되지 않아 **어느 것이
+   목표 요소인지 텍스트만으로 판단할 수 없다면**, 하나씩 눌러보지 말고
+   action을 "{REQUEST_VISION}"으로 하십시오. 스크린샷을 보는 시각 폴백이
+   대신 요소를 고릅니다. reason에 왜 구분이 안 되는지 쓰십시오."""
 
 SYSTEM_PROMPT = """당신은 웹 브라우저를 제어하는 자율 에이전트입니다.
 
@@ -87,6 +100,10 @@ class Decision:
     @property
     def is_terminal(self) -> bool:
         return self.action in (FINISH, GIVE_UP)
+
+    @property
+    def is_vision_request(self) -> bool:
+        return self.action == REQUEST_VISION
 
     @property
     def action_type(self) -> Optional[ActionType]:
@@ -167,6 +184,7 @@ def build_messages(
     history: Sequence[str] = (),
     limit: int = 20,
     handles: Optional[Dict[str, Any]] = None,
+    som_enabled: bool = False,
 ) -> List[Dict[str, str]]:
     """LLM 호출용 메시지를 구성한다.
 
@@ -179,6 +197,10 @@ def build_messages(
         f"- {a.value}: {desc}" for a, desc in LOOP_ACTIONS.items()
     )
     action_list += f'\n- {FINISH}: 목표를 달성했다.\n- {GIVE_UP}: 달성이 불가능하다.'
+    system_prompt = SYSTEM_PROMPT
+    if som_enabled:
+        action_list += f"\n- {REQUEST_VISION}: 텍스트로는 요소를 구분할 수 없다 (시각 폴백 요청)."
+        system_prompt = SYSTEM_PROMPT + VISION_PROMPT_ADDENDUM
 
     web_content = (
         f"현재 URL: {observation.url}\n"
@@ -207,7 +229,7 @@ def build_messages(
         )
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": isolated},
     ]
 

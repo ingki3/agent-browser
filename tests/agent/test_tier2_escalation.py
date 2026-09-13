@@ -114,7 +114,8 @@ def _scripted_loop(monkeypatch, script, *, grounder=None, **kwargs):
                 return StepOutcome(step=step, decision=Decision(action="give_up", reason="script end"))
             action, element_id, success, error_code = items.pop(0)
             decision = Decision(action=action, element_id=element_id, reason="scripted")
-            if action in ("finish", "give_up"):
+            if action in ("finish", "give_up", "request_vision"):
+                # 실제 _run_step과 동일 — 판단 스텝은 액션을 실행하지 않는다.
                 return StepOutcome(step=step, decision=decision)
             return StepOutcome(
                 step=step, decision=decision, result=_result(success, error_code=error_code)
@@ -311,6 +312,84 @@ def test_default_is_som_disabled():
     loop = AgentLoop(page=_Page(), engine=None, dispatcher=None, budget=BudgetGuard())
     assert loop.som_enabled is False
     assert loop.unattended is True
+
+
+# --- LLM 자발 요청 경로 (request_vision) ------------------------------------
+#
+# 실측(glm-5.3-flash, icon-buttons live) — 라벨 없는 아이콘 5개를 LLM이 하나씩
+# 다 눌러봤고 각 클릭은 *성공*이었다. "2회 연속 실패" 조건은 성공-but-헛수고
+# 에는 영원히 안 걸린다. 시각 폴백이 가장 필요한 순간에 발동하지 않는 구조.
+# LLM이 스스로 "구분이 안 된다"고 판단하면 즉시 Tier-2로 간다.
+
+
+def test_request_vision_triggers_tier2_without_prior_failures(monkeypatch):
+    ground = _grounder(GroundingResult(tag="A1", reason="cart icon", latency_ms=9.0, tokens=100))
+    loop, dispatcher = _scripted_loop(
+        monkeypatch,
+        [
+            ("click", "@e1", True, None),          # 성공했지만 헛수고
+            ("request_vision", None, True, None),  # LLM: "구분이 안 됩니다"
+            ("finish", None, True, None),
+        ],
+        grounder=ground,
+        som_enabled=True,
+    )
+    run = _run(loop)
+
+    assert len(ground.calls) == 1
+    tier2 = [s for s in run.steps if s.note == "tier2"]
+    assert len(tier2) == 1
+    assert tier2[0].succeeded is True
+    assert tier2[0].decision.action == "click"          # 재실행할 실패 액션이 없으니 CLICK
+    assert tier2[0].decision.element_id == "@s1"
+    assert run.tier2_calls == 1
+    assert run.completed is True
+    # 요청 스텝 자체는 액션을 실행하지 않는다
+    actions = [a for a, _ in dispatcher.calls]
+    assert actions == [ActionType.TAKE_SCREENSHOT, ActionType.CLICK]
+
+
+def test_request_vision_counts_toward_tier2_budget(monkeypatch):
+    """성공하는 Tier-2가 반복돼도 상한(무인 3회)은 자발 요청에도 똑같이 적용된다."""
+    ground = _grounder(GroundingResult(tag="A1", reason="ok"))
+    loop, _ = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None)] * 5 + [("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=True,
+        unattended=True,
+    )
+    run = _run(loop)
+    assert run.tier2_calls == 3
+    assert ErrorCode.TIER2_BUDGET_EXCEEDED.value in run.terminal_reason
+
+
+def test_request_vision_when_som_disabled_is_a_failed_step(monkeypatch):
+    """SoM이 꺼져 있으면 요청은 실패로 기록되고, 반복하면 연속 실패로 끊긴다."""
+    ground = _grounder(GroundingResult(tag="A1"))
+    loop, dispatcher = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None)] * 4 + [("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=False,
+    )
+    run = _run(loop)
+    assert ground.calls == []
+    assert dispatcher.calls == []
+    assert run.tier2_calls == 0
+    assert run.completed is False
+    assert "연속 3회" in run.terminal_reason
+
+
+def test_policy_prompt_offers_request_vision_only_when_som_enabled():
+    from agent.policy import REQUEST_VISION, build_messages
+    from contracts import ObserveResult
+
+    obs = ObserveResult(title="t", url="u", snapshot_epoch=0, elements=[], axtree_summary="", token_count=0)
+    on = build_messages("g", obs, step=1, max_steps=5, history=[], limit=20, som_enabled=True)
+    off = build_messages("g", obs, step=1, max_steps=5, history=[], limit=20)
+    assert REQUEST_VISION in on[0]["content"]
+    assert REQUEST_VISION not in off[0]["content"]
 
 
 def test_policy_prompt_mentions_som_ids():
