@@ -325,10 +325,13 @@ async def _run_all(
                 viewport={"width": thresholds.VIEWPORT_WIDTH,
                           "height": thresholds.VIEWPORT_HEIGHT}
             )
-            page = await context.new_page()
-            cdp = await context.new_cdp_session(page)
             try:
                 for index, task in enumerate(tasks):
+                    # 태스크마다 새 페이지 — 히스토리/포커스/DOM 상태를 이전 태스크와
+                    # 격리한다. 실측(live 50런) — 같은 페이지를 재사용하니 canvas-ui
+                    # 태스크에서 go_back이 직전 태스크 사이트로 돌아가 상태가 섞였다.
+                    page = await context.new_page()
+                    cdp = await context.new_cdp_session(page)
                     await page.goto(server.site_url(task.site_id), wait_until="domcontentloaded")
                     await page.wait_for_timeout(150)
                     engine = PerceptionEngine()
@@ -378,9 +381,11 @@ async def _run_all(
                             "tier2_successes": sum(1 for s in tier2_steps if s.succeeded),
                             "tier2_steps": len(tier2_steps),
                             "verified": verified,
+                            "final_url": page.url,
                             "trace": [s.summary() for s in run.steps],
                         }
                     )
+                    await page.close()
             finally:
                 await context.close()
                 await browser.close()
