@@ -602,9 +602,14 @@ def _build_sites() -> List[MockSite]:
                   <button class="ic" id="ic4"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
                   <button class="ic" id="ic5"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16"/></svg></button>
                 </div>
+                <div id="drawer" hidden><h2>장바구니</h2><p>담긴 상품 0개</p></div>
                 <script>
+                  // 실측 — 겉으로 아무 변화 없이 data-result만 바뀌면 에이전트는
+                  // 정답을 눌렀는지 알 수 없어 다시 요청한다(Tier-2 상한 소진).
+                  // 실제 사이트처럼 가시적 피드백(드로어)을 보여준다.
                   document.getElementById('ic3').addEventListener('click', () => {
                     document.body.setAttribute('data-result', 'ok');
+                    document.getElementById('drawer').hidden = false;
                   });
                 </script>
                 """,
@@ -635,9 +640,12 @@ def _build_sites() -> List[MockSite]:
                   <button class="k k-cart" id="k3">m3ke</button>
                   <button class="k k-user" id="k4">p0lr</button>
                 </div>
+                <div id="panel" hidden><input type="search" placeholder="검색어를 입력하세요" autofocus></div>
                 <script>
+                  // 가시적 피드백 — icon-buttons와 같은 이유.
                   document.getElementById('k2').addEventListener('click', () => {
                     document.body.setAttribute('data-result', 'ok');
+                    document.getElementById('panel').hidden = false;
                   });
                 </script>
                 """,
@@ -672,6 +680,7 @@ def _build_sites() -> List[MockSite]:
                 "캔버스 UI",
                 """
                 <canvas id="ui" width="600" height="300"></canvas>
+                <div id="status" hidden></div>
                 <script>
                   const RECTS = [
                     { label: '검색',     x: 20,  y: 100, w: 160, h: 100, color: '#dbe9ff' },
@@ -700,7 +709,12 @@ def _build_sites() -> List[MockSite]:
                     const y = ev.clientY - b.top;
                     for (const r of RECTS) {
                       if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
-                        document.body.setAttribute('data-result', r.label === '장바구니' ? 'ok' : 'wrong');
+                        const hit = r.label === '장바구니';
+                        document.body.setAttribute('data-result', hit ? 'ok' : 'wrong');
+                        // 가시적 피드백 — 맞으면 드로어, 틀리면 무엇을 눌렀는지.
+                        const s = document.getElementById('status');
+                        s.hidden = false;
+                        s.textContent = hit ? '장바구니: 담긴 상품 0개' : r.label + ' 화면 (장바구니 아님)';
                         return;
                       }
                     }
