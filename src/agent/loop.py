@@ -119,11 +119,17 @@ class StepOutcome:
     note: str = ""
     #: Tier-2 VLM 왕복 지연 (Gate 4 p95 재료). Tier-1 스텝은 0.
     vision_latency_ms: float = 0.0
+    #: 수용된 `request_vision`처럼 액션을 실행하지 않고도 성공인 판단 스텝.
+    #: 실측(live 50런) — 이 표기가 없으면 요청 스텝이 FAIL로 히스토리에 남아
+    #: LLM이 "요청이 실패했다"고 읽고 재요청, Tier-2 상한을 소진했다.
+    judged_success: bool = False
 
     @property
     def succeeded(self) -> bool:
         if self.decision.is_terminal:
             return self.decision.action == FINISH
+        if self.judged_success:
+            return True
         return bool(self.result and self.result.success)
 
     def summary(self) -> str:
@@ -635,9 +641,17 @@ class AgentLoop:
 
         if decision.is_vision_request:
             # 액션을 실행하지 않는다. run()이 이 스텝을 보고 Tier-2로 간다.
+            # SoM이 켜져 있으면 요청은 **수용된 것**이므로 성공 스텝이다 —
+            # FAIL로 남기면 히스토리가 LLM에게 "요청이 실패했다"고 알려
+            # 재요청을 유발한다(실측: icon-buttons 2런이 상한 소진).
             # SoM이 꺼져 있으면 갈 곳이 없으므로 실패 스텝으로 남긴다
             # (프롬프트에 제안하지 않았는데 모델이 고른 경우).
-            outcome.note = "vision_request" if self.som_enabled else "vision_request: SoM 비활성"
+            outcome.judged_success = self.som_enabled
+            outcome.note = (
+                "vision_request: Tier-2 시각 폴백으로 전환합니다"
+                if self.som_enabled
+                else "vision_request: SoM 비활성"
+            )
             outcome.latency_ms = (time.perf_counter() - started) * 1000
             return outcome
 
