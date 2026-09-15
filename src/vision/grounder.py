@@ -50,10 +50,32 @@ _TAG_INSTRUCTION = (
 _POINT_INSTRUCTION = (
     "당신은 웹 페이지 스크린샷에서 목표 달성을 위해 클릭할 지점을 고르는 시각 "
     "그라운딩 모델입니다. 이 페이지는 DOM 요소가 없는(Canvas 등) 화면이므로 "
-    "클릭할 픽셀 좌표를 직접 지정하십시오. 좌표 원점은 좌상단, 단위는 픽셀입니다. "
+    "클릭할 픽셀 좌표를 직접 지정하십시오. 좌표 원점은 좌상단입니다. "
+    "클릭할 영역의 중심을 지정하십시오. "
+    "좌표계는 자유롭게 선택하되 `coord_space`에 반드시 무엇을 썼는지 선언하십시오: "
+    '원본 이미지의 절대 픽셀이면 "absolute", 0~1000으로 정규화한 값이면 '
+    '"normalized_1000". 둘 중 하나여야 합니다. '
     "적합한 지점이 없으면 x, y를 null로 하십시오. "
-    '반드시 JSON 한 개만 출력하십시오: {"x": 정수, "y": 정수, "reason": "한 줄"}'
+    "반드시 JSON 한 개만 출력하십시오: "
+    '{"x": 정수, "y": 정수, "coord_space": "absolute" 또는 "normalized_1000", '
+    '"reason": "한 줄"}'
 )
+
+#: 좌표계 선언값 → 정규화 분모. `absolute`는 변환하지 않는다.
+#: 실측 — gemini-3.8-flash는 같은 프롬프트에 절대 픽셀과 0~1000 정규화를
+#: 섞어 답한다(16회 중 8회 정규화, 둘 다 장바구니 정중앙을 가리켰다).
+#: 프롬프트로 절대 픽셀을 강제하고 정규화를 금지해도 3/8이 정규화로 응답해
+#: 프롬프트만으로는 막히지 않았다. 값 크기로 추측하면(작으면 정규화) 멀쩡한
+#: 절대 좌표를 오해석하므로 — (234, 208)은 1280x720에서 그 자체로 유효하다 —
+#: 모델이 선언하게 하고 코드가 변환한다.
+_COORD_SPACES: Dict[str, Optional[int]] = {
+    "absolute": None,
+    "normalized_1000": 1000,
+}
+
+#: 좌표계 미선언 시 기본값. 기존 모델(glm-5.3-flash, gemini-2.5-flash)은
+#: 실측상 항상 절대 픽셀로 답했다.
+_DEFAULT_COORD_SPACE = "absolute"
 
 
 @dataclass
@@ -158,6 +180,23 @@ def _parse_point(payload: Any) -> Optional[Tuple[int, int]]:
         y = int(payload.get("y"))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+    raw_space = payload.get("coord_space")
+    space = str(raw_space).strip().lower() if raw_space is not None else _DEFAULT_COORD_SPACE
+    if space not in _COORD_SPACES:
+        # 모르는 좌표계는 추측하지 않는다 — 잘못 변환한 좌표로 클릭하면
+        # 엉뚱한 요소를 누르게 되므로 '그라운딩 없음'이 안전하다.
+        logger.debug("VLM이 모르는 좌표계를 선언: %r", raw_space)
+        return None
+
+    scale = _COORD_SPACES[space]
+    if scale is not None:
+        if not (0 <= x <= scale and 0 <= y <= scale):
+            logger.debug("VLM이 %s 범위 밖 좌표를 반환: (%d, %d)", space, x, y)
+            return None
+        x = round(x / scale * thresholds.VIEWPORT_WIDTH)
+        y = round(y / scale * thresholds.VIEWPORT_HEIGHT)
+
     if not (0 <= x < thresholds.VIEWPORT_WIDTH and 0 <= y < thresholds.VIEWPORT_HEIGHT):
         logger.debug("VLM이 뷰포트 밖 좌표를 반환: (%d, %d)", x, y)
         return None

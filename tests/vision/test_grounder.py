@@ -167,3 +167,60 @@ async def test_coordinate_mode_ignores_tag_field():
     client = FakeClient(json.dumps({"tag": "A1", "reason": "r"}))
     result = await ground(client, PNG, [], "goal")
     assert result.tag is None and result.point is None
+
+
+# --- 좌표계 선언 (coord_space) -------------------------------------------------
+#
+# 실측 — gemini-3.8-flash는 같은 프롬프트에 절대 픽셀과 0~1000 정규화 좌표를
+# 섞어 답한다(16회 중 8회 정규화). 프롬프트로 절대 픽셀을 강제하고 정규화를
+# 금지해도 3/8이 정규화로 응답했다. 추측(값이 작으면 정규화) 대신 모델이
+# 자기 좌표계를 선언하게 하고 코드가 변환한다.
+
+
+async def test_normalized_coord_space_is_converted_to_absolute():
+    client = FakeClient(
+        json.dumps({"x": 234, "y": 208, "coord_space": "normalized_1000", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_absolute_coord_space_is_passed_through():
+    client = FakeClient(
+        json.dumps({"x": 300, "y": 150, "coord_space": "absolute", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_missing_coord_space_defaults_to_absolute():
+    """선언이 없으면 절대 픽셀로 읽는다 — 기존 모델(glm/gemini-2.5) 호환."""
+    client = FakeClient(json.dumps({"x": 300, "y": 150, "reason": "r"}))
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_unknown_coord_space_is_rejected():
+    """모르는 좌표계는 추측하지 않고 버린다 (fail-closed)."""
+    client = FakeClient(
+        json.dumps({"x": 300, "y": 150, "coord_space": "percent", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point is None
+
+
+async def test_normalized_point_out_of_range_is_rejected():
+    """정규화 선언인데 0~1000 밖이면 버린다."""
+    client = FakeClient(
+        json.dumps({"x": 1200, "y": 50, "coord_space": "normalized_1000", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point is None
+
+
+async def test_coordinate_prompt_declares_coord_space_schema():
+    client = FakeClient(json.dumps({"x": 1, "y": 1, "reason": "r"}))
+    await ground(client, PNG, [], "goal")
+    system = client.calls[0]["messages"][0]["content"]
+    assert "coord_space" in system
+    assert "normalized_1000" in system and "absolute" in system
