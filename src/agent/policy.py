@@ -32,7 +32,10 @@ LOOP_ACTIONS: Dict[ActionType, str] = {
     ActionType.NAVIGATE: "URL로 이동한다. url 필요.",
     ActionType.GO_BACK: "이전 페이지로 돌아간다.",
     ActionType.PRESS_KEY: "키를 누른다. key 필요 (예: Enter).",
-    ActionType.EXTRACT: "CSS 셀렉터로 텍스트를 추출한다. selector 필요.",
+    ActionType.EXTRACT: (
+        "CSS 셀렉터로 텍스트를 추출한다. selector 필요. 페이지 구조를 모르면 "
+        "선택자를 추측하지 말고 read_text를 쓰십시오."
+    ),
 }
 
 #: 목표 달성/포기를 알리는 의사 액션. 실제 브라우저 액션이 아니다.
@@ -43,6 +46,9 @@ GIVE_UP = "give_up"
 #: 성공이었다. "2회 연속 실패" 조건은 성공-but-헛수고에는 안 걸린다.
 #: 키워드·휴리스틱이 아니라 모델의 판단으로 발동한다.
 REQUEST_VISION = "request_vision"
+#: 선택자 없이 페이지의 보이는 글자를 읽는 의사 액션. 결과는 다음 스텝의
+#: 신뢰되지 않는 웹 콘텐츠 구역에 한 번만 들어간다(`agent.page_text`).
+READ_TEXT = "read_text"
 
 #: som_enabled일 때만 시스템 프롬프트에 덧붙인다. 꺼진 서버에서 이 액션을
 #: 제안하면 모델이 골랐을 때 갈 곳이 없다.
@@ -104,6 +110,10 @@ class Decision:
     @property
     def is_vision_request(self) -> bool:
         return self.action == REQUEST_VISION
+
+    @property
+    def is_read_text(self) -> bool:
+        return self.action == READ_TEXT
 
     @property
     def action_type(self) -> Optional[ActionType]:
@@ -185,16 +195,21 @@ def build_messages(
     limit: int = 20,
     handles: Optional[Dict[str, Any]] = None,
     som_enabled: bool = False,
+    page_text: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """LLM 호출용 메시지를 구성한다.
 
-    웹에서 온 문자열(요소 이름, 페이지 제목)은 `security.build_prompt`로
-    신뢰 경계 밖에 격리한다.
+    웹에서 온 문자열(요소 이름, 페이지 제목, read_text로 읽은 글자)은
+    `security.build_prompt`로 신뢰 경계 밖에 격리한다.
     """
     from security import build_prompt
 
     action_list = "\n".join(
         f"- {a.value}: {desc}" for a, desc in LOOP_ACTIONS.items()
+    )
+    action_list += (
+        f"\n- {READ_TEXT}: 페이지의 보이는 글자를 읽는다(목록·표·본문처럼 요소 목록에 "
+        "없는 글자). 선택자가 필요 없다. 결과는 다음 스텝에 한 번 보인다."
     )
     action_list += f'\n- {FINISH}: 목표를 달성했다.\n- {GIVE_UP}: 달성이 불가능하다.'
     system_prompt = SYSTEM_PROMPT
@@ -207,6 +222,8 @@ def build_messages(
         f"페이지 제목: {observation.title}\n\n"
         f"상호작용 가능한 요소:\n{render_observation(observation, limit, handles)}"
     )
+    if page_text is not None:
+        web_content += f"\n\n직전 {READ_TEXT}로 읽은 페이지 글자:\n{page_text or '(보이는 글자 없음)'}"
 
     history_text = ""
     if history:

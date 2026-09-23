@@ -219,6 +219,8 @@ class AgentLoop:
         self.som_enabled = som_enabled
         self.unattended = unattended
         self._grounder = grounder
+        #: read_text 결과 — 다음 스텝 프롬프트에 **한 번만** 넣고 비운다.
+        self._pending_page_text: Optional[str] = None
 
     @property
     def tier2_max_calls(self) -> int:
@@ -618,7 +620,10 @@ class AgentLoop:
             # 없으므로(동결) 내부 핸들에서 읽어 프롬프트에만 반영한다.
             handles=getattr(self.engine, "_handles", None),
             som_enabled=self.som_enabled,
+            page_text=self._pending_page_text,
         )
+        # 한 번 보여 줬으면 비운다 — 매 스텝 붙이면 프롬프트가 계속 커진다.
+        self._pending_page_text = None
         try:
             response = await client.complete(
                 messages, max_tokens=self.max_tokens
@@ -652,6 +657,22 @@ class AgentLoop:
                 if self.som_enabled
                 else "vision_request: SoM 비활성"
             )
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        if decision.is_read_text:
+            # 브라우저 액션이 아니라 읽기다. 페이지를 바꾸지 않으므로 성공이면
+            # 판단 성공 스텝으로 남긴다(실패로 세면 연속 실패 중단에 걸린다).
+            from agent.page_text import read_visible_text
+
+            try:
+                text = await read_visible_text(self.page)
+            except Exception as exc:  # noqa: BLE001
+                outcome.note = f"read_text 실패: {type(exc).__name__}"
+            else:
+                self._pending_page_text = text
+                outcome.judged_success = True
+                outcome.note = f"read_text: {len(text)}자"
             outcome.latency_ms = (time.perf_counter() - started) * 1000
             return outcome
 
