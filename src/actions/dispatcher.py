@@ -226,6 +226,21 @@ class ActionDispatcher:
         """액션을 실행하고 `ActionResult`를 반환한다."""
         started = time.perf_counter()
         params, secret_resolved = self._resolve_secret(action, params)
+        if secret_resolved is True and not self._secret_allowed_here():
+            # 도메인에 묶인 자격증명(credentials.BoundSecrets)을 다른 사이트에서
+            # 쓰려 함 — 값도 키 이름도 입력하지 않고 실패한다.
+            result = self._result(
+                success=False,
+                action=action,
+                retry_safe=False,
+                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                error_message=(
+                    f"자격증명은 {self.ctx.secrets.domain} 도메인 페이지에서만 입력합니다. "
+                    "현재 페이지는 다른 도메인이라 입력하지 않았습니다."
+                ),
+            )
+            result.data["secret_resolved"] = False
+            return result
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
@@ -245,6 +260,21 @@ class ActionDispatcher:
             # 사용자는 키 이름이 그대로 입력된 것을 눈치채지 못한다.
             result.data["secret_resolved"] = secret_resolved
         return result
+
+    def _secret_allowed_here(self) -> bool:
+        """현재 페이지에서 치환된 값을 입력해도 되는가.
+
+        도메인에 묶이지 않은 해석기(기존 `SecretStore`, `--secrets` 파일)는
+        제한이 없다 — 하위 호환. `allowed_for`가 있으면 그것을 따른다.
+        """
+        check = getattr(self.ctx.secrets, "allowed_for", None)
+        if check is None:
+            return True
+        try:
+            url = self.ctx.page.url
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(check(url))
 
     def _resolve_secret(
         self, action: ActionType, params: Dict[str, Any]
