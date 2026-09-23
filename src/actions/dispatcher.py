@@ -98,6 +98,11 @@ class DispatchContext:
     som_enabled: bool = False
 
 
+#: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
+#: 치환된 params 사본에만 붙는다 — 결과에 실제 값을 싣지 않게 한다.
+_CONCEAL_KEY = "_conceal_value"
+
+
 #: Playwright 키 이름 별칭.
 #: Playwright는 'Enter'만 받고 'enter'/'Return'은 Unknown key로 거부한다.
 #: LLM은 소문자나 별칭('return', 'esc')을 자주 쓰므로 정규화한다.
@@ -273,6 +278,9 @@ class ActionDispatcher:
 
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
+        # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
+        # 호출자의 params(트레이스)에는 나타나지 않는다.
+        resolved_params[_CONCEAL_KEY] = True
         return resolved_params, True
 
     async def _dispatch_inner(
@@ -446,6 +454,7 @@ class ActionDispatcher:
             expected_checked=(
                 params.get("checked") if action is ActionType.CHECK_BOX else None
             ),
+            conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
 
         if post.satisfied:
@@ -496,6 +505,7 @@ class ActionDispatcher:
             expected_checked=(
                 params.get("checked") if action is ActionType.CHECK_BOX else None
             ),
+            conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
         return self._result(
             success=retry_post.satisfied,

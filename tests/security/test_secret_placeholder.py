@@ -281,6 +281,94 @@ async def test_no_store_means_no_substitution():
 
 
 # ---------------------------------------------------------------------------
+# 결과 페이로드 누출 (2026-09-23 네이버 로그인 테스트 전 점검에서 발견)
+#
+# 사후조건 검증이 type_text의 기대값을 **치환된 실제 값**으로 받는다. 검증
+# 신호(`value_applied: '<값>'`)와 실패 메시지(`기대값 '<값>' != 실제 ...`)에
+# 그대로 실려 ActionResult로 나간다. MCP 서버는 ActionResult를 호출한 LLM에
+# 돌려주므로 "LLM에는 키 이름만" 보장이 깨진다. 기존 테스트는 트레이스만 봤다.
+# 값을 가공해 받는 입력(마스킹·자동 포맷)이 흔하므로 실패 경로가 현실적이다.
+# ---------------------------------------------------------------------------
+
+
+def _all_text(result) -> str:
+    return json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+
+
+@requires_chromium
+@pytest.mark.parametrize(
+    "html",
+    [
+        # 그대로 들어가는 입력 — 성공 신호에 값이 실렸다
+        "<form><input id='p' type='password' placeholder='비밀번호'></form>",
+        # 입력을 가공하는 필드(대문자 변환) — 실패 메시지에 값이 실렸다
+        "<form><input id='p' type='text' placeholder='비밀번호' "
+        "oninput=\"this.value=this.value.toUpperCase()\"></form>",
+    ],
+    ids=["applied", "rewritten"],
+)
+async def test_resolved_secret_never_appears_in_action_result(secrets_file, html):
+    from playwright.async_api import async_playwright
+
+    from actions import ActionDispatcher, DispatchContext
+    from contracts import ActionType
+    from perception import PerceptionEngine
+
+    store = SecretStore.from_file(secrets_file)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.set_content(html)
+        engine = PerceptionEngine()
+        cdp = await context.new_cdp_session(page)
+        disp = ActionDispatcher(
+            DispatchContext(page=page, engine=engine, cdp=cdp, secrets=store)
+        )
+        obs = await engine.observe_page(page=page, prune_top_n=20)
+        result = await disp.dispatch(ActionType.TYPE_TEXT, {
+            "element_id": obs.elements[0].element_id,
+            "epoch": obs.snapshot_epoch,
+            "text": "X-PASSWORD",
+        })
+        await browser.close()
+
+    assert result.data.get("secret_resolved") is True
+    assert SECRET not in _all_text(result), "ActionResult에 평문이 실렸습니다"
+    assert SECRET.upper() not in _all_text(result), "가공된 평문이 실렸습니다"
+
+
+@requires_chromium
+async def test_observation_never_carries_password_field_value():
+    """비밀번호 필드 값은 관찰 결과에 실리지 않는다.
+
+    MCP `observe_page`는 관찰 모델 전체(요소 `value` 포함)를 호출한 LLM에
+    돌려준다. 입력 직후 관찰하면 방금 넣은 비밀번호가 그대로 나갔다.
+    일반/shadow DOM 양쪽을 본다.
+    """
+    from playwright.async_api import async_playwright
+
+    from perception import PerceptionEngine
+
+    html = (
+        "<input id='a' type='password' value='%s'>"
+        "<div id='h'></div>"
+        "<script>const r=document.getElementById('h').attachShadow({mode:'open'});"
+        "r.innerHTML=\"<input type='password' value='%s'>\";</script>"
+    ) % (SECRET, SECRET)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        obs = await PerceptionEngine().observe_page(page=page, prune_top_n=20)
+        await browser.close()
+
+    dumped = json.dumps(obs.model_dump(mode="json"), ensure_ascii=False)
+    assert len(obs.elements) >= 2, "비밀번호 필드가 관찰되지 않아 검증이 무의미합니다"
+    assert SECRET not in dumped, "관찰 결과에 비밀번호 필드 값이 실렸습니다"
+
+
+# ---------------------------------------------------------------------------
 # 4. CLI / 서버 배선
 # ---------------------------------------------------------------------------
 

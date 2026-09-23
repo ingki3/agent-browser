@@ -80,7 +80,9 @@ function() {
     tag: tag,
     role: String(role).toLowerCase(),
     name: name,
-    value: el.value !== undefined ? String(el.value).slice(0, 200) : null,
+    // 비밀번호 필드 값은 읽지 않는다 (sanitizer.py와 동일 규칙).
+    value: el.value === undefined ? null
+         : (el.type === 'password' ? (el.value ? '<secret>' : '') : String(el.value).slice(0, 200)),
     testid: el.getAttribute('data-testid') || null,
     disabled: !!el.disabled,
     bbox: { x: Math.round(r.x), y: Math.round(r.y),

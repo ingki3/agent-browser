@@ -241,6 +241,8 @@ class PageStateSnapshot:
     element_signature: str = ""
     element_checked: Optional[bool] = None
     element_value: Optional[str] = None
+    #: 대상이 비밀번호 필드인가 — 참이면 값을 신호·메시지에 싣지 않는다.
+    element_is_secret: bool = False
     #: 브라우저 컨텍스트의 탭 수 — 팝업(새 탭) 감지. 0이면 측정 안 함.
     page_count: int = 0
 
@@ -317,6 +319,7 @@ async def capture_state(
                          + '|' + (el.getAttribute('aria-pressed') || '')) : '',
             checked: el && el.checked !== undefined ? !!el.checked : null,
             value: el && el.value !== undefined ? String(el.value) : null,
+            secret: !!(el && el.type === 'password'),
           };
         }
         """.replace("__DEEP_QUERY__", DEEP_QUERY_JS),
@@ -334,6 +337,7 @@ async def capture_state(
         element_signature=str(payload.get("elSig") or ""),
         element_checked=payload.get("checked"),
         element_value=payload.get("value"),
+        element_is_secret=bool(payload.get("secret")),
         page_count=page_count,
     )
 
@@ -355,8 +359,14 @@ def verify_post_condition(
     expected_value: Optional[str] = None,
     expected_checked: Optional[bool] = None,
     dom_delta_threshold: int = 1,
+    conceal_value: bool = False,
 ) -> PostConditionResult:
     """액션 전후 상태를 비교해 실제 변화가 있었는지 판정한다.
+
+    `conceal_value=True`면 값 비교 결과에 기대값·실제값을 싣지 않는다.
+    자격증명 치환(PRD 5.3)으로 들어간 값이 신호·실패 메시지를 타고 LLM에게
+    돌아가던 경로를 막는다. 필드가 값을 가공한 경우(대문자화 등) 실제값도
+    평문에서 파생된 것이라 함께 가린다.
 
     기대 상태값이 주어지면 그것이 유일한 판정 기준이다(가장 강한 신호).
     그렇지 않으면 **효과 신호**(URL/DOM/텍스트/속성/값/새 탭) 중 하나라도
@@ -374,14 +384,24 @@ def verify_post_condition(
 
     # 기대 상태값이 있으면 그것만으로 판정한다 (가장 강한 신호).
     if expected_value is not None:
+        conceal_value = conceal_value or after.element_is_secret
         if after.element_value == expected_value:
+            shown = "<secret>" if conceal_value else repr(expected_value)
             return PostConditionResult(
-                satisfied=True, signals=[f"value_applied: {expected_value!r}"]
+                satisfied=True, signals=[f"value_applied: {shown}"]
             )
+        if conceal_value:
+            got = after.element_value
+            detail = (
+                "입력한 자격증명 값이 필드에 그대로 남지 않음"
+                f"(필드 값 길이 {len(got) if got is not None else '없음'})"
+            )
+        else:
+            detail = f"기대값 {expected_value!r} != 실제 {after.element_value!r}"
         return PostConditionResult(
             satisfied=False,
             signals=signals,
-            detail=f"기대값 {expected_value!r} != 실제 {after.element_value!r}",
+            detail=detail,
         )
 
     if expected_checked is not None:
@@ -418,9 +438,12 @@ def verify_post_condition(
     #    select_option, upload_file 등은 페이지 구조를 바꾸지 않고
     #    요소 자신의 값만 갱신하므로 위 신호로는 잡히지 않는다.
     if before.element_value != after.element_value:
-        signals.append(
-            f"element_value_changed: {before.element_value!r} -> {after.element_value!r}"
-        )
+        if before.element_is_secret or after.element_is_secret:
+            signals.append("element_value_changed: <secret>")
+        else:
+            signals.append(
+                f"element_value_changed: {before.element_value!r} -> {after.element_value!r}"
+            )
     if before.element_checked != after.element_checked:
         signals.append(
             f"element_checked_changed: {before.element_checked} -> {after.element_checked}"
