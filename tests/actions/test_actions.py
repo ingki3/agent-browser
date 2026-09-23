@@ -762,6 +762,36 @@ async def test_open_shadow_click_effect_is_seen(mock_server):
 
 
 @requires_chromium
+async def test_late_effect_within_grace_is_counted(mock_server):
+    """클릭 직후가 아니라 조금 늦게 나타나는 효과도 효과다.
+
+    실제 사이트는 클릭 → 요청 → 렌더링으로 효과가 수십~수백 ms 늦게 뜬다.
+    포커스가 효과로 인정되던 때는 이 경우도 포커스로 통과했다. 포커스를 뺀 뒤
+    대기만 하고 다시 보지 않으면 늦은 효과를 Silent Failure로 판정한다.
+    """
+    from playwright.async_api import async_playwright
+
+    late_page = (
+        "data:text/html;charset=utf-8,"
+        "<button id=b onclick=\"setTimeout(()=>{document.getElementById('o')"
+        ".textContent='저장됨'},80)\">저장</button><p id=o></p>"
+    )
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(late_page)
+        dispatcher, engine = await _make_dispatcher(page)
+        obs = await engine.observe_page(page=page)
+        target = next(e for e in obs.elements if e.role == "button")
+
+        result = await dispatcher.dispatch(ActionType.CLICK, {"element_id": target.element_id})
+        await browser.close()
+
+    assert result.success is True, result.error_message
+    assert "text_changed" in result.data["signals"]
+
+
+@requires_chromium
 async def test_popup_click_counts_as_effect(mock_server):
     """새 탭을 여는 클릭은 원래 페이지가 그대로여도 성공이다."""
     from playwright.async_api import async_playwright

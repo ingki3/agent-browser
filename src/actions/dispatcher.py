@@ -70,8 +70,9 @@ EPOCH_BUMPING_ACTIONS = frozenset(
     {ActionType.NAVIGATE, ActionType.GO_BACK, ActionType.RELOAD, ActionType.SWITCH_FRAME}
 )
 
-#: 효과 없는 클릭 뒤 늦게 뜨는 팝업을 기다리는 시간. 실측(s11_popup) — 새 탭은
-#: click()이 반환되고 20~50ms 뒤에 생겼다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
+#: 효과 없는 클릭 뒤 한 번 더 기다렸다 다시 보는 시간. 실측(s11_popup) — 새 탭은
+#: click()이 반환되고 20~50ms 뒤에 생겼다. 늦게 렌더링되는 효과도 이 안에 들면
+#: 잡힌다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
 POPUP_GRACE_MS = 150
 
 
@@ -407,12 +408,15 @@ class ActionDispatcher:
         # --- [3] 사후조건 검증 ------------------------------------------------
         after = await capture_state(self.ctx.page, handle)
         if not popups and action is ActionType.CLICK:
-            # 다른 효과가 전혀 없을 때만 짧게 더 기다려 늦게 뜨는 팝업을 잡는다.
-            # 효과가 이미 있으면 기다릴 이유가 없다(정상 경로 지연 0).
+            # 효과가 전혀 없을 때만 짧게 더 기다렸다가 **다시 본다**. 실제 사이트는
+            # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
+            # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
+            # 효과가 이미 있으면 기다리지 않는다(정상 경로 지연 0).
             if not verify_post_condition(before, after).satisfied:
                 try:
                     await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
-                except Exception:  # noqa: BLE001
+                    after = await capture_state(self.ctx.page, handle)
+                except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
                     pass
         self._off_popup(_on_popup)
         if popups:
