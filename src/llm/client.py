@@ -244,8 +244,16 @@ class OpenRouterClient:
         last_error = ""
         for attempt in range(self.config.max_retries + 1):
             try:
-                response = await self._client.post(path, json=payload)
-            except httpx.TimeoutException:
+                # 호출 1회에 **전체** 시간 상한을 건다. httpx의 timeout은 바이트
+                # 사이 간격 상한이라, 서버가 조금씩이라도 계속 보내면 끝나지
+                # 않는다. 실측(tier2_som live, 2026-09-23) — 러너가 51분째
+                # OpenRouter 연결 하나를 연 채 CPU 0%로 멈췄다. stream=False인
+                # post()는 본문을 다 읽고(aread) 반환하므로 본문까지 상한 안이다.
+                response = await asyncio.wait_for(
+                    self._client.post(path, json=payload),
+                    timeout=self.config.timeout_s,
+                )
+            except (httpx.TimeoutException, asyncio.TimeoutError):
                 last_error = f"타임아웃 ({self.config.timeout_s}s)"
             except httpx.HTTPError as exc:
                 # 예외 객체를 전파하지 않고 타입명만 남긴다.
