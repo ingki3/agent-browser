@@ -91,10 +91,9 @@ TASKS: Tuple[Task, ...] = (
             TaskStep(ActionType.TYPE_TEXT, "textbox", "성명", {"text": "홍길동"}),
             TaskStep(ActionType.CLICK, "button", "다음 단계"),
         ),
-        # <form> 안의 button은 기본 submit이라 클릭 시 페이지가 리로드된다.
-        # #name에 name 속성이 없어 값도 쿼리스트링에 남지 않으므로,
-        # '제출 네비게이션이 실제로 발생했는가'를 성공 조건으로 삼는다.
-        success_expr="location.href.includes('?')",
+        # 이전 조건 `location.href.includes('?')`는 name 없는 input 때문에 제출이
+        # 빈 '?'만 붙이고 1단계를 다시 그려도 통과했다. 실제로 2단계가 보이는지 본다.
+        success_expr="document.getElementById('title')?.textContent.includes('2/3')",
     ),
     Task(
         "add-to-cart",

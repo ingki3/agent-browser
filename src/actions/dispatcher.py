@@ -70,6 +70,10 @@ EPOCH_BUMPING_ACTIONS = frozenset(
     {ActionType.NAVIGATE, ActionType.GO_BACK, ActionType.RELOAD, ActionType.SWITCH_FRAME}
 )
 
+#: 효과 없는 클릭 뒤 늦게 뜨는 팝업을 기다리는 시간. 실측(s11_popup) — 새 탭은
+#: click()이 반환되고 20~50ms 뒤에 생겼다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
+POPUP_GRACE_MS = 150
+
 
 @dataclass
 class DispatchContext:
@@ -164,6 +168,12 @@ class ActionDispatcher:
         return self._healing_successes / self._healing_attempts
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
+
+    def _off_popup(self, listener: Any) -> None:
+        try:
+            self.ctx.page.remove_listener("popup", listener)
+        except Exception:  # noqa: BLE001 — 가짜 페이지
+            pass
 
     def _current_url(self) -> str:
         try:
@@ -369,10 +379,22 @@ class ActionDispatcher:
 
         # --- [2] 이벤트 발송 -------------------------------------------------
         before = await capture_state(self.ctx.page, handle)
+        # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
+        # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
+        popups: List[Any] = []
+
+        def _on_popup(p: Any) -> None:
+            popups.append(p)
+
+        try:
+            self.ctx.page.on("popup", _on_popup)
+        except Exception:  # noqa: BLE001 — 가짜 페이지
+            pass
         try:
             await self._execute_element_action(action, handle, params)
         except Exception as exc:  # noqa: BLE001
             # 발송 자체가 실패했으므로 부작용이 없다 -> 재시도 안전
+            self._off_popup(_on_popup)
             return self._result(
                 success=False,
                 action=action,
@@ -384,6 +406,35 @@ class ActionDispatcher:
 
         # --- [3] 사후조건 검증 ------------------------------------------------
         after = await capture_state(self.ctx.page, handle)
+        if not popups and action is ActionType.CLICK:
+            # 다른 효과가 전혀 없을 때만 짧게 더 기다려 늦게 뜨는 팝업을 잡는다.
+            # 효과가 이미 있으면 기다릴 이유가 없다(정상 경로 지연 0).
+            if not verify_post_condition(before, after).satisfied:
+                try:
+                    await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._off_popup(_on_popup)
+        if popups:
+            # 팝업 이벤트가 곧 증거다. 스냅샷 탭 수가 아직 안 늘었어도 반영한다.
+            before.page_count = before.page_count or 1
+            after.page_count = max(after.page_count, before.page_count + len(popups))
+
+        # 다운로드는 파일 저장 자체가 효과다 — 페이지는 바뀌지 않는다.
+        downloaded = params.pop("_downloaded_path", None)
+        if downloaded:
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                healed=healed_flag,
+                downloaded_path=downloaded,
+                data={
+                    "signals": [f"file_saved: {downloaded}"],
+                    "element_id": handle.element_id,
+                },
+            )
+
         post = verify_post_condition(
             before,
             after,

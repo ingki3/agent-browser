@@ -327,10 +327,58 @@ def test_text_change_satisfies_post_condition():
     assert result.satisfied is True
 
 
-def test_focus_move_satisfies_post_condition():
-    """클릭이 요소에 도달했다는 증거."""
+def test_focus_move_alone_is_not_an_effect():
+    """포커스 이동만으로는 성공이 아니다.
+
+    포커스는 브라우저가 클릭 시 자동으로 옮긴다 — 클릭이 요소에 **닿았다**는
+    증거일 뿐 무언가 **일어났다**는 증거가 아니다. PRD §4.3 사후조건 목록에도
+    없다. 실측 — onclick 없는 버튼이 1회차에만 성공으로 판정되고(포커스가
+    BODY -> BUTTON), 2회차는 포커스가 그대로라 Silent Failure가 됐다. 같은 무반응
+    버튼이 호출 순서에 따라 성공/실패로 갈렸고, 모델은 성공을 믿고 재클릭했다.
+    """
     result = verify_post_condition(base_state(), base_state(active_element="BUTTON#go"))
+    assert result.satisfied is False
+    assert result.silent_failure is True
+    # 진단용으로 기록은 남는다
+    assert any(s.startswith("focus_moved") for s in result.signals)
+
+
+def test_focus_move_with_effect_still_succeeds():
+    after = base_state(active_element="BUTTON#go", text_signature=9999)
+    result = verify_post_condition(base_state(), after)
     assert result.satisfied is True
+
+
+@pytest.mark.parametrize(
+    "before_url,after_url",
+    [
+        ("https://a.test/form", "https://a.test/form?"),
+        ("https://a.test/form", "https://a.test/form#"),
+        ("https://a.test/form?", "https://a.test/form"),
+    ],
+)
+def test_empty_query_or_fragment_is_not_navigation(before_url, after_url):
+    """핸들러 없는 form submit이 붙이는 빈 '?'는 이동이 아니다.
+
+    실측 — s03_multistep '다음 단계'가 /s03_multistep -> /s03_multistep? 로
+    바뀐 것만으로 성공 판정됐다. 페이지는 그대로였다.
+    """
+    result = verify_post_condition(base_state(url=before_url), base_state(url=after_url))
+    assert result.satisfied is False
+
+
+def test_real_query_change_is_navigation():
+    result = verify_post_condition(
+        base_state(url="https://a.test/form"), base_state(url="https://a.test/form?step=2")
+    )
+    assert result.satisfied is True
+
+
+def test_new_tab_is_an_effect():
+    """팝업(새 탭) 열림은 원래 페이지를 바꾸지 않지만 명백한 효과다."""
+    result = verify_post_condition(base_state(page_count=1), base_state(page_count=2))
+    assert result.satisfied is True
+    assert any(s.startswith("new_tab") for s in result.signals)
 
 
 def test_attribute_toggle_satisfies_post_condition():
@@ -622,6 +670,115 @@ async def test_extract_returns_text(mock_server):
 
     assert result.success is True
     assert "월간 보고서" in result.data["items"]["text"]
+
+
+# --- 사후조건: 도달이 아니라 효과 (실브라우저) ---------------------------------
+
+
+_INERT_BUTTON = (
+    "data:text/html;charset=utf-8,"
+    "<h1>무반응</h1><button id=b>아무 일도 안 하는 버튼</button>"
+)
+
+
+@requires_chromium
+@pytest.mark.parametrize("attempt_twice", [False, True])
+async def test_inert_button_click_is_silent_failure_every_time(mock_server, attempt_twice):
+    """onclick 없는 버튼은 몇 번째 클릭이든 실패여야 한다.
+
+    이전에는 1회차가 포커스 이동(BODY -> BUTTON)만으로 성공, 2회차가 실패였다.
+    판정이 호출 순서에 좌우되면 안 된다.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(_INERT_BUTTON)
+        dispatcher, engine = await _make_dispatcher(page)
+        obs = await engine.observe_page(page=page)
+        target = next(e for e in obs.elements if e.role == "button")
+
+        result = await dispatcher.dispatch(ActionType.CLICK, {"element_id": target.element_id})
+        if attempt_twice:
+            obs = await engine.observe_page(page=page)
+            target = next(e for e in obs.elements if e.role == "button")
+            result = await dispatcher.dispatch(
+                ActionType.CLICK, {"element_id": target.element_id}
+            )
+        await browser.close()
+
+    assert result.success is False
+    assert result.error_code is ErrorCode.TIMEOUT
+
+
+@requires_chromium
+async def test_download_counts_as_effect(mock_server, tmp_path):
+    """파일 저장은 페이지를 바꾸지 않지만 액션의 효과 그 자체다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context(accept_downloads=True)).new_page()
+        await page.goto(mock_server.site_url("s04_download"))
+        dispatcher, engine = await _make_dispatcher(page)
+        obs = await engine.observe_page(page=page)
+        target = next(e for e in obs.elements if "CSV" in e.name)
+
+        result = await dispatcher.dispatch(
+            ActionType.DOWNLOAD_FILE,
+            {"element_id": target.element_id, "save_dir": str(tmp_path)},
+        )
+        await browser.close()
+
+    assert result.success is True, result.error_message
+    assert result.downloaded_path and result.downloaded_path.endswith(".csv")
+
+
+@requires_chromium
+async def test_open_shadow_click_effect_is_seen(mock_server):
+    """shadow 안에서 일어난 변화도 효과다.
+
+    실측 — '주문 확정'을 누르면 shadow 안에 확인 문구가 뜨는데, 상태 캡처가
+    light DOM의 노드 수와 body.innerText만 봐서 변화가 0이었다. 예전에는 포커스
+    이동(BODY -> DIV#host)이 이 사각지대를 가려 성공으로 보였다.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(mock_server.site_url("s06_open_shadow"))
+        dispatcher, engine = await _make_dispatcher(page)
+        obs = await engine.observe_page(page=page)
+        target = next(e for e in obs.elements if "주문 확정" in e.name)
+
+        result = await dispatcher.dispatch(ActionType.CLICK, {"element_id": target.element_id})
+        confirmed = await page.evaluate("document.body.getAttribute('data-result')")
+        await browser.close()
+
+    assert confirmed == "ok"  # 클릭은 실제로 효과가 있었다
+    assert result.success is True, result.error_message
+
+
+@requires_chromium
+async def test_popup_click_counts_as_effect(mock_server):
+    """새 탭을 여는 클릭은 원래 페이지가 그대로여도 성공이다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(mock_server.site_url("s11_popup"))
+        dispatcher, engine = await _make_dispatcher(page)
+        obs = await engine.observe_page(page=page)
+        target = next(e for e in obs.elements if e.role in ("button", "link"))
+
+        result = await dispatcher.dispatch(ActionType.CLICK, {"element_id": target.element_id})
+        await browser.close()
+
+    assert result.success is True, result.error_message
+    assert any(s.startswith("new_tab") for s in result.data["signals"])
 
 
 @requires_chromium
