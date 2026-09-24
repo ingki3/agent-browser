@@ -23,6 +23,8 @@ import pytest
 
 from browser.login_flow import LoginState
 from browser.site_session import (
+    auth_cookie_report,
+    check_remember_me,
     ensure_logged_in,
     install_navigation_guard,
     open_site_context,
@@ -248,6 +250,169 @@ async def test_timeout_fails_and_hides_secrets(tmp_path):
         await ctx.close()
     assert res.source == "failed"
     assert "Pw!-login-9" not in repr(res) and "user_1" not in repr(res)
+
+
+# --- 로그인 상태 유지 · 쿠키 확인 --------------------------------------------
+
+# 네이버 실측 구조(2026-09-24): 보이는 체크박스 + 라벨, 옆에 숨은 'IP 보안' 스위치.
+REMEMBER_FORM = """<!doctype html><meta charset=utf-8><form action="/submit" method="post">
+<input name=id placeholder=아이디><input name=pw type=password placeholder=비밀번호>
+<input type=checkbox id=loginStay name=nvlong role=checkbox>
+<label for=loginStay>로그인 상태 유지</label>
+<input type=checkbox id=switchIP name=ipcheck role=switch aria-label='IP 보안' checked
+       style='position:absolute;width:0;height:0;opacity:0'>
+<label for=switchIP>ON</label>
+<input type=checkbox id=agree><label for=agree>약관 동의</label>
+<button>로그인</button></form>"""
+
+
+@pytest.mark.parametrize("html, sel", [
+    (REMEMBER_FORM, "#loginStay"),
+    # 다른 체크박스가 먼저 나와도 라벨로 골라야 한다
+    ("<input type=checkbox id=agree><label for=agree>약관 동의</label>"
+     "<input type=checkbox id=switchIP checked><label for=switchIP>IP 보안</label>"
+     "<input type=checkbox id=r><label for=r>로그인 상태 유지</label>", "#r"),
+    # 입력은 숨기고 라벨로 그린 체크박스(흔한 커스텀 UI)
+    ("<label><input type=checkbox id=r style='display:none'>Keep me signed in</label>", "#r"),
+    ("<div role=checkbox aria-checked=false id=r tabindex=0 aria-label='자동 로그인' "
+     "onclick=\"this.setAttribute('aria-checked', this.getAttribute('aria-checked')==='true'?'false':'true')\">"
+     "</div>", "#r"),
+])
+async def test_check_remember_me_checks_only_that_box(tmp_path, html, sel):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b = await pw.chromium.launch(headless=True)
+        page = await b.new_page()
+        await page.set_content(html)
+        ok = await check_remember_me(page)
+        state = await page.evaluate(
+            "(s) => { const e = document.querySelector(s);"
+            " return e.type === 'checkbox' ? e.checked : e.getAttribute('aria-checked') === 'true'; }",
+            sel)
+        others = await page.evaluate(
+            "() => Object.fromEntries([...document.querySelectorAll('#switchIP, #agree')]"
+            ".map(e => [e.id, e.checked]))")
+        again = await check_remember_me(page)  # 이미 체크 → 풀지 않는다
+        state2 = await page.evaluate(
+            "(s) => { const e = document.querySelector(s);"
+            " return e.type === 'checkbox' ? e.checked : e.getAttribute('aria-checked') === 'true'; }",
+            sel)
+        await b.close()
+    assert ok is True and state is True
+    assert others in ({}, {"switchIP": True, "agree": False}), "IP 보안·약관 체크를 건드렸습니다"
+    assert again is True and state2 is True, "두 번 부르면 체크가 풀렸습니다"
+
+
+async def test_check_remember_me_reports_missing(tmp_path):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b = await pw.chromium.launch(headless=True)
+        page = await b.new_page()
+        await page.set_content(LOGIN)
+        ok = await check_remember_me(page)
+        await b.close()
+    assert ok is None
+
+
+async def test_auth_cookie_report_shows_lifetime_not_values(tmp_path):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        ctx = await open_site_context(pw, "login.test", root=tmp_path, headless=True)
+
+        async def serve(route):
+            await route.fulfill(body="<p>x</p>", content_type="text/html", headers={
+                "set-cookie": "AUT=secret-value-1; Domain=login.test; Path=/; Max-Age=86400"})
+        await ctx.route("**/*", serve)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto("https://nid.login.test/")
+        await ctx.add_cookies([{"name": "SES", "value": "secret-value-2",
+                                "domain": ".login.test", "path": "/"}])
+        rep = await auth_cookie_report(ctx, "login.test", ["AUT", "SES", "MISSING"])
+        await ctx.close()
+    assert rep["AUT"]["persistent"] is True and 0.9 < rep["AUT"]["days_left"] <= 1.0
+    assert rep["SES"]["persistent"] is False
+    assert rep["MISSING"] is None
+    assert "secret-value" not in repr(rep)
+
+
+class RememberSite(Site):
+    """로그인 폼에 '로그인 상태 유지'가 있고, 첫 제출은 캡차로 폼을 새로 그린다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.captcha_next = True
+        self.posted: list[str] = []
+
+    async def handle(self, route):
+        req = route.request
+        if req.url.endswith("/submit"):
+            self.submits += 1
+            self.posted.append(req.post_data or "")
+            if self.captcha_next:
+                self.captcha_next = False
+                body = REMEMBER_FORM.replace("<button", "<input id=captcha name=captcha><button")
+                await route.fulfill(body=body, content_type="text/html")
+            else:
+                await route.fulfill(body=BRIDGE, content_type="text/html")
+        elif req.url.endswith("/finish") or (
+                "/inbox" in req.url and "sid=ok" in (await req.all_headers()).get("cookie", "")):
+            await super().handle(route)
+        else:  # 로그인 화면·로그인 안 된 메일함 → 체크박스가 있는 폼
+            await route.fulfill(body=REMEMBER_FORM, content_type="text/html")
+
+
+async def test_flow_checks_remember_me_and_rechecks_after_rerender(tmp_path):
+    from playwright.async_api import async_playwright
+
+    seen: dict = {}
+    async with async_playwright() as pw:
+        site = RememberSite()
+        ctx, page = await _ctx(pw, tmp_path, site)
+
+        def on_handoff(info):
+            seen["info"] = info
+
+            async def act():
+                await asyncio.sleep(0.3)
+                await page.click("button")           # 1차 → 캡차로 폼이 새로 그려짐
+                await asyncio.sleep(1.2)
+                await page.fill("#captcha", "abcd")
+                await page.click("button")           # 2차 → 성공
+            asyncio.get_running_loop().create_task(act())
+
+        res = await ensure_logged_in(ctx, page, CRED, login_url=LOGIN_URL, check_url=CHECK_URL,
+                                     on_handoff=on_handoff, human_timeout_s=15,
+                                     poll_ms=100, stable_ms=500)
+        await ctx.close()
+    assert res.source == "human"
+    assert seen["info"].remember_checked is True
+    assert all("nvlong=on" in p for p in site.posted), "두 번 제출 모두 '로그인 상태 유지'가 켜져 있어야 합니다"
+
+
+async def test_flow_respects_user_unchecking(tmp_path):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        site = RememberSite()
+        site.captcha_next = False
+        ctx, page = await _ctx(pw, tmp_path, site)
+
+        def on_handoff(info):
+            async def act():
+                await asyncio.sleep(0.3)
+                await page.uncheck("#loginStay")     # 사람이 일부러 끔
+                await asyncio.sleep(0.6)             # 폴링이 몇 번 돈다
+                await page.click("button")
+            asyncio.get_running_loop().create_task(act())
+
+        await ensure_logged_in(ctx, page, CRED, login_url=LOGIN_URL, check_url=CHECK_URL,
+                               on_handoff=on_handoff, human_timeout_s=15,
+                               poll_ms=100, stable_ms=500)
+        await ctx.close()
+    assert site.posted and "nvlong=on" not in site.posted[0], "사람이 끈 체크를 되돌렸습니다"
 
 
 # --- 이동 제한 ---------------------------------------------------------------

@@ -45,6 +45,8 @@ class HandoffInfo:
     url: str
     username_filled: bool
     password_filled: bool
+    #: '로그인 상태 유지'를 체크했나. True/False, None=칸 없음(또는 끔)
+    remember_checked: Optional[bool] = None
 
 
 @dataclass

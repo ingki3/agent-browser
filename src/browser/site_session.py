@@ -144,6 +144,96 @@ async def verify_logged_in(context: Any, check_url: str, *, stable_ms: int = 200
         await probe.close()
 
 
+async def check_remember_me(page: Any) -> Optional[bool]:
+    """'로그인 상태 유지' 체크박스를 찾아 체크한다(이미 체크돼 있으면 그대로).
+
+    반환: True 체크됨 / False 찾았지만 체크 실패 / None 못 찾음.
+    라벨 문구로만 고른다 — 'IP 보안' 같은 옆 스위치나 약관 동의는 건드리지 않는다.
+    실측(2026-09-24 네이버): input#loginStay[name=nvlong] + label '로그인 상태 유지'.
+    이 칸이 꺼진 채 로그인하면 핵심 쿠키(NID_AUT·NID_SES)가 세션 쿠키로 와서
+    브라우저를 닫는 순간 사라졌다 — 프로필 폴더를 유지해도 로그인이 남지 않는다.
+    """
+    found = await page.evaluate(_MARK_REMEMBER_JS)
+    if not found:
+        return None
+    sel = "[data-ab-remember]"
+    # 1) 사람처럼 누르기(보이는 요소) → 2) 라벨 누르기(숨은 입력 + 라벨로 그린 UI)
+    # → 3) DOM click(크기 0 등 누를 수 없는 요소). 3도 같은 click 이벤트라 페이지
+    # 핸들러가 그대로 돈다(값만 바꾸는 방식과 다름).
+    attempts = [
+        lambda: page.click(sel, timeout=2000),
+        lambda: page.click("[data-ab-remember-label]", timeout=2000),
+        lambda: page.evaluate("document.querySelector('[data-ab-remember]').click()"),
+    ]
+    for attempt in attempts:
+        if await page.evaluate(_REMEMBER_STATE_JS):
+            return True
+        try:
+            await attempt()
+        except Exception:  # noqa: BLE001 - 다음 방법으로
+            continue
+    return bool(await page.evaluate(_REMEMBER_STATE_JS))
+
+
+_REMEMBER_TEXT = r"(로그인\s*상태\s*유지|자동\s*로그인|로그인\s*유지|keep\s+me\s+(signed|logged)\s+in|remember\s+me|stay\s+signed\s+in)"
+
+_MARK_REMEMBER_JS = r"""
+() => {
+  const re = new RegExp(%s, 'i');
+  document.querySelectorAll('[data-ab-remember],[data-ab-remember-label]').forEach(e => {
+    e.removeAttribute('data-ab-remember'); e.removeAttribute('data-ab-remember-label'); });
+  const text = el => {
+    const lab = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null;
+    return [(lab && lab.innerText) || '', (el.closest('label') || {}).innerText || '',
+            el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
+  };
+  for (const el of document.querySelectorAll('input[type=checkbox]')) {
+    if (!re.test(text(el))) continue;
+    el.setAttribute('data-ab-remember', '1');
+    const lab = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : el.closest('label');
+    if (lab) lab.setAttribute('data-ab-remember-label', '1');
+    return 'input';
+  }
+  for (const el of document.querySelectorAll('[role=checkbox]:not(input)')) {
+    if (!re.test(text(el) + ' ' + (el.innerText || ''))) continue;
+    el.setAttribute('data-ab-remember', '1');
+    return 'aria';
+  }
+  return null;
+}
+""" % repr(_REMEMBER_TEXT)
+
+_REMEMBER_STATE_JS = r"""
+() => { const e = document.querySelector('[data-ab-remember]');
+  if (!e) return false;
+  return e.tagName === 'INPUT' ? e.checked : e.getAttribute('aria-checked') === 'true'; }
+"""
+
+
+async def auth_cookie_report(context: Any, domain: str, names: Sequence[str]) -> dict:
+    """로그인 쿠키가 영속인지(브라우저를 닫아도 남는지)와 남은 기간. 값은 담지 않는다."""
+    now = time.time()
+    out: dict = {n: None for n in names}
+    for c in await context.cookies():
+        dom = (c.get("domain") or "").lstrip(".").lower()
+        if c.get("name") in out and (dom == domain or dom.endswith("." + domain)):
+            exp = c.get("expires")
+            persistent = exp is not None and exp > 0
+            out[c["name"]] = {
+                "persistent": persistent,
+                "days_left": round((exp - now) / 86400, 2) if exp is not None and exp > 0 else None,
+                "domain": c.get("domain"),
+            }
+    return out
+
+
+async def _try_remember(page: Any) -> Optional[bool]:
+    try:
+        return await check_remember_me(page)
+    except Exception:  # noqa: BLE001 - 페이지 전환 중
+        return False
+
+
 async def ensure_logged_in(
     context: Any,
     page: Any,
@@ -157,8 +247,13 @@ async def ensure_logged_in(
     poll_ms: int = 1000,
     stable_ms: int = 2000,
     recheck_s: float = 3.0,
+    remember_me: bool = True,
 ) -> SiteSession:
-    """로그인된 상태로 page를 check_url에 둔다. 제출은 사람이 한다."""
+    """로그인된 상태로 page를 check_url에 둔다. 제출은 사람이 한다.
+
+    remember_me: '로그인 상태 유지'를 체크해 둔다. 폼이 새로 그려지면(캡차 화면)
+    다시 체크하지만, 같은 칸을 사람이 끄면 존중한다(되돌리지 않음).
+    """
     started = time.monotonic()
     checks = 0
 
@@ -179,8 +274,10 @@ async def ensure_logged_in(
     except Exception:  # noqa: BLE001 - 다른 도메인·칸 없음
         from browser.login_flow import FillReport
         report = FillReport(False, False)
+    remembered = await _try_remember(page) if remember_me else None
     info = HandoffInfo(state=state, url=page.url.split("?")[0],
-                       username_filled=report.username, password_filled=report.password)
+                       username_filled=report.username, password_filled=report.password,
+                       remember_checked=remembered)
     if on_handoff is not None:
         maybe = on_handoff(info)
         if asyncio.iscoroutine(maybe):
@@ -199,6 +296,11 @@ async def ensure_logged_in(
             state = await read_login_state(page)
             if state is not LoginState.LOGGED_IN:
                 await fill_login_fields(page, cred, only_empty=True)
+                # 표시가 사라졌다 = 폼이 새로 그려졌다(캡차 화면 등) → 다시 체크.
+                # 표시가 남아 있으면 같은 칸이니 사람이 끈 것을 되돌리지 않는다.
+                if remember_me and not await page.evaluate(
+                        "() => !!document.querySelector('[data-ab-remember]')"):
+                    await _try_remember(page)
         except Exception:  # noqa: BLE001 - 페이지 전환 중·다른 도메인
             continue
 
