@@ -103,6 +103,22 @@ async def test_state_login_form_then_captcha_then_logged_in():
         await browser.close()
 
 
+async def test_hidden_captcha_field_on_plain_login_page_is_not_captcha():
+    """실측(2026-09-24 네이버): 평범한 로그인 화면에도 숨은 `ncaptchaSplit` 입력이
+    있다. 이걸 캡차로 보면 자동 로그인을 한 번도 시도하지 않고 바로 사람에게 넘긴다."""
+    from playwright.async_api import async_playwright
+
+    html = LOGIN.replace(
+        "<button", "<input type=hidden id=ncaptchaSplit name=ncaptchaSplit value=none><button"
+    )
+    async with async_playwright() as pw:
+        browser, page = await _page(pw, Site("home"))
+        await page.set_content(html)
+        state = await read_login_state(page)
+        await browser.close()
+    assert state is LoginState.LOGIN_FORM
+
+
 # --- 칸 채우기 ------------------------------------------------------------
 
 

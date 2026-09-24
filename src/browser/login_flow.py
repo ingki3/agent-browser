@@ -95,10 +95,13 @@ _STATE_JS = r"""
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
   };
-  const captcha = !!document.querySelector(
-    "input[id*=captcha i], input[name*=captcha i], input[name=chptchakey], " +
+  // 보이는 것만 캡차로 본다. 실측(2026-09-24 네이버) — 평범한 로그인 화면에도
+  // 숨은 input#ncaptchaSplit이 있어, 존재만 보면 자동 로그인을 건너뛰었다.
+  const captcha = [...document.querySelectorAll(
+    "input[id*=captcha i], input[name*=captcha i], " +
     "iframe[src*=captcha i], iframe[src*=recaptcha i], iframe[src*=hcaptcha i], " +
-    "[class*=g-recaptcha], [class*=h-captcha]");
+    "[class*=g-recaptcha], [class*=h-captcha]")]
+    .some(el => (el.getAttribute('type') || '').toLowerCase() !== 'hidden' && vis(el));
   const pw = [...document.querySelectorAll('input[type=password]')].some(vis);
   return {captcha, pw};
 }
