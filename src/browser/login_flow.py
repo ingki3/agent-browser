@@ -128,18 +128,34 @@ async def read_login_state(page: Any) -> LoginState:
     return LoginState.LOGGED_IN
 
 
-async def fill_login_fields(page: Any, cred: Credential) -> FillReport:
-    """보이는 로그인 칸을 채운다. 현재 페이지가 cred 도메인이 아니면 거부."""
+async def fill_login_fields(page: Any, cred: Credential, *, only_empty: bool = False) -> FillReport:
+    """보이는 로그인 칸을 채운다. 현재 페이지가 cred 도메인이 아니면 거부.
+
+    only_empty=True: 비어 있고 포커스가 없는 칸만 채운다 — 사람이 입력 중인
+    칸을 덮어쓰지 않으면서, 캡차 화면처럼 폼이 새로 그려져 비워진 칸을 되살린다.
+    """
     host = _host(page.url)
     if not host or not _matches(host, cred.domain):
         raise PermissionError(
             f"현재 페이지가 {cred.domain} 도메인이 아니라 자격증명을 입력하지 않습니다."
         )
     found = await page.evaluate(_MARK_FIELDS_JS)
+
+    async def fill(role: str, value: str) -> bool:
+        sel = f"[data-ab-login={role}]"
+        if only_empty:
+            skip = await page.evaluate(
+                "(s) => { const el = document.querySelector(s);"
+                " return !el || el.value !== '' || document.activeElement === el; }", sel)
+            if skip:
+                return False
+        await page.fill(sel, value)
+        return True
+
     if found.get("username"):
-        await page.fill("[data-ab-login=username]", cred.username)
+        await fill("username", cred.username)
     if found.get("password"):
-        await page.fill("[data-ab-login=password]", cred.password)
+        await fill("password", cred.password)
     return FillReport(username=bool(found.get("username")), password=bool(found.get("password")))
 
 
