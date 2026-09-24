@@ -35,7 +35,8 @@ from contracts.thresholds import (
     TIER2_MAX_CALLS_UNATTENDED,
 )
 from llm import BudgetExceeded, BudgetGuard, LLMError, OpenRouterClient
-from llm.config import LLMConfig
+from llm.config import OPENROUTER_BASE_URL, LLMConfig
+from llm.decisions import DecisionsClient
 
 from agent.keywords import keywords_for_step
 from agent.policy import (
@@ -123,6 +124,10 @@ class StepOutcome:
     #: 실측(live 50런) — 이 표기가 없으면 요청 스텝이 FAIL로 히스토리에 남아
     #: LLM이 "요청이 실패했다"고 읽고 재요청, Tier-2 상한을 소진했다.
     judged_success: bool = False
+    #: 판단 주체: "llm"(채팅 모델) | "jev" | "fallback"(Jev가 넘긴 폴백 모델).
+    decided_by: str = "llm"
+    #: Jev가 폴백에게 넘긴 이유(넘기지 않았으면 빈 값).
+    defer_reason: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -140,7 +145,19 @@ class StepOutcome:
             if self.result and self.result.error_code
             else ""
         )
-        return f"{self.decision.action}{target} -> {mark} {detail}".strip()
+        line = f"{self.decision.action}{target} -> {mark} {detail}".strip()
+        # 입력값·키를 남긴다. 실측(2026-09-24 todo-add-two) — 값 없이
+        # 'type_text @e5 -> OK'만 남기면 판단기가 이미 넣은 값을 몰라 같은
+        # 입력을 8번 반복했다. 값은 목표 문장이나 자격증명 키 이름에서 온 것
+        # (치환 전)이라 새 정보를 흘리지 않는다.
+        extra = []
+        if self.decision.text:
+            extra.append(f"'{self.decision.text[:60]}' 입력")
+        if self.decision.value:
+            extra.append(f"'{self.decision.value[:60]}' 선택")
+        if self.decision.key:
+            extra.append(f"키 {self.decision.key}")
+        return line + (f" ({', '.join(extra)})" if extra else "")
 
 
 @dataclass
@@ -221,6 +238,21 @@ class AgentLoop:
         self._grounder = grounder
         #: read_text 결과 — 다음 스텝 프롬프트에 **한 번만** 넣고 비운다.
         self._pending_page_text: Optional[str] = None
+        #: decider="jev"일 때 run()이 만든다.
+        self._jev: Any = None
+        self._jev_client: Any = None
+
+    def _jev_enabled(self) -> bool:
+        """Jev 판단기를 쓸지. OpenRouter base_url에서만 켠다.
+
+        로컬 base_url(예: mlx 127.0.0.1)은 로그인 작업용이다 — 로그인 뒤 화면
+        (메일 제목 등)이 클라우드 모델(Jev)로 가면 안 된다. 설정을 잘못해도
+        페이지 내용이 새지 않게 여기서 막는다.
+        """
+        cfg = self.config
+        if cfg is None or getattr(cfg, "decider", "llm") != "jev":
+            return False
+        return (cfg.base_url or "").rstrip("/") == OPENROUTER_BASE_URL.rstrip("/")
 
     @property
     def tier2_max_calls(self) -> int:
@@ -242,6 +274,15 @@ class AgentLoop:
             run.elapsed_s = time.perf_counter() - started
             run.budget = self.budget.snapshot()
             return run
+
+        self._jev = None
+        self._jev_client = None
+        if self._jev_enabled():
+            from agent.jev_decider import JevDecider
+
+            self._jev_client = DecisionsClient(self.config, self.budget)
+            await self._jev_client.start()
+            self._jev = JevDecider(self._jev_client, limit=self.top_n)
 
         try:
             # 실패 직후 완료 선언 가드 상태 (WS-18 정밀화).
@@ -427,6 +468,8 @@ class AgentLoop:
             run.terminal_reason = str(exc)
         finally:
             await client.close()
+            if self._jev_client is not None:
+                await self._jev_client.close()
 
         run.elapsed_s = time.perf_counter() - started
         run.budget = self.budget.snapshot()
@@ -622,23 +665,64 @@ class AgentLoop:
             som_enabled=self.som_enabled,
             page_text=self._pending_page_text,
         )
+        page_text = self._pending_page_text
         # 한 번 보여 줬으면 비운다 — 매 스텝 붙이면 프롬프트가 계속 커진다.
         self._pending_page_text = None
-        try:
-            response = await client.complete(
-                messages, max_tokens=self.max_tokens
+
+        decided_by, defer_reason, note = "llm", "", ""
+        tokens, cost = 0, 0.0
+        decision: Optional[Decision] = None
+        if self._jev is not None:
+            jr = await self._jev.decide(
+                goal, observation, history=history, page_text=page_text,
+                handles=getattr(self.engine, "_handles", None),
             )
-            decision = parse_decision(response.parse_json())
-        except LLMError as exc:
-            return self._give_up_step(step, observation, started, exc)
+            tokens, cost = jr.tokens, jr.cost_usd
+            defer_reason = jr.defer_reason
+            if not defer_reason and jr.decision is not None:
+                decision, decided_by = parse_decision(jr.decision), "jev"
+            else:
+                try:
+                    response = await client.complete(
+                        messages,
+                        model=self.config.fallback_model,
+                        max_tokens=self.max_tokens,
+                        # 실측 검증 설정: 생각 짧게 + JSON 강제(형식 깨짐 0, 최대 22초)
+                        reasoning={"effort": "low"},
+                        response_format={"type": "json_object"},
+                    )
+                    decision = parse_decision(response.parse_json())
+                    decided_by = "fallback"
+                    tokens += response.total_tokens
+                    cost += response.cost_usd
+                    self._jev.fallback_used(defer_reason)
+                except LLMError as exc:
+                    if jr.decision is None:
+                        return self._give_up_step(step, observation, started, exc)
+                    # 폴백이 막혀도 Jev 답이 있으면 쓴다(스텝을 버리지 않는다).
+                    decision, decided_by = parse_decision(jr.decision), "jev"
+                    note = f"폴백 실패 → Jev 답 사용: {str(exc)[:60]}"
+        else:
+            try:
+                response = await client.complete(
+                    messages, max_tokens=self.max_tokens
+                )
+                decision = parse_decision(response.parse_json())
+            except LLMError as exc:
+                return self._give_up_step(step, observation, started, exc)
+            tokens, cost = response.total_tokens, response.cost_usd
 
         outcome = StepOutcome(
             step=step,
             decision=decision,
             observed=len(observation.elements),
-            llm_tokens=response.total_tokens,
-            llm_cost=response.cost_usd,
+            llm_tokens=tokens,
+            llm_cost=cost,
+            decided_by=decided_by,
+            defer_reason=defer_reason,
         )
+        if note:
+            outcome.note = note
 
         if decision.is_terminal:
             outcome.latency_ms = (time.perf_counter() - started) * 1000
