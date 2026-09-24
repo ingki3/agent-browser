@@ -3,7 +3,10 @@
     open_site_context()  — 사이트마다 영속 프로필 폴더(권한 700)로 브라우저를 연다
     ensure_logged_in()   — 보호 페이지를 열어 보고 로그인돼 있으면 끝.
                            아니면 칸을 채워 두고(제출 안 함) 사람에게 넘긴다.
-                           완료 판정은 '화면이 안정된 뒤 새 탭으로 보호 페이지 확인'.
+                           완료 판정은 '사람이 보는 탭이 보호 페이지에서 안정됨'.
+                           새 탭·반복 이동으로 확인하지 않는다(네이버에서 3초마다
+                           메일함↔로그인 화면이 1분간 반복된 실측, 2026-09-24).
+    LoginTracer          — 탭·주소·로그인 상태·로그인 쿠키 변화를 값 없이 기록
     install_navigation_guard() — 에이전트가 그 사이트 밖으로 이동하지 못하게 한다
 
 실측 교정(2026-09-24 네이버):
@@ -23,6 +26,7 @@ import pytest
 
 from browser.login_flow import LoginState
 from browser.site_session import (
+    LoginTracer,
     auth_cookie_report,
     check_remember_me,
     ensure_logged_in,
@@ -41,6 +45,8 @@ LOGIN = """<!doctype html><meta charset=utf-8><form action="/submit" method="pos
 <button>로그인</button></form>"""
 HOME = "<!doctype html><meta charset=utf-8><h1>받은메일함</h1>"
 # 제출 뒤 잠깐 머무는 중간 화면 — 로그인 화면도 아니고 아직 쿠키도 없다.
+FINISH = """<!doctype html><meta charset=utf-8><p>로그인 완료</p>
+<script>setTimeout(()=>location.replace('https://mail.login.test/inbox'), 300)</script>"""
 BRIDGE = """<!doctype html><meta charset=utf-8><p>이동 중…</p>
 <script>setTimeout(()=>location.href='/finish', 1200)</script>"""
 
@@ -79,7 +85,8 @@ class Site:
                 return
             await route.fulfill(body=BRIDGE, content_type="text/html")
         elif url.endswith("/finish"):
-            await route.fulfill(status=200, body=HOME, content_type="text/html", headers={
+            # 쿠키를 받고 보호 페이지로 간다(네이버: signin/finalize → mail.naver.com)
+            await route.fulfill(status=200, body=FINISH, content_type="text/html", headers={
                 "set-cookie": "sid=ok; Domain=login.test; Path=/; Max-Age=86400"})
         elif "/inbox" in url and "sid=ok" in cookie:
             await route.fulfill(body=HOME, content_type="text/html")
@@ -413,6 +420,97 @@ async def test_flow_respects_user_unchecking(tmp_path):
                                poll_ms=100, stable_ms=500)
         await ctx.close()
     assert site.posted and "nvlong=on" not in site.posted[0], "사람이 끈 체크를 되돌렸습니다"
+
+
+# --- 확인 방식: 새 탭·반복 이동 금지 + 진단 기록 ----------------------------
+
+
+class CountingSite(Site):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inbox_hits = 0
+
+    async def handle(self, route):
+        if "/inbox" in route.request.url:
+            self.inbox_hits += 1
+        await super().handle(route)
+
+
+async def test_login_check_opens_no_tabs_and_does_not_renavigate(tmp_path):
+    """네이버 실측: 3초마다 새 탭으로 메일함을 열어 확인하다 메일함↔로그인이
+    1분간 반복됐다. 사람이 보는 탭만 지켜보고, 이미 보호 페이지면 다시 이동하지 않는다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        site = CountingSite()
+        ctx, page = await _ctx(pw, tmp_path, site)
+        opened: list = []
+        ctx.on("page", lambda p: opened.append(p))
+        res = await ensure_logged_in(ctx, page, CRED, login_url=LOGIN_URL, check_url=CHECK_URL,
+                                     on_handoff=_human_submits(page, []), human_timeout_s=15,
+                                     poll_ms=100, stable_ms=500)
+        await asyncio.sleep(1.0)  # 끝난 뒤 뒤늦은 이동도 없어야 한다
+        await ctx.close()
+    assert res.source == "human", res.note
+    assert opened == [], f"확인용 탭을 {len(opened)}개 열었습니다"
+    # 1) 시작 때 프로필 확인 1회 + 2) 로그인 뒤 사이트가 스스로 보낸 1회 — 그 밖에는 없어야
+    assert site.inbox_hits == 2, f"보호 페이지 요청 {site.inbox_hits}회"
+
+
+async def test_done_signal_navigates_once_when_not_on_protected_page(tmp_path):
+    """사람이 '완료'를 알렸는데 보호 페이지가 아닌 곳에 있으면 그 탭을 한 번만 이동해 본다."""
+    from playwright.async_api import async_playwright
+
+    done = asyncio.Event()
+    async with async_playwright() as pw:
+        site = CountingSite()
+        ctx, page = await _ctx(pw, tmp_path, site)
+
+        def on_handoff(info):
+            async def act():
+                # 사람이 다른 방법으로 로그인하고 다른 페이지에 머묾
+                await ctx.add_cookies([{"name": "sid", "value": "ok", "domain": ".login.test",
+                                        "path": "/", "expires": 4102444800}])
+                await page.goto("https://www.login.test/home")
+                await asyncio.sleep(0.5)
+                done.set()
+            asyncio.get_running_loop().create_task(act())
+
+        res = await ensure_logged_in(ctx, page, CRED, login_url=LOGIN_URL, check_url=CHECK_URL,
+                                     on_handoff=on_handoff, done_event=done,
+                                     human_timeout_s=15, poll_ms=100, stable_ms=60_000)
+        url = page.url
+        await ctx.close()
+    assert res.source == "human", res.note
+    assert "/inbox" in url
+    assert site.inbox_hits == 2, f"보호 페이지 요청 {site.inbox_hits}회(시작 1 + 신호 뒤 1)"
+
+
+async def test_tracer_records_tabs_urls_states_and_cookie_lifetime_without_values(tmp_path):
+    from playwright.async_api import async_playwright
+
+    events: list = []
+    async with async_playwright() as pw:
+        ctx, page = await _ctx(pw, tmp_path, Site())
+        tracer = LoginTracer(ctx, "login.test", ["sid"], sink=events.append)
+        await tracer.start()
+        await ensure_logged_in(ctx, page, CRED, login_url=LOGIN_URL + "?token=SECRET-Q",
+                               check_url=CHECK_URL, on_handoff=_human_submits(page, []),
+                               human_timeout_s=15, poll_ms=100, stable_ms=500, tracer=tracer)
+        await tracer.poll()
+        tracer.stop()
+        await ctx.close()
+    kinds = {e["kind"] for e in events}
+    assert {"nav", "state", "cookie", "result"} <= kinds, kinds
+    navs = [e for e in events if e["kind"] == "nav"]
+    assert all(e["tab"] == 0 for e in navs)
+    assert any(e["url"].startswith("https://mail.login.test/inbox") for e in navs)
+    sid = [e for e in events if e["kind"] == "cookie" and e["name"] == "sid"]
+    assert sid and sid[-1]["present"] and sid[-1]["persistent"] and sid[-1]["days_left"] > 0.9
+    blob = repr(events)
+    for secret in ("Pw!-login-9", "user_1", "SECRET-Q", "=ok"):
+        assert secret not in blob, f"기록에 값이 들어갔습니다: {secret}"
+    assert "token" in blob, "쿼리는 키 이름만 남긴다"
 
 
 # --- 이동 제한 ---------------------------------------------------------------
