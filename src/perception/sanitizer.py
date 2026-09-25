@@ -82,7 +82,8 @@ COLLECT_SCRIPT = """
     const alt = el.getAttribute('alt');
     if (alt && alt.trim()) return alt.trim();
 
-    const value = el.getAttribute('value');
+    // 비밀번호 필드는 value 속성을 이름으로 쓰지 않는다 — 이름은 프롬프트에 들어간다.
+    const value = el.type === 'password' ? null : el.getAttribute('value');
     if (value && value.trim()) return value.trim();
 
     // 라벨이 전혀 없는 인풋은 name/id를 폴백으로 쓴다.
@@ -264,7 +265,9 @@ COLLECT_SCRIPT = """
         seq: seq++,
         role: role,
         name: name,
-        value: el.value !== undefined ? String(el.value).slice(0, 200) : null,
+        // 비밀번호 필드 값은 읽지 않는다 — 관찰 결과는 MCP로 LLM에 그대로 간다.
+        value: el.value === undefined ? null
+             : (el.type === 'password' ? (el.value ? '<secret>' : '') : String(el.value).slice(0, 200)),
         tag: el.tagName.toLowerCase(),
         testid: el.getAttribute('data-testid') || el.getAttribute('data-test-id') || null,
         href: el.getAttribute('href') || null,

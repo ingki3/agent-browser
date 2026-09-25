@@ -1,6 +1,7 @@
-"""Mock 사이트 20종 정의 및 정적 서버 (src/AGENTS.md §5 WS-6 수용 기준).
+"""Mock 사이트 25종 정의 및 정적 서버 (src/AGENTS.md §5 WS-6 수용 기준).
 
-13대 필수 시나리오를 20종 사이트에 분산 배치한다. 각 사이트는 단일 HTML
+13대 필수 시나리오를 22종 사이트에 분산 배치하고, Stage 4 Tier-2(SoM)
+실패 유발 페이지 3종(icon-buttons / obfuscated-labels / canvas-ui)을 더한다. 각 사이트는 단일 HTML
 문자열로 생성되며, 외부 네트워크 의존이 전혀 없다(플레이키 방지).
 
 시나리오 커버리지는 `Scenario` Enum과 각 사이트의 `scenarios` 선언으로
@@ -106,6 +107,19 @@ def _build_sites() -> List[MockSite]:
                 <input id="otp" name="otp" inputmode="numeric" maxlength="6">
                 <button id="verify">인증 확인</button>
                 <button id="resend">코드 재전송</button>
+                <p id="status" hidden></p>
+                <script>
+                  const s = document.getElementById('status');
+                  document.getElementById('verify').addEventListener('click', () => {
+                    s.hidden = false;
+                    s.textContent = '인증 코드를 확인하는 중입니다';
+                    document.body.setAttribute('data-result', 'ok');
+                  });
+                  document.getElementById('resend').addEventListener('click', () => {
+                    s.hidden = false;
+                    s.textContent = '코드를 다시 보냈습니다';
+                  });
+                </script>
                 """,
             ),
         )
@@ -122,12 +136,20 @@ def _build_sites() -> List[MockSite]:
             html=_page(
                 "신청서 작성",
                 """
-                <h1>신청서 (1/3단계)</h1>
+                <h1 id="title">신청서 (1/3단계)</h1>
                 <form id="step1">
-                  <label for="name">성명</label><input id="name">
+                  <label for="name">성명</label><input id="name" name="name">
                   <label for="doc">증빙 서류</label><input id="doc" type="file">
                   <button id="next">다음 단계</button>
                 </form>
+                <script>
+                  // 제출하면 실제 다단계 폼처럼 다음 단계가 보인다. 이전에는 input에
+                  // name이 없어 제출이 빈 '?'만 붙인 채 1단계를 다시 그렸고, 하네스는
+                  // 그 '?'를 "다음 단계로 넘어감"으로 셌다(검증기도 URL 전환으로 셌다).
+                  if (new URLSearchParams(location.search).has('name')) {
+                    document.getElementById('title').textContent = '신청서 (2/3단계)';
+                  }
+                </script>
                 """,
             ),
         )
@@ -181,7 +203,11 @@ def _build_sites() -> List[MockSite]:
                 <script>
                   const host = document.getElementById('host');
                   const root = host.attachShadow({mode: 'open'});
-                  root.innerHTML = '<button id="inner-open">주문 확정</button>';
+                  root.innerHTML = '<button id="inner-open">주문 확정</button><p id="done" hidden>주문이 확정되었습니다</p>';
+                  root.getElementById('inner-open').addEventListener('click', () => {
+                    root.getElementById('done').hidden = false;
+                    document.body.setAttribute('data-result', 'ok');
+                  });
                 </script>
                 """,
             ),
@@ -255,8 +281,10 @@ def _build_sites() -> List[MockSite]:
                 <h1>특가 상품</h1>
                 <div id="ad">광고 A</div>
                 <button id="cart">장바구니 담기</button>
+                <p id="count">장바구니 0개</p>
                 <script>
                   let n = 0;
+                  let inCart = 0;
                   setInterval(() => {
                     const ad = document.getElementById('ad');
                     ad.remove();
@@ -265,6 +293,10 @@ def _build_sites() -> List[MockSite]:
                     fresh.textContent = '광고 ' + (++n);
                     document.body.insertBefore(fresh, document.getElementById('cart'));
                   }, 200);
+                  document.getElementById('cart').addEventListener('click', () => {
+                    document.getElementById('count').textContent = '장바구니 ' + (++inCart) + '개';
+                    document.body.setAttribute('data-result', 'ok');
+                  });
                 </script>
                 """,
             ),
@@ -362,10 +394,17 @@ def _build_sites() -> List[MockSite]:
                 """
                 <h1>지연 콘텐츠</h1>
                 <div id="slot">불러오는 중...</div>
+                <p id="status" hidden></p>
                 <script>
                   setTimeout(() => {
                     document.getElementById('slot').innerHTML =
                       '<button id="lazy-btn">지연 로딩 버튼</button>';
+                    document.getElementById('lazy-btn').addEventListener('click', () => {
+                      const s = document.getElementById('status');
+                      s.hidden = false;
+                      s.textContent = '지연 콘텐츠를 열었습니다';
+                      document.body.setAttribute('data-result', 'ok');
+                    });
                   }, 300);
                 </script>
                 """,
@@ -565,12 +604,193 @@ def _build_sites() -> List[MockSite]:
                 <div class="cta">
                   <button id="checkout">주문 결제하기</button>
                 </div>
+                <p id="status" hidden></p>
                 <footer>
                   <a href="/s22_dense/terms">약관</a>
                   <a href="/s22_dense/privacy">개인정보</a>
                   <a href="/s22_dense/help">고객센터</a>
                 </footer>
+                <script>
+                  document.getElementById('checkout').addEventListener('click', () => {{
+                    const s = document.getElementById('status');
+                    s.hidden = false;
+                    s.textContent = '결제 페이지로 이동합니다';
+                    document.body.setAttribute('data-result', 'ok');
+                  }});
+                </script>
                 """,
+            ),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 4 Tier-2 실패 유발 페이지 3종 (PRD §3.1 SoM 폴백)
+    #
+    # Tier-1 텍스트 파이프라인이 **실제로 실패해야** 발동률 측정이 유형 D(미탐)가
+    # 되지 않는다. 세 페이지 모두 golden_target을 두지 않는다 — 텍스트로
+    # 정답을 지목할 수 없는 페이지라 Recall 골든셋(Tier-1 측정 도구 검증)에
+    # 끼어들면 그 자체가 결함이다. 정답 판정은 클릭 후 body[data-result="ok"].
+    # ------------------------------------------------------------------
+
+    # 23. 아이콘 전용 버튼 — 텍스트/aria-label 없음. 정답은 3번째(장바구니 모양).
+    sites.append(
+        MockSite(
+            site_id="icon-buttons",
+            title="아이콘 툴바",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "아이콘 툴바",
+                """
+                <h1>도구</h1>
+                <div id="toolbar">
+                  <button class="ic" id="ic1"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="M15 15l6 6"/></svg></button>
+                  <button class="ic" id="ic2"><svg viewBox="0 0 24 24"><path d="M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z"/></svg></button>
+                  <button class="ic" id="ic3"><svg viewBox="0 0 24 24"><path d="M3 4h2l3 11h11l3-8H7"/><circle cx="10" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/></svg></button>
+                  <button class="ic" id="ic4"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
+                  <button class="ic" id="ic5"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16"/></svg></button>
+                </div>
+                <div id="drawer" hidden><h2>장바구니</h2><p>담긴 상품 0개</p></div>
+                <div id="other" hidden></div>
+                <script>
+                  // 실측 — 겉으로 아무 변화 없이 data-result만 바뀌면 에이전트는
+                  // 정답을 눌렀는지 알 수 없어 다시 요청한다(Tier-2 상한 소진).
+                  // 실제 사이트처럼 가시적 피드백(드로어)을 보여준다.
+                  document.getElementById('ic3').addEventListener('click', () => {
+                    document.body.setAttribute('data-result', 'ok');
+                    document.getElementById('drawer').hidden = false;
+                  });
+                  // 오답 아이콘도 실제 사이트처럼 **무언가 한다**(검색창, 홈 등).
+                  // 무반응이면 사후조건 검증상 실패가 되어, "눌렀는데 엉뚱한 것이
+                  // 열렸다"는 실제 헛수고 양상(성공-but-헛수고)을 재현하지 못한다.
+                  const OTHER = {ic1: '검색 창', ic2: '홈 화면', ic4: '설정 화면', ic5: '메뉴'};
+                  for (const [id, label] of Object.entries(OTHER)) {
+                    document.getElementById(id).addEventListener('click', () => {
+                      const o = document.getElementById('other');
+                      o.hidden = false;
+                      o.textContent = label + '이(가) 열렸습니다';
+                    });
+                  }
+                </script>
+                """,
+                head="""<style>
+                  #toolbar { display: flex; gap: 12px; }
+                  .ic { width: 48px; height: 48px; padding: 8px; border: 1px solid #444;
+                        background: #fafafa; border-radius: 6px; }
+                  .ic svg { width: 100%; height: 100%; fill: none; stroke: #222; stroke-width: 2; }
+                </style>""",
+            ),
+        )
+    )
+
+    # 24. 난독화 라벨 — 텍스트는 해시, 시각 구분은 CSS 배경(스프라이트 모사)뿐.
+    #     정답은 '검색' 스타일(돋보기 그라디언트)이 입혀진 q9zz 버튼.
+    sites.append(
+        MockSite(
+            site_id="obfuscated-labels",
+            title="난독화 라벨",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "난독화 라벨",
+                """
+                <h1>x1a9</h1>
+                <div id="bar">
+                  <button class="k k-home" id="k1">x7f2</button>
+                  <button class="k k-search" id="k2">q9zz</button>
+                  <button class="k k-cart" id="k3">m3ke</button>
+                  <button class="k k-user" id="k4">p0lr</button>
+                </div>
+                <div id="panel" hidden><input type="search" placeholder="검색어를 입력하세요" autofocus></div>
+                <div id="other" hidden></div>
+                <script>
+                  // 가시적 피드백 — icon-buttons와 같은 이유.
+                  document.getElementById('k2').addEventListener('click', () => {
+                    document.body.setAttribute('data-result', 'ok');
+                    document.getElementById('panel').hidden = false;
+                  });
+                  // 오답 버튼도 무언가 한다 — icon-buttons와 같은 이유.
+                  const OTHER = {k1: '홈', k3: '장바구니', k4: '내 정보'};
+                  for (const [id, label] of Object.entries(OTHER)) {
+                    document.getElementById(id).addEventListener('click', () => {
+                      const o = document.getElementById('other');
+                      o.hidden = false;
+                      o.textContent = label + ' 화면';
+                    });
+                  }
+                </script>
+                """,
+                head="""<style>
+                  #bar { display: flex; gap: 10px; }
+                  .k { width: 96px; height: 40px; border: 1px solid #333; color: #333;
+                       font-family: monospace; background-repeat: no-repeat;
+                       background-position: 6px center; background-size: 24px 24px;
+                       padding-left: 34px; text-align: left; }
+                  .k-home { background-color: #e8f0ff; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z' fill='%23335'/></svg>"); }
+                  .k-search { background-color: #fff3d6; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='10' cy='10' r='6' fill='none' stroke='%23a60' stroke-width='2.5'/><path d='M15 15l6 6' stroke='%23a60' stroke-width='2.5'/></svg>"); }
+                  .k-cart { background-color: #e6ffe6; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 4h2l3 11h11l3-8H7' fill='none' stroke='%23262' stroke-width='2'/></svg>"); }
+                  .k-user { background-color: #ffe6f0; background-image:
+                    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='8' r='4' fill='%23623'/><path d='M4 21c0-4 4-6 8-6s8 2 8 6' fill='%23623'/></svg>"); }
+                </style>""",
+            ),
+        )
+    )
+
+    # 25. 순수 Canvas UI (옵션 B) — DOM 상호작용 요소가 0개.
+    #     후보 수집기가 빈 리스트를 반환해야 하는 페이지이며, 좌표 클릭으로만
+    #     정답(장바구니 사각형: x 220..380, y 100..200)에 도달할 수 있다.
+    sites.append(
+        MockSite(
+            site_id="canvas-ui",
+            title="캔버스 UI",
+            scenarios=(Scenario.SPA_ROUTING,),
+            html=_page(
+                "캔버스 UI",
+                """
+                <canvas id="ui" width="600" height="300"></canvas>
+                <div id="status" hidden></div>
+                <script>
+                  const RECTS = [
+                    { label: '검색',     x: 20,  y: 100, w: 160, h: 100, color: '#dbe9ff' },
+                    { label: '장바구니', x: 220, y: 100, w: 160, h: 100, color: '#dfffe0' },
+                    { label: '설정',     x: 420, y: 100, w: 160, h: 100, color: '#ffe8d6' },
+                  ];
+                  const cv = document.getElementById('ui');
+                  const ctx = cv.getContext('2d');
+                  ctx.fillStyle = '#fff';
+                  ctx.fillRect(0, 0, cv.width, cv.height);
+                  for (const r of RECTS) {
+                    ctx.fillStyle = r.color;
+                    ctx.fillRect(r.x, r.y, r.w, r.h);
+                    ctx.strokeStyle = '#333';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(r.x, r.y, r.w, r.h);
+                    ctx.fillStyle = '#111';
+                    ctx.font = '24px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(r.label, r.x + r.w / 2, r.y + r.h / 2);
+                  }
+                  cv.addEventListener('click', (ev) => {
+                    const b = cv.getBoundingClientRect();
+                    const x = ev.clientX - b.left;
+                    const y = ev.clientY - b.top;
+                    for (const r of RECTS) {
+                      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+                        const hit = r.label === '장바구니';
+                        document.body.setAttribute('data-result', hit ? 'ok' : 'wrong');
+                        // 가시적 피드백 — 맞으면 드로어, 틀리면 무엇을 눌렀는지.
+                        const s = document.getElementById('status');
+                        s.hidden = false;
+                        s.textContent = hit ? '장바구니: 담긴 상품 0개' : r.label + ' 화면 (장바구니 아님)';
+                        return;
+                      }
+                    }
+                  });
+                </script>
+                """,
+                head="<style>body{margin:0} #ui{display:block}</style>",
             ),
         )
     )

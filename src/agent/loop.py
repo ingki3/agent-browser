@@ -22,15 +22,21 @@ Top-20에 들지 못하고, LLM은 정확하게 "필요한 요소가 없다"고 
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from contracts import ActionResult, ActionType, ErrorCode, ObserveResult
-from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
+from contracts import ActionResult, ActionType, BBox, ErrorCode, ObserveResult
+from contracts.thresholds import (
+    MAX_WALL_CLOCK_SECONDS,
+    TIER2_MAX_CALLS_INTERACTIVE,
+    TIER2_MAX_CALLS_UNATTENDED,
+)
 from llm import BudgetExceeded, BudgetGuard, LLMError, OpenRouterClient
-from llm.config import LLMConfig
+from llm.config import OPENROUTER_BASE_URL, LLMConfig
+from llm.decisions import DecisionsClient
 
 from agent.keywords import keywords_for_step
 from agent.policy import (
@@ -80,6 +86,25 @@ MAX_CONSECUTIVE_FAILURES = 3
 SETTLE_TIMEOUT_MS = 8000
 SETTLE_EXTRA_MS = 600
 
+#: Tier-2 발동 조건 — 같은 목표에 대한 **무해하지 않은** 연속 실패 횟수
+#: (PRD §3.1 사다리: Tier-1 2회 실패 -> SoM). 구식 참조 실패(WS-18)는
+#: 직전 성공의 부산물이므로 세지 않는다.
+TIER2_TRIGGER_FAILURES = 2
+
+#: Tier-2에서 element_id를 바꿔 그대로 재실행할 수 있는 액션. 그 밖의
+#: 액션(navigate, scroll 등)이 마지막 실패였다면 클릭으로 대체한다 —
+#: 시각 폴백이 답할 수 있는 것은 "어느 요소인가"뿐이기 때문이다.
+_TIER2_REPLAYABLE = frozenset(
+    {
+        ActionType.CLICK,
+        ActionType.TYPE_TEXT,
+        ActionType.HOVER,
+        ActionType.SELECT_OPTION,
+        ActionType.CHECK_BOX,
+        ActionType.PRESS_KEY,
+    }
+)
+
 
 @dataclass
 class StepOutcome:
@@ -93,11 +118,23 @@ class StepOutcome:
     llm_tokens: int = 0
     llm_cost: float = 0.0
     note: str = ""
+    #: Tier-2 VLM 왕복 지연 (Gate 4 p95 재료). Tier-1 스텝은 0.
+    vision_latency_ms: float = 0.0
+    #: 수용된 `request_vision`처럼 액션을 실행하지 않고도 성공인 판단 스텝.
+    #: 실측(live 50런) — 이 표기가 없으면 요청 스텝이 FAIL로 히스토리에 남아
+    #: LLM이 "요청이 실패했다"고 읽고 재요청, Tier-2 상한을 소진했다.
+    judged_success: bool = False
+    #: 판단 주체: "llm"(채팅 모델) | "jev" | "fallback"(Jev가 넘긴 폴백 모델).
+    decided_by: str = "llm"
+    #: Jev가 폴백에게 넘긴 이유(넘기지 않았으면 빈 값).
+    defer_reason: str = ""
 
     @property
     def succeeded(self) -> bool:
         if self.decision.is_terminal:
             return self.decision.action == FINISH
+        if self.judged_success:
+            return True
         return bool(self.result and self.result.success)
 
     def summary(self) -> str:
@@ -108,7 +145,19 @@ class StepOutcome:
             if self.result and self.result.error_code
             else ""
         )
-        return f"{self.decision.action}{target} -> {mark} {detail}".strip()
+        line = f"{self.decision.action}{target} -> {mark} {detail}".strip()
+        # 입력값·키를 남긴다. 실측(2026-09-24 todo-add-two) — 값 없이
+        # 'type_text @e5 -> OK'만 남기면 판단기가 이미 넣은 값을 몰라 같은
+        # 입력을 8번 반복했다. 값은 목표 문장이나 자격증명 키 이름에서 온 것
+        # (치환 전)이라 새 정보를 흘리지 않는다.
+        extra = []
+        if self.decision.text:
+            extra.append(f"'{self.decision.text[:60]}' 입력")
+        if self.decision.value:
+            extra.append(f"'{self.decision.value[:60]}' 선택")
+        if self.decision.key:
+            extra.append(f"키 {self.decision.key}")
+        return line + (f" ({', '.join(extra)})" if extra else "")
 
 
 @dataclass
@@ -122,6 +171,8 @@ class TaskRun:
     budget: Dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
     final_url: str = ""
+    #: Tier-2 SoM 발동 횟수 (PRD §3.4 태스크당 상한 대상)
+    tier2_calls: int = 0
 
     @property
     def step_count(self) -> int:
@@ -144,6 +195,7 @@ class TaskRun:
             "elapsed_s": round(self.elapsed_s, 2),
             "final_url": self.final_url,
             "budget": self.budget,
+            "tier2_calls": self.tier2_calls,
             "trace": [s.summary() for s in self.steps],
         }
 
@@ -166,6 +218,9 @@ class AgentLoop:
         max_steps: int = 0,
         top_n: int = 20,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        som_enabled: bool = False,
+        unattended: bool = True,
+        grounder: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.page = page
         self.engine = engine
@@ -175,6 +230,33 @@ class AgentLoop:
         self.max_steps = max_steps or self.budget.max_steps
         self.top_n = top_n
         self.max_tokens = max_tokens
+        # Tier-2 SoM (PRD §3.1). 기본 off — 꺼져 있으면 아래 경로는 전혀
+        # 타지 않으며 기존 동작과 동일하다. `grounder`는 테스트 주입용이며
+        # 기본값은 `vision.grounder.ground`(지연 import).
+        self.som_enabled = som_enabled
+        self.unattended = unattended
+        self._grounder = grounder
+        #: read_text 결과 — 다음 스텝 프롬프트에 **한 번만** 넣고 비운다.
+        self._pending_page_text: Optional[str] = None
+        #: decider="jev"일 때 run()이 만든다.
+        self._jev: Any = None
+        self._jev_client: Any = None
+
+    def _jev_enabled(self) -> bool:
+        """Jev 판단기를 쓸지. OpenRouter base_url에서만 켠다.
+
+        로컬 base_url(예: mlx 127.0.0.1)은 로그인 작업용이다 — 로그인 뒤 화면
+        (메일 제목 등)이 클라우드 모델(Jev)로 가면 안 된다. 설정을 잘못해도
+        페이지 내용이 새지 않게 여기서 막는다.
+        """
+        cfg = self.config
+        if cfg is None or getattr(cfg, "decider", "llm") != "jev":
+            return False
+        return (cfg.base_url or "").rstrip("/") == OPENROUTER_BASE_URL.rstrip("/")
+
+    @property
+    def tier2_max_calls(self) -> int:
+        return TIER2_MAX_CALLS_UNATTENDED if self.unattended else TIER2_MAX_CALLS_INTERACTIVE
 
     async def run(self, goal: str) -> TaskRun:
         """목표를 달성할 때까지 루프를 돌린다."""
@@ -193,6 +275,15 @@ class AgentLoop:
             run.budget = self.budget.snapshot()
             return run
 
+        self._jev = None
+        self._jev_client = None
+        if self._jev_enabled():
+            from agent.jev_decider import JevDecider
+
+            self._jev_client = DecisionsClient(self.config, self.budget)
+            await self._jev_client.start()
+            self._jev = JevDecider(self._jev_client, limit=self.top_n)
+
         try:
             # 실패 직후 완료 선언 가드 상태 (WS-18 정밀화).
             # last_action_failed: 직전에 실행한 실제 액션의 성공 여부
@@ -203,6 +294,11 @@ class AgentLoop:
             last_failure_harmless = False
             finish_rejected = False
             last_success_element: Optional[str] = None
+            # Tier-2 발동 판정용 — 무해하지 않은 연속 실패 수와 마지막 실패 판단.
+            tier2_pressure = 0
+            last_failed_decision: Optional[Decision] = None
+            #: LLM이 직전 스텝에서 request_vision을 골랐으면 그 Decision.
+            vision_requested: Optional[Decision] = None
 
             for step in range(1, self.max_steps + 1):
                 # PRD 실행 시간 상한 — 태스크당 Wall-Clock 10분.
@@ -227,9 +323,36 @@ class AgentLoop:
                     run.terminal_reason = str(exc)
                     break
 
-                outcome = await self._run_step(
-                    client, goal, step, history, failures
+                # 두 발동 경로 (PRD §3.1 + 실측 보강):
+                #  (1) 무해하지 않은 연속 실패 2회 — 원안.
+                #  (2) LLM의 자발 요청(request_vision) — 성공-but-헛수고
+                #      (라벨 없는 아이콘을 순서대로 다 눌러보는) 양상은
+                #      (1)로는 영원히 안 잡힌다. 실측 — icon-buttons live.
+                escalate = self.som_enabled and (
+                    (tier2_pressure >= TIER2_TRIGGER_FAILURES and last_failed_decision is not None)
+                    or vision_requested is not None
                 )
+                if escalate:
+                    # 태스크당 상한 (PRD §3.4). 무인 3회 / 대화형 5회.
+                    if run.tier2_calls >= self.tier2_max_calls:
+                        run.terminal_reason = (
+                            f"{ErrorCode.TIER2_BUDGET_EXCEEDED.value}: Tier-2 SoM "
+                            f"호출 상한({self.tier2_max_calls}회) 초과"
+                        )
+                        break
+                    run.tier2_calls += 1
+                    # 자발 요청이면 재실행할 실패 액션이 없다 -> CLICK 기본.
+                    replay = last_failed_decision or Decision(
+                        action=ActionType.CLICK.value, reason=vision_requested.reason
+                    )
+                    vision_requested = None
+                    outcome = await self._tier2_step(
+                        client, goal, step, failures, replay
+                    )
+                else:
+                    outcome = await self._run_step(
+                        client, goal, step, history, failures
+                    )
                 run.steps.append(outcome)
 
                 if outcome.decision.action == FINISH:
@@ -288,8 +411,17 @@ class AgentLoop:
                     run.terminal_reason = f"LLM 포기: {outcome.decision.reason}"
                     break
 
+                if outcome.decision.is_vision_request and self.som_enabled:
+                    # 다음 스텝에서 Tier-2로 간다. 실패로 세지 않는다 —
+                    # 판단이지 액션이 아니다.
+                    vision_requested = outcome.decision
+                    history.append(outcome.summary())
+                    continue
+
                 if outcome.succeeded:
                     consecutive_failures = 0
+                    tier2_pressure = 0
+                    last_failed_decision = None
                     last_action_failed = False
                     last_failure_harmless = False
                     # 무해 판정용 — 이 요소에 대한 이후의 구식 참조 실패는
@@ -320,6 +452,9 @@ class AgentLoop:
                         and outcome.decision.element_id == last_success_element
                     )
                     last_failure_harmless = is_stale_ref and same_element
+                    if not last_failure_harmless:
+                        tier2_pressure += 1
+                        last_failed_decision = outcome.decision
                     failures.append(outcome.summary())
                     history.append(outcome.summary())
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -333,6 +468,8 @@ class AgentLoop:
             run.terminal_reason = str(exc)
         finally:
             await client.close()
+            if self._jev_client is not None:
+                await self._jev_client.close()
 
         run.elapsed_s = time.perf_counter() - started
         run.budget = self.budget.snapshot()
@@ -353,6 +490,107 @@ class AgentLoop:
             latency_ms=(time.perf_counter() - started) * 1000,
             note=str(exc)[:120],
         )
+
+    # -- Tier-2 SoM 시각 폴백 (PRD §3.1) -------------------------------------
+
+    async def _tier2_step(
+        self,
+        client: OpenRouterClient,
+        goal: str,
+        step: int,
+        failures: Sequence[str],
+        last_decision: Decision,
+    ) -> StepOutcome:
+        """SoM 스크린샷 -> VLM 그라운딩 -> 같은 액션 재실행.
+
+        태그 모드: 고른 태그를 `@sN` 핸들로 묶어 마지막 실패 액션을
+        element_id만 바꿔 재디스패치한다(기존 검증·치유·HITL 경로 유지).
+        좌표 모드(후보 0개, Canvas): CLICK {x, y}만 지원한다.
+        """
+        started = time.perf_counter()
+        action = last_decision.action_type
+        if action not in _TIER2_REPLAYABLE:
+            action = ActionType.CLICK
+        decision = Decision(
+            action=action.value,
+            element_id=None,
+            text=last_decision.text,
+            value=last_decision.value,
+            key=last_decision.key,
+            reason="Tier-2 시각 폴백",
+        )
+        outcome = StepOutcome(step=step, decision=decision, note="tier2")
+
+        shot = await self.dispatcher.dispatch(
+            ActionType.TAKE_SCREENSHOT, {"annotate_som": True}
+        )
+        if not shot.success:
+            outcome.result = shot
+            outcome.note = "tier2: 캡처 실패"
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        from vision import SomCandidate, bind_tag
+
+        data = shot.data or {}
+        png = base64.b64decode(data.get("image_b64", "") or "")
+        candidates = [
+            SomCandidate(
+                tag=t["tag"],
+                selector_path=t.get("selector_path", ""),
+                bbox=BBox(**t["bbox"]),
+                role=t.get("role", ""),
+                name=t.get("name", ""),
+            )
+            for t in data.get("som_tags", [])
+        ]
+
+        grounder = self._grounder
+        if grounder is None:
+            from vision import ground as grounder  # noqa: F811 — 지연 import
+
+        try:
+            grounding = await grounder(
+                client,
+                png,
+                candidates,
+                goal,
+                failure_context="\n".join(list(failures)[-3:]),
+            )
+        except (LLMError, BudgetExceeded) as exc:
+            if isinstance(exc, BudgetExceeded):
+                raise
+            outcome.note = f"tier2: VLM 오류 {str(exc)[:100]}"
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        outcome.vision_latency_ms = grounding.latency_ms
+        outcome.llm_tokens = grounding.tokens
+        outcome.llm_cost = grounding.cost_usd
+
+        if grounding.tag is not None:
+            candidate = next(c for c in candidates if c.tag == grounding.tag)
+            try:
+                element_id = await bind_tag(self.engine, self.page, candidate)
+            except LookupError as exc:
+                outcome.note = f"tier2: {exc}"
+                outcome.latency_ms = (time.perf_counter() - started) * 1000
+                return outcome
+            decision.element_id = element_id
+            params = decision_to_params(decision)
+            params["epoch"] = self.engine.epoch
+            outcome.result = await self.dispatcher.dispatch(action, params)
+        elif grounding.point is not None:
+            x, y = grounding.point
+            decision.action = ActionType.CLICK.value
+            outcome.result = await self.dispatcher.dispatch(
+                ActionType.CLICK, {"x": x, "y": y, "epoch": self.engine.epoch}
+            )
+        else:
+            outcome.note = f"tier2: 그라운딩 실패 ({grounding.reason[:80]})"
+
+        outcome.latency_ms = (time.perf_counter() - started) * 1000
+        return outcome
 
     async def _settle(self) -> None:
         """네비게이션이 진행 중이면 안정될 때까지 잠시 기다린다.
@@ -424,24 +662,101 @@ class AgentLoop:
             # 링크 목적지 힌트를 위해 핸들을 넘긴다. 계약 모델에는 href가
             # 없으므로(동결) 내부 핸들에서 읽어 프롬프트에만 반영한다.
             handles=getattr(self.engine, "_handles", None),
+            som_enabled=self.som_enabled,
+            page_text=self._pending_page_text,
         )
-        try:
-            response = await client.complete(
-                messages, max_tokens=self.max_tokens
+        page_text = self._pending_page_text
+        # 한 번 보여 줬으면 비운다 — 매 스텝 붙이면 프롬프트가 계속 커진다.
+        self._pending_page_text = None
+
+        decided_by, defer_reason, note = "llm", "", ""
+        tokens, cost = 0, 0.0
+        decision: Optional[Decision] = None
+        if self._jev is not None:
+            jr = await self._jev.decide(
+                goal, observation, history=history, page_text=page_text,
+                handles=getattr(self.engine, "_handles", None),
             )
-            decision = parse_decision(response.parse_json())
-        except LLMError as exc:
-            return self._give_up_step(step, observation, started, exc)
+            tokens, cost = jr.tokens, jr.cost_usd
+            defer_reason = jr.defer_reason
+            if not defer_reason and jr.decision is not None:
+                decision, decided_by = parse_decision(jr.decision), "jev"
+            else:
+                try:
+                    response = await client.complete(
+                        messages,
+                        model=self.config.fallback_model,
+                        max_tokens=self.max_tokens,
+                        # 실측 검증 설정: 생각 짧게 + JSON 강제(형식 깨짐 0, 최대 22초)
+                        reasoning={"effort": "low"},
+                        response_format={"type": "json_object"},
+                    )
+                    decision = parse_decision(response.parse_json())
+                    decided_by = "fallback"
+                    tokens += response.total_tokens
+                    cost += response.cost_usd
+                    self._jev.fallback_used(defer_reason)
+                except LLMError as exc:
+                    if jr.decision is None:
+                        return self._give_up_step(step, observation, started, exc)
+                    # 폴백이 막혀도 Jev 답이 있으면 쓴다(스텝을 버리지 않는다).
+                    decision, decided_by = parse_decision(jr.decision), "jev"
+                    note = f"폴백 실패 → Jev 답 사용: {str(exc)[:60]}"
+        else:
+            try:
+                response = await client.complete(
+                    messages, max_tokens=self.max_tokens
+                )
+                decision = parse_decision(response.parse_json())
+            except LLMError as exc:
+                return self._give_up_step(step, observation, started, exc)
+            tokens, cost = response.total_tokens, response.cost_usd
 
         outcome = StepOutcome(
             step=step,
             decision=decision,
             observed=len(observation.elements),
-            llm_tokens=response.total_tokens,
-            llm_cost=response.cost_usd,
+            llm_tokens=tokens,
+            llm_cost=cost,
+            decided_by=decided_by,
+            defer_reason=defer_reason,
         )
+        if note:
+            outcome.note = note
 
         if decision.is_terminal:
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        if decision.is_vision_request:
+            # 액션을 실행하지 않는다. run()이 이 스텝을 보고 Tier-2로 간다.
+            # SoM이 켜져 있으면 요청은 **수용된 것**이므로 성공 스텝이다 —
+            # FAIL로 남기면 히스토리가 LLM에게 "요청이 실패했다"고 알려
+            # 재요청을 유발한다(실측: icon-buttons 2런이 상한 소진).
+            # SoM이 꺼져 있으면 갈 곳이 없으므로 실패 스텝으로 남긴다
+            # (프롬프트에 제안하지 않았는데 모델이 고른 경우).
+            outcome.judged_success = self.som_enabled
+            outcome.note = (
+                "vision_request: Tier-2 시각 폴백으로 전환합니다"
+                if self.som_enabled
+                else "vision_request: SoM 비활성"
+            )
+            outcome.latency_ms = (time.perf_counter() - started) * 1000
+            return outcome
+
+        if decision.is_read_text:
+            # 브라우저 액션이 아니라 읽기다. 페이지를 바꾸지 않으므로 성공이면
+            # 판단 성공 스텝으로 남긴다(실패로 세면 연속 실패 중단에 걸린다).
+            from agent.page_text import read_visible_text
+
+            try:
+                text = await read_visible_text(self.page)
+            except Exception as exc:  # noqa: BLE001
+                outcome.note = f"read_text 실패: {type(exc).__name__}"
+            else:
+                self._pending_page_text = text
+                outcome.judged_success = True
+                outcome.note = f"read_text: {len(text)}자"
             outcome.latency_ms = (time.perf_counter() - started) * 1000
             return outcome
 

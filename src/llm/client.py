@@ -145,16 +145,24 @@ class OpenRouterClient:
 
     async def complete(
         self,
-        messages: List[Dict[str, str]],
+        # 계약 예외 근거 — Tier-2 SoM(PRD §3.1)은 `content`에 텍스트+이미지
+        # 파트 리스트를 담아야 한다(OpenAI 호환 멀티모달 형식). 텍스트 전용
+        # 호출은 str content 그대로이므로 기존 호출자는 영향이 없다.
+        messages: List[Dict[str, Any]],
         *,
         model: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 1024,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning: Optional[Dict[str, Any]] = None,
     ) -> LLMResponse:
         """Chat Completion을 호출한다.
 
         호출 **전에** 예산을 확인한다. 응답 후 확인하면 이미 과금된 뒤다.
+
+        `reasoning`은 OpenRouter 통합 reasoning 파라미터(`{"effort": "low"}` 등)를
+        그대로 전달한다. 지정하지 않으면 페이로드에 넣지 않아 기존 호출자의
+        동작이 바뀌지 않는다.
         """
         if self._client is None:
             raise LLMError("클라이언트가 시작되지 않았습니다. async with를 사용하십시오.")
@@ -172,6 +180,8 @@ class OpenRouterClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if reasoning is not None:
+            payload["reasoning"] = reasoning
 
         data = await self._post_with_retry("/chat/completions", payload)
 
@@ -234,8 +244,16 @@ class OpenRouterClient:
         last_error = ""
         for attempt in range(self.config.max_retries + 1):
             try:
-                response = await self._client.post(path, json=payload)
-            except httpx.TimeoutException:
+                # 호출 1회에 **전체** 시간 상한을 건다. httpx의 timeout은 바이트
+                # 사이 간격 상한이라, 서버가 조금씩이라도 계속 보내면 끝나지
+                # 않는다. 실측(tier2_som live, 2026-09-23) — 러너가 51분째
+                # OpenRouter 연결 하나를 연 채 CPU 0%로 멈췄다. stream=False인
+                # post()는 본문을 다 읽고(aread) 반환하므로 본문까지 상한 안이다.
+                response = await asyncio.wait_for(
+                    self._client.post(path, json=payload),
+                    timeout=self.config.timeout_s,
+                )
+            except (httpx.TimeoutException, asyncio.TimeoutError):
                 last_error = f"타임아웃 ({self.config.timeout_s}s)"
             except httpx.HTTPError as exc:
                 # 예외 객체를 전파하지 않고 타입명만 남긴다.

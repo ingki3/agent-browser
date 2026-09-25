@@ -145,6 +145,14 @@ class PerceptionEngine:
         logger.debug("에포크 증가 -> %d (%s)", self._epoch, reason)
         return self._epoch
 
+    def register_external_handle(self, element_id: str, handle: ElementHandle) -> None:
+        """외부(Tier-2 SoM 브리지 등)가 만든 핸들을 현재 에포크에 등록한다.
+
+        `_handles`에 그대로 넣으므로 `bump_epoch()`가 다른 핸들과 함께
+        무효화한다 — 별도 수명 규칙을 두지 않는다.
+        """
+        self._handles[element_id] = handle
+
     def get_handle(self, element_id: str) -> Optional[ElementHandle]:
         """element_id에 대응하는 핸들을 조회한다 (현재 에포크만 유효)."""
         handle = self._handles.get(element_id)

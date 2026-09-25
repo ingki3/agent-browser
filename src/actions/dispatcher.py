@@ -70,6 +70,11 @@ EPOCH_BUMPING_ACTIONS = frozenset(
     {ActionType.NAVIGATE, ActionType.GO_BACK, ActionType.RELOAD, ActionType.SWITCH_FRAME}
 )
 
+#: 효과 없는 클릭 뒤 한 번 더 기다렸다 다시 보는 시간. 실측(s11_popup) — 새 탭은
+#: click()이 반환되고 20~50ms 뒤에 생겼다. 늦게 렌더링되는 효과도 이 안에 들면
+#: 잡힌다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
+POPUP_GRACE_MS = 150
+
 
 @dataclass
 class DispatchContext:
@@ -87,6 +92,15 @@ class DispatchContext:
     #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 미주입 시 치환하지 않는다.
     #: 주입되면 type_text의 text가 등록된 키일 때만 실제 값으로 바꾼다.
     secrets: Any = None
+    #: Tier-2 SoM 게이트 (PRD §8-2). 기본 OFF — 레거시 클라이언트는
+    #: `annotate_som=True`에 여전히 E_FEATURE_NOT_IMPLEMENTED를 받는다.
+    #: MCP 서버가 `capabilities.experimental.som_vision` 협상 후 켠다.
+    som_enabled: bool = False
+
+
+#: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
+#: 치환된 params 사본에만 붙는다 — 결과에 실제 값을 싣지 않게 한다.
+_CONCEAL_KEY = "_conceal_value"
 
 
 #: Playwright 키 이름 별칭.
@@ -161,6 +175,12 @@ class ActionDispatcher:
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
 
+    def _off_popup(self, listener: Any) -> None:
+        try:
+            self.ctx.page.remove_listener("popup", listener)
+        except Exception:  # noqa: BLE001 — 가짜 페이지
+            pass
+
     def _current_url(self) -> str:
         try:
             return self.ctx.page.url or ""
@@ -206,6 +226,21 @@ class ActionDispatcher:
         """액션을 실행하고 `ActionResult`를 반환한다."""
         started = time.perf_counter()
         params, secret_resolved = self._resolve_secret(action, params)
+        if secret_resolved is True and not self._secret_allowed_here():
+            # 도메인에 묶인 자격증명(credentials.BoundSecrets)을 다른 사이트에서
+            # 쓰려 함 — 값도 키 이름도 입력하지 않고 실패한다.
+            result = self._result(
+                success=False,
+                action=action,
+                retry_safe=False,
+                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                error_message=(
+                    f"자격증명은 {self.ctx.secrets.domain} 도메인 페이지에서만 입력합니다. "
+                    "현재 페이지는 다른 도메인이라 입력하지 않았습니다."
+                ),
+            )
+            result.data["secret_resolved"] = False
+            return result
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
@@ -225,6 +260,21 @@ class ActionDispatcher:
             # 사용자는 키 이름이 그대로 입력된 것을 눈치채지 못한다.
             result.data["secret_resolved"] = secret_resolved
         return result
+
+    def _secret_allowed_here(self) -> bool:
+        """현재 페이지에서 치환된 값을 입력해도 되는가.
+
+        도메인에 묶이지 않은 해석기(기존 `SecretStore`, `--secrets` 파일)는
+        제한이 없다 — 하위 호환. `allowed_for`가 있으면 그것을 따른다.
+        """
+        check = getattr(self.ctx.secrets, "allowed_for", None)
+        if check is None:
+            return True
+        try:
+            url = self.ctx.page.url
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(check(url))
 
     def _resolve_secret(
         self, action: ActionType, params: Dict[str, Any]
@@ -258,6 +308,9 @@ class ActionDispatcher:
 
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
+        # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
+        # 호출자의 params(트레이스)에는 나타나지 않는다.
+        resolved_params[_CONCEAL_KEY] = True
         return resolved_params, True
 
     async def _dispatch_inner(
@@ -268,6 +321,8 @@ class ActionDispatcher:
             return await self._execute_elementless(action, params)
 
         element_id = params.get("element_id")
+        if not element_id and action is ActionType.CLICK and params.get("x") is not None:
+            return await self._click_coordinates(action, params)
         if not element_id:
             return self._result(
                 success=False,
@@ -363,10 +418,22 @@ class ActionDispatcher:
 
         # --- [2] 이벤트 발송 -------------------------------------------------
         before = await capture_state(self.ctx.page, handle)
+        # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
+        # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
+        popups: List[Any] = []
+
+        def _on_popup(p: Any) -> None:
+            popups.append(p)
+
+        try:
+            self.ctx.page.on("popup", _on_popup)
+        except Exception:  # noqa: BLE001 — 가짜 페이지
+            pass
         try:
             await self._execute_element_action(action, handle, params)
         except Exception as exc:  # noqa: BLE001
             # 발송 자체가 실패했으므로 부작용이 없다 -> 재시도 안전
+            self._off_popup(_on_popup)
             return self._result(
                 success=False,
                 action=action,
@@ -378,6 +445,38 @@ class ActionDispatcher:
 
         # --- [3] 사후조건 검증 ------------------------------------------------
         after = await capture_state(self.ctx.page, handle)
+        if not popups and action is ActionType.CLICK:
+            # 효과가 전혀 없을 때만 짧게 더 기다렸다가 **다시 본다**. 실제 사이트는
+            # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
+            # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
+            # 효과가 이미 있으면 기다리지 않는다(정상 경로 지연 0).
+            if not verify_post_condition(before, after).satisfied:
+                try:
+                    await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
+                    after = await capture_state(self.ctx.page, handle)
+                except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
+                    pass
+        self._off_popup(_on_popup)
+        if popups:
+            # 팝업 이벤트가 곧 증거다. 스냅샷 탭 수가 아직 안 늘었어도 반영한다.
+            before.page_count = before.page_count or 1
+            after.page_count = max(after.page_count, before.page_count + len(popups))
+
+        # 다운로드는 파일 저장 자체가 효과다 — 페이지는 바뀌지 않는다.
+        downloaded = params.pop("_downloaded_path", None)
+        if downloaded:
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                healed=healed_flag,
+                downloaded_path=downloaded,
+                data={
+                    "signals": [f"file_saved: {downloaded}"],
+                    "element_id": handle.element_id,
+                },
+            )
+
         post = verify_post_condition(
             before,
             after,
@@ -385,6 +484,7 @@ class ActionDispatcher:
             expected_checked=(
                 params.get("checked") if action is ActionType.CHECK_BOX else None
             ),
+            conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
 
         if post.satisfied:
@@ -435,6 +535,7 @@ class ActionDispatcher:
             expected_checked=(
                 params.get("checked") if action is ActionType.CHECK_BOX else None
             ),
+            conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
         return self._result(
             success=retry_post.satisfied,
@@ -690,13 +791,17 @@ class ActionDispatcher:
 
         if action is ActionType.TAKE_SCREENSHOT:
             if params.get("annotate_som"):
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,
-                    error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
-                    error_message="SoM 주석은 v1.1에서 활성화됩니다.",
-                )
+                if not self.ctx.som_enabled:
+                    # PRD §8-2: 게이트 OFF면 레거시 클라이언트 보호를 위해
+                    # 미구현 코드를 그대로 반환한다(actions_test/mcp_smoke 의존).
+                    return self._result(
+                        success=False,
+                        action=action,
+                        retry_safe=True,
+                        error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                        error_message="SoM 주석은 som_enabled 게이트가 꺼져 있어 비활성입니다.",
+                    )
+                return await self._screenshot_som(action)
             try:
                 shot = await page.screenshot(full_page=params.get("full_page", False))
             except Exception as exc:  # noqa: BLE001
@@ -730,6 +835,72 @@ class ActionDispatcher:
 
         if action is ActionType.TAB_CONTROL:
             return await self._dispatch_tab_control(action, params)
+
+    async def _click_coordinates(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> ActionResult:
+        """뷰포트 좌표 클릭 (v1.1 재동결, Tier-2 SoM / Canvas 폴백).
+
+        DOM 대상이 없으므로 요소 staleness 검증 대신 **epoch 일치**로
+        시점을 검증한다. 좌표는 SoM 스크린샷을 찍은 그 스냅샷에서만
+        의미가 있고, 페이지가 바뀌었다면 같은 좌표가 다른 것을 가리킨다.
+
+        사후조건은 DOM 신호로만 잡을 수 있다. Canvas 클릭은 DOM을 바꾸지
+        않는 것이 정상이므로, 무변화를 실패로 처리하지 않고
+        `data["silent"]=True`로 보고해 호출자(루프/VLM)가 판단하게 한다.
+        """
+        page = self.ctx.page
+        x, y = int(params["x"]), int(params["y"])
+
+        claimed_epoch = params.get("epoch")
+        current = self.ctx.engine.epoch
+        if claimed_epoch is None or int(claimed_epoch) != current:
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.TOCTOU_MISMATCH,
+                error_message=(
+                    f"좌표 클릭 epoch 불일치: 요청 {claimed_epoch}, 현재 {current}. "
+                    "SoM 스크린샷을 다시 찍으십시오."
+                ),
+                reobserve_required=True,
+            )
+
+        viewport = page.viewport_size or {}
+        vw, vh = viewport.get("width", 0), viewport.get("height", 0)
+        if vw and vh and (x >= vw or y >= vh):
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=f"좌표 ({x}, {y})가 뷰포트 {vw}x{vh} 밖입니다.",
+            )
+
+        before = await capture_state(page)
+        try:
+            await page.mouse.click(x, y, button=params.get("button", "left"))
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                error_message=f"좌표 클릭 발송 실패: {exc}",
+            )
+        after = await capture_state(page)
+        post = verify_post_condition(before, after)
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+            data={
+                "coordinates": {"x": x, "y": y},
+                "signals": post.signals,
+                "silent": not post.satisfied,
+            },
+        )
 
     async def _dispatch_tab_control(
         self, action: ActionType, params: Dict[str, Any]
@@ -943,6 +1114,60 @@ class ActionDispatcher:
             action=ActionType.EXTRACT,
             retry_safe=True,
             data={"items": payload if extract_all else payload[0]},
+        )
+
+    async def _screenshot_som(self, action: ActionType) -> ActionResult:
+        """Tier-2 SoM 스크린샷 (PRD §3.1, §3.4). `som_enabled` 게이트 통과 후에만 호출.
+
+        반환 data:
+        * som_tags        — [{tag, role, name, bbox, selector_path}] (프루닝 이전 후보, 최대 60)
+        * image_b64       — 라벨이 얹힌 뷰포트 PNG (1280×720)
+        * image_tokens    — 계약 상수 SOM_IMAGE_TOKENS_PER_CAPTURE (예산 누적용)
+        * candidate_count — 후보 수. 0이면 순수 Canvas 등 DOM 타깃이 없는 페이지이며,
+                            호출자는 이를 좌표 모드 전환 신호로 쓴다(옵션 B).
+                            따라서 0개도 **성공**으로 반환한다.
+
+        vision 패키지는 지연 import — SoM이 꺼진 배포에서 dispatcher가
+        vision 의존을 끌고 들어오지 않게 한다.
+        """
+        import base64
+
+        from contracts import thresholds
+        from vision import collect_candidates, render_som
+
+        try:
+            candidates = await collect_candidates(self.ctx.page)
+            png = await render_som(self.ctx.page, candidates)
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.SCREENSHOT_FAILED,
+                error_message=f"SoM 캡처 실패: {exc}",
+            )
+
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=True,
+            data={
+                "bytes": len(png),
+                "som_tags": [
+                    {
+                        "tag": c.tag,
+                        "role": c.role,
+                        "name": c.name,
+                        "bbox": c.bbox.model_dump(),
+                        # 루프가 후보를 재구성해 bind_tag에 넘길 때 필요하다.
+                        "selector_path": c.selector_path,
+                    }
+                    for c in candidates
+                ],
+                "image_b64": base64.b64encode(png).decode("ascii"),
+                "image_tokens": thresholds.SOM_IMAGE_TOKENS_PER_CAPTURE,
+                "candidate_count": len(candidates),
+            },
         )
 
     async def _switch_frame(self, params: Dict[str, Any]) -> ActionResult:

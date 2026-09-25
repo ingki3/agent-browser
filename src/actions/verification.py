@@ -241,6 +241,10 @@ class PageStateSnapshot:
     element_signature: str = ""
     element_checked: Optional[bool] = None
     element_value: Optional[str] = None
+    #: 대상이 비밀번호 필드인가 — 참이면 값을 신호·메시지에 싣지 않는다.
+    element_is_secret: bool = False
+    #: 브라우저 컨텍스트의 탭 수 — 팝업(새 탭) 감지. 0이면 측정 안 함.
+    page_count: int = 0
 
 
 @dataclass
@@ -273,7 +277,33 @@ async def capture_state(
         (cssPath) => {
           __DEEP_QUERY__
           const el = deepQuery(cssPath);
-          const text = (document.body ? document.body.innerText || '' : '');
+          // 노드 수와 텍스트는 open shadow root까지 합산한다. 실측 — shadow 안
+          // 버튼이 shadow 안에 확인 문구를 띄웠는데 light DOM만 세서 변화가 0,
+          // Silent Failure로 판정됐다(포커스가 효과로 인정되던 때는 가려졌다).
+          let nodes = 0;
+          let text = (document.body ? document.body.innerText || '' : '');
+          const stack = [document];
+          let guard = 0;
+          while (stack.length && guard++ < 500) {
+            const root = stack.pop();
+            let all;
+            try { all = root.querySelectorAll('*'); } catch (e) { continue; }
+            nodes += all.length;
+            for (const node of all) {
+              if (!node.shadowRoot) continue;
+              stack.push(node.shadowRoot);
+              // shadow에는 innerText가 없다. textContent는 숨겨진 글자까지 포함해
+              // `hidden` 해제를 못 잡으므로, 화면에 보이는 텍스트 노드만 모은다.
+              const walker = document.createTreeWalker(node.shadowRoot, NodeFilter.SHOW_TEXT);
+              let t;
+              while ((t = walker.nextNode())) {
+                const p = t.parentElement;
+                if (p && (!p.checkVisibility || p.checkVisibility())) {
+                  text += '\\u0000' + t.nodeValue;
+                }
+              }
+            }
+          }
           // 간이 문자열 해시 (djb2)
           let h = 5381;
           for (let i = 0; i < text.length; i++) {
@@ -282,18 +312,23 @@ async def capture_state(
           const active = document.activeElement;
           return {
             url: location.href,
-            nodes: document.querySelectorAll('*').length,
+            nodes: nodes,
             textSig: h,
             active: active ? (active.tagName + '#' + (active.id || '')) : '',
             elSig: el ? (el.className + '|' + (el.getAttribute('aria-expanded') || '')
                          + '|' + (el.getAttribute('aria-pressed') || '')) : '',
             checked: el && el.checked !== undefined ? !!el.checked : null,
             value: el && el.value !== undefined ? String(el.value) : null,
+            secret: !!(el && el.type === 'password'),
           };
         }
         """.replace("__DEEP_QUERY__", DEEP_QUERY_JS),
         handle.css_path if handle else None,
     )
+    try:
+        page_count = len(page.context.pages)
+    except Exception:  # noqa: BLE001 — 가짜 페이지/컨텍스트 없음
+        page_count = 0
     return PageStateSnapshot(
         url=payload["url"],
         dom_node_count=int(payload["nodes"]),
@@ -302,7 +337,19 @@ async def capture_state(
         element_signature=str(payload.get("elSig") or ""),
         element_checked=payload.get("checked"),
         element_value=payload.get("value"),
+        element_is_secret=bool(payload.get("secret")),
+        page_count=page_count,
     )
+
+
+def _normalize_url(url: str) -> str:
+    """끝의 빈 '?'/'#'을 떼어낸다 — 그 자체로는 이동이 아니다.
+
+    실측 — 핸들러 없는 <form> 안 버튼을 누르면 브라우저가 같은 페이지로
+    submit하며 `/s03_multistep` -> `/s03_multistep?` 가 됐다. 페이지 내용은
+    그대로였는데 URL 전환으로 성공 판정됐다.
+    """
+    return url.rstrip("?#")
 
 
 def verify_post_condition(
@@ -312,26 +359,49 @@ def verify_post_condition(
     expected_value: Optional[str] = None,
     expected_checked: Optional[bool] = None,
     dom_delta_threshold: int = 1,
+    conceal_value: bool = False,
 ) -> PostConditionResult:
     """액션 전후 상태를 비교해 실제 변화가 있었는지 판정한다.
 
+    `conceal_value=True`면 값 비교 결과에 기대값·실제값을 싣지 않는다.
+    자격증명 치환(PRD 5.3)으로 들어간 값이 신호·실패 메시지를 타고 LLM에게
+    돌아가던 경로를 막는다. 필드가 값을 가공한 경우(대문자화 등) 실제값도
+    평문에서 파생된 것이라 함께 가린다.
+
     기대 상태값이 주어지면 그것이 유일한 판정 기준이다(가장 강한 신호).
-    그렇지 않으면 URL/DOM/텍스트/포커스/속성 중 하나라도 변하면 성공으로
-    본다. 판정을 좁게 잡으면 정상 액션을 Silent Failure로 오판해
+    그렇지 않으면 **효과 신호**(URL/DOM/텍스트/속성/값/새 탭) 중 하나라도
+    있으면 성공이다. 판정을 좁게 잡으면 정상 액션을 Silent Failure로 오판해
     액션 성공률이 실제보다 낮게 측정된다.
+
+    포커스 이동은 **도달 신호**라 성공 근거에서 뺀다 — 브라우저가 클릭 시
+    자동으로 옮기므로 무언가 일어났다는 증거가 아니다(PRD §4.3 목록에도 없음).
+    실측 — onclick 없는 버튼이 1회차에는 포커스 이동(BODY -> BUTTON)만으로
+    성공, 2회차에는 포커스가 그대로라 Silent Failure였다. 같은 무반응 버튼이
+    호출 순서로 판정이 갈렸고, 오프라인 게이트의 클릭 성공 판정 55~60%가 이
+    신호 하나에 기대고 있었다. 진단을 위해 신호 목록에는 남긴다.
     """
     signals: List[str] = []
 
     # 기대 상태값이 있으면 그것만으로 판정한다 (가장 강한 신호).
     if expected_value is not None:
+        conceal_value = conceal_value or after.element_is_secret
         if after.element_value == expected_value:
+            shown = "<secret>" if conceal_value else repr(expected_value)
             return PostConditionResult(
-                satisfied=True, signals=[f"value_applied: {expected_value!r}"]
+                satisfied=True, signals=[f"value_applied: {shown}"]
             )
+        if conceal_value:
+            got = after.element_value
+            detail = (
+                "입력한 자격증명 값이 필드에 그대로 남지 않음"
+                f"(필드 값 길이 {len(got) if got is not None else '없음'})"
+            )
+        else:
+            detail = f"기대값 {expected_value!r} != 실제 {after.element_value!r}"
         return PostConditionResult(
             satisfied=False,
             signals=signals,
-            detail=f"기대값 {expected_value!r} != 실제 {after.element_value!r}",
+            detail=detail,
         )
 
     if expected_checked is not None:
@@ -345,8 +415,10 @@ def verify_post_condition(
             detail=f"기대 checked {expected_checked} != 실제 {after.element_checked}",
         )
 
-    # 1) URL 전환
-    if before.url != after.url:
+    # --- 효과 신호 ---------------------------------------------------------
+
+    # 1) URL 전환 (끝의 빈 '?'/'#'만 다르면 이동이 아니다)
+    if _normalize_url(before.url) != _normalize_url(after.url):
         signals.append(f"url_changed: {before.url} -> {after.url}")
 
     # 2) DOM 변위 / 신규 노드
@@ -358,33 +430,45 @@ def verify_post_condition(
     if before.text_signature != after.text_signature:
         signals.append("text_changed")
 
-    # 4) 포커스 이동 (클릭이 실제로 요소에 도달했다는 증거)
-    if before.active_element != after.active_element:
-        signals.append(f"focus_moved: {before.active_element} -> {after.active_element}")
-
-    # 5) 대상 요소 속성/클래스 토글 (aria-expanded, aria-pressed 등)
+    # 4) 대상 요소 속성/클래스 토글 (aria-expanded, aria-pressed 등)
     if before.element_signature != after.element_signature:
         signals.append("element_attr_changed")
 
-    # 6) 대상 요소의 value/checked 변화
+    # 5) 대상 요소의 value/checked 변화
     #    select_option, upload_file 등은 페이지 구조를 바꾸지 않고
     #    요소 자신의 값만 갱신하므로 위 신호로는 잡히지 않는다.
     if before.element_value != after.element_value:
-        signals.append(
-            f"element_value_changed: {before.element_value!r} -> {after.element_value!r}"
-        )
+        if before.element_is_secret or after.element_is_secret:
+            signals.append("element_value_changed: <secret>")
+        else:
+            signals.append(
+                f"element_value_changed: {before.element_value!r} -> {after.element_value!r}"
+            )
     if before.element_checked != after.element_checked:
         signals.append(
             f"element_checked_changed: {before.element_checked} -> {after.element_checked}"
         )
 
-    if signals:
+    # 6) 새 탭(팝업) — 원래 페이지는 그대로지만 명백한 효과다.
+    #    포커스를 효과에서 빼기 전에는 팝업 클릭이 포커스 이동으로 우연히
+    #    통과했다. 이 신호가 없으면 팝업이 Silent Failure로 떨어진다.
+    if before.page_count and after.page_count > before.page_count:
+        signals.append(f"new_tab: {before.page_count} -> {after.page_count}")
+
+    effect = bool(signals)
+
+    # --- 도달 신호 (진단용, 성공 근거 아님) --------------------------------
+    if before.active_element != after.active_element:
+        signals.append(f"focus_moved: {before.active_element} -> {after.active_element}")
+
+    if effect:
         return PostConditionResult(satisfied=True, signals=signals)
 
     return PostConditionResult(
         satisfied=False,
-        signals=[],
+        signals=signals,
         detail=(
-            "URL/DOM/텍스트/포커스/속성 어디에도 변화가 없음 (Silent Failure 의심)"
+            "URL/DOM/텍스트/속성/값/탭 어디에도 변화가 없음 (Silent Failure 의심)"
+            + (" — 포커스만 이동함" if signals else "")
         ),
     )

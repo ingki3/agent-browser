@@ -32,6 +32,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 #: 저비용·구조화 출력 지원 모델을 기본으로 둔다. 태스크당 $0.75 상한
 #: (contracts.thresholds.MAX_USD_PER_TASK) 안에서 30스텝을 돌 수 있어야 한다.
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+#: decider="jev"일 때 Jev가 막히면 넘겨받는 채팅 모델(생각 짧게 + JSON 강제로 호출).
+DEFAULT_FALLBACK_MODEL = "qwen/qwen3.8-27b"
 
 #: `KEY=VALUE` 파싱. 값의 따옴표와 인라인 주석을 제거한다.
 _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
@@ -119,12 +121,21 @@ class LLMConfig:
 
     api_key: str = field(default="", repr=False)
     model: str = DEFAULT_MODEL
+    #: Tier-2 SoM 비전 호출 모델 (선택). 빈 값이면 `model`을 그대로 쓴다 —
+    #: 기본 모델(gpt-4o-mini)은 이미지 입력을 지원하므로 별도 지정은 옵션이다.
+    vision_model: str = ""
     base_url: str = OPENROUTER_BASE_URL
     #: OpenRouter 순위 페이지에 표시될 앱 정보 (선택)
     app_url: str = ""
     app_title: str = "agent-browser"
     timeout_s: float = 60.0
     max_retries: int = 2
+    #: 에이전트 판단 방식. "llm"(기본, 채팅 모델) | "jev"(Jev 보기 고르기 + 폴백).
+    #: jev는 OpenRouter에서만 켜진다 — 로컬 base_url(로그인 작업)에서는 무시한다.
+    decider: str = "llm"
+    #: decider="jev"일 때 Jev가 막히면 넘겨받는 채팅 모델.
+    #: 실측(2026-09-24): qwen3.8-27b 폴백 3회 28/28/28, 최대 22초, 시간초과 0.
+    fallback_model: str = DEFAULT_FALLBACK_MODEL
 
     @property
     def configured(self) -> bool:
@@ -146,6 +157,11 @@ class LLMConfig:
         if self.has_placeholder_key:
             return "<플레이스홀더 — 실제 키로 교체 필요>"
         return _redact(self.api_key)
+
+    @property
+    def effective_vision_model(self) -> str:
+        """비전 호출에 실제로 쓸 모델명."""
+        return self.vision_model or self.model
 
     def summary(self) -> str:
         """로그에 안전하게 남길 수 있는 설정 요약."""
@@ -179,9 +195,12 @@ def load_config(
     return LLMConfig(
         api_key=pick("OPENROUTER_API_KEY"),
         model=model_override or pick("OPENROUTER_MODEL", DEFAULT_MODEL),
+        vision_model=pick("OPENROUTER_VISION_MODEL"),
         base_url=pick("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
         app_url=pick("OPENROUTER_APP_URL"),
         app_title=pick("OPENROUTER_APP_TITLE", "agent-browser"),
         timeout_s=float(pick("OPENROUTER_TIMEOUT_S", "60") or 60),
         max_retries=int(pick("OPENROUTER_MAX_RETRIES", "2") or 2),
+        decider=(pick("AGENT_DECIDER", "llm") or "llm").strip().lower(),
+        fallback_model=pick("AGENT_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL),
     )

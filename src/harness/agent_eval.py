@@ -144,6 +144,7 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
                     "usd": 0.0,
                     "final_url": "",
                     "trace": [],
+                    "decided_by": [],
                     "error": (
                         f"태스크 시간 초과 "
                         f"({MAX_WALL_CLOCK_SECONDS + TASK_TIMEOUT_MARGIN_S}초)"
@@ -167,6 +168,8 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
                 "usd": round(run.budget.get("usd", 0.0), 6),
                 "final_url": run.final_url[:120],
                 "trace": [s.summary() for s in run.steps],
+                #: 판단 주체(llm / jev / fallback) — decider=jev 비교용
+                "decided_by": [s.decided_by for s in run.steps],
                 "failure_reason": "" if verified else reason,
             }
         )
@@ -182,6 +185,7 @@ async def _run_task(browser: Any, task: RealTask, config: Any) -> Dict[str, Any]
                 "usd": 0.0,
                 "final_url": "",
                 "trace": [],
+                "decided_by": [],
                 "error": f"{type(exc).__name__}: {str(exc)[:120]}",
                 "failure_reason": "실행 오류",
             }
