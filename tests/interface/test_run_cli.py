@@ -227,6 +227,9 @@ def test_real_loop_read_text_reaches_answer_prompt(server, fake_llm, tmp_path):
     assert rec["final_answer"] == "사과는 3000원입니다."
     user = fake_llm.answer.calls[0][1]["content"]
     assert "[읽은 글 1]" in user and "사과 3000원" in user.split("[읽은 글 1]")[1]
+    # R1: 결과의 answer_input 은 실제 전송된 user 메시지 안의 본문 그대로.
+    assert rec["answer_input"] and rec["answer_input"] in user
+    assert "사과 3000원" in rec["answer_input"]
 
 
 @requires_chromium

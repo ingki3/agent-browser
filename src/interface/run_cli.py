@@ -2,7 +2,7 @@
 
 실행부는 harness/agent_eval.py 의 `_run_task` 를 따른다(BudgetGuard 기본값, 루프를
 벽시계 wait_for 로 한 번 더 감싼다). 결과는 JSON 한 덩어리 — 표준출력에는 본문
-(final_page_text)을 뺀 요약을, `--out` 파일에는 전부를 권한 0600 으로 쓴다.
+(final_page_text·answer_input)을 뺀 요약을, `--out` 파일에는 전부를 권한 0600 으로 쓴다.
 
 모드:
   * 기본: headless Chromium(1280x720).
@@ -81,6 +81,7 @@ ANSWER_DEFAULTS: Tuple[Tuple[str, Any], ...] = (
     ("answer_error", ""),
     ("answer_input_chars", 0),
     ("answer_truncated_chars", 0),
+    ("answer_input", ""),
     ("answer_usd", 0.0),
     ("answer_tokens", 0),
 )
@@ -387,11 +388,15 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
     return record
 
 
+#: 콘솔 요약에서 빼는 키 — 페이지 본문이 들어간다(--out 파일에만 남긴다).
+CONSOLE_EXCLUDED_KEYS = frozenset({"final_page_text", "answer_input"})
+
+
 def run(args: argparse.Namespace) -> int:
     """`agent-browser run` 진입점. 결과 JSON 을 만들었으면 0."""
     record = asyncio.run(run_goal(args))
     if args.out:
         write_result(Path(args.out).expanduser(), record)
-    print(json.dumps({k: v for k, v in record.items() if k != "final_page_text"},
+    print(json.dumps({k: v for k, v in record.items() if k not in CONSOLE_EXCLUDED_KEYS},
                      ensure_ascii=False, indent=2))
     return 0

@@ -72,17 +72,19 @@ def _clip(texts: Sequence[str], limit: int) -> Tuple[List[str], int, int]:
     return kept, used, total - used
 
 
-def build_answer_messages(
+def build_answer_request(
     goal: str,
     read_texts: Sequence[str],
     final_page_text: str,
     final_url: str,
     *,
     limit: Optional[int] = None,
-) -> Tuple[List[Dict[str, str]], int, int]:
-    """(messages, 입력 글자 수, 잘린 글자 수). 순수 함수.
+) -> Tuple[List[Dict[str, str]], int, int, str]:
+    """(messages, 입력 글자 수, 잘린 글자 수, 경계 안 본문). 순수 함수.
 
     글 순서: read_text 로 읽은 글(읽은 순서, 완전히 같은 글은 한 번) → 끝 화면 글.
+    네 번째 값은 user 메시지의 BOUNDARY_OPEN~BOUNDARY_CLOSE 사이에 넣은 바로 그
+    문자열(무력화·잘림 적용 후) — 결과의 `answer_input` 으로 남겨 답의 근거를 감사한다.
     """
     limit = ANSWER_INPUT_LIMIT if limit is None else limit
     labels: List[str] = []
@@ -111,7 +113,22 @@ def build_answer_messages(
         [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
         used,
         cut,
+        body,
     )
+
+
+def build_answer_messages(
+    goal: str,
+    read_texts: Sequence[str],
+    final_page_text: str,
+    final_url: str,
+    *,
+    limit: Optional[int] = None,
+) -> Tuple[List[Dict[str, str]], int, int]:
+    """(messages, 입력 글자 수, 잘린 글자 수). 순수 함수(build_answer_request 의 앞 세 값)."""
+    messages, used, cut, _ = build_answer_request(
+        goal, read_texts, final_page_text, final_url, limit=limit)
+    return messages, used, cut
 
 
 def _clean_reply(text: str) -> str:
@@ -129,9 +146,11 @@ async def generate_answer(
     """답을 만든다. 예외를 올리지 않는다.
 
     반환 키: final_answer, answer_model, answer_elapsed_s, answer_error,
-    answer_input_chars, answer_truncated_chars, answer_usd, answer_tokens.
+    answer_input_chars, answer_truncated_chars, answer_input, answer_usd, answer_tokens.
+    `answer_input` 은 실제로 보낸 경계 안 본문 그대로(호출이 실패해도 채운다).
     """
-    messages, used, cut = build_answer_messages(goal, read_texts, final_page_text, final_url)
+    messages, used, cut, body = build_answer_request(
+        goal, read_texts, final_page_text, final_url)
     out: Dict[str, Any] = {
         "final_answer": "",
         "answer_model": config.model,
@@ -139,6 +158,7 @@ async def generate_answer(
         "answer_error": "",
         "answer_input_chars": used,
         "answer_truncated_chars": cut,
+        "answer_input": body,
         "answer_usd": 0.0,
         "answer_tokens": 0,
     }
