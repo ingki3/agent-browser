@@ -39,7 +39,10 @@ class FakeClient:
         self.budget = budget or BudgetGuard()
         self.calls: list[dict] = []
 
-    async def complete(self, messages, *, model=None, temperature=0.0, max_tokens=1024, response_format=None):
+    async def complete(
+        self, messages, *, model=None, temperature=0.0, max_tokens=1024,
+        response_format=None, reasoning=None,
+    ):
         self.calls.append(
             {
                 "messages": messages,
@@ -47,6 +50,7 @@ class FakeClient:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 "response_format": response_format,
+                "reasoning": reasoning,
             }
         )
         return LLMResponse(
@@ -72,6 +76,28 @@ async def test_tag_mode_returns_chosen_tag():
     assert result.latency_ms >= 0
 
 
+async def test_tag_answer_with_trailing_role_is_accepted():
+    """실측 — glm-5.3-flash가 'A3 button'처럼 후보 목록의 역할까지 따라 적었다.
+
+    첫 토큰이 유효한 태그면 그 태그로 본다. 'A3'과 'A30'을 혼동하지 않도록
+    공백/구두점 경계로만 자른다.
+    """
+    client = FakeClient(json.dumps({"tag": "A3 button", "reason": "x"}))
+    result = await ground(client, PNG, [_cand("A1"), _cand("A3")], "goal")
+    assert result.tag == "A3"
+
+
+async def test_grounder_requests_minimal_reasoning_and_room_for_it():
+    """실측(glm-5.3-flash, SoM 5후보) — effort 미지정 시 p95 7~15초, 사고 토큰이
+    max_tokens 256을 먹어 본문이 비는 일이 있었다. effort=low에서 1.5초.
+    reasoning을 끌 수는 없는 모델(enabled=false -> 400)이라 effort로 조인다."""
+    client = FakeClient(json.dumps({"tag": "A1", "reason": "x"}))
+    await ground(client, PNG, [_cand("A1")], "goal")
+    call = client.calls[0]
+    assert call["reasoning"] == {"effort": "low"}
+    assert call["max_tokens"] >= 1024
+
+
 async def test_hallucinated_tag_is_rejected():
     client = FakeClient(json.dumps({"tag": "Z9", "reason": "x"}))
     result = await ground(client, PNG, [_cand("A1")], "goal")
@@ -84,7 +110,7 @@ async def test_tag_mode_message_shape():
     await ground(client, PNG, [_cand("A1", name="검색")], "검색하기", failure_context="click @e2 FAIL")
     call = client.calls[0]
     assert call["response_format"] == {"type": "json_object"}
-    assert call["max_tokens"] == 256
+    assert call["max_tokens"] == 4096
     assert call["temperature"] == 0
     system = call["messages"][0]
     assert system["role"] == "system"
@@ -141,3 +167,60 @@ async def test_coordinate_mode_ignores_tag_field():
     client = FakeClient(json.dumps({"tag": "A1", "reason": "r"}))
     result = await ground(client, PNG, [], "goal")
     assert result.tag is None and result.point is None
+
+
+# --- 좌표계 선언 (coord_space) -------------------------------------------------
+#
+# 실측 — gemini-3.8-flash는 같은 프롬프트에 절대 픽셀과 0~1000 정규화 좌표를
+# 섞어 답한다(16회 중 8회 정규화). 프롬프트로 절대 픽셀을 강제하고 정규화를
+# 금지해도 3/8이 정규화로 응답했다. 추측(값이 작으면 정규화) 대신 모델이
+# 자기 좌표계를 선언하게 하고 코드가 변환한다.
+
+
+async def test_normalized_coord_space_is_converted_to_absolute():
+    client = FakeClient(
+        json.dumps({"x": 234, "y": 208, "coord_space": "normalized_1000", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_absolute_coord_space_is_passed_through():
+    client = FakeClient(
+        json.dumps({"x": 300, "y": 150, "coord_space": "absolute", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_missing_coord_space_defaults_to_absolute():
+    """선언이 없으면 절대 픽셀로 읽는다 — 기존 모델(glm/gemini-2.5) 호환."""
+    client = FakeClient(json.dumps({"x": 300, "y": 150, "reason": "r"}))
+    result = await ground(client, PNG, [], "goal")
+    assert result.point == (300, 150)
+
+
+async def test_unknown_coord_space_is_rejected():
+    """모르는 좌표계는 추측하지 않고 버린다 (fail-closed)."""
+    client = FakeClient(
+        json.dumps({"x": 300, "y": 150, "coord_space": "percent", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point is None
+
+
+async def test_normalized_point_out_of_range_is_rejected():
+    """정규화 선언인데 0~1000 밖이면 버린다."""
+    client = FakeClient(
+        json.dumps({"x": 1200, "y": 50, "coord_space": "normalized_1000", "reason": "r"})
+    )
+    result = await ground(client, PNG, [], "goal")
+    assert result.point is None
+
+
+async def test_coordinate_prompt_declares_coord_space_schema():
+    client = FakeClient(json.dumps({"x": 1, "y": 1, "reason": "r"}))
+    await ground(client, PNG, [], "goal")
+    system = client.calls[0]["messages"][0]["content"]
+    assert "coord_space" in system
+    assert "normalized_1000" in system and "absolute" in system

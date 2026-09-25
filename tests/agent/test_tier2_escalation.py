@@ -114,8 +114,19 @@ def _scripted_loop(monkeypatch, script, *, grounder=None, **kwargs):
                 return StepOutcome(step=step, decision=Decision(action="give_up", reason="script end"))
             action, element_id, success, error_code = items.pop(0)
             decision = Decision(action=action, element_id=element_id, reason="scripted")
-            if action in ("finish", "give_up"):
-                return StepOutcome(step=step, decision=decision)
+            if action in ("finish", "give_up", "request_vision"):
+                # 실제 _run_step과 동일 — 판단 스텝은 액션을 실행하지 않는다.
+                # 수용된 request_vision은 성공 스텝이다(실제 구현과 동일).
+                return StepOutcome(
+                    step=step,
+                    decision=decision,
+                    judged_success=decision.is_vision_request and self.som_enabled,
+                    note=(
+                        "vision_request: Tier-2 시각 폴백으로 전환합니다"
+                        if decision.is_vision_request and self.som_enabled
+                        else ("vision_request: SoM 비활성" if decision.is_vision_request else "")
+                    ),
+                )
             return StepOutcome(
                 step=step, decision=decision, result=_result(success, error_code=error_code)
             )
@@ -311,6 +322,201 @@ def test_default_is_som_disabled():
     loop = AgentLoop(page=_Page(), engine=None, dispatcher=None, budget=BudgetGuard())
     assert loop.som_enabled is False
     assert loop.unattended is True
+
+
+# --- LLM 자발 요청 경로 (request_vision) ------------------------------------
+#
+# 실측(glm-5.3-flash, icon-buttons live) — 라벨 없는 아이콘 5개를 LLM이 하나씩
+# 다 눌러봤고 각 클릭은 *성공*이었다. "2회 연속 실패" 조건은 성공-but-헛수고
+# 에는 영원히 안 걸린다. 시각 폴백이 가장 필요한 순간에 발동하지 않는 구조.
+# LLM이 스스로 "구분이 안 된다"고 판단하면 즉시 Tier-2로 간다.
+
+
+def test_request_vision_triggers_tier2_without_prior_failures(monkeypatch):
+    ground = _grounder(GroundingResult(tag="A1", reason="cart icon", latency_ms=9.0, tokens=100))
+    loop, dispatcher = _scripted_loop(
+        monkeypatch,
+        [
+            ("click", "@e1", True, None),          # 성공했지만 헛수고
+            ("request_vision", None, True, None),  # LLM: "구분이 안 됩니다"
+            ("finish", None, True, None),
+        ],
+        grounder=ground,
+        som_enabled=True,
+    )
+    run = _run(loop)
+
+    assert len(ground.calls) == 1
+    tier2 = [s for s in run.steps if s.note == "tier2"]
+    assert len(tier2) == 1
+    assert tier2[0].succeeded is True
+    assert tier2[0].decision.action == "click"          # 재실행할 실패 액션이 없으니 CLICK
+    assert tier2[0].decision.element_id == "@s1"
+    assert run.tier2_calls == 1
+    assert run.completed is True
+    # 요청 스텝 자체는 액션을 실행하지 않는다
+    actions = [a for a, _ in dispatcher.calls]
+    assert actions == [ActionType.TAKE_SCREENSHOT, ActionType.CLICK]
+
+
+def test_request_vision_counts_toward_tier2_budget(monkeypatch):
+    """성공하는 Tier-2가 반복돼도 상한(무인 3회)은 자발 요청에도 똑같이 적용된다."""
+    ground = _grounder(GroundingResult(tag="A1", reason="ok"))
+    loop, _ = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None)] * 5 + [("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=True,
+        unattended=True,
+    )
+    run = _run(loop)
+    assert run.tier2_calls == 3
+    assert ErrorCode.TIER2_BUDGET_EXCEEDED.value in run.terminal_reason
+
+
+def test_request_vision_when_som_disabled_is_a_failed_step(monkeypatch):
+    """SoM이 꺼져 있으면 요청은 실패로 기록되고, 반복하면 연속 실패로 끊긴다."""
+    ground = _grounder(GroundingResult(tag="A1"))
+    loop, dispatcher = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None)] * 4 + [("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=False,
+    )
+    run = _run(loop)
+    assert ground.calls == []
+    assert dispatcher.calls == []
+    assert run.tier2_calls == 0
+    assert run.completed is False
+    assert "연속 3회" in run.terminal_reason
+
+
+# --- 수용된 request_vision은 성공 스텝이다 -------------------------------------
+#
+# 실측(live 50런) — Tier-2 런 5개 전부 히스토리에 이렇게 남았다:
+#     request_vision -> FAIL vision_request
+#     click @s1      -> OK tier2
+# 비전 호출은 실제로 됐고 정답까지 맞혔는데 요청 스텝이 FAIL로 찍혔다.
+# 그 줄이 그대로 LLM 히스토리에 들어가 "네 요청은 실패했다"고 알려주니,
+# 모델은 믿고 재요청했고 icon-buttons 런 2건이 상한 3회를 소진해 끝났다.
+# 루프 상태에서만 실패로 세지 않았을 뿐, 모델에게 보이는 텍스트는 FAIL이었다.
+
+
+def test_accepted_request_vision_is_reported_as_success(monkeypatch):
+    ground = _grounder(GroundingResult(tag="A1", reason="cart icon"))
+    loop, _ = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None), ("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=True,
+    )
+    run = _run(loop)
+    requests = [s for s in run.steps if s.decision.is_vision_request]
+    assert len(requests) == 1
+    assert requests[0].succeeded is True
+    assert "FAIL" not in requests[0].summary()
+    assert "OK" in requests[0].summary()
+
+
+def test_rejected_request_vision_is_still_a_failure(monkeypatch):
+    """SoM이 꺼져 있으면 갈 곳이 없으므로 실패 표기를 유지한다."""
+    ground = _grounder(GroundingResult(tag="A1"))
+    loop, _ = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None)] * 4 + [("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=False,
+    )
+    run = _run(loop)
+    requests = [s for s in run.steps if s.decision.is_vision_request]
+    assert requests
+    assert all(s.succeeded is False for s in requests)
+    assert "FAIL" in requests[0].summary()
+
+
+def test_accepted_request_vision_history_line_does_not_say_fail(monkeypatch):
+    """LLM이 실제로 보는 히스토리 줄을 검증한다 — 재요청 유발의 직접 원인."""
+    seen: list[list[str]] = []
+
+    ground = _grounder(GroundingResult(tag="A1", reason="ok"))
+    loop, _ = _scripted_loop(
+        monkeypatch,
+        [("request_vision", None, True, None), ("finish", None, True, None)],
+        grounder=ground,
+        som_enabled=True,
+    )
+    original = loop._run_step
+
+    async def spy(client, goal, step, history, failures):
+        seen.append(list(history))
+        return await original(client, goal, step, history, failures)
+
+    loop._run_step = spy  # type: ignore[method-assign]
+    _run(loop)
+
+    # finish 스텝이 볼 히스토리에 request_vision 줄이 FAIL로 남아 있으면 안 된다.
+    assert seen, "히스토리를 관측하지 못했다"
+    vision_lines = [
+        line for hist in seen for line in hist if line.startswith("request_vision")
+    ]
+    assert vision_lines, "request_vision 줄이 히스토리에 없다"
+    assert all("FAIL" not in line for line in vision_lines), vision_lines
+
+
+@pytest.mark.parametrize("som_enabled,expected_ok", [(True, True), (False, False)])
+def test_real_run_step_marks_request_vision(monkeypatch, som_enabled, expected_ok):
+    """`_run_step` 실물을 탄다 — ScriptedLoop이 우회하는 경로를 직접 검증.
+
+    다른 테스트는 `_run_step`을 스크립트로 대체하므로 구현 자체는 검증하지
+    못한다. 여기서는 LLM 응답만 가짜로 주고 실제 코드를 통과시킨다.
+    """
+
+    class _Resp:
+        content = '{"action": "request_vision", "reason": "아이콘 구분 불가"}'
+        total_tokens = 10
+        cost_usd = 0.0
+
+        def parse_json(self):
+            import json
+
+            return json.loads(self.content)
+
+    class _Client:
+        async def complete(self, messages, **kwargs):
+            return _Resp()
+
+    class _Engine:
+        async def observe_page(self, page, **kwargs):
+            from contracts import ObserveResult
+
+            return ObserveResult(
+                title="t", url="u", snapshot_epoch=0, elements=[],
+                axtree_summary="", token_count=0,
+            )
+
+    loop = AgentLoop(
+        page=_Page(),
+        engine=_Engine(),
+        dispatcher=_FakeDispatcher(PerceptionEngine()),
+        budget=BudgetGuard(),
+        som_enabled=som_enabled,
+    )
+    outcome = asyncio.run(loop._run_step(_Client(), "장바구니 열기", 1, [], []))
+
+    assert outcome.decision.is_vision_request
+    assert outcome.succeeded is expected_ok
+    assert ("FAIL" in outcome.summary()) is not expected_ok
+
+
+def test_policy_prompt_offers_request_vision_only_when_som_enabled():
+    from agent.policy import REQUEST_VISION, build_messages
+    from contracts import ObserveResult
+
+    obs = ObserveResult(title="t", url="u", snapshot_epoch=0, elements=[], axtree_summary="", token_count=0)
+    on = build_messages("g", obs, step=1, max_steps=5, history=[], limit=20, som_enabled=True)
+    off = build_messages("g", obs, step=1, max_steps=5, history=[], limit=20)
+    assert REQUEST_VISION in on[0]["content"]
+    assert REQUEST_VISION not in off[0]["content"]
 
 
 def test_policy_prompt_mentions_som_ids():

@@ -32,6 +32,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 #: 저비용·구조화 출력 지원 모델을 기본으로 둔다. 태스크당 $0.75 상한
 #: (contracts.thresholds.MAX_USD_PER_TASK) 안에서 30스텝을 돌 수 있어야 한다.
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+#: decider="jev"일 때 Jev가 막히면 넘겨받는 채팅 모델(생각 짧게 + JSON 강제로 호출).
+DEFAULT_FALLBACK_MODEL = "qwen/qwen3.8-27b"
 
 #: `KEY=VALUE` 파싱. 값의 따옴표와 인라인 주석을 제거한다.
 _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
@@ -128,6 +130,12 @@ class LLMConfig:
     app_title: str = "agent-browser"
     timeout_s: float = 60.0
     max_retries: int = 2
+    #: 에이전트 판단 방식. "llm"(기본, 채팅 모델) | "jev"(Jev 보기 고르기 + 폴백).
+    #: jev는 OpenRouter에서만 켜진다 — 로컬 base_url(로그인 작업)에서는 무시한다.
+    decider: str = "llm"
+    #: decider="jev"일 때 Jev가 막히면 넘겨받는 채팅 모델.
+    #: 실측(2026-09-24): qwen3.8-27b 폴백 3회 28/28/28, 최대 22초, 시간초과 0.
+    fallback_model: str = DEFAULT_FALLBACK_MODEL
 
     @property
     def configured(self) -> bool:
@@ -193,4 +201,6 @@ def load_config(
         app_title=pick("OPENROUTER_APP_TITLE", "agent-browser"),
         timeout_s=float(pick("OPENROUTER_TIMEOUT_S", "60") or 60),
         max_retries=int(pick("OPENROUTER_MAX_RETRIES", "2") or 2),
+        decider=(pick("AGENT_DECIDER", "llm") or "llm").strip().lower(),
+        fallback_model=pick("AGENT_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL),
     )

@@ -97,3 +97,23 @@ def test_sabotage_b_wrong_grounder_fails():
     assert "tier2_verified" in payload["reason"]
     # 발동률·지연 자체는 여전히 통과 — 독립 검증만이 이 결함을 잡는다.
     assert payload["trigger_rate"] == 0.1
+
+
+def test_sabotage_c_loop_ignoring_vision_request_fails(monkeypatch):
+    """루프가 request_vision을 무시하면(발동 경로 (2) 결손) FAIL이어야 한다.
+
+    실측 — 이것이 첫 live 측정에서 실제로 일어난 미탐이다: 실 모델은 실패
+    대신 헛수고 클릭을 했고, "2회 실패" 조건만 있던 루프는 발동하지 않았다.
+    당시 mock은 실패를 내도록 짜여 있어 하네스가 통과했다(유형 D).
+    """
+    from agent.policy import Decision
+
+    monkeypatch.setattr(
+        Decision, "is_vision_request", property(lambda self: False)
+    )
+    result = _run()
+    payload = result.to_dict()
+    print("SABOTAGE_C", result.to_json())
+    assert payload["covered_triggered"] == 0
+    assert payload["passed"] is False
+    assert result.error and "커버리지" in result.error
