@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-768개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+854개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -126,6 +126,19 @@ uv run agent-browser llm-check             # 실제 호출 (약 $0.000001)
 키가 플레이스홀더 상태면 그렇다고 알려줍니다. 태스크를 다 돌린 뒤 401을 받는 일이 없도록 만들었습니다.
 
 **빠른 판단 모드 (선택).** `.env`에 `AGENT_DECIDER=jev`를 넣으면 Jev(보기 고르기 전용 모델)가 "다음 행동 → 대상 → 입력값"을 좁은 질문으로 하나씩 빠르게(한 번 약 0.2초) 판단합니다. 확신이 낮거나, 직전 행동이 실패했거나, 입력값을 만들어야 할 때만 `AGENT_FALLBACK_MODEL`(기본 `qwen/qwen3.8-27b`)이 넘겨받습니다. OpenRouter에서만 켜지고, 로컬 모델로 도는 로그인 작업에서는 쓰지 않습니다(페이지 내용이 클라우드로 가지 않게). 실측(agent_eval 31개 × 3회)은 평균 28.7/31 성공, 31개에 약 5~6분, $0.036입니다. 약점은 "끝났다"를 잘못 판단하는 경우(3회 중 거짓 완료 0~2건)입니다.
+
+**목표 1개 실행 (`run`).** 주소와 목표 문장 하나로 에이전트를 돌리고 결과를 JSON으로 받습니다.
+
+```bash
+uv run agent-browser run --url https://example.com --goal "첫 문단을 요약해 줘" --out result.json
+uv run agent-browser run --url URL --goal GOAL --human               # 실제 창·ko-KR (위장 없음)
+uv run agent-browser run --url URL --goal GOAL --user-chrome         # 설치된 Chrome, 전용 프로필(~/.agent-browser/chrome-profile)
+uv run agent-browser run --url URL --goal GOAL --handoff --handoff-wait 300
+```
+
+`--out` 파일은 페이지 본문이 들어가므로 권한 0600으로 씁니다. `--handoff`를 켜면 차단·캡차 화면에서 멈추고, 사람이 창에서 해결한 뒤 터미널에서 Enter를 누르거나 `touch ~/.agent-browser/handoff.done`(`--handoff-file`로 변경)하면 같은 목표로 이어 갑니다(이때도 화면을 다시 확인해, 여전히 막혀 있으면 멈춥니다). 정상 화면을 차단으로 잘못 본 경우에는 터미널에 `f`(또는 `force`)를 입력하고 Enter를 누르거나 `echo force > ~/.agent-browser/handoff.done` 하면 강제로 계속하며, 그 실행 동안 같은 판정은 다시 넘기지 않습니다(결과의 `handoffs[].forced`에 기록). `--user-chrome`은 우리가 띄운 Chrome만 닫습니다(`--keep-open`이면 둡니다). `--human`과 `--user-chrome`은 함께 쓸 수 없고, `--chrome-profile`에 평소 Chrome 프로필 경로를 주면 브라우저를 띄우기 전에 한 줄 오류로 거부합니다(exit 2).
+
+> 막히면 사람에게 넘긴다 — 캡차를 풀거나 차단을 우회하지 않는다.
 
 ### 4. 실환경 태스크 실행
 
