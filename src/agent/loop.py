@@ -27,7 +27,8 @@ import base64
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from browser.challenge import Challenge, detect_challenge
 from contracts import ActionResult, ActionType, BBox, ErrorCode, ObserveResult
@@ -206,6 +207,36 @@ class TaskRun:
         }
 
 
+class HandoffOutcome(str, Enum):
+    """사람 인계 훅(on_challenge)의 결과 (WS-22 R2).
+
+    * UNRESOLVED — 시간 초과·신호 없음(False 와 같다). 끝낸다.
+    * RESOLVED — 사람이 해결했다고 알림(True 와 같다). 믿지 않고 다시 본다.
+    * FORCE — 사람이 "그냥 계속" 을 지시(오탐). 재확인 결과와 무관하게 진행하고,
+      그 실행 동안 같은 판정(kind+vendor+reason)은 다시 인계하지 않는다.
+    """
+
+    UNRESOLVED = "unresolved"
+    RESOLVED = "resolved"
+    FORCE = "force"
+
+
+def normalize_handoff(value: Any) -> HandoffOutcome:
+    """훅 반환값을 HandoffOutcome 으로. 기존 계약(bool)도 받는다."""
+    if isinstance(value, HandoffOutcome):
+        return value
+    if isinstance(value, str):
+        try:
+            return HandoffOutcome(value.strip().lower())
+        except ValueError:
+            return HandoffOutcome.UNRESOLVED
+    return HandoffOutcome.RESOLVED if value is True else HandoffOutcome.UNRESOLVED
+
+
+def _challenge_key(ch: Challenge) -> Tuple[str, str, str]:
+    return (ch.kind.value, ch.vendor, ch.reason)
+
+
 class AgentLoop:
     """관찰-판단-액션 루프.
 
@@ -227,7 +258,9 @@ class AgentLoop:
         som_enabled: bool = False,
         unattended: bool = True,
         grounder: Optional[Callable[..., Any]] = None,
-        on_challenge: Optional[Callable[[Challenge], Awaitable[bool]]] = None,
+        on_challenge: Optional[
+            Callable[[Challenge], Awaitable[Union[bool, HandoffOutcome]]]
+        ] = None,
     ) -> None:
         self.page = page
         self.engine = engine
@@ -248,9 +281,12 @@ class AgentLoop:
         #: decider="jev"일 때 run()이 만든다.
         self._jev: Any = None
         self._jev_client: Any = None
-        #: 차단/캡차 화면을 만나면 사람에게 넘기는 훅(WS-22). True = 사람이
-        #: 해결했다고 알림. 자체 타임아웃을 가져야 한다(루프 벽시계 상한도 적용).
+        #: 차단/캡차 화면을 만나면 사람에게 넘기는 훅(WS-22). True/RESOLVED = 사람이
+        #: 해결했다고 알림, FORCE = 오탐이니 그냥 계속. 자체 타임아웃을 가져야 한다
+        #: (루프 벽시계 상한도 적용).
         self.on_challenge = on_challenge
+        #: 사람이 강제 계속을 지시한 판정(kind, vendor, reason) — 그 실행 동안 재인계 안 함.
+        self._forced: Set[Tuple[str, str, str]] = set()
         #: 마지막 메인 프레임 문서 응답의 HTTP 상태(차단 판정 보조).
         self._last_status: Optional[int] = None
 
@@ -275,16 +311,26 @@ class AgentLoop:
         if not found.detected:
             return False
         run.challenge = found.kind.value
+        if _challenge_key(found) in self._forced:
+            # 사람이 이 판정을 오탐이라며 강제 계속을 지시했다 — 다시 넘기지 않는다.
+            return False
         logger.info("차단/캡차 감지: %s (%s) — %s", found.kind.value, found.vendor, found.reason)
         if self.on_challenge is not None:
             remaining = MAX_WALL_CLOCK_SECONDS - (time.perf_counter() - started)
             try:
-                resolved = await asyncio.wait_for(
+                outcome = normalize_handoff(await asyncio.wait_for(
                     self.on_challenge(found), timeout=max(remaining, 0.0)
-                )
+                ))
             except Exception:  # noqa: BLE001 - 타임아웃·훅 오류는 미해결로 본다
-                resolved = False
-            if resolved:
+                outcome = HandoffOutcome.UNRESOLVED
+            if outcome is HandoffOutcome.FORCE:
+                # 사람이 명시적으로 "그냥 계속" — 판정기를 느슨하게 하는 대신 이 판정만 넘긴다.
+                logger.info("사람 강제 계속: %s (%s) — %s", found.kind.value, found.vendor,
+                            found.reason)
+                self._forced.add(_challenge_key(found))
+                self._last_status = None
+                return False
+            if outcome is HandoffOutcome.RESOLVED:
                 # 사람이 해결했다고 알렸다 — 믿지 않고 다시 본다.
                 self._last_status = None
                 again = await detect_challenge(page, last_status=None)
@@ -339,6 +385,7 @@ class AgentLoop:
             self._jev = JevDecider(self._jev_client, limit=self.top_n)
 
         self._last_status = None
+        self._forced = set()
         listened = self.page if callable(getattr(self.page, "on", None)) else None
         if listened is not None:
             listened.on("response", self._on_response)

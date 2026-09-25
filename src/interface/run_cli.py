@@ -11,7 +11,8 @@
     connect_over_cdp 로 붙는다. 끝나면 우리가 띄운 Chrome 만 닫는다(`--keep-open` 이면 둔다).
   * `--handoff`: 차단·캡차 화면을 만나면 멈추고 사람에게 넘긴다. 사람이 창에서 해결한 뒤
     신호 파일(기본 ~/.agent-browser/handoff.done)을 만들거나, 터미널(표준입력이 TTY)에서
-    Enter 를 누르면 — 먼저 오는 쪽으로 — 같은 목표로 이어 간다.
+    Enter 를 누르면 — 먼저 오는 쪽으로 — 같은 목표로 이어 간다. 오탐이면 "f"/"force"
+    입력 후 Enter(또는 신호 파일 내용 "force")로 강제 계속 — 같은 판정은 다시 넘기지 않는다.
 
 **캡차를 풀거나 차단을 우회하지 않는다.** 막히면 사람에게 넘기고, 사람이 해결했다는
 신호도 믿지 않고 화면을 다시 확인한다(AgentLoop._check_challenge).
@@ -27,7 +28,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
 
@@ -94,14 +95,36 @@ def write_result(path: Path, record: Dict[str, Any]) -> None:
             os.close(fd)
 
 
-async def wait_for_human(done_file: Path, wait_s: float, *, stdin: Any = None) -> Optional[str]:
-    """사람 해결 신호를 기다린다. "file" | "enter" | None(시간 초과).
+#: 강제 계속 신호 — 터미널 입력 또는 신호 파일 내용(앞뒤 공백·대소문자 무시)
+FORCE_WORDS = frozenset({"f", "force"})
+_FILE_READ_LIMIT = 64
 
-    신호 파일이 생기거나, 표준입력이 TTY 일 때 Enter 가 들어오면 — 먼저 오는 쪽.
+
+def _is_force(text: str) -> bool:
+    return text.strip().casefold() in FORCE_WORDS
+
+
+def _read_signal_file(path: Path) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(_FILE_READ_LIMIT)
+    except OSError:
+        return ""
+
+
+async def wait_for_human_signal(
+    done_file: Path, wait_s: float, *, stdin: Any = None
+) -> Optional[Tuple[str, bool]]:
+    """사람 신호를 기다린다. (via, forced) | None(시간 초과).
+
+    via 는 "file" | "enter". 신호 파일이 생기거나, 표준입력이 TTY 일 때 한 줄이
+    들어오면 — 먼저 오는 쪽. 입력 줄·파일 내용이 "f"/"force" 면 forced=True
+    (빈 Enter·빈 파일은 "해결했다").
     """
     stdin = sys.stdin if stdin is None else stdin
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
+    typed: Dict[str, str] = {"line": ""}
     fd = -1
     try:
         if stdin is not None and stdin.isatty():
@@ -109,7 +132,7 @@ async def wait_for_human(done_file: Path, wait_s: float, *, stdin: Any = None) -
 
             def _on_input() -> None:
                 try:
-                    stdin.readline()
+                    typed["line"] = stdin.readline() or ""
                 except Exception:  # noqa: BLE001
                     pass
                 entered.set()
@@ -121,9 +144,9 @@ async def wait_for_human(done_file: Path, wait_s: float, *, stdin: Any = None) -
         deadline = time.monotonic() + wait_s
         while True:
             if Path(done_file).exists():
-                return "file"
+                return "file", _is_force(_read_signal_file(Path(done_file)))
             if entered.is_set():
-                return "enter"
+                return "enter", _is_force(typed["line"])
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
@@ -136,11 +159,23 @@ async def wait_for_human(done_file: Path, wait_s: float, *, stdin: Any = None) -
             loop.remove_reader(fd)
 
 
+async def wait_for_human(done_file: Path, wait_s: float, *, stdin: Any = None) -> Optional[str]:
+    """사람 해결 신호를 기다린다. "file" | "enter" | None(시간 초과). (호환용)"""
+    got = await wait_for_human_signal(done_file, wait_s, stdin=stdin)
+    return got[0] if got is not None else None
+
+
 def make_handoff(record: Dict[str, Any], wait_s: float, done_file: Path, *, stdin: Any = None):
-    """AgentLoop.on_challenge 훅: 안내 출력 → 사람 신호(파일/Enter)를 최대 wait_s 기다린다."""
+    """AgentLoop.on_challenge 훅: 안내 출력 → 사람 신호(파일/Enter)를 최대 wait_s 기다린다.
+
+    반환: HandoffOutcome — UNRESOLVED(시간 초과) / RESOLVED(해결, 루프가 재확인) /
+    FORCE(오탐이니 그냥 계속 — 같은 판정은 그 실행 동안 다시 넘기지 않는다).
+    """
+    from agent.loop import HandoffOutcome
+
     done_file = Path(done_file).expanduser()
 
-    async def on_challenge(challenge: Any) -> bool:
+    async def on_challenge(challenge: Any) -> HandoffOutcome:
         try:
             done_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError:
@@ -150,21 +185,27 @@ def make_handoff(record: Dict[str, Any], wait_s: float, done_file: Path, *, stdi
         print(
             f"\n[사람 확인 필요] {challenge.kind.value} ({challenge.vendor}) — {challenge.reason}\n"
             f"  브라우저 창에서 직접 해결한 뒤 Enter 를 누르거나: touch {done_file}\n"
+            f"  오탐(정상 화면)이면 강제 계속: f 또는 force 입력 후 Enter, "
+            f"또는: echo force > {done_file}\n"
             f"  최대 {wait_s:.0f}초 기다립니다.",
             file=sys.stderr, flush=True,
         )
-        via = await wait_for_human(done_file, wait_s, stdin=stdin)
+        got = await wait_for_human_signal(done_file, wait_s, stdin=stdin)
         done_file.unlink(missing_ok=True)
+        via, forced = got if got is not None else (None, False)
         record["handoffs"].append({
             "kind": challenge.kind.value,
             "vendor": challenge.vendor,
             "reason": challenge.reason,
             "resolved_signal": via is not None,
             "via": via,
+            "forced": bool(forced),
             "waited_s": round(time.monotonic() - t0, 2),
         })
         record["human_wait_s"] = round(sum(h["waited_s"] for h in record["handoffs"]), 2)
-        return via is not None
+        if via is None:
+            return HandoffOutcome.UNRESOLVED
+        return HandoffOutcome.FORCE if forced else HandoffOutcome.RESOLVED
 
     return on_challenge
 

@@ -207,3 +207,108 @@ async def test_normal_page_never_calls_handler(monkeypatch):
     run = await _run(monkeypatch, html=NORMAL, chat=chat, on_challenge=make)
     assert calls == [] and run.completed and run.challenge is None
     assert run.to_dict()["challenge"] is None
+
+
+# ---------------------------------------------------------------- 강제 계속 (R2-1)
+
+# 짧은 정상 공지인데 차단 문구가 그대로 든 페이지 — 판정기는 느슨하게 하지 않으므로
+# BLOCKED 로 잡힌다(오탐). 사람이 "강제 계속" 을 지시하면 진행해야 한다.
+FALSE_POSITIVE = """<!doctype html><meta charset=utf-8><title>공지</title>
+<p>점검 시간에는 접속이 일시적으로 제한될 수 있으며 곧 복구됩니다.</p>
+<input aria-label='검색어' id=q><button>검색</button><p>상품 목록</p>"""
+
+
+def test_normalize_handoff_accepts_bool_and_force():
+    from agent.loop import HandoffOutcome, normalize_handoff
+
+    assert normalize_handoff(True) is HandoffOutcome.RESOLVED
+    assert normalize_handoff(False) is HandoffOutcome.UNRESOLVED
+    assert normalize_handoff(None) is HandoffOutcome.UNRESOLVED
+    assert normalize_handoff("force") is HandoffOutcome.FORCE
+    assert normalize_handoff(HandoffOutcome.FORCE) is HandoffOutcome.FORCE
+    assert normalize_handoff(HandoffOutcome.RESOLVED) is HandoffOutcome.RESOLVED
+
+
+@requires_chromium
+async def test_false_positive_force_continue_calls_llm_and_completes(monkeypatch):
+    chat = FakeChat(['{"action":"finish","reason":"상품 목록이 보인다"}'])
+    seen = []
+
+    def make(page):
+        async def on_challenge(ch):
+            seen.append(ch)
+            return "force"   # 사람: 오탐이니 그냥 계속
+        return on_challenge
+
+    run = await _run(monkeypatch, html=FALSE_POSITIVE, chat=chat, on_challenge=make)
+    assert len(seen) == 1 and seen[0].kind.value == "blocked"
+    assert chat.calls == 1, "강제 계속이면 LLM 을 불러야 한다"
+    assert run.completed, run.terminal_reason
+    assert run.challenge == "blocked", "인계가 있었다는 기록은 남는다"
+
+
+@requires_chromium
+async def test_force_continue_same_challenge_not_handed_off_again(monkeypatch):
+    chat = FakeChat(['{"action":"read_text","reason":"읽는다"}',
+                     '{"action":"read_text","reason":"또 읽는다"}',
+                     '{"action":"finish","reason":"상품 목록이 보인다"}'])
+    seen = []
+
+    def make(page):
+        async def on_challenge(ch):
+            seen.append(ch)
+            return "force"
+        return on_challenge
+
+    run = await _run(monkeypatch, html=FALSE_POSITIVE, chat=chat, on_challenge=make)
+    assert len(seen) == 1, f"같은 판정은 다시 인계하지 않는다: {len(seen)}회"
+    assert chat.calls == 3 and run.completed, run.terminal_reason
+
+
+@requires_chromium
+async def test_force_continue_then_different_challenge_hands_off_again(monkeypatch):
+    from playwright.async_api import async_playwright
+
+    chat = FakeChat(['{"action":"navigate","url":"http://shop.test/check","reason":"이동"}'])
+    monkeypatch.setattr(loop_mod, "OpenRouterClient", lambda *a, **k: chat)
+    seen = []
+
+    async def on_challenge(ch):
+        seen.append(ch)
+        return "force" if len(seen) == 1 else False
+
+    async with async_playwright() as pw:
+        b = await pw.chromium.launch(headless=True)
+        ctx = await b.new_context()
+        await ctx.route("http://shop.test/**", lambda r: r.fulfill(
+            status=200, content_type="text/html; charset=utf-8",
+            body="<!doctype html><meta charset=utf-8><title>Just a moment...</title><p>잠시만</p>"))
+        page = await ctx.new_page()
+        await page.set_content(FALSE_POSITIVE)
+        engine = PerceptionEngine()
+        disp = ActionDispatcher(DispatchContext(page=page, engine=engine,
+                                                cdp=await ctx.new_cdp_session(page)))
+        run = await AgentLoop(page=page, engine=engine, dispatcher=disp, config=_cfg(),
+                              max_steps=4, on_challenge=on_challenge).run("상품을 찾아 줘")
+        await b.close()
+    assert [c.kind.value for c in seen] == ["blocked", "captcha"], seen
+    assert chat.calls == 1 and not run.completed
+    assert run.terminal_reason.startswith(ErrorCode.CAPTCHA_DETECTED.value), run.terminal_reason
+    assert run.challenge == "captcha"
+
+
+@requires_chromium
+async def test_resolved_signal_on_false_positive_still_rechecks_and_stops(monkeypatch):
+    """빈 Enter/빈 파일(=해결했다)은 여전히 재확인한다 — 오탐 화면이면 그대로 멈춘다."""
+    chat = FakeChat([])
+    calls = []
+
+    def make(page):
+        async def on_challenge(ch):
+            calls.append(ch)
+            return True
+        return on_challenge
+
+    run = await _run(monkeypatch, html=FALSE_POSITIVE, chat=chat, on_challenge=make)
+    assert len(calls) == 1 and chat.calls == 0 and not run.completed
+    assert run.terminal_reason.startswith(ErrorCode.CAPTCHA_DETECTED.value)

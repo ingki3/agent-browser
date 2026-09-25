@@ -184,6 +184,85 @@ def test_attached_close_does_not_touch_foreign_process():
     uc.close()  # 사용자가 띄운 Chrome: 아무것도 하지 않는다
 
 
+# ---------------------------------------------------------------- R2-2 뮤테이션 공백
+
+
+def _fake_home_roots(tmp_path):
+    """tmp_path 안의 가짜 홈과 그 안의 평소 프로필 루트(실제 사용자 폴더는 건드리지 않는다)."""
+    home = tmp_path / "fakehome"
+    root = home / "Library" / "Application Support" / "Google" / "Chrome"
+    (root / "Default").mkdir(parents=True)
+    return home, root
+
+
+def test_symlink_to_user_profile_root_rejected(tmp_path, monkeypatch):
+    home, root = _fake_home_roots(tmp_path)
+    monkeypatch.setattr(user_chrome, "_USER_PROFILE_ROOTS", (root,))
+    link = tmp_path / "innocent-link"
+    link.symlink_to(root)
+    with pytest.raises(ValueError):
+        build_chrome_args(profile_dir=link, port=9333)
+    with pytest.raises(ValueError):
+        prepare_profile_dir(link / "Default")
+    parent_link = tmp_path / "g"
+    parent_link.symlink_to(root.parent)
+    with pytest.raises(ValueError):
+        prepare_profile_dir(parent_link / "chrome" / "default")
+
+
+def test_relative_dotdot_path_to_user_profile_rejected(tmp_path, monkeypatch):
+    home, root = _fake_home_roots(tmp_path)
+    monkeypatch.setattr(user_chrome, "_USER_PROFILE_ROOTS", (root,))
+    work = home / "work" / "sub"
+    work.mkdir(parents=True)
+    monkeypatch.chdir(work)
+    rel = Path("..") / ".." / "Library" / "Application Support" / "Google" / "Chrome"
+    with pytest.raises(ValueError):
+        build_chrome_args(profile_dir=rel, port=9333)
+    with pytest.raises(ValueError):
+        prepare_profile_dir(Path("..") / "x" / ".." / ".." / "Library" / "Application Support"
+                            / "Google" / "Chrome" / "Default")
+
+
+def test_pick_free_port_binds_loopback_only(monkeypatch):
+    assert user_chrome._HOST == "127.0.0.1"
+    bound = []
+    real_socket = user_chrome.socket.socket
+
+    class Spy(real_socket):
+        def bind(self, addr):
+            bound.append(addr)
+            return super().bind(addr)
+
+    monkeypatch.setattr(user_chrome.socket, "socket", Spy)
+    port = user_chrome.pick_free_port()
+    assert 0 < port < 65536
+    assert bound == [("127.0.0.1", 0)]
+
+
+def test_endpoint_is_loopback():
+    assert UserChrome(port=9333).endpoint == "http://127.0.0.1:9333"
+
+
+def test_attached_close_never_signals_any_process(monkeypatch):
+    """attach 로 붙은 Chrome(process=None).close() 는 종료 호출을 0회 한다."""
+    calls = []
+    monkeypatch.setattr(user_chrome.os, "killpg", lambda *a: calls.append(("killpg", a)))
+    monkeypatch.setattr(user_chrome.os, "kill", lambda *a: calls.append(("kill", a)))
+    monkeypatch.setattr(user_chrome.subprocess.Popen, "terminate",
+                        lambda self: calls.append(("terminate",)))
+    monkeypatch.setattr(user_chrome.subprocess.Popen, "kill",
+                        lambda self: calls.append(("kill-proc",)))
+
+    monkeypatch.setattr(user_chrome, "_version_info",
+                        lambda port, timeout=1.0: {"webSocketDebuggerUrl": "ws://x"})
+    uc = asyncio.run(user_chrome.attach(9333, timeout_s=0.1))
+    assert uc.process is None and uc.owned is False
+    uc.close()
+    uc.close(timeout=0.01)
+    assert calls == []
+
+
 # ---------------------------------------------------------------- 통합 (opt-in)
 
 _INTEGRATION = os.environ.get("AB_USER_CHROME_TEST") == "1" and find_chrome() is not None

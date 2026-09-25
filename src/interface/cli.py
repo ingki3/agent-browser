@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 from contracts import ExecutionMode
@@ -263,6 +264,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "run":
         if (args.chrome_profile or args.keep_open) and not args.user_chrome:
             parser.error("--chrome-profile / --keep-open 은 --user-chrome 과 함께 씁니다")
+        if args.human and args.user_chrome:
+            parser.error("--human 과 --user-chrome 은 함께 쓸 수 없습니다(둘 중 하나만)")
+        if args.user_chrome:
+            # 평소 Chrome 프로필 가드 — 브라우저·폴더를 만들기 전에, 트레이스백 없이 한 줄.
+            from browser.user_chrome import DEFAULT_PROFILE_DIR, _guard_profile
+
+            try:
+                _guard_profile(Path(args.chrome_profile).expanduser()
+                               if args.chrome_profile else DEFAULT_PROFILE_DIR)
+            except ValueError as exc:
+                parser.exit(2, f"agent-browser run: 오류: {exc}\n")
         from interface import run_cli
 
         return run_cli.run(args)

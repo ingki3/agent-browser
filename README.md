@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-822개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
+854개가 통과해야 합니다. Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -136,7 +136,7 @@ uv run agent-browser run --url URL --goal GOAL --user-chrome         # 설치된
 uv run agent-browser run --url URL --goal GOAL --handoff --handoff-wait 300
 ```
 
-`--out` 파일은 페이지 본문이 들어가므로 권한 0600으로 씁니다. `--handoff`를 켜면 차단·캡차 화면에서 멈추고, 사람이 창에서 해결한 뒤 터미널에서 Enter를 누르거나 `touch ~/.agent-browser/handoff.done`(`--handoff-file`로 변경)하면 같은 목표로 이어 갑니다. `--user-chrome`은 우리가 띄운 Chrome만 닫습니다(`--keep-open`이면 둡니다).
+`--out` 파일은 페이지 본문이 들어가므로 권한 0600으로 씁니다. `--handoff`를 켜면 차단·캡차 화면에서 멈추고, 사람이 창에서 해결한 뒤 터미널에서 Enter를 누르거나 `touch ~/.agent-browser/handoff.done`(`--handoff-file`로 변경)하면 같은 목표로 이어 갑니다(이때도 화면을 다시 확인해, 여전히 막혀 있으면 멈춥니다). 정상 화면을 차단으로 잘못 본 경우에는 터미널에 `f`(또는 `force`)를 입력하고 Enter를 누르거나 `echo force > ~/.agent-browser/handoff.done` 하면 강제로 계속하며, 그 실행 동안 같은 판정은 다시 넘기지 않습니다(결과의 `handoffs[].forced`에 기록). `--user-chrome`은 우리가 띄운 Chrome만 닫습니다(`--keep-open`이면 둡니다). `--human`과 `--user-chrome`은 함께 쓸 수 없고, `--chrome-profile`에 평소 Chrome 프로필 경로를 주면 브라우저를 띄우기 전에 한 줄 오류로 거부합니다(exit 2).
 
 > 막히면 사람에게 넘긴다 — 캡차를 풀거나 차단을 우회하지 않는다.
 
