@@ -28,7 +28,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from contracts.thresholds import MAX_WALL_CLOCK_SECONDS
 
@@ -67,7 +67,46 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
                    help="사람 대기 최대 초(기본 300)")
     p.add_argument("--handoff-file", default=str(DEFAULT_HANDOFF_FILE), metavar="PATH",
                    help=f"사람 해결 신호 파일(기본 {DEFAULT_HANDOFF_FILE})")
+    p.add_argument("--no-answer", action="store_true",
+                   help="끝난 뒤 답 생성(final_answer)을 하지 않음")
     return p
+
+
+#: 결과 JSON 의 답 생성 키 기본값(WS-23). 답을 만들지 않은 경로에서도 채운다.
+ANSWER_DEFAULTS: Tuple[Tuple[str, Any], ...] = (
+    ("final_answer", ""),
+    ("finish_reason", ""),
+    ("answer_model", ""),
+    ("answer_elapsed_s", 0.0),
+    ("answer_error", ""),
+    ("answer_input_chars", 0),
+    ("answer_truncated_chars", 0),
+    ("answer_usd", 0.0),
+    ("answer_tokens", 0),
+)
+
+
+def _capture_read_texts(loop: Any, sink: List[str]) -> None:
+    """루프가 read_text 로 읽은 글을 sink 에 순서대로 모은다(루프 코드는 그대로).
+
+    read_text 스텝이 성공하면 AgentLoop 는 읽은 글을 `_pending_page_text` 에 두고
+    다음 스텝 프롬프트에 한 번 넣은 뒤 비운다 — 어디에도 남지 않는다. 그래서 이
+    인스턴스의 `_run_step` 을 감싸, 반환 직후 그 값을 **읽기만** 한다. 인자·반환값·
+    상태를 바꾸지 않으므로 스텝 수·결정·종료 조건은 이전과 같다.
+    """
+    inner = getattr(loop, "_run_step", None)
+    if inner is None:
+        return
+
+    async def _run_step(*a: Any, **kw: Any) -> Any:
+        outcome = await inner(*a, **kw)
+        text = getattr(loop, "_pending_page_text", None)
+        decision = getattr(outcome, "decision", None)
+        if text and decision is not None and getattr(decision, "is_read_text", False):
+            sink.append(text)
+        return outcome
+
+    loop._run_step = _run_step
 
 
 def _load_config() -> Any:
@@ -255,6 +294,10 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
         "human_wait_s": 0.0,
         "http_status": None,
     }
+    budget = BudgetGuard()
+    #: 실행 중 read_text 로 읽은 글(읽은 순서) — 답 생성 입력
+    read_texts: List[str] = []
+    answer_ok = False
     started = time.perf_counter()
     async with async_playwright() as pw:
         browser, context, page, uc = await _open_browser(pw, args, record)
@@ -270,7 +313,7 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
                 engine=engine,
                 dispatcher=dispatcher,
                 config=config,
-                budget=BudgetGuard(),
+                budget=budget,
                 max_steps=args.max_steps,
                 on_challenge=(
                     make_handoff(record, args.handoff_wait, Path(args.handoff_file), stdin=stdin)
@@ -279,6 +322,7 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
             )
             # 루프 자체 상한이 먼저 걸리게 여유를 두고, 사람 대기 시간만큼 늘린다.
             wall = MAX_WALL_CLOCK_SECONDS + WALL_MARGIN_S + (args.handoff_wait if args.handoff else 0)
+            _capture_read_texts(loop, read_texts)
             try:
                 run = await asyncio.wait_for(loop.run(args.goal), timeout=wall)
             except asyncio.TimeoutError:
@@ -297,22 +341,26 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
                     "decided_by_counts": dict(Counter(s.decided_by for s in run.steps)),
                     "usd": run.budget.get("usd"),
                     "tokens": run.budget.get("tokens"),
-                    "final_answer": finals[-1].decision.reason if finals else "",
+                    # 끝낸 이유 한 줄(예: "jev finish 0.75") — 답이 아니다(WS-23).
+                    "finish_reason": finals[-1].decision.reason if finals else "",
                 })
+                answer_ok = run.completed is True
         except Exception as exc:  # noqa: BLE001
             record["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
             record.setdefault("completed", False)
             record.setdefault("terminal_reason", "실행 오류")
+            answer_ok = False
         finally:
             # 어떤 경로로 끝나도 결과 키는 모두 채운다(소비자가 KeyError 로 죽지 않게).
             for key, default in (("step_count", 0), ("steps", []), ("decided_by", []),
                                  ("decided_by_counts", {}), ("usd", 0.0), ("tokens", 0),
-                                 ("final_answer", "")):
+                                 *ANSWER_DEFAULTS):
                 record.setdefault(key, default)
+            full_text = ""
             try:
                 record.setdefault("final_url", page.url)
-                text = await _read_body_text(page)
-                record["final_page_text"] = text[:PAGE_TEXT_LIMIT]
+                full_text = await _read_body_text(page) or ""
+                record["final_page_text"] = full_text[:PAGE_TEXT_LIMIT]
             except Exception as exc:  # noqa: BLE001
                 record.setdefault("final_url", "")
                 record["final_page_text"] = f"<읽기 실패 {type(exc).__name__}>"
@@ -327,6 +375,15 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
             else:
                 await context.close()
                 await browser.close()
+    # 답 생성(WS-23) — 브라우저를 닫은 뒤, 완료(completed)일 때만. 포기·차단·시간 초과·
+    # 실행 오류면 만들지 않는다(차단 화면을 요약하지 않게). 루프와 같은 config·예산.
+    if answer_ok and not getattr(args, "no_answer", False):
+        from interface.run_answer import generate_answer
+
+        record.update(await generate_answer(
+            config, budget, args.goal, read_texts, full_text, record.get("final_url") or "",
+        ))
+        record["elapsed_s"] = round(time.perf_counter() - started, 2)
     return record
 
 

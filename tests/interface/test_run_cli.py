@@ -24,7 +24,7 @@ import pytest
 
 from agent import loop as loop_mod
 from contracts import ErrorCode
-from interface import cli, run_cli
+from interface import cli, run_answer, run_cli
 from llm import LLMConfig
 from llm.client import LLMResponse
 
@@ -32,6 +32,7 @@ RESULT_KEYS = {
     "goal", "start_url", "final_url", "completed", "terminal_reason", "step_count",
     "steps", "decided_by", "decided_by_counts", "usd", "tokens", "challenge",
     "handoffs", "human_wait_s", "http_status", "final_answer", "final_page_text",
+    "finish_reason", "answer_model", "answer_elapsed_s", "answer_error", "answer_input_chars",
 }
 
 
@@ -110,11 +111,34 @@ def server():
         srv.server_close()
 
 
+class FakeAnswer:
+    """답 생성(run_answer) 대역 — 실제 네트워크로 나가지 않게 한다(WS-23)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *a, **k):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def complete(self, messages, **kw):
+        self.calls.append(messages)
+        return LLMResponse(content="사과는 3000원입니다.", model="m",
+                           prompt_tokens=10, completion_tokens=5, cost_usd=0.001)
+
+
 @pytest.fixture
 def fake_llm(monkeypatch):
     chat = FakeChat(['{"action":"finish","reason":"상품 목록에 사과 3000원이 보인다"}'])
     monkeypatch.setattr(loop_mod, "OpenRouterClient", lambda *a, **k: chat)
     monkeypatch.setattr(run_cli, "_load_config", _cfg)
+    chat.answer = FakeAnswer()
+    monkeypatch.setattr(run_answer, "OpenRouterClient", chat.answer)
     return chat
 
 
@@ -175,7 +199,10 @@ def test_run_fills_all_keys_and_out_is_0600(server, fake_llm, tmp_path, capsys):
     assert rec["http_status"] == 200
     assert rec["step_count"] == 1 and rec["decided_by"] == ["llm"]
     assert rec["decided_by_counts"] == {"llm": 1}
-    assert "사과 3000원" in rec["final_answer"]
+    # WS-23: final_answer 는 생성된 답, 끝낸 이유는 finish_reason.
+    assert rec["final_answer"] == "사과는 3000원입니다."
+    assert "사과 3000원" in rec["finish_reason"]
+    assert len(fake_llm.answer.calls) == 1
     assert "사과 3000원" in rec["final_page_text"]
     assert rec["handoffs"] == [] and rec["human_wait_s"] == 0.0
     assert rec["challenge"] == "" or rec["challenge"] is None
@@ -183,6 +210,23 @@ def test_run_fills_all_keys_and_out_is_0600(server, fake_llm, tmp_path, capsys):
     assert isinstance(rec["usd"], (int, float)) and isinstance(rec["tokens"], int)
     printed = json.loads(capsys.readouterr().out)
     assert "final_page_text" not in printed and printed["completed"] is True
+
+
+@requires_chromium
+def test_real_loop_read_text_reaches_answer_prompt(server, fake_llm, tmp_path):
+    """실제 AgentLoop: read_text 로 읽은 글이 답 생성 프롬프트에 들어가고, 스텝은 그대로(WS-23)."""
+    url, _ = server
+    fake_llm.bodies = ['{"action":"read_text","reason":"읽는다"}',
+                       '{"action":"finish","reason":"다 읽었다"}']
+    out = tmp_path / "r.json"
+    assert cli.main(["run", "--url", url, "--goal", "사과 가격", "--max-steps", "3",
+                     "--out", str(out)]) == 0
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["completed"] is True and rec["step_count"] == 2 and fake_llm.calls == 2
+    assert rec["finish_reason"] == "다 읽었다"
+    assert rec["final_answer"] == "사과는 3000원입니다."
+    user = fake_llm.answer.calls[0][1]["content"]
+    assert "[읽은 글 1]" in user and "사과 3000원" in user.split("[읽은 글 1]")[1]
 
 
 @requires_chromium
