@@ -4,6 +4,7 @@
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
+    agent-browser run --url <주소> --goal <목표> [--human|--user-chrome] [--handoff]  # 목표 1개 실행
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -151,6 +152,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="실제 API를 호출하지 않고 설정만 확인합니다 (비용 0).",
     )
 
+    # --- run ---
+    from interface import run_cli
+
+    run_cli.add_parser(sub)
+
     return parser
 
 
@@ -254,6 +260,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from interface import session_cli
 
         return session_cli.run(args)
+    if args.command == "run":
+        if (args.chrome_profile or args.keep_open) and not args.user_chrome:
+            parser.error("--chrome-profile / --keep-open 은 --user-chrome 과 함께 씁니다")
+        from interface import run_cli
+
+        return run_cli.run(args)
 
     parser.error(f"알 수 없는 명령: {args.command}")
     return 2
