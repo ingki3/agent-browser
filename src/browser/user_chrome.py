@@ -63,11 +63,21 @@ def find_chrome() -> Optional[Path]:
     return None
 
 
+def _fold(path: Path) -> Tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts)
+
+
 def _is_user_default_profile(path: Path) -> bool:
-    p = path.expanduser().resolve()
+    """평소 프로필 루트(또는 그 아래)인지. 대소문자는 무시하고 비교한다.
+
+    macOS 기본 파일시스템(APFS)은 대소문자를 무시하는데 resolve() 는 대소문자를
+    정규화하지 않는다 — ``~/library/application support/google/chrome`` 도 같은 폴더다.
+    대소문자만 다른 경로는 실제로 쓸 일이 없으므로 모든 OS 에서 막는다(보수적).
+    """
+    p = _fold(path.expanduser().resolve())
     for root in _USER_PROFILE_ROOTS:
-        r = root.resolve()
-        if p == r or r in p.parents:
+        r = _fold(root.expanduser().resolve())
+        if p[: len(r)] == r:
             return True
     return False
 

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import threading
@@ -115,6 +116,29 @@ def test_user_default_chrome_profile_rejected(sub):
         prepare_profile_dir(target)
 
 
+@pytest.mark.parametrize("parts", [
+    ("library", "application support", "google", "chrome"),
+    ("LIBRARY", "Application Support", "Google", "CHROME", "Default"),
+    ("Library", "application Support", "google", "Chrome Beta"),
+])
+def test_user_default_chrome_profile_case_variants_rejected(parts):
+    """macOS 기본 파일시스템은 대소문자를 무시한다 — 대소문자만 다른 경로도 평소 프로필이다."""
+    target = Path.home().joinpath(*parts)
+    with pytest.raises(ValueError):
+        build_chrome_args(profile_dir=target, port=9333)
+    with pytest.raises(ValueError):
+        prepare_profile_dir(target)
+
+
+def test_sibling_of_chrome_root_still_allowed(tmp_path, monkeypatch):
+    """대소문자 비교가 형제 폴더(Google/ChromeX)까지 막지는 않는다."""
+    root = tmp_path / "Google" / "Chrome"
+    monkeypatch.setattr(user_chrome, "_USER_PROFILE_ROOTS", (root,))
+    assert prepare_profile_dir(tmp_path / "google" / "ChromeX").name == "ChromeX"
+    with pytest.raises(ValueError):
+        prepare_profile_dir(tmp_path / "GOOGLE" / "chrome" / "Default")
+
+
 def test_linux_default_chrome_profile_rejected():
     with pytest.raises(ValueError):
         prepare_profile_dir(Path.home() / ".config" / "google-chrome")
@@ -195,11 +219,39 @@ def local_server():
 
 
 def _alive(pid: int) -> bool:
+    """프로세스가 실제로 살아 있는지. 좀비(Z, 종료됐지만 아직 wait 안 됨)는 죽은 것으로 본다.
+
+    os.kill(pid, 0) 만 보면 좀비도 True 라서 "attach 한 close() 가 Chrome 을 죽이는"
+    사보타주를 못 잡았다(검증 ws22-p3 ④ S5). ps 상태로 좀비를 가린다.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    import subprocess
+    stat_ = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+    return bool(stat_) and not stat_.startswith("Z")
+
+
+def test_alive_treats_zombie_as_dead():
+    import subprocess
+    import time
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    try:
+        st = ""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(proc.pid)],
+                                capture_output=True, text=True).stdout.strip()
+            if st.startswith("Z"):
+                break
+            time.sleep(0.05)
+        assert st.startswith("Z"), f"좀비 상태를 만들지 못함: {st!r}"
+        assert _alive(proc.pid) is False
+        assert _alive(os.getpid()) is True
+    finally:
+        proc.wait()
 
 
 @integration
@@ -232,7 +284,10 @@ async def test_real_chrome_not_webdriver_and_close_kills_only_ours(tmp_path, loc
             attached = await user_chrome.attach(uc.port)
             assert attached.owned is False
             attached.close()
-            assert _alive(pid)
+            await asyncio.sleep(1.0)  # 잘못 죽였다면 종료가 반영될 시간
+            assert _alive(pid), "attach 한 close() 가 우리 Chrome 을 죽였음(좀비 포함)"
+            assert uc.process is not None and uc.process.poll() is None, "attach 한 close() 가 우리 Chrome 을 죽였음"
+            assert user_chrome._version_info(uc.port) is not None, "디버그 포트가 응답하지 않음"
             await browser.close()  # CDP 연결만 끊는다(connect_over_cdp)
     finally:
         uc.close()
