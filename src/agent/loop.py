@@ -22,12 +22,15 @@ Top-20에 들지 못하고, LLM은 정확하게 "필요한 요소가 없다"고 
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from browser.challenge import Challenge, detect_challenge
 from contracts import ActionResult, ActionType, BBox, ErrorCode, ObserveResult
 from contracts.thresholds import (
     MAX_WALL_CLOCK_SECONDS,
@@ -173,6 +176,9 @@ class TaskRun:
     final_url: str = ""
     #: Tier-2 SoM 발동 횟수 (PRD §3.4 태스크당 상한 대상)
     tier2_calls: int = 0
+    #: 차단/캡차 화면을 만났으면 그 종류("captcha" | "blocked"). 사람이 해결해
+    #: 계속 진행했더라도 남는다(WS-22).
+    challenge: Optional[str] = None
 
     @property
     def step_count(self) -> int:
@@ -196,8 +202,39 @@ class TaskRun:
             "final_url": self.final_url,
             "budget": self.budget,
             "tier2_calls": self.tier2_calls,
+            "challenge": self.challenge,
             "trace": [s.summary() for s in self.steps],
         }
+
+
+class HandoffOutcome(str, Enum):
+    """사람 인계 훅(on_challenge)의 결과 (WS-22 R2).
+
+    * UNRESOLVED — 시간 초과·신호 없음(False 와 같다). 끝낸다.
+    * RESOLVED — 사람이 해결했다고 알림(True 와 같다). 믿지 않고 다시 본다.
+    * FORCE — 사람이 "그냥 계속" 을 지시(오탐). 재확인 결과와 무관하게 진행하고,
+      그 실행 동안 같은 판정(kind+vendor+reason)은 다시 인계하지 않는다.
+    """
+
+    UNRESOLVED = "unresolved"
+    RESOLVED = "resolved"
+    FORCE = "force"
+
+
+def normalize_handoff(value: Any) -> HandoffOutcome:
+    """훅 반환값을 HandoffOutcome 으로. 기존 계약(bool)도 받는다."""
+    if isinstance(value, HandoffOutcome):
+        return value
+    if isinstance(value, str):
+        try:
+            return HandoffOutcome(value.strip().lower())
+        except ValueError:
+            return HandoffOutcome.UNRESOLVED
+    return HandoffOutcome.RESOLVED if value is True else HandoffOutcome.UNRESOLVED
+
+
+def _challenge_key(ch: Challenge) -> Tuple[str, str, str]:
+    return (ch.kind.value, ch.vendor, ch.reason)
 
 
 class AgentLoop:
@@ -221,6 +258,9 @@ class AgentLoop:
         som_enabled: bool = False,
         unattended: bool = True,
         grounder: Optional[Callable[..., Any]] = None,
+        on_challenge: Optional[
+            Callable[[Challenge], Awaitable[Union[bool, HandoffOutcome]]]
+        ] = None,
     ) -> None:
         self.page = page
         self.engine = engine
@@ -241,6 +281,66 @@ class AgentLoop:
         #: decider="jev"일 때 run()이 만든다.
         self._jev: Any = None
         self._jev_client: Any = None
+        #: 차단/캡차 화면을 만나면 사람에게 넘기는 훅(WS-22). True/RESOLVED = 사람이
+        #: 해결했다고 알림, FORCE = 오탐이니 그냥 계속. 자체 타임아웃을 가져야 한다
+        #: (루프 벽시계 상한도 적용).
+        self.on_challenge = on_challenge
+        #: 사람이 강제 계속을 지시한 판정(kind, vendor, reason) — 그 실행 동안 재인계 안 함.
+        self._forced: Set[Tuple[str, str, str]] = set()
+        #: 마지막 메인 프레임 문서 응답의 HTTP 상태(차단 판정 보조).
+        self._last_status: Optional[int] = None
+
+    def _on_response(self, response: Any) -> None:
+        """메인 프레임 문서 응답의 상태코드만 기억한다(본문·헤더는 읽지 않는다)."""
+        try:
+            frame = response.frame
+            if response.request.is_navigation_request() and frame.parent_frame is None:
+                self._last_status = response.status
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _check_challenge(self, run: TaskRun, started: float) -> bool:
+        """차단/캡차 화면이면 사람에게 넘기고, 끝내야 하면 True.
+
+        LLM을 부르기 전에 본다 — 실측(네이버 쇼핑·쿠팡)에서 차단 화면을 보고
+        scroll/read_text를 7~9번 헛돌다 포기했다. 캡차를 풀거나 우회하지 않는다.
+        """
+        active = getattr(self.dispatcher, "ctx", None)
+        page = getattr(active, "page", None) or self.page
+        found = await detect_challenge(page, last_status=self._last_status)
+        if not found.detected:
+            return False
+        run.challenge = found.kind.value
+        if _challenge_key(found) in self._forced:
+            # 사람이 이 판정을 오탐이라며 강제 계속을 지시했다 — 다시 넘기지 않는다.
+            return False
+        logger.info("차단/캡차 감지: %s (%s) — %s", found.kind.value, found.vendor, found.reason)
+        if self.on_challenge is not None:
+            remaining = MAX_WALL_CLOCK_SECONDS - (time.perf_counter() - started)
+            try:
+                outcome = normalize_handoff(await asyncio.wait_for(
+                    self.on_challenge(found), timeout=max(remaining, 0.0)
+                ))
+            except Exception:  # noqa: BLE001 - 타임아웃·훅 오류는 미해결로 본다
+                outcome = HandoffOutcome.UNRESOLVED
+            if outcome is HandoffOutcome.FORCE:
+                # 사람이 명시적으로 "그냥 계속" — 판정기를 느슨하게 하는 대신 이 판정만 넘긴다.
+                logger.info("사람 강제 계속: %s (%s) — %s", found.kind.value, found.vendor,
+                            found.reason)
+                self._forced.add(_challenge_key(found))
+                self._last_status = None
+                return False
+            if outcome is HandoffOutcome.RESOLVED:
+                # 사람이 해결했다고 알렸다 — 믿지 않고 다시 본다.
+                self._last_status = None
+                again = await detect_challenge(page, last_status=None)
+                if not again.detected:
+                    return False
+                found = again
+        run.terminal_reason = (
+            f"{ErrorCode.CAPTCHA_DETECTED.value}: {found.kind.value} — {found.reason}"
+        )
+        return True
 
     def _jev_enabled(self) -> bool:
         """Jev 판단기를 쓸지. OpenRouter base_url에서만 켠다.
@@ -284,6 +384,12 @@ class AgentLoop:
             await self._jev_client.start()
             self._jev = JevDecider(self._jev_client, limit=self.top_n)
 
+        self._last_status = None
+        self._forced = set()
+        listened = self.page if callable(getattr(self.page, "on", None)) else None
+        if listened is not None:
+            listened.on("response", self._on_response)
+
         try:
             # 실패 직후 완료 선언 가드 상태 (WS-18 정밀화).
             # last_action_failed: 직전에 실행한 실제 액션의 성공 여부
@@ -315,6 +421,12 @@ class AgentLoop:
                         f"실행 시간 상한 초과: {elapsed:.0f}초 "
                         f"(상한 {MAX_WALL_CLOCK_SECONDS}초)"
                     )
+                    break
+
+                # 차단/캡차 화면(WS-22) — LLM을 부르기 전에 본다. 매 스텝
+                # evaluate 1회(수 ms)라 URL 변화 여부와 무관하게 확인한다
+                # (SPA는 URL 없이 캡차를 띄우기도 한다).
+                if await self._check_challenge(run, started):
                     break
 
                 try:
@@ -467,6 +579,11 @@ class AgentLoop:
         except BudgetExceeded as exc:
             run.terminal_reason = str(exc)
         finally:
+            if listened is not None:
+                try:
+                    listened.remove_listener("response", self._on_response)
+                except Exception:  # noqa: BLE001
+                    pass
             await client.close()
             if self._jev_client is not None:
                 await self._jev_client.close()

@@ -67,8 +67,18 @@ class BrowserCore:
         max_tabs: int = thresholds.MAX_TABS_PER_SESSION,
         viewport_width: int = thresholds.VIEWPORT_WIDTH,
         viewport_height: int = thresholds.VIEWPORT_HEIGHT,
+        human_like: bool = False,
     ) -> None:
+        """
+        human_like=True 이면 사람이 쓰는 브라우저와 같은 기본값을 쓴다(위장 없음):
+          - viewport 고정 대신 no_viewport (창 크기 = 실제 창, screen 위장 없음)
+          - locale="ko-KR" (Accept-Language 헤더와 navigator.languages 채움)
+        UA 변경·navigator.webdriver 숨기기 같은 위장은 하지 않는다.
+        headless 여부는 바꾸지 않는다 — 창 보이는 브라우저가 필요하면 호출자가
+        headless=False 를 함께 줘야 한다.
+        """
         self.headless = headless
+        self.human_like = human_like
         self.session_store = session_store or SessionStore()
         self.max_contexts = max_contexts
         self.max_tabs = max_tabs
@@ -115,6 +125,11 @@ class BrowserCore:
 
     # -- 컨텍스트 (BrowserCoreProtocol) --------------------------------------
 
+    def _context_options(self) -> Dict[str, Any]:
+        if self.human_like:
+            return {"no_viewport": True, "locale": "ko-KR"}
+        return {"viewport": dict(self.viewport)}
+
     async def new_context(self, profile_name: str) -> Any:
         """프로파일 전용 격리 컨텍스트를 생성한다.
 
@@ -135,8 +150,7 @@ class BrowserCore:
                 f"활성 컨텍스트 상한({self.max_contexts})을 초과했습니다.",
             )
 
-        options: Dict[str, Any] = {"viewport": dict(self.viewport)}
-        context = await self._browser.new_context(**options)
+        context = await self._browser.new_context(**self._context_options())
         self._contexts[profile_name] = ManagedContext(
             profile_name=profile_name, context=context
         )
@@ -157,7 +171,7 @@ class BrowserCore:
 
         storage_state = self.session_store.load(profile_name, passphrase)
         context = await self._browser.new_context(
-            viewport=dict(self.viewport), storage_state=storage_state
+            **self._context_options(), storage_state=storage_state
         )
         self._contexts[profile_name] = ManagedContext(
             profile_name=profile_name, context=context
