@@ -75,6 +75,17 @@ EPOCH_BUMPING_ACTIONS = frozenset(
 #: 잡힌다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
 POPUP_GRACE_MS = 150
 
+#: 스크롤 중 문서가 바뀌었을 때 Playwright 예외 메시지(WS-24 F1 로컬 재현).
+_CONTEXT_DESTROYED = "Execution context was destroyed"
+#: 그때 새 문서 로드를 기다리는 상한 — 짧게(스텝 지연을 키우지 않게).
+_SCROLL_RELOAD_WAIT_MS = 5000
+#: 문서 높이 — body 가 아직 없는 순간(새 문서 head 수신 중)에도 null 에 걸리지 않게
+#: scrollingElement → documentElement 순으로 본다(WS-24 F1 로컬 재현).
+_SCROLL_HEIGHT_JS = (
+    "(() => { const el = document.scrollingElement || document.documentElement;"
+    " return el ? el.scrollHeight : 0; })()"
+)
+
 
 @dataclass
 class DispatchContext:
@@ -180,6 +191,15 @@ class ActionDispatcher:
             self.ctx.page.remove_listener("popup", listener)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+
+    @staticmethod
+    async def _scroll_once(page: Any, delta: int) -> bool:
+        """한 번 스크롤하고 문서 높이가 바뀌었는지(동적 로드) 돌려준다."""
+        before_height = await page.evaluate(_SCROLL_HEIGHT_JS)
+        await page.evaluate(f"window.scrollBy(0, {delta})")
+        await page.wait_for_timeout(150)
+        after_height = await page.evaluate(_SCROLL_HEIGHT_JS)
+        return after_height != before_height
 
     def _current_url(self) -> str:
         try:
@@ -753,17 +773,30 @@ class ActionDispatcher:
         if action is ActionType.SCROLL:
             distance = params.get("distance", 500)
             delta = distance if params.get("direction", "down") == "down" else -distance
-            before_height = await page.evaluate("document.body.scrollHeight")
-            await page.evaluate(f"window.scrollBy(0, {delta})")
-            await page.wait_for_timeout(150)
-            after_height = await page.evaluate("document.body.scrollHeight")
+            try:
+                changed = await self._scroll_once(page, delta)
+            except Exception as exc:  # noqa: BLE001
+                # WS-24 F1: 검색 제출 직후처럼 스크롤 중 문서가 바뀌면 Playwright 가
+                # "Execution context was destroyed" 를 던진다(로컬 재현). 이 경우만
+                # 새 문서 로드를 짧게 기다려 1회 재시도하고, 재관찰을 요구한다.
+                # 다른 예외는 삼키지 않는다(dispatch 의 PAGE_CRASHED 로 간다).
+                if _CONTEXT_DESTROYED not in str(exc):
+                    raise
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded", timeout=_SCROLL_RELOAD_WAIT_MS
+                    )
+                except Exception:  # noqa: BLE001 - 대기 실패는 재시도 결과로 판정
+                    pass
+                await self._scroll_once(page, delta)
+                changed = True
             return self._result(
                 success=True,
                 action=action,
                 retry_safe=True,
                 data={"scrolled": delta},
-                # 동적 노드가 로드되었으면 재관찰이 필요하다.
-                reobserve_required=after_height != before_height,
+                # 동적 노드가 로드되었거나 문서가 바뀌었으면 재관찰이 필요하다.
+                reobserve_required=changed,
             )
 
         if action is ActionType.PRESS_KEY:

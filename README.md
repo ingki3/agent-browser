@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-894개가 통과해야 합니다(3개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+924개가 통과해야 합니다(3개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -141,6 +141,7 @@ uv run agent-browser run --url URL --goal GOAL --no-answer           # 답 생�
 - `finish_reason`: 에이전트가 끝낸 이유 한 줄입니다(예: `jev finish 0.75`). 예전에 `final_answer`에 들어가던 값입니다.
 - `answer_input`: 답 생성 모델에 실제로 보낸 페이지 글(경계 안 본문, 무력화·잘림 적용 후) 그대로입니다 — 답의 근거 감사용이며 `--out` 파일에만 남고 콘솔 요약에는 나오지 않습니다(답을 만들지 않았으면 `""`). 대조할 때는 NFKC 정규화를 권장합니다(네이버는 `李`를 호환 한자 U+F9E1로 씁니다).
 - 답 생성은 루프와 같은 모델·엔드포인트(`OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`)로 갑니다 — 로컬이면 로컬, Jev·폴백 모델은 쓰지 않습니다. 비용은 `usd`/`tokens`에 포함되지 않고 `answer_usd`/`answer_tokens`로 따로 보입니다(같은 예산 상한 안).
+- `http_status`는 첫 이동 응답, `last_http_status`는 실행 중 마지막 메인 프레임 문서 응답의 상태입니다(브라우저 context 전체 — `target=_blank`·`window.open`으로 연 새 탭의 첫 문서 포함, iframe 문서는 제외, 여러 탭이 동시에 움직이면 마지막으로 온 응답). 첫 화면은 200인데 검색 페이지에서 403으로 막힌 경우를 구분합니다. 단, 에이전트 루프의 차단 판정은 지금 보고 있는 탭의 화면 내용으로 하므로, 루프가 옮겨 가지 않은 새 탭의 차단 화면은 `challenge`에 잡히지 않고 `last_http_status`에만 남습니다. `steps`의 실패 줄에는 오류 메시지 앞 80자를 한 줄로 접어 붙이고, 그 안 `http(s)://` URL의 쿼리·fragment는 `?…`로 가립니다(`type_text`는 입력값이 섞일 수 있어 붙이지 않음).
 
 `--out` 파일은 페이지 본문이 들어가므로 권한 0600으로 씁니다. `--handoff`를 켜면 차단·캡차 화면에서 멈추고, 사람이 창에서 해결한 뒤 터미널에서 Enter를 누르거나 `touch ~/.agent-browser/handoff.done`(`--handoff-file`로 변경)하면 같은 목표로 이어 갑니다(이때도 화면을 다시 확인해, 여전히 막혀 있으면 멈춥니다). 정상 화면을 차단으로 잘못 본 경우에는 터미널에 `f`(또는 `force`)를 입력하고 Enter를 누르거나 `echo force > ~/.agent-browser/handoff.done` 하면 강제로 계속하며, 그 실행 동안 같은 판정은 다시 넘기지 않습니다(결과의 `handoffs[].forced`에 기록). `--user-chrome`은 우리가 띄운 Chrome만 닫습니다(`--keep-open`이면 둡니다). `--human`과 `--user-chrome`은 함께 쓸 수 없고, `--chrome-profile`에 평소 Chrome 프로필 경로를 주면 브라우저를 띄우기 전에 한 줄 오류로 거부합니다(exit 2).
 

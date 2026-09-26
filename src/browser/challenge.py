@@ -87,6 +87,11 @@ _CAPTCHA_PHRASES = (
     ("just a moment", "cloudflare", "Cloudflare 브라우저 확인 화면"),
     ("verify you are human", "cloudflare", "Cloudflare 사람 확인 요구"),
     ("checking your browser", "cloudflare", "Cloudflare 브라우저 확인 화면"),
+    # G마켓 검색 결과에서 만난 Cloudflare 확인 화면(2026-09-25 실측, HTTP 403). 감지
+    # 시점 제목에 "Just a moment" 가 없어 "HTTP 403 + 짧은 본문" 으로만 잡혔다(이유에
+    # 가변 길이가 들어가 강제 계속 키가 흔들림). 짧은 단어("봇 확인")는 FAQ·기사에도
+    # 나오므로 안내문의 완결된 문장만 쓴다.
+    ("간단한 봇 확인 절차가 진행되고 있습니다", "cloudflare", "Cloudflare 봇 확인 화면(한국어 안내)"),
 )
 _BLOCKED_PHRASES = (
     ("접속이 일시적으로 제한", "naver", "네이버 접속 일시 제한"),
