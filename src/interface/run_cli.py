@@ -87,6 +87,56 @@ ANSWER_DEFAULTS: Tuple[Tuple[str, Any], ...] = (
 )
 
 
+#: 실패 스텝 기록에 붙이는 오류 메시지 앞부분 길이(WS-24 F1-c).
+STEP_ERROR_CHARS = 80
+#: 오류 메시지를 붙이지 않는 액션 — type_text 는 예외 메시지에 입력값(자격증명
+#: 치환 뒤의 실제 값 포함)이 섞일 수 있다. 비밀값 치환은 type_text 에만 있다
+#: (ActionDispatcher._resolve_secret).
+_NO_ERROR_DETAIL_ACTIONS = frozenset({"type_text"})
+
+
+def step_line(outcome: Any) -> str:
+    """결과 JSON 의 steps 한 줄. 실패면 오류 메시지 앞부분을 붙인다(WS-24 F1-c).
+
+    실측(G마켓 user-chrome) — "scroll -> FAIL E_PAGE_CRASHED" 만 남아 원인을 알 수
+    없었다. 루프의 요약(판단기 히스토리에도 쓰인다)은 그대로 두고 결과 기록에만 붙인다.
+    """
+    line = outcome.summary()
+    result = getattr(outcome, "result", None)
+    if outcome.succeeded or outcome.note or result is None:
+        return line
+    if outcome.decision.action in _NO_ERROR_DETAIL_ACTIONS:
+        return line
+    message = " ".join(str(getattr(result, "error_message", "") or "").split())
+    if not message:
+        return line
+    return f"{line} — {message[:STEP_ERROR_CHARS]}"
+
+
+def _track_main_document_status(target: Any, record: Dict[str, Any]) -> Any:
+    """target(context 우선) 의 메인 프레임 문서 응답 상태를 record["last_http_status"] 에.
+
+    WS-24 F2: 첫 이동(http_status)만 남기면 검색 페이지에서 403 으로 막혀도 200 이었다.
+    context 단위로 달아 새 탭(탭 전환·팝업)의 문서 응답도 잡는다 — 여러 탭이 동시에
+    움직이면 "마지막으로 온 메인 문서 응답"이다(어느 탭인지는 구분하지 않는다).
+    반환값은 해제용 리스너(달지 못했으면 None). 루프의 _last_status 는 강제 계속 때
+    None 으로 초기화되므로 쓰지 않는다.
+    """
+    on = getattr(target, "on", None)
+    if not callable(on):
+        return None
+
+    def _on_response(response: Any) -> None:
+        try:
+            if response.request.is_navigation_request() and response.frame.parent_frame is None:
+                record["last_http_status"] = response.status
+        except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
+            pass
+
+    on("response", _on_response)
+    return _on_response
+
+
 def _capture_read_texts(loop: Any, sink: List[str]) -> None:
     """루프가 read_text 로 읽은 글을 sink 에 순서대로 모은다(루프 코드는 그대로).
 
@@ -294,6 +344,8 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
         "handoffs": [],
         "human_wait_s": 0.0,
         "http_status": None,
+        #: 실행 중 마지막 메인 프레임 문서 응답의 상태(WS-24) — http_status 는 첫 이동만.
+        "last_http_status": None,
     }
     budget = BudgetGuard()
     #: 실행 중 read_text 로 읽은 글(읽은 순서) — 답 생성 입력
@@ -302,9 +354,14 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
     started = time.perf_counter()
     async with async_playwright() as pw:
         browser, context, page, uc = await _open_browser(pw, args, record)
+        status_target = context if callable(getattr(context, "on", None)) else page
+        status_listener = _track_main_document_status(status_target, record)
         try:
             resp = await page.goto(args.url, wait_until="domcontentloaded", timeout=30000)
             record["http_status"] = resp.status if resp is not None else None
+            if record["last_http_status"] is None:
+                # 리스너를 못 단 경우(가짜 페이지 등)에도 첫 이동 상태는 남긴다.
+                record["last_http_status"] = record["http_status"]
             await page.wait_for_timeout(900)
             cdp = await context.new_cdp_session(page)
             engine = PerceptionEngine()
@@ -337,7 +394,7 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
                     "terminal_reason": run.terminal_reason,
                     "challenge": run.challenge,
                     "step_count": run.step_count,
-                    "steps": [s.summary() for s in run.steps],
+                    "steps": [step_line(s) for s in run.steps],
                     "decided_by": [s.decided_by for s in run.steps],
                     "decided_by_counts": dict(Counter(s.decided_by for s in run.steps)),
                     "usd": run.budget.get("usd"),
@@ -366,6 +423,11 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
                 record.setdefault("final_url", "")
                 record["final_page_text"] = f"<읽기 실패 {type(exc).__name__}>"
             record["elapsed_s"] = round(time.perf_counter() - started, 2)
+            if status_listener is not None:
+                try:
+                    status_target.remove_listener("response", status_listener)
+                except Exception:  # noqa: BLE001
+                    pass
             if uc is not None:
                 # CDP 연결만 끊는다(사용자 창의 기본 context 는 닫지 않는다).
                 try:
