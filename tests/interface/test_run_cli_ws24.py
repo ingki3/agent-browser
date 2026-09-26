@@ -32,6 +32,15 @@ HOME_THEN_BLOCK = """<!doctype html><meta charset=utf-8><title>쇼핑</title><p>
 BLOCK = "<!doctype html><meta charset=utf-8><title>막힘</title><p>요청이 거부되었습니다.</p>"
 # 하위 프레임의 403 은 메인 문서 상태가 아니다.
 HOME_WITH_BAD_IFRAME = HOME + "<iframe src='/search?q=frame' width=10 height=10></iframe>"
+# 새 탭(R1): 첫 화면은 200 이고, 곧바로 새 탭이 열린다. 새 탭의 첫 문서 응답은
+# 프레임이 생기기 전에 요청돼 response.frame 이 예외를 낸다(실측).
+HOME_POPUP_LINK = HOME + """<a id=pop href='/search?q=tab' target=_blank>새 창</a>
+<script>setTimeout(() => document.getElementById('pop').click(), 50)</script>"""
+HOME_POPUP_OPEN = HOME + "<script>setTimeout(() => window.open('/search?q=win'), 50)</script>"
+HOME_POPUP_FRAMED = HOME + "<script>setTimeout(() => window.open('/framed'), 50)</script>"
+# 새 탭 문서는 200, 그 안의 iframe 은 403 — iframe 은 여전히 무시해야 한다.
+FRAMED = """<!doctype html><meta charset=utf-8><title>새 탭</title><p>상품 목록 사과 3000원</p>
+<iframe src='/search?q=inner' width=10 height=10></iframe>"""
 
 
 @pytest.fixture
@@ -45,6 +54,14 @@ def server():
                 body = HOME_THEN_BLOCK
             elif self.path.startswith("/iframe-home"):
                 body = HOME_WITH_BAD_IFRAME
+            elif self.path.startswith("/popup-link"):
+                body = HOME_POPUP_LINK
+            elif self.path.startswith("/popup-open"):
+                body = HOME_POPUP_OPEN
+            elif self.path.startswith("/popup-framed"):
+                body = HOME_POPUP_FRAMED
+            elif self.path.startswith("/framed"):
+                body = FRAMED
             data = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -85,6 +102,40 @@ def test_step_line_appends_error_message_head():
     assert "\n" not in line, "한 줄로 접는다"
     tail = line.split("E_PAGE_CRASHED", 1)[1]
     assert len(tail) <= run_cli.STEP_ERROR_CHARS + 6, "앞부분만 붙인다"
+
+
+def test_step_line_folds_newlines_within_head():
+    """개행이 앞 80자 안에 있어도 한 줄로 접는다(R1-2)."""
+    msg = "Error: Page.evaluate:\n  Execution context\r\n\twas destroyed"
+    line = run_cli.step_line(_outcome("scroll", ErrorCode.PAGE_CRASHED, msg))
+    assert "\n" not in line and "\r" not in line and "\t" not in line
+    assert line.endswith("— Error: Page.evaluate: Execution context was destroyed"), line
+
+
+def test_step_line_hides_url_query_and_fragment():
+    """오류 메시지 안 URL 의 쿼리·fragment 는 가린다(R1-3) — 콘솔 요약에도 나온다."""
+    msg = ("Page.goto: net::ERR_UNSAFE_PORT at http://127.0.0.1:9/login?user=alice&token=QUE"
+           "#frag")
+    line = run_cli.step_line(_outcome("navigate", ErrorCode.NAVIGATE_TIMEOUT, msg,
+                                      url="http://127.0.0.1:9/login"))
+    assert "alice" not in line and "token" not in line and "frag" not in line, line
+    assert line.endswith("at http://127.0.0.1:9/login?…"), line
+    # fragment 만 있어도 가리고, http(s) 가 아닌 토큰은 건드리지 않는다.
+    line2 = run_cli.step_line(_outcome("click", ErrorCode.TIMEOUT,
+                                       "at https://ex.com/a#tab=secret, sel a?b=1",
+                                       element_id="@e1"))
+    assert line2.endswith("at https://ex.com/a?… sel a?b=1"), line2
+
+
+def test_step_line_hides_query_before_truncation():
+    """쿼리를 먼저 가린 뒤 자른다 — 80자 경계에 걸린 쿼리 일부도 남지 않는다."""
+    msg = "x" * 60 + " http://h/p?secret=" + "S" * 40
+    line = run_cli.step_line(_outcome("click", ErrorCode.TIMEOUT, msg, element_id="@e1"))
+    assert "secret" not in line and "SS" not in line, line
+    # 먼저 가리므로 긴 쿼리 뒤의 원인 문구가 80자 안으로 들어온다.
+    msg2 = "Page.goto: at http://h/p?" + "q=" + "Q" * 120 + " net::ERR_ABORTED"
+    line2 = run_cli.step_line(_outcome("navigate", ErrorCode.NAVIGATE_TIMEOUT, msg2, url="http://h/p"))
+    assert line2.endswith("at http://h/p?… net::ERR_ABORTED"), line2
 
 
 def test_step_line_never_appends_type_text_error():
@@ -151,6 +202,37 @@ def test_last_http_status_normal_run_equals_first(server, fake_llm, tmp_path):
                      "--max-steps", "3", "--out", str(out)]) == 0
     rec = json.loads(out.read_text(encoding="utf-8"))
     assert rec["http_status"] == 200 and rec["last_http_status"] == 200
+
+
+def _run_rec(server, path, tmp_path):
+    out = tmp_path / "r.json"
+    assert cli.main(["run", "--url", server + path, "--goal", "사과 가격",
+                     "--max-steps", "3", "--out", str(out)]) == 0
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+@requires_chromium
+def test_last_http_status_catches_target_blank_new_tab(server, fake_llm, tmp_path):
+    """target=_blank 로 연 새 탭의 첫 문서가 403 이면 last_http_status=403 (R1-1)."""
+    rec = _run_rec(server, "/popup-link", tmp_path)
+    assert rec["http_status"] == 200
+    assert rec["last_http_status"] == 403, rec
+
+
+@requires_chromium
+def test_last_http_status_catches_window_open_new_tab(server, fake_llm, tmp_path):
+    """window.open 으로 연 새 탭의 첫 문서 403 도 잡는다 (R1-1)."""
+    rec = _run_rec(server, "/popup-open", tmp_path)
+    assert rec["http_status"] == 200
+    assert rec["last_http_status"] == 403, rec
+
+
+@requires_chromium
+def test_last_http_status_new_tab_ignores_its_iframe(server, fake_llm, tmp_path):
+    """새 탭 문서는 200, 그 안 iframe 403 은 무시 — 결과는 200 (R1-1)."""
+    rec = _run_rec(server, "/popup-framed", tmp_path)
+    assert rec["http_status"] == 200
+    assert rec["last_http_status"] == 200, rec
 
 
 def test_last_http_status_key_present_on_error_path(monkeypatch):

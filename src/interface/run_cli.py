@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -93,6 +94,9 @@ STEP_ERROR_CHARS = 80
 #: 치환 뒤의 실제 값 포함)이 섞일 수 있다. 비밀값 치환은 type_text 에만 있다
 #: (ActionDispatcher._resolve_secret).
 _NO_ERROR_DETAIL_ACTIONS = frozenset({"type_text"})
+#: 오류 메시지 안 URL 의 쿼리·fragment(WS-24 R1-3) — "http://h/p?user=a&token=b" 가 결과
+#: JSON 과 콘솔 요약에 그대로 남았다. http(s):// 토큰만 대상으로 "?…" 로 가린다.
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#]*)[?#]\S*")
 
 
 def step_line(outcome: Any) -> str:
@@ -108,6 +112,8 @@ def step_line(outcome: Any) -> str:
     if outcome.decision.action in _NO_ERROR_DETAIL_ACTIONS:
         return line
     message = " ".join(str(getattr(result, "error_message", "") or "").split())
+    # 자르기 전에 가린다 — 80자 경계에 걸친 쿼리 일부도 남지 않게.
+    message = _URL_QUERY_RE.sub(r"\1?…", message)
     if not message:
         return line
     return f"{line} — {message[:STEP_ERROR_CHARS]}"
@@ -128,13 +134,32 @@ def _track_main_document_status(target: Any, record: Dict[str, Any]) -> Any:
 
     def _on_response(response: Any) -> None:
         try:
-            if response.request.is_navigation_request() and response.frame.parent_frame is None:
+            if _is_main_document_response(response):
                 record["last_http_status"] = response.status
         except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
             pass
 
     on("response", _on_response)
     return _on_response
+
+
+def _is_main_document_response(response: Any) -> bool:
+    """메인 프레임(탭 최상위) 문서 응답인가.
+
+    WS-24 R1-1 실측: target=_blank·window.open 으로 연 새 탭의 **첫** 문서 응답은
+    프레임이 생기기 전에 요청돼 response.frame 이 "Frame for this navigation request is
+    not available" 예외를 낸다(context 'page' 이벤트도 그 응답 뒤에 온다). 그 경우만
+    문서 요청이면 새 탭 최상위 문서로 본다 — iframe 문서 요청은 부모 문서 안에서 프레임이
+    먼저 붙은 뒤 나가므로 frame 을 얻고, parent_frame 검사로 계속 걸러진다(실측).
+    """
+    request = response.request
+    if not request.is_navigation_request():
+        return False
+    try:
+        frame = response.frame
+    except Exception:  # noqa: BLE001 - 새 탭 첫 요청: 프레임 미생성
+        return request.resource_type == "document"
+    return frame.parent_frame is None
 
 
 def _capture_read_texts(loop: Any, sink: List[str]) -> None:
