@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -85,6 +86,174 @@ _SCROLL_HEIGHT_JS = (
     "(() => { const el = document.scrollingElement || document.documentElement;"
     " return el ? el.scrollHeight : 0; })()"
 )
+
+#: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
+#: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
+#: 링크 max 52, select onchange max 12, JS setTimeout(0) max 70, setTimeout(100) max 155.
+#: CPU 12코어 부하에서 폼·링크·select·setTimeout(0) max 82ms, setTimeout(100) max 166ms.
+#: 150ms 는 여유 0, 100ms 는 setTimeout(100) 을 5/30 만 감지했다. 200ms 는 부하 최악
+#: 대비 ~34ms 여유. 창 안에 요청이 없으면 기다리지 않는다 — 이동 없는 액션의 추가
+#: 지연은 이 값 이하다(모든 이동 없는 click/press_key 가 이만큼 느려진다).
+#: 링크·리다이렉트 클릭은 Playwright click() 이 커밋까지 기다려 반환하므로 nav_wait_ms 가
+#: 0 에 가깝게 찍힌다 — 대기가 없었다는 뜻이 아니라 click() 안에서 기다린 것이다.
+NAV_DETECT_MS = 200
+#: 이동이 시작됐을 때 새 문서의 domcontentloaded 까지 기다리는 상한
+#: (루프의 SETTLE_TIMEOUT_MS 와 같은 값). 넘기면 더 기다리지 않고 진행한다.
+NAV_SETTLE_TIMEOUT_MS = 8000
+#: 다운로드·빈 응답은 문서를 바꾸지 않는다 — 곧바로 진행한다.
+_NO_DOCUMENT_STATUS = frozenset({204, 205})
+
+
+class _NavWatch:
+    """액션이 유발한 메인 프레임 문서 내비게이션을 감지하고 새 문서를 기다린다 (WS-25).
+
+    액션을 보내기 **전에** 붙인다. 오래된 문서의 load state 는 이미 충족돼 있어
+    `wait_for_load_state` 가 즉시 반환되는 함정이 있으므로, 요청 시작 → 메인 프레임
+    framenavigated(커밋) → 그 이후의 domcontentloaded 이벤트 순서를 직접 본다.
+
+    한계: SPA(pushState, 문서 요청 없음)와 감지 창 밖(예: 1초 뒤 JS)에서 시작되는
+    이동은 잡지 않는다 — 기존 사후조건·루프 `_settle` 이 맡는다.
+    """
+
+    def __init__(self, page: Any) -> None:
+        self.page = page
+        self.active = False
+        self.started = False
+        self.committed = False
+        self.dcl = False
+        self.aborted = ""
+        self._current: Any = None
+        self._changed = asyncio.Event()
+        self._handlers: List[Tuple[str, Any]] = []
+        try:
+            self._main = page.main_frame
+            for name, fn in (
+                ("request", self._on_request),
+                ("response", self._on_response),
+                ("requestfailed", self._on_failed),
+                ("framenavigated", self._on_nav),
+                ("domcontentloaded", self._on_dcl),
+                ("download", self._on_download),
+            ):
+                page.on(name, fn)
+                self._handlers.append((name, fn))
+            self.active = True
+        except Exception:  # noqa: BLE001 — 프레임(switch_frame)·가짜 페이지
+            self.close()
+
+    def _is_main_nav(self, request: Any) -> bool:
+        try:
+            return bool(request.is_navigation_request()) and request.frame == self._main
+        except Exception:  # noqa: BLE001 — 서비스 워커 요청 등은 frame 이 없다
+            return False
+
+    def _on_request(self, request: Any) -> None:
+        if self._is_main_nav(request):
+            # 리다이렉트·연속 이동은 새 요청이 이전 것을 대체한다.
+            self._current = request
+            self.started = True
+            self.aborted = ""
+            self._changed.set()
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            if response.request is not self._current:
+                return
+            status = response.status
+            disposition = (response.headers or {}).get("content-disposition", "")
+        except Exception:  # noqa: BLE001
+            return
+        if status in _NO_DOCUMENT_STATUS:
+            self.aborted = f"status_{status}"
+        elif "attachment" in disposition.lower():
+            self.aborted = "download"
+        self._changed.set()
+
+    def _on_failed(self, request: Any) -> None:
+        if request is self._current and not self.committed:
+            self.aborted = "request_failed"
+            self._changed.set()
+
+    def _on_download(self, _download: Any) -> None:
+        if not self.committed:
+            self.aborted = "download"
+            self._changed.set()
+
+    def _on_nav(self, frame: Any) -> None:
+        if self.started and frame == self._main:
+            self.committed = True
+            self.dcl = False
+            self.aborted = ""
+            self._changed.set()
+
+    def _on_dcl(self, _page: Any) -> None:
+        # 커밋 이후의 domcontentloaded 만 새 문서의 것이다.
+        if self.committed:
+            self.dcl = True
+            self._changed.set()
+
+    async def _wait_change(self, deadline: float) -> bool:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return False
+        self._changed.clear()
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def settle(self) -> Dict[str, Any]:
+        """감지 창 안에 이동이 시작됐으면 새 문서를 기다린다. 기다린 정보를 돌려준다.
+
+        이동이 없었으면 빈 dict(추가 지연 ≤ NAV_DETECT_MS).
+        """
+        if not self.active:
+            return {}
+        t0 = time.perf_counter()
+        try:
+            detect_deadline = t0 + NAV_DETECT_MS / 1000
+            while not self.started and await self._wait_change(detect_deadline):
+                pass
+            if not self.started:
+                return {}
+            deadline = t0 + NAV_SETTLE_TIMEOUT_MS / 1000
+            while not self.aborted and not (self.committed and self.dcl):
+                if not await self._wait_change(deadline):
+                    break
+            info: Dict[str, Any] = {
+                "nav_wait_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "nav_committed": self.committed,
+            }
+            if self.aborted:
+                info["nav_aborted"] = self.aborted
+            elif not (self.committed and self.dcl):
+                info["nav_timed_out"] = True
+            return info
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        for name, fn in self._handlers:
+            try:
+                self.page.remove_listener(name, fn)
+            except Exception:  # noqa: BLE001
+                pass
+        self._handlers = []
+        self.active = False
+
+
+#: 페이지를 옮길 수 있는 요소 액션(WS-25). type_text 는 press_enter 일 때만 —
+#: 입력만으로 문서가 바뀌는 경우는 드물고, 매 입력에 감지 창 지연을 물리지 않는다.
+_NAV_ELEMENT_ACTIONS = frozenset(
+    {ActionType.CLICK, ActionType.SELECT_OPTION, ActionType.CHECK_BOX}
+)
+
+
+def _may_navigate(action: ActionType, params: Dict[str, Any]) -> bool:
+    if action in _NAV_ELEMENT_ACTIONS:
+        return True
+    return action is ActionType.TYPE_TEXT and bool(params.get("press_enter"))
 
 
 @dataclass
@@ -167,6 +336,8 @@ class ActionDispatcher:
         self.ctx = context
         self._healing_attempts = 0
         self._healing_successes = 0
+        #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
+        self._nav_info: Dict[str, Any] = {}
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -261,6 +432,7 @@ class ActionDispatcher:
             )
             result.data["secret_resolved"] = False
             return result
+        self._nav_info = {}
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
@@ -272,6 +444,14 @@ class ActionDispatcher:
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"{type(exc).__name__}: {exc}",
             )
+        if self._nav_info:
+            # WS-25: 문서 이동을 기다렸다 — 기다린 사실을 남기고, 새 문서가 떴으면
+            # 이전 관찰(요소 id)은 무효이므로 재관찰을 요구한다.
+            result.data.update(self._nav_info)
+            if self._nav_info.get("nav_committed"):
+                # current_url 은 _result() 가 settle 뒤에 이미 계산했다.
+                result.reobserve_required = True
+            self._nav_info = {}
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
@@ -449,11 +629,15 @@ class ActionDispatcher:
             self.ctx.page.on("popup", _on_popup)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+        # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
+        watch = _NavWatch(self.ctx.page) if _may_navigate(action, params) else None
         try:
             await self._execute_element_action(action, handle, params)
         except Exception as exc:  # noqa: BLE001
             # 발송 자체가 실패했으므로 부작용이 없다 -> 재시도 안전
             self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
             return self._result(
                 success=False,
                 action=action,
@@ -462,10 +646,26 @@ class ActionDispatcher:
                 error_message=f"이벤트 발송 실패: {exc}",
                 healed=healed_flag,
             )
+        if watch is not None:
+            self._nav_info = await watch.settle()
 
         # --- [3] 사후조건 검증 ------------------------------------------------
-        after = await capture_state(self.ctx.page, handle)
-        if not popups and action is ActionType.CLICK:
+        try:
+            after = await capture_state(self.ctx.page, handle)
+        except Exception:  # noqa: BLE001
+            if not self._nav_info:
+                raise
+            # 상한을 넘겨 진행했는데 그 사이 문서가 바뀌는 중 — 이동 자체가 효과다.
+            self._off_popup(_on_popup)
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                healed=healed_flag,
+                reobserve_required=True,
+                data={"signals": ["navigation_started"], "element_id": handle.element_id},
+            )
+        if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed"):
             # 효과가 전혀 없을 때만 짧게 더 기다렸다가 **다시 본다**. 실제 사이트는
             # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
             # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
@@ -802,9 +1002,11 @@ class ActionDispatcher:
         if action is ActionType.PRESS_KEY:
             raw_key = str(params.get("key", ""))
             key = _normalize_key(raw_key)
+            watch = _NavWatch(page)
             try:
                 await page.keyboard.press(key)
             except Exception as exc:  # noqa: BLE001
+                watch.close()
                 return self._result(
                     success=False,
                     action=action,
@@ -812,6 +1014,9 @@ class ActionDispatcher:
                     error_code=ErrorCode.KEY_PRESS_FAILED,
                     error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
                 )
+            # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
+            # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
+            self._nav_info = await watch.settle()
             return self._result(
                 success=True, action=action, retry_safe=False, data={"key": key}
             )
@@ -912,9 +1117,11 @@ class ActionDispatcher:
             )
 
         before = await capture_state(page)
+        watch = _NavWatch(page)
         try:
             await page.mouse.click(x, y, button=params.get("button", "left"))
         except Exception as exc:  # noqa: BLE001
+            watch.close()
             return self._result(
                 success=False,
                 action=action,
@@ -922,7 +1129,21 @@ class ActionDispatcher:
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
                 error_message=f"좌표 클릭 발송 실패: {exc}",
             )
-        after = await capture_state(page)
+        # WS-25: 좌표 클릭(mouse.click)은 이동을 기다리지 않는다 — 여기서 기다린다.
+        self._nav_info = await watch.settle()
+        try:
+            after = await capture_state(page)
+        except Exception:  # noqa: BLE001
+            if not self._nav_info:
+                raise
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                reobserve_required=True,
+                data={"coordinates": {"x": x, "y": y}, "signals": ["navigation_started"],
+                      "silent": False},
+            )
         post = verify_post_condition(before, after)
         return self._result(
             success=True,
