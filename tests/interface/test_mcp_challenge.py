@@ -124,7 +124,7 @@ async def test_observe_keeps_observation_and_adds_signal(site):
 
 
 @requires_chromium
-async def test_click_opening_new_tab_updates_last_status(site):
+async def test_click_opening_new_tab_reports_tab_and_its_status(site):
     async with BrowserMCPServer() as server:
         first = await _nav(server, site + "/popup")
         assert first.data["last_http_status"] == 200
@@ -135,9 +135,17 @@ async def test_click_opening_new_tab_updates_last_status(site):
             tool_name(ActionType.CLICK),
             {"element_id": link["element_id"], "epoch": observation["snapshot_epoch"]},
         )
+        sw = await server.call_tool(
+            tool_name(ActionType.TAB_CONTROL),
+            {"command": "switch", "tab_id": r.data["opened_tab_ids"][0]},
+        )
+    assert sw.data["last_http_status"] == 403
     assert r.success is True, r.error_message
-    assert r.data["last_http_status"] == 403
-    assert "challenge" in r.data
+    # WS-26b: 상태는 판정하는 탭(원래 탭) 기준 — 팝업의 403 은 새 탭 id 로 알리고,
+    # switch 로 옮기면 그 탭의 403 이 실린다.
+    assert r.data["last_http_status"] == 200
+    assert r.data["challenge"] is None
+    assert len(r.data["opened_tab_ids"]) == 1
 
 
 @requires_chromium

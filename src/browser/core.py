@@ -154,6 +154,7 @@ class BrowserCore:
         self._contexts[profile_name] = ManagedContext(
             profile_name=profile_name, context=context
         )
+        self._watch_context_pages(profile_name, context)
         logger.debug("컨텍스트 생성: %s", profile_name)
         return context
 
@@ -176,6 +177,7 @@ class BrowserCore:
         self._contexts[profile_name] = ManagedContext(
             profile_name=profile_name, context=context
         )
+        self._watch_context_pages(profile_name, context)
         return context
 
     async def save_session(self, profile_name: str, passphrase: str) -> str:
@@ -190,6 +192,86 @@ class BrowserCore:
         return str(path)
 
     # -- 탭 -----------------------------------------------------------------
+
+    def _watch_context_pages(self, profile_name: str, context: Any) -> None:
+        """컨텍스트에서 새로 생긴 페이지(팝업 포함)를 관리 탭으로 등록한다 (WS-26b).
+
+        target=_blank·window.open 팝업은 코어를 거치지 않고 생겨 tabs() 에 없었다
+        (검증 NB-3). context 'page' 이벤트는 new_page() 로 만든 페이지에도 오므로
+        같은 페이지는 한 번만 등록한다(_register_page 가 페이지 동일성으로 확인).
+        팝업은 활성 탭을 바꾸지 않는다 — 옮기는 것은 부르는 쪽(tab_control switch) 몫.
+        """
+        on = getattr(context, "on", None)
+        if not callable(on):
+            return
+
+        def _on_page(page: Any) -> None:
+            try:
+                self._register_page(profile_name, page, popup=True)
+            except Exception:  # noqa: BLE001 - 등록 실패로 브라우저 이벤트 처리를 막지 않는다
+                logger.warning("새 페이지 탭 등록 실패", exc_info=True)
+
+        on("page", _on_page)
+
+    def _find_tab_by_page(self, page: Any) -> Optional[ManagedTab]:
+        for tab in self._tab_index.values():
+            if tab.page is page:
+                return tab
+        return None
+
+    def _register_page(
+        self, profile_name: str, page: Any, *, popup: bool
+    ) -> Optional[ManagedTab]:
+        """page 를 관리 탭으로 등록한다. 이미 등록돼 있으면 그 탭을 돌려준다.
+
+        popup=True(이벤트 경로)이면 탭 상한을 넘을 때 등록하지 않고 로그만 남긴다
+        (예외를 던지면 Playwright 이벤트 처리 중이라 받을 사람이 없다).
+        """
+        existing = self._find_tab_by_page(page)
+        if existing is not None:
+            return existing
+        managed = self._contexts.get(profile_name)
+        if managed is None:
+            return None
+        if len(self._tab_index) >= self.max_tabs:
+            if popup:
+                logger.warning(
+                    "세션 탭 상한(%d)이라 새 페이지를 탭으로 등록하지 않습니다: %s",
+                    self.max_tabs,
+                    getattr(page, "url", ""),
+                )
+                return None
+            raise BrowserCoreError(
+                ErrorCode.TAB_LIMIT_EXCEEDED,
+                f"세션 탭 상한({self.max_tabs})을 초과했습니다.",
+            )
+
+        self._tab_counter += 1
+        tab_id = f"tab-{self._tab_counter}"
+        tab = ManagedTab(tab_id=tab_id, page=page, profile_name=profile_name)
+        managed.tabs[tab_id] = tab
+        self._tab_index[tab_id] = tab
+        try:
+            page.on("close", lambda _p=None, _id=tab_id: self._on_page_closed(_id))
+        except Exception:  # noqa: BLE001 - 가짜 페이지
+            pass
+        return tab
+
+    def _forget_tab(self, tab_id: str) -> Optional[ManagedTab]:
+        """탭 목록에서 뺀다. 활성 탭이었으면 남은 첫 탭으로(close_tab 과 같은 규칙)."""
+        tab = self._tab_index.pop(tab_id, None)
+        if tab is None:
+            return None
+        managed = self._contexts.get(tab.profile_name)
+        if managed:
+            managed.tabs.pop(tab_id, None)
+        if self._active_tab_id == tab_id:
+            self._active_tab_id = next(iter(self._tab_index), None)
+        return tab
+
+    def _on_page_closed(self, tab_id: str) -> None:
+        """페이지가 (사이트 JS·사용자·close_tab 등으로) 닫히면 탭 목록에서 뺀다."""
+        self._forget_tab(tab_id)
 
     async def new_tab(self, profile_name: str, url: Optional[str] = None) -> ManagedTab:
         managed = self._contexts.get(profile_name)
@@ -206,12 +288,10 @@ class BrowserCore:
         async with managed.lock:
             page = await managed.context.new_page()
 
-        self._tab_counter += 1
-        tab_id = f"tab-{self._tab_counter}"
-        tab = ManagedTab(tab_id=tab_id, page=page, profile_name=profile_name)
-        managed.tabs[tab_id] = tab
-        self._tab_index[tab_id] = tab
-        self._active_tab_id = tab_id
+        # context 'page' 이벤트가 먼저 등록했으면 그 탭을 그대로 쓴다(이중 등록 없음).
+        tab = self._register_page(profile_name, page, popup=False)
+        assert tab is not None
+        self._active_tab_id = tab.tab_id
 
         if url:
             await page.goto(url, wait_until="domcontentloaded")
@@ -230,17 +310,12 @@ class BrowserCore:
         return tab.page
 
     async def close_tab(self, tab_id: str) -> None:
-        tab = self._tab_index.pop(tab_id, None)
+        tab = self._forget_tab(tab_id)
         if tab is None:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}"
             )
-        managed = self._contexts.get(tab.profile_name)
-        if managed:
-            managed.tabs.pop(tab_id, None)
         await tab.page.close()
-        if self._active_tab_id == tab_id:
-            self._active_tab_id = next(iter(self._tab_index), None)
 
     def switch_tab(self, tab_id: str) -> None:
         if tab_id not in self._tab_index:
@@ -248,6 +323,10 @@ class BrowserCore:
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}"
             )
         self._active_tab_id = tab_id
+
+    def set_active_tab(self, tab_id: str) -> None:
+        """switch_tab 별칭. 디스패처 tab_control 이 이 이름으로 부른다."""
+        self.switch_tab(tab_id)
 
     def list_tabs(self) -> Dict[str, str]:
         """tab_id → profile_name 매핑을 반환한다."""
@@ -258,6 +337,10 @@ class BrowserCore:
         if not tab_id:
             return None
         return self._tab_index.get(tab_id)
+
+    def tab_for_page(self, page: Any) -> Optional["ManagedTab"]:
+        """Page 로 관리 탭을 조회한다. 등록되지 않았으면 None."""
+        return self._find_tab_by_page(page)
 
     def tabs(self) -> List["ManagedTab"]:
         """생성 순서대로 관리 탭 목록을 반환한다."""

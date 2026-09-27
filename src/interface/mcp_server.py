@@ -122,7 +122,7 @@ CHALLENGE_CHECK_ACTIONS = frozenset({
 #: 대상 툴 설명 뒤에 붙는 공통 안내.
 CHALLENGE_NOTE = (
     " 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다"
-    "(kind=captcha|blocked, vendor, reason; data.last_http_status 는 마지막 메인 문서 HTTP 상태)"
+    "(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태)"
     " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오."
 )
 
@@ -171,8 +171,11 @@ class BrowserMCPServer:
         self._hitl: Any = None
         self._egress: Any = None
         self._started = False
-        #: 메인 프레임 문서 응답 상태(WS-26). context 리스너가 갱신한다.
+        #: 세션 전역 메인 문서 상태(WS-26). 탭별 기록(_page_status)이 없을 때만 쓴다
+        #: (브라우저 없이 디스패처를 바꿔 끼운 단위 테스트 등).
         self._http_status: Dict[str, Any] = {"last_http_status": None}
+        #: 탭(페이지)별 메인 문서 상태(WS-26b). start() 가 context 에 단다.
+        self._page_status: Any = None
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -188,12 +191,12 @@ class BrowserMCPServer:
 
         self._core = await BrowserCore(headless=self.headless).start()
         await self._core.new_context("mcp-session")
-        # 새 탭·팝업 문서 응답도 잡도록 context 단위로 단다(run 과 같은 규칙).
-        from browser.doc_status import track_main_document_status
+        # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
+        # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
+        from browser.doc_status import PageDocumentStatus
 
-        track_main_document_status(
-            self._core.context_for("mcp-session"), self._http_status
-        )
+        self._page_status = PageDocumentStatus()
+        self._page_status.attach(self._core.context_for("mcp-session"))
         tab = await self._core.new_tab("mcp-session")
         self._page = tab.page
         self._cdp = await self._core.new_cdp_session(tab.tab_id)
@@ -290,17 +293,33 @@ class BrowserMCPServer:
 
         판정만 한다 — 풀거나 우회하지 않는다. 판정 실패는 challenge=None 으로 둔다.
         기존 data 키는 덮어쓰지 않는다.
+
+        판정 페이지는 root_page(프레임 진입 전 최상위) → page → self._page 순이다 —
+        최상위가 캡차인데 그 안 정상 iframe 에 들어가 있어도 캡차를 놓치지 않는다.
+        WS-26b: 상태는 **그 페이지가** 받은 마지막 메인 문서 응답이고, 판정에는 지금
+        URL 이 그 응답 URL 과 같을 때만 넘긴다(pushState 로 옮긴 SPA 화면 오판 방지).
         """
-        last_status = self._http_status.get("last_http_status")
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
+        if page is None:
+            page = self._page
+        tracker = self._page_status
+        last_status: Optional[int] = None
+        judge_status: Optional[int] = None
+        try:
+            if tracker is not None:
+                last_status = tracker.status_for(page)
+                judge_status = tracker.judge_status_for(page)
+            else:
+                last_status = self._http_status.get("last_http_status")
+                judge_status = last_status
+        except Exception:  # noqa: BLE001 - 상태 조회 실패로 결과를 망가뜨리지 않는다
+            logger.warning("문서 상태 조회 실패 — null 로 둔다", exc_info=True)
         challenge: Optional[Dict[str, str]] = None
         try:
             from browser import challenge as challenge_mod
 
-            ctx = getattr(self._dispatcher, "ctx", None)
-            page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
-            if page is None:
-                page = self._page
-            found = await challenge_mod.detect_challenge(page, last_status=last_status)
+            found = await challenge_mod.detect_challenge(page, last_status=judge_status)
             if found.detected:
                 challenge = {
                     "kind": found.kind.value,

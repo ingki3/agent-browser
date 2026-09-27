@@ -220,8 +220,12 @@ click         ->  element_id="@e3", epoch=0
 
 `navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
 
-- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다.
-- `data.last_http_status` — 세션(새 탭·팝업 포함)에서 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태. 아직 없으면 `null`.
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다.
+- `data.last_http_status` — 판정한 탭이 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태(다른 탭·팝업의 응답은 섞이지 않음). 아직 없으면 `null`. 차단 판정에는 지금 주소가 그 응답 주소와 같을 때만 씁니다(`#…`만 다르면 같은 문서) — 403 뒤 `history.pushState`로 주소를 바꾼 화면은 상태코드로 막힘 판정하지 않습니다.
+
+한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.
+
+탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다.
 
 agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
 
