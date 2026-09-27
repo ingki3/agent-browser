@@ -216,6 +216,15 @@ click         ->  element_id="@e3", epoch=0
 
 `click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
 
+### 차단·캡차 신호
+
+`navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
+
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다.
+- `data.last_http_status` — 세션(새 탭·팝업 포함)에서 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태. 아직 없으면 `null`.
+
+agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
+
 ---
 
 ## 구조

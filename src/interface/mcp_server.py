@@ -102,8 +102,36 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
 }
 
 
+#: 결과 data 에 차단·캡차 신호(challenge, last_http_status)를 싣는 액션 (WS-26).
+#: 화면이 바뀌거나 화면을 보는 액션만 — 나머지(스크린샷·추출·스크롤·호버 등)는
+#: 판정 비용·소음을 줄이려고 싣지 않는다.
+CHALLENGE_CHECK_ACTIONS = frozenset({
+    ActionType.NAVIGATE,
+    ActionType.GO_BACK,
+    ActionType.RELOAD,
+    ActionType.CLICK,
+    ActionType.PRESS_KEY,
+    ActionType.TYPE_TEXT,
+    ActionType.SELECT_OPTION,
+    ActionType.CHECK_BOX,
+    ActionType.OBSERVE_PAGE,
+    ActionType.TAB_CONTROL,
+    ActionType.WAIT_FOR,
+})
+
+#: 대상 툴 설명 뒤에 붙는 공통 안내.
+CHALLENGE_NOTE = (
+    " 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다"
+    "(kind=captcha|blocked, vendor, reason; data.last_http_status 는 마지막 메인 문서 HTTP 상태)"
+    " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오."
+)
+
+
 def _describe(action: ActionType) -> str:
-    return _DESCRIPTIONS.get(action, f"{action.value} 액션을 실행합니다.")
+    text = _DESCRIPTIONS.get(action, f"{action.value} 액션을 실행합니다.")
+    if action in CHALLENGE_CHECK_ACTIONS:
+        text += CHALLENGE_NOTE
+    return text
 
 
 class BrowserMCPServer:
@@ -143,6 +171,8 @@ class BrowserMCPServer:
         self._hitl: Any = None
         self._egress: Any = None
         self._started = False
+        #: 메인 프레임 문서 응답 상태(WS-26). context 리스너가 갱신한다.
+        self._http_status: Dict[str, Any] = {"last_http_status": None}
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -158,6 +188,12 @@ class BrowserMCPServer:
 
         self._core = await BrowserCore(headless=self.headless).start()
         await self._core.new_context("mcp-session")
+        # 새 탭·팝업 문서 응답도 잡도록 context 단위로 단다(run 과 같은 규칙).
+        from browser.doc_status import track_main_document_status
+
+        track_main_document_status(
+            self._core.context_for("mcp-session"), self._http_status
+        )
         tab = await self._core.new_tab("mcp-session")
         self._page = tab.page
         self._cdp = await self._core.new_cdp_session(tab.tab_id)
@@ -244,7 +280,37 @@ class BrowserMCPServer:
         if blocked is not None:
             return blocked
 
-        return await self._dispatcher.dispatch(action, params)
+        result = await self._dispatcher.dispatch(action, params)
+        if action in CHALLENGE_CHECK_ACTIONS:
+            await self._attach_challenge(result)
+        return result
+
+    async def _attach_challenge(self, result: ActionResult) -> None:
+        """활성 탭 화면의 차단·캡차 판정을 result.data 에 병합한다 (WS-26).
+
+        판정만 한다 — 풀거나 우회하지 않는다. 판정 실패는 challenge=None 으로 둔다.
+        기존 data 키는 덮어쓰지 않는다.
+        """
+        last_status = self._http_status.get("last_http_status")
+        challenge: Optional[Dict[str, str]] = None
+        try:
+            from browser import challenge as challenge_mod
+
+            ctx = getattr(self._dispatcher, "ctx", None)
+            page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
+            if page is None:
+                page = self._page
+            found = await challenge_mod.detect_challenge(page, last_status=last_status)
+            if found.detected:
+                challenge = {
+                    "kind": found.kind.value,
+                    "vendor": found.vendor,
+                    "reason": found.reason,
+                }
+        except Exception:  # noqa: BLE001 - 판정 실패로 결과를 망가뜨리지 않는다
+            logger.warning("차단 판정 실패 — challenge=None 으로 둔다", exc_info=True)
+        result.data.setdefault("challenge", challenge)
+        result.data.setdefault("last_http_status", last_status)
 
     async def _check_hitl(
         self, action: ActionType, params: Dict[str, Any]
