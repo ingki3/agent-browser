@@ -216,7 +216,7 @@ async def test_js_location_change_inside_window_waits(server):
 
 
 # (g-1') 경계 — setTimeout(100) JS 이동은 창(200ms) 안이다: 기다린다.
-# 실측 요청 시작 max 155ms(유휴)·161ms(CPU 부하) — 창을 줄이면 여기서 잡힌다.
+# 실측 요청 시작 max 155ms(유휴)·166ms(CPU 부하). 창 경계를 동작으로 가르는 건 아래 (R2) 대조 테스트다.
 @requires_chromium
 async def test_js_location_change_after_100ms_is_inside_window(server):
     from playwright.async_api import async_playwright
@@ -249,6 +249,40 @@ async def test_js_location_change_after_window_is_not_waited(server):
     assert "/result" not in url_at_return
     assert "nav_wait_ms" not in r.data, r.data
     assert elapsed < dmod.NAV_DETECT_MS + 300, elapsed
+
+
+# (R2) 창 경계를 숫자가 아니라 동작으로 고정 — 같은 setTimeout(130) 이동을 현행 창(200)은
+# 기다리고, 창 50 은 기다리지 않는다. 실측(settle 시작 기준 요청 시작, 로컬 Chromium):
+# 유휴 127~130ms(30회), CPU 12코어 부하 92~148ms(40회). 200 대비 여유 ≥52ms, 50 대비 ≥42ms.
+# 창을 100 으로 줄이면(유휴 128ms 요청을 놓친다) 첫 테스트가 잡는다.
+_LATE_MS = 130
+
+
+@requires_chromium
+async def test_js_location_change_at_130ms_waits_with_current_window(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + f"/?late={_LATE_MS}")
+        r = await _click(engine, page, d, "늦은 이동")
+        url_at_return = page.url
+        await b.close()
+    assert r.success, r.error_message
+    assert "/result" in url_at_return, url_at_return
+    assert r.data.get("nav_committed") is True, r.data
+
+
+@requires_chromium
+async def test_js_location_change_at_130ms_not_waited_with_small_window(server, monkeypatch):
+    from playwright.async_api import async_playwright
+
+    monkeypatch.setattr(dmod, "NAV_DETECT_MS", 50)
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + f"/?late={_LATE_MS}")
+        r = await _click(engine, page, d, "늦은 이동")
+        await b.close()
+    assert "nav_wait_ms" not in r.data, r.data
+    assert "nav_committed" not in r.data, r.data
 
 
 # (c) 이동 없는 클릭 — 추가 지연은 감지 창 + 여유 이하, 결과 동일
@@ -333,11 +367,68 @@ async def test_enter_to_non_document_proceeds_quickly(server, path, reason):
         url = page.url
         await b.close()
     assert r.success, r.error_message
-    assert r.data.get("nav_aborted") == reason, r.data
+    if reason in ("download", "status_204"):
+        # CPU 부하에서 Chromium 이 첨부·204 응답을 requestfailed 로 먼저 알리기도 한다(곧바로
+        # 진행은 같다). 응답별 판정 자체는 아래 가짜 객체 단위 테스트가 고정한다.
+        assert r.data.get("nav_aborted") in (reason, "request_failed"), r.data
+    else:
+        assert r.data.get("nav_aborted") == reason, r.data
     assert r.data.get("nav_committed") is False
     assert r.reobserve_required is False
     assert url.endswith("/"), url
     assert elapsed < 1000, elapsed
+
+
+# (R2) 위 download·204 케이스는 Chromium 이 requestfailed 로도 알려 줘서, 응답별 판정이
+# 사라져도 통과한다. 그 판정 자체는 이벤트 순서와 무관하게 가짜 객체로 고정한다.
+class _FakeReq:
+    def __init__(self, frame):
+        self.frame = frame
+
+    def is_navigation_request(self):
+        return True
+
+
+class _FakeResp:
+    def __init__(self, request, status=200, headers=None):
+        self.request, self.status, self.headers = request, status, headers or {}
+
+
+class _FakePage:
+    def __init__(self):
+        self.main_frame = object()
+
+    def on(self, *_a):
+        pass
+
+    def remove_listener(self, *_a):
+        pass
+
+
+def _response_verdict(status, headers=None):
+    page = _FakePage()
+    w = dmod._NavWatch(page)
+    req = _FakeReq(page.main_frame)
+    w._on_request(req)
+    w._on_response(_FakeResp(req, status=status, headers=headers))
+    return w.aborted
+
+
+def test_no_document_status_marks_status_aborted():
+    assert _response_verdict(204) == "status_204"
+    assert _response_verdict(205) == "status_205"
+    assert _response_verdict(200) == ""
+    assert _response_verdict(302) == ""
+
+
+def test_attachment_response_and_download_event_mark_download():
+    assert _response_verdict(200, {"content-disposition": "Attachment; filename=a.bin"}) == "download"
+    assert _response_verdict(200, {"content-disposition": "inline"}) == ""
+    page = _FakePage()
+    w2 = dmod._NavWatch(page)
+    w2._on_request(_FakeReq(page.main_frame))
+    w2._on_download(object())
+    assert w2.aborted == "download"
 
 
 # (f) 새 탭 popup 클릭 — popup_tab_id/new_tab 동작 유지, 멈추지 않음
@@ -382,7 +473,7 @@ async def test_coordinate_click_on_link_waits(server):
 
 
 # 감지 창 크기 — 검증 D절 실측으로 고른 값. 요청 시작 지연 최악(부하 setTimeout(100))
-# 161ms 보다 커야 놓치지 않고, 이동 없는 모든 click/press_key 가 이 값만큼 느려지므로
+# 166ms 보다 커야 놓치지 않고, 이동 없는 모든 click/press_key 가 이 값만큼 느려지므로
 # 크게 잡지 않는다.
 def test_detect_window_covers_measured_worst_case_without_overpaying():
     assert 170 <= dmod.NAV_DETECT_MS <= 250, dmod.NAV_DETECT_MS
