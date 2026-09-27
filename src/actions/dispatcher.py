@@ -88,12 +88,15 @@ _SCROLL_HEIGHT_JS = (
 )
 
 #: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
-#: 실측(로컬 Chromium): Enter 폼 제출은 키 입력 반환 뒤 p50 21ms·최대 53ms,
-#: JS setTimeout(0) location 변경 16ms, select onchange 1ms 안에 요청이 시작됐다.
-#: 링크 클릭은 Playwright click() 이 커밋까지 기다려 반환 전에 이미 시작돼 있다.
-#: G마켓 Enter 실측은 README/보고 참고. 창 안에 요청이 없으면 기다리지 않는다 —
-#: 이동 없는 액션의 추가 지연은 이 값 이하다.
-NAV_DETECT_MS = 300
+#: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
+#: 링크 max 52, select onchange max 12, JS setTimeout(0) max 70, setTimeout(100) max 155.
+#: CPU 12코어 부하에서 폼·링크·select·setTimeout(0) max 82ms, setTimeout(100) max 161ms.
+#: 150ms 는 여유 0, 100ms 는 setTimeout(100) 을 5/30 만 감지했다. 200ms 는 부하 최악
+#: 대비 ~40ms 여유. 창 안에 요청이 없으면 기다리지 않는다 — 이동 없는 액션의 추가
+#: 지연은 이 값 이하다(모든 이동 없는 click/press_key 가 이만큼 느려진다).
+#: 링크·리다이렉트 클릭은 Playwright click() 이 커밋까지 기다려 반환하므로 nav_wait_ms 가
+#: 0 에 가깝게 찍힌다 — 대기가 없었다는 뜻이 아니라 click() 안에서 기다린 것이다.
+NAV_DETECT_MS = 200
 #: 이동이 시작됐을 때 새 문서의 domcontentloaded 까지 기다리는 상한
 #: (루프의 SETTLE_TIMEOUT_MS 와 같은 값). 넘기면 더 기다리지 않고 진행한다.
 NAV_SETTLE_TIMEOUT_MS = 8000
@@ -446,8 +449,8 @@ class ActionDispatcher:
             # 이전 관찰(요소 id)은 무효이므로 재관찰을 요구한다.
             result.data.update(self._nav_info)
             if self._nav_info.get("nav_committed"):
+                # current_url 은 _result() 가 settle 뒤에 이미 계산했다.
                 result.reobserve_required = True
-                result.current_url = self._current_url()
             self._nav_info = {}
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)

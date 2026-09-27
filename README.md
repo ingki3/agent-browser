@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-939개가 통과해야 합니다(3개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+947개가 통과해야 합니다(3개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -214,7 +214,7 @@ click         ->  element_id="@e3", epoch=0
 
 페이지가 바뀌면 `epoch`이 올라가고 이전 `element_id`는 무효가 됩니다. 오래된 ID로 액션을 보내면 `E_TOCTOU_MISMATCH`로 거부됩니다 — 다른 요소를 잘못 누르는 것보다 낫다는 판단입니다.
 
-`click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 300ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 300ms) 느려집니다.
+`click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
 
 ---
 
@@ -282,7 +282,7 @@ reasoning 계열 모델은 본문보다 사고 토큰을 먼저 소비합니다.
 
 **모델 판단의 편차** — 실패 사례는 런타임 결함이 아니라 LLM이 실행마다 다른 선택을 하는 경우입니다. `max_tokens` 조정으로 해결되지 않으며, 모델 비교가 다음 과제입니다.
 
-**액션 뒤 이동 대기는 문서 요청만 봅니다** — SPA의 `pushState` 라우팅(문서 요청 없음)과, 액션 뒤 300ms가 지나서 시작되는 이동(예: 1초 뒤 JS로 `location` 변경)은 기다리지 않습니다. 이때는 기존 사후조건 검증과 루프의 관찰 재시도가 맡습니다.
+**액션 뒤 이동 대기는 문서 요청만 봅니다** — SPA의 `pushState` 라우팅(문서 요청 없음)과, 액션 뒤 200ms가 지나서 시작되는 이동(예: 400ms 뒤 JS로 `location` 변경)은 기다리지 않습니다. 이때는 기존 사후조건 검증과 루프의 관찰 재시도가 맡습니다. 연결 실패가 Chromium 오류 문서(`chrome-error://`)로 커밋되면 새 문서로 보아 `nav_committed=true`로 남습니다.
 
 **Tier-2 시각 폴백은 옵트인입니다** — 텍스트 셀렉터가 2회 연속 실패하면(아이콘 버튼, 난독화 라벨, Canvas UI) 스크린샷에 태그를 얹어 비전 모델에게 묻는 폴백이 있습니다. `serve --som-vision`으로 켭니다. 끄면 `take_screenshot(annotate_som=True)`는 이전처럼 `E_FEATURE_NOT_IMPLEMENTED`를 반환합니다(레거시 클라이언트 보호).
 

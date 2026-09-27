@@ -44,6 +44,27 @@ HOME = """<!doctype html><meta charset=utf-8><title>홈</title>
 <a href='/fail'>끊김</a>
 <p id=o></p>"""
 
+#: R1 추가 페이지 — 기존 HOME 요소 목록은 건드리지 않는다.
+PAGES = {
+    # 스트리밍 head 문서로 가는 링크(커밋 뒤 dcl 이 1.5초 늦다)
+    "/tostream": "<!doctype html><meta charset=utf-8><title>홈</title>"
+                 "<a href='/stream?d=1500'>느린 문서로</a>",
+    # iframe 만 이동시키는 링크 — 메인 문서는 그대로
+    "/iframe": "<!doctype html><meta charset=utf-8><title>홈</title>"
+               "<iframe name=f src='/frame' width=300 height=100></iframe>"
+               "<a href='/result?d=0' target=f>프레임만 이동</a>",
+    "/frame": "<!doctype html><meta charset=utf-8><title>프레임</title><p>프레임</p>",
+    # 같은 문서 안 이동(hash) — 문서 요청이 없다
+    "/hash": "<!doctype html><meta charset=utf-8><title>홈</title>"
+             "<a href='#section'>섹션으로</a>"
+             "<button onclick=\"location.hash='#x';location.href='/nocontent'\">해시 후 빈 응답</button>"
+             "<div style='height:3000px'></div><h2 id=section>섹션</h2>",
+    # keydown 핸들러가 동기적으로 location 을 바꾼다 — 요청이 키 입력 중에 곧바로 나간다
+    "/keynav": "<!doctype html><meta charset=utf-8><title>홈</title>"
+               "<input id=q aria-label='검색어' "
+               "onkeydown=\"if(event.key==='Enter'){location.href='/result?d=800'}\">",
+}
+
 
 @pytest.fixture
 def server():
@@ -72,6 +93,24 @@ def server():
             elif u.path == "/fail":
                 self.connection.close()
                 return
+            elif u.path == "/stream":
+                # 스트리밍 head: 머리를 먼저 보내 문서를 커밋시키고, 나머지는 d ms 뒤에 보낸다.
+                # domcontentloaded 는 커밋 뒤 d ms 늦게 온다.
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    head = ("<!doctype html><meta charset=utf-8><title>느린 문서</title>"
+                            "<!--" + "x" * 4096 + "--><p>머리</p>")
+                    self.wfile.write(head.encode())
+                    self.wfile.flush()
+                    time.sleep(d / 1000)
+                    self.wfile.write("<p>본문</p>".encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            elif u.path in PAGES:
+                body = PAGES[u.path]
             else:
                 late = int((qs.get("late") or ["1000"])[0])
                 body = HOME.format(d=d, late=late)
@@ -176,13 +215,31 @@ async def test_js_location_change_inside_window_waits(server):
     assert r.reobserve_required is True
 
 
-# (g-2) 창 밖(1초 뒤) 이동은 기다리지 않는다 — 알려진 한계
+# (g-1') 경계 — setTimeout(100) JS 이동은 창(200ms) 안이다: 기다린다.
+# 실측 요청 시작 max 155ms(유휴)·161ms(CPU 부하) — 창을 줄이면 여기서 잡힌다.
+@requires_chromium
+async def test_js_location_change_after_100ms_is_inside_window(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/?late=100")
+        r = await _click(engine, page, d, "늦은 이동")
+        url_at_return = page.url
+        await b.close()
+    assert r.success, r.error_message
+    assert "/result" in url_at_return, url_at_return
+    assert r.data.get("nav_committed") is True, r.data
+    assert r.reobserve_required is True
+
+
+# (g-2) 경계 — setTimeout(400) 이동은 창 밖: 기다리지 않는다(알려진 한계로 고정).
+# 창을 400ms 이상으로 늘리면 여기서 잡힌다.
 @requires_chromium
 async def test_js_location_change_after_window_is_not_waited(server):
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        b, page, engine, d = await _open(pw, server + "/?late=1000")
+        b, page, engine, d = await _open(pw, server + "/?late=400")
         t0 = time.perf_counter()
         r = await _click(engine, page, d, "늦은 이동")
         elapsed = (time.perf_counter() - t0) * 1000
@@ -190,8 +247,8 @@ async def test_js_location_change_after_window_is_not_waited(server):
         await b.close()
     assert r.success, r.error_message
     assert "/result" not in url_at_return
-    assert "nav_wait_ms" not in r.data
-    assert elapsed < 900, elapsed
+    assert "nav_wait_ms" not in r.data, r.data
+    assert elapsed < dmod.NAV_DETECT_MS + 300, elapsed
 
 
 # (c) 이동 없는 클릭 — 추가 지연은 감지 창 + 여유 이하, 결과 동일
@@ -319,3 +376,144 @@ async def test_coordinate_click_on_link_waits(server):
     assert r.success, r.error_message
     assert "/result" in url_at_return
     assert r.reobserve_required is True
+
+
+# ---- R1: 검증 B절 생존 뮤턴트를 잡는 테스트 -------------------------------------
+
+
+# 감지 창 크기 — 검증 D절 실측으로 고른 값. 요청 시작 지연 최악(부하 setTimeout(100))
+# 161ms 보다 커야 놓치지 않고, 이동 없는 모든 click/press_key 가 이 값만큼 느려지므로
+# 크게 잡지 않는다.
+def test_detect_window_covers_measured_worst_case_without_overpaying():
+    assert 170 <= dmod.NAV_DETECT_MS <= 250, dmod.NAV_DETECT_MS
+
+
+# (R1-a, M2c) 커밋만 보고 반환하지 않는다 — 스트리밍 head 로 커밋 뒤 dcl 이 1.5초 늦는
+# 문서에서, 반환 시 문서가 아직 loading 이면 안 된다.
+@requires_chromium
+async def test_streaming_head_waits_for_domcontentloaded_not_just_commit(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/tostream")
+        r = await _click(engine, page, d, "느린 문서로")
+        state = await page.evaluate("document.readyState")
+        url = page.url
+        await b.close()
+    assert r.success, r.error_message
+    assert "/stream" in url, url
+    assert state != "loading", state
+    assert r.data.get("nav_committed") is True, r.data
+    assert "nav_timed_out" not in r.data, r.data
+    assert r.data["nav_wait_ms"] >= 1200, r.data
+
+
+# (R1-b, M6) iframe 만 이동시키는 클릭은 메인 문서 이동이 아니다 — 기다리지 않는다.
+@requires_chromium
+async def test_iframe_only_navigation_is_not_waited(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/iframe")
+        t0 = time.perf_counter()
+        r = await _click(engine, page, d, "프레임만 이동")
+        elapsed = (time.perf_counter() - t0) * 1000
+        url = page.url
+        frame_urls = [f.url for f in page.frames]
+        await b.close()
+    # 사후조건은 메인 문서만 보므로 프레임 이동은 "변화 없음"으로 판정될 수 있다(기존 동작,
+    # 이 테스트 범위 밖). 여기서는 메인 문서 대기를 하지 않았는지만 본다.
+    assert r.error_code is None or r.error_code.value != "E_PAGE_CRASHED", r.error_message
+    assert url.endswith("/iframe"), url
+    assert any("/result" in u for u in frame_urls), frame_urls  # 프레임은 실제로 옮겨갔다
+    assert "nav_wait_ms" not in r.data, r.data
+    assert "nav_committed" not in r.data, r.data
+    assert elapsed < dmod.NAV_DETECT_MS + 1000, elapsed
+
+
+# (R1-c, M7) 대기 리스너가 남지 않는다 — 이동 있는/없는 액션 여러 번 뒤 page 리스너 수 불변.
+# 공개 API 에 리스너 수 조회가 없어 Playwright 구현 객체(_impl_obj, pyee EventEmitter)의
+# listeners() 를 본다. page.on/remove_listener 가 바로 이 객체에 위임된다.
+_WATCH_EVENTS = ("request", "response", "requestfailed", "framenavigated",
+                 "domcontentloaded", "download")
+
+
+def _listener_counts(page):
+    return {ev: len(page._impl_obj.listeners(ev)) for ev in _WATCH_EVENTS}
+
+
+@requires_chromium
+async def test_nav_watch_leaves_no_page_listeners(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/?d=0")
+        before = _listener_counts(page)
+        for _ in range(3):
+            r = await _click(engine, page, d, "더하기")  # 이동 없음
+            assert r.success, r.error_message
+            await page.focus("#q")
+            rk = await d.dispatch(ActionType.PRESS_KEY, {"key": "a"})  # 이동 없음
+            assert rk.success, rk.error_message
+        rn = await _click(engine, page, d, "결과로 가기")  # 이동 있음
+        assert rn.data.get("nav_committed") is True, rn.data
+        after = _listener_counts(page)
+        await b.close()
+    assert after == before, (before, after)
+
+
+# (R1-d, M10) press_enter 없는 type_text 는 문서 이동 감시를 하지 않는다 — 입력마다
+# 감지 창만큼 느려지면 안 된다. 창을 1초로 키워 차이를 분명히 한다.
+@requires_chromium
+async def test_type_text_without_enter_has_no_nav_watch(server, monkeypatch):
+    from playwright.async_api import async_playwright
+
+    monkeypatch.setattr(dmod, "NAV_DETECT_MS", 1000)
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/")
+        eid = await _element(engine, page, "검색어")
+        t0 = time.perf_counter()
+        r = await d.dispatch(ActionType.TYPE_TEXT,
+                             {"element_id": eid, "epoch": engine.epoch, "text": "abc"})
+        elapsed = (time.perf_counter() - t0) * 1000
+        await b.close()
+    assert r.success, r.error_message
+    assert "nav_wait_ms" not in r.data, r.data
+    assert elapsed < 500, elapsed
+
+
+# (R1-e, M12) hash 이동(같은 문서)은 문서 요청이 없다 — framenavigated 가 떠도 커밋으로
+# 치지 않는다. 해시를 바꾼 직후 204 로 가는 버튼에서, 문서 요청은 시작됐지만 새 문서는
+# 없으므로 nav_committed 는 False 여야 한다.
+@requires_chromium
+async def test_hash_link_is_not_a_document_commit(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/hash")
+        r = await _click(engine, page, d, "섹션으로")
+        rh = await _click(engine, page, d, "해시 후 빈 응답")
+        await b.close()
+    assert r.success, r.error_message
+    assert "nav_committed" not in r.data, r.data
+    assert "nav_wait_ms" not in r.data, r.data
+    # 204 응답은 Chromium 이 내비게이션을 취소해 requestfailed 로 먼저 올 수도 있다.
+    assert rh.data.get("nav_aborted") in ("status_204", "request_failed"), rh.data
+    assert rh.data.get("nav_committed") is False, rh.data
+
+
+# (R1-f, M1b) press_key 도 리스너를 키 입력 **전에** 단다 — keydown 핸들러가 동기적으로
+# location 을 바꾸고 잠시 바쁘면, 문서 요청이 키 입력이 끝나기 전에 이미 나간다.
+@requires_chromium
+async def test_press_key_listener_attached_before_key(server):
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        b, page, engine, d = await _open(pw, server + "/keynav")
+        await page.focus("#q")
+        r = await d.dispatch(ActionType.PRESS_KEY, {"key": "Enter"})
+        url_at_return = page.url
+        await b.close()
+    assert r.success, r.error_message
+    assert "/result" in url_at_return, url_at_return
+    assert r.data.get("nav_committed") is True, r.data
