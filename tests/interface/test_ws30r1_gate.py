@@ -162,6 +162,13 @@ ENTER_TARGETS = {
     "input_tel": ("<input id=t type=tel>", True),
     "input_url": ("<input id=t type=url>", True),
     "input_date": ("<input id=t type=date>", True),
+    # WS-30b NB-R1-1(X12): 날짜·시간 계열 전부와 type 없음·모르는 type(브라우저는 text 로 다룸).
+    "input_time": ("<input id=t type=time>", True),
+    "input_datetime_local": ("<input id=t type=datetime-local>", True),
+    "input_month": ("<input id=t type=month>", True),
+    "input_week": ("<input id=t type=week>", True),
+    "input_no_type": ("<input id=t name=q>", True),
+    "input_unknown_type": ("<input id=t type=foo>", True),
     "input_checkbox": ("<input id=t type=checkbox>", True),
     "input_radio": ("<input id=t type=radio name=r>", True),
     "input_range": ("<input id=t type=range>", True),
@@ -198,6 +205,32 @@ async def test_enter_on_every_submitting_target_is_gated(site, kind):
     else:
         assert r.success, (kind, r.error_code, r.error_message)
         assert "/checkout" not in url
+
+
+#: WS-30b NB-R1-1: `form=` 속성으로 폼 밖에서 폼에 연결된 요소 — Chromium 은 Enter 로 그 폼을 제출한다.
+FORM_ATTR_TARGETS = {
+    "input_text": "<input id=t name=q form=f>",
+    "button": "<button id=t form=f>다음</button>",
+    "input_submit": "<input id=t type=submit form=f value=\"다음\">",
+}
+
+
+@requires_chromium
+@pytest.mark.parametrize("kind", sorted(FORM_ATTR_TARGETS))
+async def test_enter_on_form_attribute_outside_form_is_gated(site, kind):
+    PAGES["/fa"] = (
+        "<!doctype html><meta charset=utf-8><title>fa</title>"
+        "<form id=f action=\"/checkout\"><input name=a><input type=submit value=go></form>"
+        + FORM_ATTR_TARGETS[kind]
+    )
+    async with BrowserMCPServer() as server:
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/fa"})
+        await _page(server).focus("#t")
+        r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+        await _page(server).wait_for_timeout(200)
+        url = _page(server).url
+    assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, (kind, r.error_message)
+    assert "/checkout" not in url, f"차단됐는데 제출됨: {kind}"
 
 
 @requires_chromium
@@ -368,6 +401,39 @@ async def test_cross_origin_frame_form_enter_is_gated(site, other_origin):
         frame_url = _page(server).url
     assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, r.error_message
     assert "/fdone" not in frame_url
+
+
+@requires_chromium
+async def test_forged_has_focus_in_two_frames_fails_closed(site, other_origin):
+    """WS-30b NB-R1-1(X6): 두 다른 출처 프레임이 모두 `document.hasFocus()` 를 true 라고 속이면
+    포커스 사슬이 한 줄이 아니다 → 판정 불가(차단). 가장 깊은 프레임만 믿으면 폼 밖 요소로 읽혀
+    통과했다(포커스는 실제로 다른 프레임의 폼 입력칸)."""
+    PAGES["/two"] = (
+        "<!doctype html><meta charset=utf-8><title>two</title>"
+        f"<iframe id=sf src=\"{other_origin}/inner\" width=300 height=120></iframe>"
+        "<iframe id=mid src=\"/mid\" width=300 height=120></iframe>"
+    )
+    PAGES["/mid"] = (
+        "<!doctype html><meta charset=utf-8><p>mid</p>"
+        f"<iframe id=deep src=\"{other_origin}/inner\" width=280 height=100></iframe>"
+    )
+    PAGES["/inner"] = (
+        "<!doctype html><meta charset=utf-8><title>inner</title>"
+        "<form action=\"/fdone\"><input id=fq name=fq aria-label=\"프레임 검색\"></form>"
+        "<input id=loose aria-label=\"프레임 메모\">"
+    )
+    async with BrowserMCPServer() as server:
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/two"})
+        page = _page(server)
+        for f in page.frames:
+            if "/inner" in f.url:
+                await f.evaluate("document.hasFocus = () => true")
+        await page.frame_locator("#sf").locator("#fq").focus()
+        r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+        await page.wait_for_timeout(300)
+        submitted = any("/fdone" in f.url for f in page.frames)
+    assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, r.error_message
+    assert not submitted
 
 
 @requires_chromium
