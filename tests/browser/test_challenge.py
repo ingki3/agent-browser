@@ -93,8 +93,10 @@ async def _detect(html: str, **kw):
 @pytest.mark.parametrize(
     "html,kind,vendor",
     [
-        (NAVER_LIMIT, ChallengeKind.BLOCKED, "naver"),
-        (NAVER_SECURITY, ChallengeKind.CAPTCHA, "naver"),
+        # WS-30b: 네이버 문구라도 페이지가 네이버 도메인이 아니면(set_content = about:blank) generic.
+        # 네이버 도메인일 때 naver 는 test_ws30b_challenge_vendor.py 가 본다.
+        (NAVER_LIMIT, ChallengeKind.BLOCKED, "generic"),
+        (NAVER_SECURITY, ChallengeKind.CAPTCHA, "generic"),
         (AKAMAI, ChallengeKind.BLOCKED, "akamai"),
         (CLOUDFLARE, ChallengeKind.CAPTCHA, "cloudflare"),
         (VISIBLE_RECAPTCHA, ChallengeKind.CAPTCHA, "recaptcha"),

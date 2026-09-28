@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 #: 이보다 긴 본문에서는 문구 일치만으로 차단/캡차로 보지 않는다.
 LONG_PAGE_CHARS = 3000
@@ -77,7 +78,8 @@ _PROBE_JS = r"""
     break;
   }
   const body = document.body ? (document.body.innerText || '') : '';
-  return {title: document.title || '', text: body.slice(0, 4000), len: body.length, widget};
+  return {title: document.title || '', text: body.slice(0, 4000), len: body.length, widget,
+          url: location.href};
 }
 """
 
@@ -98,10 +100,36 @@ _BLOCKED_PHRASES = (
     ("sorry, you have been blocked", "cloudflare", "Cloudflare 차단 화면"),
 )
 
+#: 사이트 고유 문구로 판정하는 벤더 → 그 벤더의 등록 도메인 (WS-30b). 문구만으로 벤더를 단정하지
+#: 않는다 — 페이지 주소가 이 도메인(또는 하위 도메인)일 때만 vendor 를 채우고 아니면 generic.
+#: Cloudflare·Akamai 는 앞단(CDN) 화면이라 어느 사이트 도메인에서나 나오므로 목록에 없다(도메인 무관).
+SITE_VENDOR_DOMAINS = {
+    "naver": ("naver.com",),
+}
+
+
+def vendor_domain_matches(vendor: str, url: Optional[str]) -> bool:
+    """vendor 를 이 url 에 대해 주장해도 되는가. 도메인 무관 벤더(CDN 등)는 항상 True."""
+    domains = SITE_VENDOR_DOMAINS.get(vendor)
+    if not domains:
+        return True
+    try:
+        host = (urlparse(url or "").hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _vendor_for(vendor: str, url: Optional[str]) -> str:
+    return vendor if vendor_domain_matches(vendor, url) else "generic"
+
 
 def classify(title: str, text: str, length: int, widget: str,
-             last_status: Optional[int] = None) -> Challenge:
-    """프로브 결과를 판정한다(순수 함수 — 브라우저 없이 시험 가능)."""
+             last_status: Optional[int] = None, *, url: Optional[str] = None) -> Challenge:
+    """프로브 결과를 판정한다(순수 함수 — 브라우저 없이 시험 가능).
+
+    url 은 페이지 주소 — 사이트 고유 문구의 vendor 는 주소가 그 사이트일 때만 채운다(WS-30b).
+    """
     if widget:
         vendor = "generic" if widget == "generic" else widget
         return Challenge(ChallengeKind.CAPTCHA, f"보이는 캡차 위젯({widget})", vendor)
@@ -110,10 +138,10 @@ def classify(title: str, text: str, length: int, widget: str,
     hay = f"{title}\n{text}".lower()
     for phrase, vendor, reason in _CAPTCHA_PHRASES:
         if phrase in hay:
-            return Challenge(ChallengeKind.CAPTCHA, reason, vendor)
+            return Challenge(ChallengeKind.CAPTCHA, reason, _vendor_for(vendor, url))
     for phrase, vendor, reason in _BLOCKED_PHRASES:
         if phrase in hay:
-            return Challenge(ChallengeKind.BLOCKED, reason, vendor)
+            return Challenge(ChallengeKind.BLOCKED, reason, _vendor_for(vendor, url))
     if "access denied" in hay and ("edgesuite" in hay or "reference #" in hay):
         return Challenge(ChallengeKind.BLOCKED, "Akamai 접근 거부(Access Denied)", "akamai")
     if last_status in BLOCK_STATUSES and length < SHORT_BODY_CHARS:
@@ -136,4 +164,5 @@ async def detect_challenge(page: Any, *, last_status: Optional[int] = None) -> C
         int(s.get("len") or 0),
         str(s.get("widget") or ""),
         last_status,
+        url=str(s.get("url") or getattr(page, "url", "") or ""),
     )
