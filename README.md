@@ -224,6 +224,12 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 
 `user-chrome` 은 Google Chrome 이 설치돼 있어야 하고 창이 뜹니다(화면 없는 서버에서는 `headless` 를 쓰십시오).
 
+### 이동 대기 (`serve --nav-settle {on,off}`)
+
+기본 `on` — `click`·`press_key` 등 페이지를 옮길 수 있는 액션 뒤 새 문서가 뜰 때까지 기다립니다(아래 "관찰 → 액션 흐름" 절의 이동 대기 설명). 대가로 이동이 없는 `click`/`press_key` 도 감지 창만큼(약 0.2초) 느려집니다.
+`off` 는 이 대기를 끕니다. 액션을 많이 보내고 이동 여부를 스스로 판단하는 에이전트가 속도를 원할 때 씁니다(로컬 실측: 이동 없는 click p50 약 219ms → 26ms).
+`off` 면 결과가 떠나는 중인 옛 문서 기준일 수 있고 `data` 에 `nav_wait_ms` 등 대기 키가 붙지 않습니다 — 이동 뒤 `wait_for`(`selector`·`network_idle`·`spa_route`)나 `observe_page` 로 새 문서를 확인할 책임이 호출자에게 있습니다(`stabilize` 는 옛 문서에서 곧바로 만족되므로 이 용도에 맞지 않습니다). 이동이 실제로 성공해도 그 액션 결과가 `E_TIMEOUT`·`E_PAGE_CRASHED` 로 올 수 있고, 그 결과의 `data.challenge`·`last_http_status` 도 옛 문서 기준입니다 — `reobserve_required` 면 다시 관찰해 판단하십시오. `run` 명령은 항상 `on` 입니다.
+
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
 
 연동이 되는지 미리 확인하려면 다음을 실행하십시오. 실제 MCP 클라이언트 세션으로 `initialize → tools/list → tools/call` 왕복을 검증합니다.

@@ -2,6 +2,7 @@
 
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
+                          [--nav-settle {on,off}]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -89,6 +90,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-open",
         action="store_true",
         help="--browser user-chrome 전용: 서버 종료 시 띄운 Chrome 을 닫지 않음",
+    )
+    serve.add_argument(
+        "--nav-settle",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "이동 대기 (기본 on). on: click·press_key 등 뒤 새 문서가 뜰 때까지 기다림 — "
+            "대가로 이동 없는 click/press_key 가 약 0.2초 느려짐. off: 기다리지 않음 — "
+            "이동 뒤 새 문서 확인은 부르는 쪽이 wait_for/observe_page 로 해야 함."
+        ),
     )
 
     # --- tui ---
@@ -214,6 +225,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                     Path(args.chrome_profile).expanduser() if args.chrome_profile else None
                 ),
                 keep_open=bool(args.keep_open),
+                nav_settle=args.nav_settle == "on",
             )
         )
     except KeyboardInterrupt:
