@@ -207,11 +207,26 @@ async def test_enter_on_select_pre_approved_submits(site):
         "<select id=t name=s><option>a</option></select><input type=submit value=go></form>"
     )
     async with BrowserMCPServer(pre_approved_actions=("press_key:*",)) as server:
+        # select 의 Enter 가 폼을 암묵 제출하는지는 플랫폼마다 다르다(macOS Chromium 은
+        # 제출, CI 의 Linux Chromium 은 제출하지 않음). 같은 브라우저에서 게이트를 거치지
+        # 않은 기준 동작을 먼저 재고, 사전 승인된 press_key 가 그와 같은지 본다.
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/f"})
+        page = _page(server)
+        await page.focus("#t")
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(300)
+        browser_submits = "/checkout" in page.url
+
         await _call(server, ActionType.NAVIGATE, {"url": site + "/f"})
         await _page(server).focus("#t")
         r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
-    assert r.success, (r.error_code, r.error_message)
-    assert "/checkout" in r.current_url
+        await _page(server).wait_for_timeout(300)
+        url = _page(server).url
+    # 사전 승인이면 게이트는 통과해야 한다(차단 오류 없음).
+    assert r.error_code is not ErrorCode.HITL_UNATTENDED_BLOCKED, r.error_message
+    assert ("/checkout" in url) == browser_submits, (browser_submits, url, r.error_code)
+    if browser_submits:
+        assert r.success, (r.error_code, r.error_message)
 
 
 @requires_chromium
