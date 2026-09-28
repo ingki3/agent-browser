@@ -349,6 +349,55 @@ async def test_user_chrome_usual_profile_rejected_before_any_process(fake_pw, mo
     assert fake_pw["pw"] is None  # playwright 도 띄우지 않음
 
 
+async def test_user_chrome_core_guards_usual_profile_even_with_fake_launch(fake_pw, fake_launch):
+    """NB-4: launch_user_chrome 을 가짜로 바꿔도 BrowserCore 가 먼저 평소 프로필을 막는다
+    (core 의 _guard_profile 호출 자체를 고정 — launch 쪽 가드에만 기대지 않는다)."""
+    usual = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    with pytest.raises(ValueError):
+        await BrowserCore(browser_mode="user-chrome", chrome_profile=usual).start()
+    assert fake_launch["calls"] == []
+    assert fake_pw["pw"] is None
+
+
+# ---------------------------------------------------------------- MCP 시작 실패 정리 (NB-2)
+
+
+async def _mcp_start_with_failing_init(monkeypatch, keep_open: bool, profile: Path) -> None:
+    from interface.mcp_server import BrowserMCPServer
+
+    async def _boom(self: Any) -> None:
+        raise RuntimeError("init-fail")
+
+    monkeypatch.setattr(BrowserMCPServer, "_init_session", _boom)
+    srv = BrowserMCPServer(browser_mode="user-chrome", chrome_profile=profile,
+                           keep_open=keep_open)
+    with pytest.raises(RuntimeError, match="init-fail"):
+        await srv.start()
+    assert srv.started is False
+
+
+@pytest.mark.parametrize("keep_open", [False, True])
+async def test_mcp_start_failure_closes_chrome_regardless_of_keep_open(
+    fake_pw, fake_launch, monkeypatch, tmp_path, keep_open
+):
+    """Chrome 연결 뒤 _init_session 이 실패하면 keep_open 과 무관하게 우리 Chrome 을 닫는다."""
+    await _mcp_start_with_failing_init(monkeypatch, keep_open, tmp_path / "p")
+    assert fake_launch["uc"].close_calls == 1
+    assert fake_pw["pw"].stopped is True
+
+
+async def test_mcp_normal_close_with_keep_open_leaves_chrome(fake_pw, fake_launch, tmp_path):
+    """정상 close 는 keep_open 을 존중한다(기존 유지)."""
+    from interface.mcp_server import BrowserMCPServer
+
+    srv = BrowserMCPServer(browser_mode="user-chrome", chrome_profile=tmp_path / "p",
+                           keep_open=True)
+    await srv.start()
+    await srv.close()
+    assert fake_launch["uc"].close_calls == 0
+    assert fake_pw["pw"].stopped is True
+
+
 async def test_user_chrome_popup_registered_as_tab(fake_pw, fake_launch, tmp_path):
     """채택한 기본 컨텍스트에도 WS-26b 팝업 등록이 붙는다."""
     core = await BrowserCore(browser_mode="user-chrome", chrome_profile=tmp_path / "p").start()

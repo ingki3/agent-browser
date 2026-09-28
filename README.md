@@ -205,6 +205,7 @@ agent-browser serve --browser user-chrome --chrome-profile ~/ab-shop --keep-open
 - **전용 프로필만 씁니다.** 평소 Chrome 프로필(`~/Library/Application Support/Google/Chrome` 등)을 `--chrome-profile` 로 주면 서버가 시작을 거부합니다(쿠키·비밀번호 보호, Chrome 136+ 원격 디버깅 제약). 전용 폴더는 권한 700 으로 만듭니다. 그 창에서 한 번 로그인하면 전용 프로필에 남아 다음 실행에도 유지됩니다 — 그래서 `user-chrome` 은 저장 세션 주입(`session login` 세션)을 쓰지 않습니다.
 - `user-chrome` 은 새 시크릿 창을 만들지 않고 Chrome 의 기본 창(프로필)을 그대로 씁니다. 처음 열린 빈 탭이 첫 탭이 됩니다. 컨텍스트는 하나만 씁니다.
 - 서버가 끝나면 띄운 Chrome 도 닫습니다. `--keep-open` 이면 남겨 둡니다(시작 실패 때는 옵션과 무관하게 닫습니다). `--chrome-profile`·`--keep-open` 은 `--browser user-chrome` 과만 함께 쓸 수 있습니다.
+- 서버를 신호로 끝내도(`SIGTERM`·`SIGHUP`·Ctrl+C) 같은 정리를 거쳐 닫고 종료 코드 128+신호 번호로 끝납니다. 정리는 최대 10초이고, 신호를 한 번 더 보내면 기다리지 않고 바로 끝납니다. 강제 종료(`kill -9`)하면 Chrome 창이 남을 수 있음, 그때는 창을 직접 닫으세요.
 - 브라우저는 첫 툴 호출 때 뜹니다. 시작 로그는 stderr 한 줄이고 stdout 은 MCP 프로토콜 전용입니다.
 
 Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claude Code 는 `claude mcp add agent-browser -- uv run --directory /절대/경로/agent-browser agent-browser serve --browser user-chrome`).
