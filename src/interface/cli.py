@@ -1,6 +1,8 @@
 """CLI 진입점 (PRD §3.3 실행 모드).
 
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
+                          [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
+                          [--nav-settle {on,off}]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -66,6 +68,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Tier-2 SoM 시각 폴백 활성화 (v1.1). take_screenshot(annotate_som=True)가 "
             "태그 오버레이 스크린샷을 반환한다. 미지정 시 E_FEATURE_NOT_IMPLEMENTED."
+        ),
+    )
+    serve.add_argument(
+        "--browser",
+        choices=["headless", "human", "user-chrome"],
+        default="headless",
+        help=(
+            "브라우저 방식 (기본 headless). human: 창 보이는 Chromium(위장 없음). "
+            "user-chrome: 설치된 Chrome 을 전용 프로필로 띄워 붙음(차단 사이트용)."
+        ),
+    )
+    serve.add_argument(
+        "--chrome-profile",
+        default=None,
+        metavar="PATH",
+        help="--browser user-chrome 전용: 전용 Chrome 프로필 폴더 "
+        "(기본 ~/.agent-browser/chrome-profile, 평소 Chrome 프로필은 거부)",
+    )
+    serve.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="--browser user-chrome 전용: 서버 종료 시 띄운 Chrome 을 닫지 않음",
+    )
+    serve.add_argument(
+        "--nav-settle",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "이동 대기 (기본 on). on: click·press_key 등 뒤 새 문서가 뜰 때까지 기다림 — "
+            "대가로 이동 없는 click/press_key 가 약 0.2초 느려짐. off: 기다리지 않음 — "
+            "이동 뒤 새 문서 확인은 부르는 쪽이 wait_for/observe_page 로 해야 함."
         ),
     )
 
@@ -187,6 +220,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 allowed_domains=tuple(args.allow_domain),
                 secrets_path=args.secrets,
                 som_enabled=args.som_vision,
+                browser_mode=args.browser,
+                chrome_profile=(
+                    Path(args.chrome_profile).expanduser() if args.chrome_profile else None
+                ),
+                keep_open=bool(args.keep_open),
+                nav_settle=args.nav_settle == "on",
             )
         )
     except KeyboardInterrupt:
@@ -252,6 +291,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "tools":
         return _cmd_tools(args.json)
     if args.command == "serve":
+        if (args.chrome_profile or args.keep_open) and args.browser != "user-chrome":
+            parser.error("--chrome-profile / --keep-open 은 --browser user-chrome 과 함께 씁니다")
+        if args.browser == "user-chrome":
+            # 평소 Chrome 프로필 가드 — 서버·브라우저를 만들기 전에, stdout 없이 stderr 한 줄.
+            from browser.user_chrome import DEFAULT_PROFILE_DIR, _guard_profile
+
+            try:
+                _guard_profile(Path(args.chrome_profile).expanduser()
+                               if args.chrome_profile else DEFAULT_PROFILE_DIR)
+            except ValueError as exc:
+                parser.exit(2, f"agent-browser serve: 오류: {exc}\n")
         return _cmd_serve(args)
     if args.command == "tui":
         return _cmd_tui(args)

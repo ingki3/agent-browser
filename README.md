@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-951개가 통과해야 합니다(3개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1080개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -185,6 +185,51 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
 
+### 브라우저 방식 (`serve --browser`)
+
+MCP 서버가 여는 브라우저를 시작 옵션으로 고릅니다. Egress 가드·HITL·차단 신호(`data.challenge`)는 세 방식 모두 같습니다.
+
+| 방식 | 무엇 | 언제 |
+| :--- | :--- | :--- |
+| `headless` (기본) | 화면 없는 Playwright Chromium, 고정 뷰포트 1280×720 | 일반 사이트, CI, 가장 가볍고 빠름 |
+| `human` | 창이 보이는 Chromium, 창 크기 그대로(`no_viewport`), `locale=ko-KR` | 사람이 지켜보거나 중간에 손을 대야 할 때 |
+| `user-chrome` | 설치된 Google Chrome 을 자동화 플래그 없이 **전용 프로필**로 띄워 CDP(127.0.0.1)로 붙음 | headless·human 이 막히는 사이트(실측: G마켓은 이 방식만 검색까지 통과) |
+
+```bash
+agent-browser serve --browser human
+agent-browser serve --browser user-chrome                        # 전용 프로필 ~/.agent-browser/chrome-profile
+agent-browser serve --browser user-chrome --chrome-profile ~/ab-shop --keep-open
+```
+
+- **위장이 아닙니다.** UA 변경·`navigator.webdriver` 숨기기·stealth 스크립트·캡차 풀기는 하지 않습니다. `user-chrome` 에서 `navigator.webdriver` 가 `false` 인 것은 `--enable-automation` 없이 띄운 평범한 Chrome 이기 때문입니다.
+- **전용 프로필만 씁니다.** 평소 Chrome 프로필(`~/Library/Application Support/Google/Chrome` 등)을 `--chrome-profile` 로 주면 서버가 시작을 거부합니다(쿠키·비밀번호 보호, Chrome 136+ 원격 디버깅 제약). 전용 폴더는 권한 700 으로 만듭니다. 그 창에서 한 번 로그인하면 전용 프로필에 남아 다음 실행에도 유지됩니다 — 그래서 `user-chrome` 은 저장 세션 주입(`session login` 세션)을 쓰지 않습니다.
+- `user-chrome` 은 새 시크릿 창을 만들지 않고 Chrome 의 기본 창(프로필)을 그대로 씁니다. 처음 열린 빈 탭이 첫 탭이 됩니다. 컨텍스트는 하나만 씁니다.
+- 서버가 끝나면 띄운 Chrome 도 닫습니다. `--keep-open` 이면 남겨 둡니다(시작 실패 때는 옵션과 무관하게 닫습니다). `--chrome-profile`·`--keep-open` 은 `--browser user-chrome` 과만 함께 쓸 수 있습니다.
+- 서버를 신호로 끝내도(`SIGTERM`·`SIGHUP`·Ctrl+C) 같은 정리를 거쳐 닫고 종료 코드 128+신호 번호로 끝납니다. 정리는 최대 10초이고, 신호를 한 번 더 보내면 기다리지 않고 바로 끝납니다. 강제 종료(`kill -9`)하면 Chrome 창이 남을 수 있음, 그때는 창을 직접 닫으세요.
+- 브라우저는 첫 툴 호출 때 뜹니다. 시작 로그는 stderr 한 줄이고 stdout 은 MCP 프로토콜 전용입니다.
+
+Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claude Code 는 `claude mcp add agent-browser -- uv run --directory /절대/경로/agent-browser agent-browser serve --browser user-chrome`).
+
+```json
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "uv",
+      "args": ["run", "--directory", "/절대/경로/agent-browser",
+               "agent-browser", "serve", "--browser", "user-chrome"]
+    }
+  }
+}
+```
+
+`user-chrome` 은 Google Chrome 이 설치돼 있어야 하고 창이 뜹니다(화면 없는 서버에서는 `headless` 를 쓰십시오).
+
+### 이동 대기 (`serve --nav-settle {on,off}`)
+
+기본 `on` — `click`·`press_key` 등 페이지를 옮길 수 있는 액션 뒤 새 문서가 뜰 때까지 기다립니다(아래 "관찰 → 액션 흐름" 절의 이동 대기 설명). 대가로 이동이 없는 `click`/`press_key` 도 감지 창만큼(약 0.2초) 느려집니다.
+`off` 는 이 대기를 끕니다. 액션을 많이 보내고 이동 여부를 스스로 판단하는 에이전트가 속도를 원할 때 씁니다(로컬 실측: 이동 없는 click p50 약 219ms → 26ms).
+`off` 면 결과가 떠나는 중인 옛 문서 기준일 수 있고 `data` 에 `nav_wait_ms` 등 대기 키가 붙지 않습니다 — 이동 뒤 `wait_for`(`selector`·`network_idle`·`spa_route`)나 `observe_page` 로 새 문서를 확인할 책임이 호출자에게 있습니다(`stabilize` 는 옛 문서에서 곧바로 만족되므로 이 용도에 맞지 않습니다). 이동이 실제로 성공해도 그 액션 결과가 `E_TIMEOUT`·`E_PAGE_CRASHED` 로 올 수 있고, 그 결과의 `data.challenge`·`last_http_status` 도 옛 문서 기준입니다 — `reobserve_required` 면 다시 관찰해 판단하십시오. `run` 명령은 항상 `on` 입니다.
+
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
 
 연동이 되는지 미리 확인하려면 다음을 실행하십시오. 실제 MCP 클라이언트 세션으로 `initialize → tools/list → tools/call` 왕복을 검증합니다.
@@ -215,6 +260,19 @@ click         ->  element_id="@e3", epoch=0
 페이지가 바뀌면 `epoch`이 올라가고 이전 `element_id`는 무효가 됩니다. 오래된 ID로 액션을 보내면 `E_TOCTOU_MISMATCH`로 거부됩니다 — 다른 요소를 잘못 누르는 것보다 낫다는 판단입니다.
 
 `click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
+
+### 차단·캡차 신호
+
+`navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
+
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다.
+- `data.last_http_status` — 판정한 탭이 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태(다른 탭·팝업의 응답은 섞이지 않음). 아직 없으면 `null`. 차단 판정에는 지금 주소가 그 응답 주소와 같을 때만 씁니다(`#…`만 다르면 같은 문서) — 403 뒤 `history.pushState`로 주소를 바꾼 화면은 상태코드로 막힘 판정하지 않습니다.
+
+한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.
+
+탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다.
+
+agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
 
 ---
 

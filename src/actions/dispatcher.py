@@ -276,6 +276,11 @@ class DispatchContext:
     #: `annotate_som=True`에 여전히 E_FEATURE_NOT_IMPLEMENTED를 받는다.
     #: MCP 서버가 `capabilities.experimental.som_vision` 협상 후 켠다.
     som_enabled: bool = False
+    #: 이동 대기 스위치 (WS-28). True(기본)면 페이지를 옮길 수 있는 액션 뒤 새 문서를
+    #: 기다린다(WS-25 `_NavWatch`). False 면 감시자를 붙이지 않는다 — 이동 없는
+    #: click/press_key 가 감지 창(NAV_DETECT_MS)만큼 빨라지는 대신, 이동 뒤 새 문서를
+    #: 확인할 책임(wait_for/observe)이 호출자에게 있다. `serve --nav-settle off`.
+    nav_settle: bool = True
 
 
 #: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
@@ -338,6 +343,8 @@ class ActionDispatcher:
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
         self._nav_info: Dict[str, Any] = {}
+        #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
+        self._opened_pages: List[Any] = []
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -356,6 +363,35 @@ class ActionDispatcher:
         return self._healing_successes / self._healing_attempts
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
+
+    def _set_active_page(self, page: Any, tab_id: str) -> None:
+        """탭 전환·생성·종료로 활성 페이지를 바꾼다 (WS-26b, 검증 NB-4).
+
+        root_page 는 switch_frame 으로 들어가기 전 **그 탭의** 최상위 페이지다. 탭이
+        바뀌면 옛 탭의 root_page 가 남아 차단 판정·프레임 복귀가 옛 탭을 보므로 비운다.
+        """
+        self.ctx.page = page
+        self.ctx.tab_id = tab_id
+        self.ctx.root_page = None
+
+    def _attach_opened_tabs(self, result: ActionResult) -> None:
+        """이 액션이 연 팝업의 코어 탭 id 를 data["opened_tab_ids"] 로 알린다.
+
+        코어에 등록되지 않은 팝업(탭 상한 초과·코어 미주입)은 빠진다. 기존 키는
+        덮어쓰지 않는다.
+        """
+        pages, self._opened_pages = self._opened_pages, []
+        core = self.ctx.core
+        finder = getattr(core, "tab_for_page", None)
+        if not callable(finder):
+            return
+        ids = []
+        for page in pages:
+            tab = finder(page)
+            if tab is not None and tab.tab_id not in ids:
+                ids.append(tab.tab_id)
+        if ids:
+            result.data.setdefault("opened_tab_ids", ids)
 
     def _off_popup(self, listener: Any) -> None:
         try:
@@ -433,6 +469,7 @@ class ActionDispatcher:
             result.data["secret_resolved"] = False
             return result
         self._nav_info = {}
+        self._opened_pages = []
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
@@ -452,6 +489,8 @@ class ActionDispatcher:
                 # current_url 은 _result() 가 settle 뒤에 이미 계산했다.
                 result.reobserve_required = True
             self._nav_info = {}
+        if self._opened_pages:
+            self._attach_opened_tabs(result)
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
@@ -630,7 +669,11 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
         # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
-        watch = _NavWatch(self.ctx.page) if _may_navigate(action, params) else None
+        watch = (
+            _NavWatch(self.ctx.page)
+            if self.ctx.nav_settle and _may_navigate(action, params)
+            else None
+        )
         try:
             await self._execute_element_action(action, handle, params)
         except Exception as exc:  # noqa: BLE001
@@ -677,6 +720,8 @@ class ActionDispatcher:
                 except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
                     pass
         self._off_popup(_on_popup)
+        # WS-26b: 이 액션이 연 새 탭 — dispatch() 가 코어 탭 id 로 바꿔 data 에 싣는다.
+        self._opened_pages = list(popups)
         if popups:
             # 팝업 이벤트가 곧 증거다. 스냅샷 탭 수가 아직 안 늘었어도 반영한다.
             before.page_count = before.page_count or 1
@@ -1002,11 +1047,12 @@ class ActionDispatcher:
         if action is ActionType.PRESS_KEY:
             raw_key = str(params.get("key", ""))
             key = _normalize_key(raw_key)
-            watch = _NavWatch(page)
+            watch = _NavWatch(page) if self.ctx.nav_settle else None
             try:
                 await page.keyboard.press(key)
             except Exception as exc:  # noqa: BLE001
-                watch.close()
+                if watch is not None:
+                    watch.close()
                 return self._result(
                     success=False,
                     action=action,
@@ -1016,7 +1062,8 @@ class ActionDispatcher:
                 )
             # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
             # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
-            self._nav_info = await watch.settle()
+            if watch is not None:
+                self._nav_info = await watch.settle()
             return self._result(
                 success=True, action=action, retry_safe=False, data={"key": key}
             )
@@ -1117,11 +1164,12 @@ class ActionDispatcher:
             )
 
         before = await capture_state(page)
-        watch = _NavWatch(page)
+        watch = _NavWatch(page) if self.ctx.nav_settle else None
         try:
             await page.mouse.click(x, y, button=params.get("button", "left"))
         except Exception as exc:  # noqa: BLE001
-            watch.close()
+            if watch is not None:
+                watch.close()
             return self._result(
                 success=False,
                 action=action,
@@ -1130,7 +1178,8 @@ class ActionDispatcher:
                 error_message=f"좌표 클릭 발송 실패: {exc}",
             )
         # WS-25: 좌표 클릭(mouse.click)은 이동을 기다리지 않는다 — 여기서 기다린다.
-        self._nav_info = await watch.settle()
+        if watch is not None:
+            self._nav_info = await watch.settle()
         try:
             after = await capture_state(page)
         except Exception:  # noqa: BLE001
@@ -1192,13 +1241,13 @@ class ActionDispatcher:
                     },
                 )
 
-            if command == "new":
+            if command in ("create", "new"):
+                # 계약(TabControlInput)은 "create", 내부 호출 호환용으로 "new" 도 받는다.
                 tab = await core.new_tab(
                     core.active_profile, url=params.get("url")
                 )
                 # 새 탭이 활성 대상이 되도록 디스패처 컨텍스트를 갱신한다.
-                self.ctx.page = tab.page
-                self.ctx.tab_id = tab.tab_id
+                self._set_active_page(tab.page, tab.tab_id)
                 self.ctx.engine.bump_epoch("tab_new")
                 return self._result(
                     success=True,
@@ -1220,8 +1269,7 @@ class ActionDispatcher:
                         error_message=f"탭을 찾을 수 없습니다: {tab_id}",
                     )
                 core.set_active_tab(tab.tab_id)
-                self.ctx.page = tab.page
-                self.ctx.tab_id = tab.tab_id
+                self._set_active_page(tab.page, tab.tab_id)
                 # 탭 전환은 컨텍스트 전환이므로 에포크를 올린다 (PRD §4.2).
                 self.ctx.engine.bump_epoch("tab_switch")
                 return self._result(
@@ -1246,8 +1294,7 @@ class ActionDispatcher:
                 remaining = core.tabs()
                 if remaining:
                     core.set_active_tab(remaining[0].tab_id)
-                    self.ctx.page = remaining[0].page
-                    self.ctx.tab_id = remaining[0].tab_id
+                    self._set_active_page(remaining[0].page, remaining[0].tab_id)
                 self.ctx.engine.bump_epoch("tab_close")
                 return self._result(
                     success=True,
@@ -1272,7 +1319,7 @@ class ActionDispatcher:
             error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
             error_message=(
                 f"알 수 없는 서브커맨드: {command!r} "
-                "(new / switch / close / list 중 하나여야 합니다)"
+                "(create / switch / close / list 중 하나여야 합니다)"
             ),
         )
 
