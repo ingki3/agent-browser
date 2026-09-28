@@ -261,6 +261,8 @@ browser_navigate          URL 이동
 
 응답 형식: 응답(`ActionResult` JSON)에서 **빠진 필드는 계약 기본값**입니다(`healed=false`, `downloaded_path`·`popup_tab_id`·`error_code`·`error_message`=`null`, `data`=`{}`, 관찰 요소의 `value`=`null`·`is_shadow`=`false`). `success`·`action`·`current_url`·`snapshot_epoch`·`tab_id`·`retry_safe`·`reobserve_required`는 항상 있고, 실패면 `error_code`·`error_message`도 있습니다. `data` 안의 `null`은 그대로 싣습니다(`data.challenge: null` = 차단 없음). 계약 모델(`ActionResult.model_validate`)로 다시 읽으면 빠짐없는 결과와 같은 객체입니다.
 
+결과 크기 상한: `observe_page`·`extract` 응답이 `serve --max-result-chars`(기본 20,000자)를 넘으면 **항목 경계**(관찰 요소는 점수 순, 추출 행은 문서 순 앞쪽)에서 잘라 싣고 `data.truncated`에 `total_items`·`returned_items`·`total_chars`·`returned_chars`·`hint`를 붙입니다. 기본값 근거: Claude Code 는 MCP 도구 결과가 25,000 토큰을 넘으면 결과를 통째로 버리고, 한글 본문은 1자 ≈ 1토큰(cl100k 실측 0.97)이라 2만 자면 여유가 있습니다(비교 시험에서 `observe_page(force_full_tree)` 143,456자·`extract` 58,620자가 버려졌습니다). 추출 항목 **하나**가 이미 상한을 넘으면 그 항목의 `text`만 글자 묶음(이모지·결합 문자) 경계, 가능하면 공백에서 자르고 `text_truncated: true`·`text_chars`(원래 글자 수), `data.truncated.item_text_truncated: true`를 붙입니다. 더 보려면 `extract`의 `selector`를 좁히거나 `observe_page`의 `prune_top_n`을 쓰십시오.
+
 ```
 observe_page  ->  @e3 (button "로그인"), epoch=0
 click         ->  element_id="@e3", epoch=0

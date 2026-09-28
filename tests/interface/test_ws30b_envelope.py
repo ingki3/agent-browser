@@ -24,7 +24,7 @@ import pytest
 from contracts import ActionResult, ActionType, ErrorCode, ObserveResult
 from interface.mcp_server import BrowserMCPServer, envelope_json, tool_name
 
-requires_chromium = pytest.mark.requires_chromium
+from test_run_cli import requires_chromium  # noqa: E402,F401 - Chromium 유무 판정 재사용
 
 
 def _reparsed_equal(original: ActionResult, text: str) -> None:
