@@ -185,6 +185,45 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
 
+### 브라우저 방식 (`serve --browser`)
+
+MCP 서버가 여는 브라우저를 시작 옵션으로 고릅니다. Egress 가드·HITL·차단 신호(`data.challenge`)는 세 방식 모두 같습니다.
+
+| 방식 | 무엇 | 언제 |
+| :--- | :--- | :--- |
+| `headless` (기본) | 화면 없는 Playwright Chromium, 고정 뷰포트 1280×720 | 일반 사이트, CI, 가장 가볍고 빠름 |
+| `human` | 창이 보이는 Chromium, 창 크기 그대로(`no_viewport`), `locale=ko-KR` | 사람이 지켜보거나 중간에 손을 대야 할 때 |
+| `user-chrome` | 설치된 Google Chrome 을 자동화 플래그 없이 **전용 프로필**로 띄워 CDP(127.0.0.1)로 붙음 | headless·human 이 막히는 사이트(실측: G마켓은 이 방식만 검색까지 통과) |
+
+```bash
+agent-browser serve --browser human
+agent-browser serve --browser user-chrome                        # 전용 프로필 ~/.agent-browser/chrome-profile
+agent-browser serve --browser user-chrome --chrome-profile ~/ab-shop --keep-open
+```
+
+- **위장이 아닙니다.** UA 변경·`navigator.webdriver` 숨기기·stealth 스크립트·캡차 풀기는 하지 않습니다. `user-chrome` 에서 `navigator.webdriver` 가 `false` 인 것은 `--enable-automation` 없이 띄운 평범한 Chrome 이기 때문입니다.
+- **전용 프로필만 씁니다.** 평소 Chrome 프로필(`~/Library/Application Support/Google/Chrome` 등)을 `--chrome-profile` 로 주면 서버가 시작을 거부합니다(쿠키·비밀번호 보호, Chrome 136+ 원격 디버깅 제약). 전용 폴더는 권한 700 으로 만듭니다. 그 창에서 한 번 로그인하면 전용 프로필에 남아 다음 실행에도 유지됩니다 — 그래서 `user-chrome` 은 저장 세션 주입(`session login` 세션)을 쓰지 않습니다.
+- `user-chrome` 은 새 시크릿 창을 만들지 않고 Chrome 의 기본 창(프로필)을 그대로 씁니다. 처음 열린 빈 탭이 첫 탭이 됩니다. 컨텍스트는 하나만 씁니다.
+- 서버가 끝나면 띄운 Chrome 도 닫습니다. `--keep-open` 이면 남겨 둡니다(시작 실패 때는 옵션과 무관하게 닫습니다). `--chrome-profile`·`--keep-open` 은 `--browser user-chrome` 과만 함께 쓸 수 있습니다.
+- 서버를 신호로 끝내도(`SIGTERM`·`SIGHUP`·Ctrl+C) 같은 정리를 거쳐 닫고 종료 코드 128+신호 번호로 끝납니다. 정리는 최대 10초이고, 신호를 한 번 더 보내면 기다리지 않고 바로 끝납니다. 강제 종료(`kill -9`)하면 Chrome 창이 남을 수 있음, 그때는 창을 직접 닫으세요.
+- 브라우저는 첫 툴 호출 때 뜹니다. 시작 로그는 stderr 한 줄이고 stdout 은 MCP 프로토콜 전용입니다.
+
+Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claude Code 는 `claude mcp add agent-browser -- uv run --directory /절대/경로/agent-browser agent-browser serve --browser user-chrome`).
+
+```json
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "uv",
+      "args": ["run", "--directory", "/절대/경로/agent-browser",
+               "agent-browser", "serve", "--browser", "user-chrome"]
+    }
+  }
+}
+```
+
+`user-chrome` 은 Google Chrome 이 설치돼 있어야 하고 창이 뜹니다(화면 없는 서버에서는 `headless` 를 쓰십시오).
+
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
 
 연동이 되는지 미리 확인하려면 다음을 실행하십시오. 실제 MCP 클라이언트 세션으로 `initialize → tools/list → tools/call` 왕복을 검증합니다.

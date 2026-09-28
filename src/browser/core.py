@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode, thresholds
@@ -55,6 +56,10 @@ class ManagedContext:
     tabs: Dict[str, ManagedTab] = field(default_factory=dict)
 
 
+#: 브라우저 방식 (WS-27). serve --browser 와 같은 이름.
+BROWSER_MODES = ("headless", "human", "user-chrome")
+
+
 class BrowserCore:
     """Playwright 기반 브라우저 수명주기 관리자."""
 
@@ -68,6 +73,9 @@ class BrowserCore:
         viewport_width: int = thresholds.VIEWPORT_WIDTH,
         viewport_height: int = thresholds.VIEWPORT_HEIGHT,
         human_like: bool = False,
+        browser_mode: str = "headless",
+        chrome_profile: Optional[Path] = None,
+        keep_open: bool = False,
     ) -> None:
         """
         human_like=True 이면 사람이 쓰는 브라우저와 같은 기본값을 쓴다(위장 없음):
@@ -76,7 +84,25 @@ class BrowserCore:
         UA 변경·navigator.webdriver 숨기기 같은 위장은 하지 않는다.
         headless 여부는 바꾸지 않는다 — 창 보이는 브라우저가 필요하면 호출자가
         headless=False 를 함께 줘야 한다.
+
+        browser_mode (WS-27):
+          - "headless": 기존 동작(headless/human_like 인자 그대로).
+          - "human": headless=False + human_like=True (창 보임, 위장 없음).
+          - "user-chrome": 설치된 Chrome 을 자동화 플래그 없이 전용 프로필
+            (chrome_profile, 기본 user_chrome.DEFAULT_PROFILE_DIR)로 띄워
+            connect_over_cdp 로 붙고, 그 기본 컨텍스트를 채택한다(쿠키·로그인 유지).
+            컨텍스트는 1개만, 저장 세션 주입은 지원하지 않는다. keep_open=True 면
+            close() 때 띄운 Chrome 을 남긴다.
         """
+        if browser_mode not in BROWSER_MODES:
+            raise ValueError(
+                f"알 수 없는 브라우저 방식: {browser_mode!r} (가능: {', '.join(BROWSER_MODES)})"
+            )
+        if browser_mode == "human":
+            headless, human_like = False, True
+        self.browser_mode = browser_mode
+        self.chrome_profile = chrome_profile
+        self.keep_open = keep_open
         self.headless = headless
         self.human_like = human_like
         self.session_store = session_store or SessionStore()
@@ -90,18 +116,63 @@ class BrowserCore:
         self._tab_index: Dict[str, ManagedTab] = {}
         self._active_tab_id: Optional[str] = None
         self._tab_counter = 0
+        #: user-chrome: 우리가 띄운 Chrome(UserChrome)과 아직 탭으로 채택하지 않은 첫 페이지
+        self._user_chrome: Any = None
+        self._adoptable_page: Any = None
+
+    @property
+    def is_user_chrome(self) -> bool:
+        return self.browser_mode == "user-chrome"
 
     # -- 수명주기 -----------------------------------------------------------
 
     async def start(self) -> "BrowserCore":
+        if self.is_user_chrome:
+            return await self._start_user_chrome()
+
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(headless=self.headless)
         return self
 
+    async def _start_user_chrome(self) -> "BrowserCore":
+        """전용 프로필 Chrome 을 띄우고 CDP(127.0.0.1)로 붙는다.
+
+        순서: 평소 프로필 가드 → Chrome 실행 → playwright 시작 → connect_over_cdp.
+        가드에 걸리면 프로세스도 playwright 도 만들지 않는다. 실행 뒤 어느 단계든
+        실패하면 띄운 Chrome 을 keep_open 과 무관하게 정리한다(고아 Chrome 방지).
+        """
+        from browser import user_chrome
+
+        profile = self.chrome_profile or user_chrome.DEFAULT_PROFILE_DIR
+        user_chrome._guard_profile(Path(profile))  # ValueError: 평소 프로필
+        uc = await user_chrome.launch_user_chrome(profile_dir=profile)
+        try:
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.connect_over_cdp(uc.endpoint)
+        except BaseException:
+            try:
+                uc.close()
+            finally:
+                if self._playwright is not None:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("playwright 정리 실패", exc_info=True)
+                    self._playwright = None
+                self._browser = None
+            raise
+        self._user_chrome = uc
+        return self
+
     async def close(self) -> None:
         for managed in list(self._contexts.values()):
+            if self.is_user_chrome:
+                # 채택한 기본 컨텍스트를 닫으면 Chrome 창이 통째로 사라진다 — 닫지 않는다.
+                continue
             try:
                 await managed.context.close()
             except Exception as exc:  # noqa: BLE001
@@ -109,13 +180,24 @@ class BrowserCore:
         self._contexts.clear()
         self._tab_index.clear()
         self._active_tab_id = None
+        self._adoptable_page = None
 
         if self._browser:
-            await self._browser.close()
+            try:
+                # connect_over_cdp 로 붙은 브라우저는 close() 가 연결만 끊는다.
+                await self._browser.close()
+            except Exception as exc:  # noqa: BLE001
+                if not self.is_user_chrome:
+                    raise
+                logger.debug("CDP 연결 종료 실패: %s", exc)
             self._browser = None
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
+        if self._user_chrome is not None:
+            uc, self._user_chrome = self._user_chrome, None
+            if not self.keep_open:
+                uc.close()
 
     async def __aenter__(self) -> "BrowserCore":
         return await self.start()
@@ -144,6 +226,9 @@ class BrowserCore:
         if existing:
             return existing.context
 
+        if self.is_user_chrome:
+            return self._adopt_default_context(profile_name)
+
         if len(self._contexts) >= self.max_contexts:
             raise BrowserCoreError(
                 ErrorCode.TAB_LIMIT_EXCEEDED,
@@ -164,6 +249,12 @@ class BrowserCore:
         """저장된 암호화 storageState를 주입해 컨텍스트를 생성한다."""
         if self._browser is None:
             raise BrowserCoreError(ErrorCode.PAGE_CRASHED, "브라우저가 시작되지 않았습니다.")
+        if self.is_user_chrome:
+            raise BrowserCoreError(
+                ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                "user-chrome 방식은 저장 세션 주입을 지원하지 않습니다 — 전용 Chrome 프로필 "
+                "자체가 세션 저장소입니다(그 창에서 한 번 로그인하면 유지됩니다).",
+            )
         if len(self._contexts) >= self.max_contexts:
             raise BrowserCoreError(
                 ErrorCode.TAB_LIMIT_EXCEEDED,
@@ -179,6 +270,49 @@ class BrowserCore:
         )
         self._watch_context_pages(profile_name, context)
         return context
+
+    def _adopt_default_context(self, profile_name: str) -> Any:
+        """user-chrome: 연결된 Chrome 의 기본 컨텍스트를 profile_name 으로 채택한다.
+
+        새 incognito 컨텍스트를 만들면 전용 프로필의 쿠키·로그인을 못 쓴다 — 그래서
+        browser.contexts[0] 을 쓴다. 한 Chrome 에 기본 컨텍스트는 하나라 컨텍스트도
+        1개만 허용한다(두 번째 프로필 요청은 오류). 이미 열린 about:blank 페이지는
+        첫 new_tab 이 새 탭 대신 채택한다(빈 탭이 창에 남지 않게).
+        """
+        if self._contexts:
+            held = next(iter(self._contexts))
+            raise BrowserCoreError(
+                ErrorCode.TAB_LIMIT_EXCEEDED,
+                f"user-chrome 방식은 컨텍스트를 1개만 씁니다(사용 중: {held!r}, "
+                f"요청: {profile_name!r}).",
+            )
+        contexts = list(getattr(self._browser, "contexts", None) or [])
+        if not contexts:
+            raise BrowserCoreError(
+                ErrorCode.PAGE_CRASHED, "연결된 Chrome 에 기본 컨텍스트가 없습니다."
+            )
+        context = contexts[0]
+        self._contexts[profile_name] = ManagedContext(
+            profile_name=profile_name, context=context
+        )
+        self._watch_context_pages(profile_name, context)
+        pages = list(getattr(context, "pages", None) or [])
+        if len(pages) == 1 and getattr(pages[0], "url", "") == "about:blank":
+            self._adoptable_page = pages[0]
+        logger.debug("user-chrome 기본 컨텍스트 채택: %s", profile_name)
+        return context
+
+    def _take_adoptable_page(self) -> Any:
+        page, self._adoptable_page = self._adoptable_page, None
+        if page is None:
+            return None
+        is_closed = getattr(page, "is_closed", None)
+        try:
+            if callable(is_closed) and is_closed():
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return page
 
     async def save_session(self, profile_name: str, passphrase: str) -> str:
         """현재 컨텍스트의 storageState를 암호화 저장한다."""
@@ -286,7 +420,9 @@ class BrowserCore:
             )
 
         async with managed.lock:
-            page = await managed.context.new_page()
+            page = self._take_adoptable_page() if self.is_user_chrome else None
+            if page is None:
+                page = await managed.context.new_page()
 
         # context 'page' 이벤트가 먼저 등록했으면 그 탭을 그대로 쓴다(이중 등록 없음).
         tab = self._register_page(profile_name, page, popup=False)

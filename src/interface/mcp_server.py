@@ -18,7 +18,11 @@ MCP 서버는 stdio로 구동되며 클라이언트 연결당 하나의 브라�
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import signal
+import time
 from typing import Any, Dict, List, Optional
 
 from contracts import (
@@ -151,6 +155,9 @@ class BrowserMCPServer:
         headless: bool = True,
         secrets: Any = None,
         som_enabled: bool = False,
+        browser_mode: str = "headless",
+        chrome_profile: Any = None,
+        keep_open: bool = False,
     ) -> None:
         #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
         #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
@@ -162,6 +169,11 @@ class BrowserMCPServer:
         self.allowed_domains = allowed_domains
         self.pre_approved_actions = pre_approved_actions
         self.headless = headless
+        #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
+        #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
+        self.browser_mode = browser_mode
+        self.chrome_profile = chrome_profile
+        self.keep_open = keep_open
 
         self._core: Any = None
         self._engine: Any = None
@@ -184,12 +196,38 @@ class BrowserMCPServer:
         if self._started:
             return
 
-        from actions import ActionDispatcher, DispatchContext
         from browser import BrowserCore
+
+        core = BrowserCore(
+            headless=self.headless,
+            browser_mode=self.browser_mode,
+            chrome_profile=self.chrome_profile,
+            keep_open=self.keep_open,
+        )
+        self._core = await core.start()
+        try:
+            await self._init_session()
+        except BaseException:
+            # 시작 도중 실패하면 띄운 브라우저(user-chrome 이면 Chrome 프로세스)를 남기지 않는다.
+            # keep_open 은 정상 종료 때만 존중한다 — 시작 실패면 옵션과 무관하게 닫는다(README).
+            self._core.keep_open = False
+            try:
+                await self._core.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("시작 실패 뒤 브라우저 정리 실패", exc_info=True)
+            self._core = None
+            raise
+        self._started = True
+        logger.info(
+            "MCP 브라우저 세션 시작 (mode=%s, browser=%s)", self.mode.value, self.browser_mode
+        )
+
+    async def _init_session(self) -> None:
+        """컨텍스트·첫 탭·디스패처·Egress 가드·HITL 을 준비한다(세 방식 공통)."""
+        from actions import ActionDispatcher, DispatchContext
         from perception import PerceptionEngine
         from security import EgressGuard, EgressPolicy, HITLGate
 
-        self._core = await BrowserCore(headless=self.headless).start()
         await self._core.new_context("mcp-session")
         # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
         # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
@@ -228,8 +266,6 @@ class BrowserMCPServer:
         self._hitl = HITLGate(
             mode=self.mode, pre_approved_actions=self.pre_approved_actions
         )
-        self._started = True
-        logger.info("MCP 브라우저 세션 시작 (mode=%s)", self.mode.value)
 
     async def close(self) -> None:
         if self._core is not None:
@@ -420,6 +456,9 @@ def create_server(
     pre_approved_actions: tuple = (),
     secrets: Any = None,
     som_enabled: bool = False,
+    browser_mode: str = "headless",
+    chrome_profile: Any = None,
+    keep_open: bool = False,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -435,6 +474,9 @@ def create_server(
         pre_approved_actions=pre_approved_actions,
         secrets=secrets,
         som_enabled=som_enabled,
+        browser_mode=browser_mode,
+        chrome_profile=chrome_profile,
+        keep_open=keep_open,
     )
 
     def _build_tools() -> List[Tool]:
@@ -501,8 +543,16 @@ async def run_stdio(
     allowed_domains: tuple = (),
     secrets_path: Optional[str] = None,
     som_enabled: bool = False,
+    browser_mode: str = "headless",
+    chrome_profile: Any = None,
+    keep_open: bool = False,
 ) -> None:
-    """stdio 트랜스포트로 MCP 서버를 구동한다."""
+    """stdio 트랜스포트로 MCP 서버를 구동한다.
+
+    stdout 은 MCP 프로토콜 전용이다 — 시작 로그는 stderr 로 한 줄만 쓴다.
+    """
+    import sys
+
     from mcp.server.stdio import stdio_server
 
     secrets = None
@@ -517,11 +567,154 @@ async def run_stdio(
         allowed_domains=allowed_domains,
         secrets=secrets,
         som_enabled=som_enabled,
+        browser_mode=browser_mode,
+        chrome_profile=chrome_profile,
+        keep_open=keep_open,
     )
-    try:
+    extra = ""
+    if browser_mode == "user-chrome":
+        extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
+    print(
+        f"agent-browser serve: browser={browser_mode} mode={mode.value}{extra}"
+        " (브라우저는 첫 툴 호출 때 시작)",
+        file=sys.stderr,
+        flush=True,
+    )
+    async def _serve() -> None:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream, write_stream, server.create_initialization_options()
             )
-    finally:
-        await backend.close()
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    received: List[int] = []
+    previous = _install_shutdown_signals(loop, stop, received)
+    serve_task = asyncio.ensure_future(_serve())
+    stop_task = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        serve_task.cancel()
+        stop_task.cancel()
+        _restore_signals(previous)
+        await _bounded_close(backend)
+        raise
+
+    if not received:
+        # 정상 종료(stdin EOF 등): 기존과 같다 — 정리 뒤 반환(종료 코드 0), 서버 예외는 다시 올린다.
+        stop_task.cancel()
+        try:
+            await serve_task
+        finally:
+            _restore_signals(previous)
+            await _bounded_close(backend)
+        return
+
+    # 종료 신호: 서버를 취소하고(기다리지 않음) 브라우저를 정리한 뒤 프로세스를 끝낸다.
+    # stdin 리더는 스레드에서 막혀 있어 취소가 끝나지 않을 수 있으므로(실측: SIGINT 로
+    # asyncio.run 이 무한 대기) 정리가 끝나면 os._exit 로 바로 종료한다.
+    serve_task.cancel()
+    # 진행 중인 툴 호출(브라우저 시작 등)이 취소 정리를 마칠 시간을 짧게 준다(상한 있음 —
+    # stdin 리더 스레드 때문에 서버 태스크 자체는 끝나지 않을 수 있다).
+    await asyncio.wait({serve_task}, timeout=min(SHUTDOWN_TASK_GRACE_S, SHUTDOWN_CLOSE_TIMEOUT_S))
+    signum = received[0]
+    ok = await _bounded_close(backend)
+    _stderr_line(
+        f"agent-browser serve: {'정리 완료' if ok else '정리 미완료'} — 종료 코드 {128 + signum}"
+    )
+    os._exit(128 + signum)
+
+
+#: 종료 신호 뒤 backend.close() 상한(초). UserChrome.close 의 기본 timeout(10초)과 같다.
+SHUTDOWN_CLOSE_TIMEOUT_S = 10.0
+#: 정리가 이벤트 루프를 막는(동기 대기) 경우의 감시 스레드 여유(초). 상한+여유 뒤 강제 종료.
+SHUTDOWN_WATCHDOG_GRACE_S = 5.0
+#: 신호 뒤 취소된 서버 태스크가 자기 정리를 마치기를 기다리는 시간(초).
+SHUTDOWN_TASK_GRACE_S = 2.0
+#: serve 가 처리하는 종료 신호. SIGKILL 은 잡을 수 없다(README 참조).
+SHUTDOWN_SIGNALS = tuple(
+    getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, n)
+)
+
+
+def _stderr_line(text: str) -> None:
+    """stderr 에 한 줄(신호 처리기 안에서도 안전하게 os.write). stdout 은 MCP 전용."""
+    try:
+        os.write(2, (text + "\n").encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
+def _install_shutdown_signals(loop: Any, stop: Any, received: List[int]) -> Dict[int, Any]:
+    """SIGTERM·SIGHUP·SIGINT 처리기를 단다. 이전 처리기를 돌려준다.
+
+    loop.add_signal_handler 가 아니라 signal.signal 을 쓴다 — 정리가 이벤트 루프를 동기로
+    막고 있을 때(UserChrome.close 의 proc.wait 등)도 두 번째 신호로 바로 끝낼 수 있게.
+    첫 신호: stop 이벤트(루프 스레드 안전) + 감시 스레드 시작. 두 번째 신호: 즉시 종료.
+    """
+    import threading
+
+    def _handler(signum: int, _frame: Any) -> None:
+        name = signal.Signals(signum).name
+        if received:
+            _stderr_line(f"agent-browser serve: 신호 {name} 다시 받음 — 정리를 기다리지 않고 종료")
+            os._exit(128 + signum)
+        received.append(signum)
+        _stderr_line(f"agent-browser serve: 신호 {name} — 브라우저 정리 후 종료")
+        cap = SHUTDOWN_CLOSE_TIMEOUT_S + SHUTDOWN_WATCHDOG_GRACE_S
+
+        def _watchdog() -> None:
+            time.sleep(cap)
+            _stderr_line(f"agent-browser serve: 정리가 {cap:g}s 안에 끝나지 않아 강제 종료")
+            os._exit(128 + signum)
+
+        threading.Thread(target=_watchdog, name="serve-shutdown-watchdog", daemon=True).start()
+        loop.call_soon_threadsafe(stop.set)
+
+    previous: Dict[int, Any] = {}
+    for sig in SHUTDOWN_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, _handler)
+        except (ValueError, OSError):  # 메인 스레드가 아니면 등록 불가 — 기존 동작 유지
+            continue
+    return previous
+
+
+def _restore_signals(previous: Dict[int, Any]) -> None:
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError, TypeError):
+            pass
+
+
+async def _bounded_close(backend: Any) -> bool:
+    """backend.close() 를 상한 시간 안에서 돌린다. 끝까지 정리했으면 True."""
+    try:
+        await asyncio.wait_for(backend.close(), timeout=SHUTDOWN_CLOSE_TIMEOUT_S)
+        return True
+    except asyncio.TimeoutError:
+        _stderr_line(
+            f"agent-browser serve: 브라우저 정리가 상한({SHUTDOWN_CLOSE_TIMEOUT_S:g}s)을 넘어 중단"
+        )
+        _kill_owned_chrome(backend)
+    except Exception as exc:  # noqa: BLE001
+        _stderr_line(f"agent-browser serve: 브라우저 정리 실패: {exc!r}")
+        _kill_owned_chrome(backend)
+    return False
+
+
+def _kill_owned_chrome(backend: Any) -> None:
+    """정리가 막혔을 때 마지막 수단: 우리가 띄운 Chrome 만 닫는다(keep_open 이면 둔다).
+
+    UserChrome.close 는 attach 로 붙은(소유하지 않은) Chrome 은 건드리지 않는다.
+    """
+    core = getattr(backend, "_core", None)
+    uc = getattr(core, "_user_chrome", None)
+    if uc is None or getattr(core, "keep_open", False):
+        return
+    try:
+        uc.close(timeout=2.0)
+    except Exception as exc:  # noqa: BLE001
+        _stderr_line(f"agent-browser serve: Chrome 종료 실패: {exc!r}")
