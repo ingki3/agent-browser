@@ -151,6 +151,9 @@ class BrowserMCPServer:
         headless: bool = True,
         secrets: Any = None,
         som_enabled: bool = False,
+        browser_mode: str = "headless",
+        chrome_profile: Any = None,
+        keep_open: bool = False,
     ) -> None:
         #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
         #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
@@ -162,6 +165,11 @@ class BrowserMCPServer:
         self.allowed_domains = allowed_domains
         self.pre_approved_actions = pre_approved_actions
         self.headless = headless
+        #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
+        #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
+        self.browser_mode = browser_mode
+        self.chrome_profile = chrome_profile
+        self.keep_open = keep_open
 
         self._core: Any = None
         self._engine: Any = None
@@ -184,12 +192,36 @@ class BrowserMCPServer:
         if self._started:
             return
 
-        from actions import ActionDispatcher, DispatchContext
         from browser import BrowserCore
+
+        core = BrowserCore(
+            headless=self.headless,
+            browser_mode=self.browser_mode,
+            chrome_profile=self.chrome_profile,
+            keep_open=self.keep_open,
+        )
+        self._core = await core.start()
+        try:
+            await self._init_session()
+        except BaseException:
+            # 시작 도중 실패하면 띄운 브라우저(user-chrome 이면 Chrome 프로세스)를 남기지 않는다.
+            try:
+                await self._core.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("시작 실패 뒤 브라우저 정리 실패", exc_info=True)
+            self._core = None
+            raise
+        self._started = True
+        logger.info(
+            "MCP 브라우저 세션 시작 (mode=%s, browser=%s)", self.mode.value, self.browser_mode
+        )
+
+    async def _init_session(self) -> None:
+        """컨텍스트·첫 탭·디스패처·Egress 가드·HITL 을 준비한다(세 방식 공통)."""
+        from actions import ActionDispatcher, DispatchContext
         from perception import PerceptionEngine
         from security import EgressGuard, EgressPolicy, HITLGate
 
-        self._core = await BrowserCore(headless=self.headless).start()
         await self._core.new_context("mcp-session")
         # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
         # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
@@ -228,8 +260,6 @@ class BrowserMCPServer:
         self._hitl = HITLGate(
             mode=self.mode, pre_approved_actions=self.pre_approved_actions
         )
-        self._started = True
-        logger.info("MCP 브라우저 세션 시작 (mode=%s)", self.mode.value)
 
     async def close(self) -> None:
         if self._core is not None:
@@ -420,6 +450,9 @@ def create_server(
     pre_approved_actions: tuple = (),
     secrets: Any = None,
     som_enabled: bool = False,
+    browser_mode: str = "headless",
+    chrome_profile: Any = None,
+    keep_open: bool = False,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -435,6 +468,9 @@ def create_server(
         pre_approved_actions=pre_approved_actions,
         secrets=secrets,
         som_enabled=som_enabled,
+        browser_mode=browser_mode,
+        chrome_profile=chrome_profile,
+        keep_open=keep_open,
     )
 
     def _build_tools() -> List[Tool]:
@@ -501,8 +537,16 @@ async def run_stdio(
     allowed_domains: tuple = (),
     secrets_path: Optional[str] = None,
     som_enabled: bool = False,
+    browser_mode: str = "headless",
+    chrome_profile: Any = None,
+    keep_open: bool = False,
 ) -> None:
-    """stdio 트랜스포트로 MCP 서버를 구동한다."""
+    """stdio 트랜스포트로 MCP 서버를 구동한다.
+
+    stdout 은 MCP 프로토콜 전용이다 — 시작 로그는 stderr 로 한 줄만 쓴다.
+    """
+    import sys
+
     from mcp.server.stdio import stdio_server
 
     secrets = None
@@ -517,6 +561,18 @@ async def run_stdio(
         allowed_domains=allowed_domains,
         secrets=secrets,
         som_enabled=som_enabled,
+        browser_mode=browser_mode,
+        chrome_profile=chrome_profile,
+        keep_open=keep_open,
+    )
+    extra = ""
+    if browser_mode == "user-chrome":
+        extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
+    print(
+        f"agent-browser serve: browser={browser_mode} mode={mode.value}{extra}"
+        " (브라우저는 첫 툴 호출 때 시작)",
+        file=sys.stderr,
+        flush=True,
     )
     try:
         async with stdio_server() as (read_stream, write_stream):
