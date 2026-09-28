@@ -218,6 +218,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             run_stdio(
                 mode=ExecutionMode(args.mode),
                 allowed_domains=tuple(args.allow_domain),
+                # WS-30: 파싱만 되고 전달되지 않던 결함 — 서버의 HITL 게이트까지 넘긴다.
+                pre_approved_actions=tuple(args.pre_approve),
                 secrets_path=args.secrets,
                 som_enabled=args.som_vision,
                 browser_mode=args.browser,

@@ -98,10 +98,20 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.PRESS_KEY: "키보드 이벤트를 발생시킵니다 (Enter, Tab, Escape 등).",
     ActionType.WAIT_FOR: "지정한 조건이 만족될 때까지 대기합니다.",
     ActionType.EXTRACT: "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
-    ActionType.SWITCH_FRAME: "iframe 또는 Shadow DOM 컨텍스트로 전환합니다.",
+    ActionType.SWITCH_FRAME: (
+        "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 "
+        "먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다 — 중첩 프레임은 바깥부터 한 단계씩 "
+        "부르십시오(성공 data.child_frames 의 selector_hint 가 다음 후보). "
+        "최상위 문서로 돌아가려면 {\"to_main\": true} 만 보내십시오. "
+        "현재 프레임에 없어 최상위 기준으로 찾으면 더 얕은 프레임으로 되돌아갈 수 있습니다 — "
+        "성공 data.resolved_from(\"current_frame\"|\"root\")·frame_depth 로 확인하십시오."
+    ),
     ActionType.HANDLE_DIALOG: "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
     ActionType.UPLOAD_FILE: "파일 입력 필드에 파일을 바인딩합니다.",
-    ActionType.DOWNLOAD_FILE: "다운로드를 트리거하고 파일을 저장합니다.",
+    ActionType.DOWNLOAD_FILE: (
+        "다운로드를 트리거하고 파일을 저장합니다. save_dir 는 절대 경로여야 합니다"
+        "(상대 경로는 거부, `..` 는 정규화해 저장)."
+    ),
     ActionType.TAB_CONTROL: "탭을 생성/전환/종료하거나 목록을 조회합니다.",
 }
 
@@ -131,11 +141,41 @@ CHALLENGE_NOTE = (
 )
 
 
+def pre_approve_hint(action: ActionType, element_name: str) -> str:
+    """`--pre-approve` 에 그대로 넣으면 이 액션을 여는 값 (HITLGate._is_pre_approved 형식).
+
+    요소 이름이 없으면(업·다운로드, press_key 등) 이름 매칭이 불가능하므로 `<action>:*`.
+    """
+    name = (element_name or "").strip()
+    return f"{action.value}:{name}" if name else f"{action.value}:*"
+
+
+def blocked_hint_text(hint: str) -> str:
+    """무인 차단 메시지 끝에 붙는 사람(운영자)용 해결 경로."""
+    return (
+        f" — 이 액션을 허용하려면 서버를 `--pre-approve \"{hint}\"` 으로 다시 띄우거나"
+        " `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요."
+    )
+
+
 def _describe(action: ActionType) -> str:
     text = _DESCRIPTIONS.get(action, f"{action.value} 액션을 실행합니다.")
     if action in CHALLENGE_CHECK_ACTIONS:
         text += CHALLENGE_NOTE
     return text
+
+
+#: Chromium 실측(WS-30 R1, 제출 버튼 있는 폼): 포커스된 <input type=…> 에서 Enter 가 폼을 제출하는 type.
+#: text/search/email/number/password/tel/url/date/time/datetime-local/month/week/checkbox/radio/range
+#: + 버튼형 submit/image. 제출 안 함: color/file/button/reset(reset 은 폼을 비운다 — 제출은 아님).
+#: type 속성이 없거나 모르는 값이면 브라우저는 text 로 다룬다 → el.type 은 'text' 로 읽힌다.
+_ENTER_SUBMITS_INPUT_TYPES = frozenset({
+    "text", "search", "email", "number", "password", "tel", "url",
+    "date", "time", "datetime-local", "month", "week",
+    "checkbox", "radio", "range", "submit", "image",
+})
+#: 키로 누르면 그 요소를 클릭하는 input type(이름 게이트 대상).
+_BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 
 
 class BrowserMCPServer:
@@ -305,7 +345,20 @@ class BrowserMCPServer:
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
         params: Dict[str, Any] = dict(arguments or {})
-        if model is not None:
+        to_main = False
+        if action is ActionType.SWITCH_FRAME and "to_main" in params:
+            # WS-30 추가 B: 디스패처의 메인 복귀(to_main)는 계약(동결)에 없는 키라 검증에서
+            # 버려지고 '정확히 하나' 검증에 걸려 MCP 로는 복귀할 수 없었다 — 경계 특례.
+            to_main = bool(params.pop("to_main"))
+            if to_main and any(params.get(k) for k in ("frame_selector", "shadow_root_selector")):
+                return self._error_result(
+                    action,
+                    ErrorCode.FRAME_NOT_FOUND,
+                    "to_main 과 frame_selector/shadow_root_selector 는 함께 지정할 수 없습니다.",
+                )
+        if to_main:
+            params = {"to_main": True}
+        elif model is not None:
             try:
                 validated = model(**params)
                 params = validated.model_dump(exclude_none=True)
@@ -317,6 +370,10 @@ class BrowserMCPServer:
                     else ErrorCode.INVALID_URL,
                     f"입력 검증 실패: {exc}",
                 )
+        # WS-30 항목 2: 계약 키(trigger_element_id 등)를 디스패처 키로 — 게이트도 같은 키를 본다.
+        from actions.dispatcher import normalize_action_params
+
+        params = normalize_action_params(action, params)
 
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         blocked = await self._check_hitl(action, params)
@@ -384,13 +441,40 @@ class BrowserMCPServer:
             if handle is not None:
                 element_name = handle.name
 
+        submits_form = bool(params.get("press_enter"))
+        unresolved = ""
+        selector = params.get("selector", "") or ""
+        dispatcher = self._dispatcher
+        if action is ActionType.CLICK and selector and not element_id:
+            # WS-30 추가 A: selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정한다.
+            # 0개·여러 개·읽기 실패면 판정 불가 → 고위험(fail-closed).
+            if dispatcher is None:
+                unresolved = "selector 대상을 읽을 수 없음"
+            else:
+                target = await dispatcher.describe_selector_target(selector)
+                element_name = str(target.get("name") or "")
+                unresolved = str(target.get("unresolved") or "")
+        elif action is ActionType.TYPE_TEXT and not submits_form:
+            text = str(params.get("text") or "")
+            if "\n" in text or "\r" in text:
+                # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
+                info = await dispatcher.describe_element(element_id) if dispatcher else None
+                if info is None:
+                    unresolved = "입력 대상을 읽을 수 없음"
+                elif info.get("tag") == "INPUT" and info.get("in_form"):
+                    submits_form = True
+        elif action is ActionType.PRESS_KEY:
+            submits_form, name, unresolved = await self._press_key_target(params)
+            element_name = name or element_name
+
         decision = self._hitl.evaluate(
             ActionContext(
                 action=action,
                 element_name=element_name,
-                selector=params.get("selector", "") or "",
+                selector=selector,
                 domain=self._current_domain(),
-                submits_form=bool(params.get("press_enter")),
+                submits_form=submits_form,
+                unresolved_target=unresolved,
             )
         )
         if decision.allowed:
@@ -401,18 +485,67 @@ class BrowserMCPServer:
             # 대화형 모드: 클라이언트가 렌더링할 정형 모달을 함께 전달한다.
             message = decision.dialog.message
 
-        return self._error_result(
-            action,
-            decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED,
-            message,
-            data={
-                "requires_confirmation": decision.requires_confirmation,
-                "risk": decision.risk.value,
-                "dialog": (
-                    decision.dialog.model_dump(mode="json") if decision.dialog else None
-                ),
-            },
-        )
+        data: Dict[str, Any] = {
+            "requires_confirmation": decision.requires_confirmation,
+            "risk": decision.risk.value,
+            "dialog": (
+                decision.dialog.model_dump(mode="json") if decision.dialog else None
+            ),
+        }
+        code = decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED
+        if code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+            # WS-30 항목 5: 에이전트가 "어떻게 승인하나요?"로 멈추지 않게, 사람(운영자)이
+            # 할 수 있는 해결 경로만 알린다 — 다른 도구로 돌아가는 방법은 알리지 않는다.
+            hint = pre_approve_hint(action, element_name)
+            message += blocked_hint_text(hint)
+            data["pre_approve_hint"] = hint
+
+        return self._error_result(action, code, message, data=data)
+
+    async def _press_key_target(self, params: Dict[str, Any]) -> tuple:
+        """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
+
+        type_text(press_enter=True) 는 '폼 제출'로 막히는데 type_text 뒤 press_key("Enter") 는
+        같은 제출이 통과하던 불일치를 막는다. 반환: (submits_form, 대상 이름, 판정 불가 사유).
+
+        무엇이 제출하는지는 Chromium 실측 표(`_ENTER_SUBMITS_INPUT_TYPES` 등)를 따른다. 포커스는
+        최상위 Page 기준(키가 가는 곳)으로 읽는다 — `ActionDispatcher.focused_target`.
+        """
+        from actions.dispatcher import key_kind
+
+        kind = key_kind(str(params.get("key", "")))
+        if not kind:
+            return False, "", ""
+        dispatcher = self._dispatcher
+        info = await dispatcher.focused_target() if dispatcher is not None else None
+        if info is None:
+            # Enter·Space 모두 요소를 누를 수 있다 — 대상을 모르면 판정 불가(fail-closed).
+            return False, "", "포커스 요소를 읽을 수 없음"
+        if info.get("opaque"):
+            return False, "", "포커스가 다른 출처 프레임 안에 있음"
+        tag = str(info.get("tag") or "")
+        itype = str(info.get("type") or "")
+        in_form = bool(info.get("in_form"))
+        name = str(info.get("name") or "")
+        if kind == "enter":
+            if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES:
+                # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출(버튼형이면 그 버튼 이름도).
+                return True, name if itype in _BUTTON_INPUT_TYPES else "", ""
+            if in_form and tag == "SELECT":
+                return True, "", ""
+        if in_form and (
+            (tag == "BUTTON" and itype in ("", "submit"))
+            or (tag == "INPUT" and itype in ("submit", "image"))
+        ):
+            # 폼 안 제출 버튼을 키로 누름 = 폼 제출(이름이 '다음' 이어도).
+            return True, name, ""
+        if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in _BUTTON_INPUT_TYPES):
+            # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름 게이트를 탄다.
+            return False, name, ""
+        if info.get("unknown_tag") and info.get("inside_form"):
+            # 폼 안 사용자 정의 요소(폼 연계 요소일 수 있음) — 키 동작을 확정할 수 없다.
+            return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스"
+        return False, "", ""
 
     def _current_domain(self) -> str:
         try:
@@ -547,6 +680,7 @@ async def run_stdio(
     *,
     mode: ExecutionMode = ExecutionMode.UNATTENDED,
     allowed_domains: tuple = (),
+    pre_approved_actions: tuple = (),
     secrets_path: Optional[str] = None,
     som_enabled: bool = False,
     browser_mode: str = "headless",
@@ -572,6 +706,7 @@ async def run_stdio(
     server, backend = create_server(
         mode=mode,
         allowed_domains=allowed_domains,
+        pre_approved_actions=tuple(pre_approved_actions),
         secrets=secrets,
         som_enabled=som_enabled,
         browser_mode=browser_mode,

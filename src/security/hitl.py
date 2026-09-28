@@ -69,6 +69,9 @@ class ActionContext:
     submits_form: bool = False
     #: 금액 등 부가 정보 (ConfirmDialog 메시지에 사용)
     detail: str = ""
+    #: 대상을 특정·판정할 수 없었던 사유 (WS-30). 비어 있지 않으면 고위험으로 본다
+    #: (fail-closed) — 예: selector 가 0개/여러 개에 맞음, 포커스 요소를 읽을 수 없음.
+    unresolved_target: str = ""
 
 
 @dataclass
@@ -94,6 +97,9 @@ def _contains_keyword(text: str, keywords: Sequence[str]) -> Optional[str]:
 def classify_risk(ctx: ActionContext) -> tuple[RiskLevel, str]:
     """액션의 위험 등급을 판정한다."""
     haystack = f"{ctx.element_name} {ctx.selector} {ctx.detail}"
+
+    if ctx.unresolved_target:
+        return RiskLevel.HIGH, f"대상 판정 불가({ctx.unresolved_target}) — 안전하게 차단"
 
     hit = _contains_keyword(haystack, HIGH_RISK_KEYWORDS)
     if hit:

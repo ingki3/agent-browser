@@ -32,6 +32,69 @@ INTERACTIVE_ROLES = (
 #: 최소 클릭 가능 크기 (이보다 작으면 트래킹 픽셀 등으로 간주)
 MIN_CLICKABLE_PX = 2
 
+#: 관찰 엔진의 요소 이름 규칙 (JS 함수 선언 `accessibleName(el)`).
+#: **한 곳에서만 정의한다** — 관찰(COLLECT_SCRIPT)과 HITL 게이트(actions.dispatcher 의
+#: `_TARGET_INFO_JS`: selector 클릭·포커스 요소 판정)가 같은 이름을 읽어야 같은 요소가 경로에 따라
+#: 다른 판정을 받지 않는다(WS-30 R1 BLOCKING-1: `<input type=submit value=결제>` 가 element_id 로는
+#: '결제'(차단), selector·포커스 키로는 ''(통과)였다).
+ACCESSIBLE_NAME_JS = """
+function accessibleName(el) {
+  // W3C Accessible Name Computation 순서를 따른다:
+  //   aria-label > aria-labelledby > <label> > 콘텐츠 텍스트 > placeholder > title
+  //
+  // 주의: title은 **가장 마지막**이다. 실환경 검증에서 Wikipedia의
+  // 'Log in' 링크가 72자짜리 title 툴팁("You're encouraged to log in;
+  // however, it's not mandatory...")으로 이름이 잡혀 검색이 불가능했다.
+  // title은 보조 설명이지 요소의 이름이 아니다.
+  // 요소가 속한 문서 기준으로 참조를 찾는다 — 관찰(프레임 안에서 실행)에서는 document 와 같고,
+  // 게이트가 최상위에서 iframe 안 포커스 요소를 읽을 때도 그 요소의 문서를 본다.
+  const doc = el.ownerDocument || document;
+  const aria = el.getAttribute('aria-label');
+  if (aria && aria.trim()) return aria.trim();
+
+  const labelledby = el.getAttribute('aria-labelledby');
+  if (labelledby) {
+    const ref = doc.getElementById(labelledby);
+    if (ref && ref.textContent.trim()) return ref.textContent.trim();
+  }
+  if (el.id) {
+    const lbl = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+    if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
+  }
+
+  // 콘텐츠 텍스트 (링크/버튼의 실제 라벨)
+  // input[type=submit|button]은 텍스트 노드가 없고 value가 라벨이다.
+  if (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) {
+    if (el.value && el.value.trim()) return el.value.trim();
+  }
+  const text = (el.innerText || el.textContent || '').trim();
+  if (text) return text.slice(0, 120);
+
+  // 텍스트가 없는 경우에만 보조 속성으로 폴백한다.
+  const ph = el.getAttribute('placeholder');
+  if (ph && ph.trim()) return ph.trim();
+
+  const title = el.getAttribute('title');
+  if (title && title.trim()) return title.trim();
+
+  const alt = el.getAttribute('alt');
+  if (alt && alt.trim()) return alt.trim();
+
+  // 비밀번호 필드는 value 속성을 이름으로 쓰지 않는다 — 이름은 프롬프트에 들어간다.
+  const value = el.type === 'password' ? null : el.getAttribute('value');
+  if (value && value.trim()) return value.trim();
+
+  // 라벨이 전혀 없는 인풋은 name/id를 폴백으로 쓴다.
+  // 접근성상 결함이지만 실제 웹에 흔하며, 이름이 비면 에이전트가
+  // 해당 요소를 지목할 방법이 없다.
+  const nm = el.getAttribute('name');
+  if (nm && nm.trim()) return nm.trim();
+  if (el.id) return el.id;
+
+  return '';
+}
+"""
+
 #: 페이지 컨텍스트에서 한 번에 실행되는 수집 스크립트.
 #: 반환값은 순수 JSON 직렬화 가능 구조여야 한다.
 COLLECT_SCRIPT = """
@@ -43,58 +106,7 @@ COLLECT_SCRIPT = """
   const results = [];
   let seq = 0;
 
-  function accessibleName(el) {
-    // W3C Accessible Name Computation 순서를 따른다:
-    //   aria-label > aria-labelledby > <label> > 콘텐츠 텍스트 > placeholder > title
-    //
-    // 주의: title은 **가장 마지막**이다. 실환경 검증에서 Wikipedia의
-    // 'Log in' 링크가 72자짜리 title 툴팁("You're encouraged to log in;
-    // however, it's not mandatory...")으로 이름이 잡혀 검색이 불가능했다.
-    // title은 보조 설명이지 요소의 이름이 아니다.
-    const aria = el.getAttribute('aria-label');
-    if (aria && aria.trim()) return aria.trim();
-
-    const labelledby = el.getAttribute('aria-labelledby');
-    if (labelledby) {
-      const ref = document.getElementById(labelledby);
-      if (ref && ref.textContent.trim()) return ref.textContent.trim();
-    }
-    if (el.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
-    }
-
-    // 콘텐츠 텍스트 (링크/버튼의 실제 라벨)
-    // input[type=submit|button]은 텍스트 노드가 없고 value가 라벨이다.
-    if (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) {
-      if (el.value && el.value.trim()) return el.value.trim();
-    }
-    const text = (el.innerText || el.textContent || '').trim();
-    if (text) return text.slice(0, 120);
-
-    // 텍스트가 없는 경우에만 보조 속성으로 폴백한다.
-    const ph = el.getAttribute('placeholder');
-    if (ph && ph.trim()) return ph.trim();
-
-    const title = el.getAttribute('title');
-    if (title && title.trim()) return title.trim();
-
-    const alt = el.getAttribute('alt');
-    if (alt && alt.trim()) return alt.trim();
-
-    // 비밀번호 필드는 value 속성을 이름으로 쓰지 않는다 — 이름은 프롬프트에 들어간다.
-    const value = el.type === 'password' ? null : el.getAttribute('value');
-    if (value && value.trim()) return value.trim();
-
-    // 라벨이 전혀 없는 인풋은 name/id를 폴백으로 쓴다.
-    // 접근성상 결함이지만 실제 웹에 흔하며, 이름이 비면 에이전트가
-    // 해당 요소를 지목할 방법이 없다.
-    const nm = el.getAttribute('name');
-    if (nm && nm.trim()) return nm.trim();
-    if (el.id) return el.id;
-
-    return '';
-  }
+  %(accessible_name)s
 
   function inferRole(el) {
     const explicit = el.getAttribute('role');
@@ -294,6 +306,7 @@ COLLECT_SCRIPT = """
     "tags": list(INTERACTIVE_TAGS),
     "roles": list(INTERACTIVE_ROLES),
     "min_px": MIN_CLICKABLE_PX,
+    "accessible_name": ACCESSIBLE_NAME_JS.strip(),
 }
 
 
