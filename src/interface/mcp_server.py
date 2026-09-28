@@ -98,7 +98,12 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.PRESS_KEY: "키보드 이벤트를 발생시킵니다 (Enter, Tab, Escape 등).",
     ActionType.WAIT_FOR: "지정한 조건이 만족될 때까지 대기합니다.",
     ActionType.EXTRACT: "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
-    ActionType.SWITCH_FRAME: "iframe 또는 Shadow DOM 컨텍스트로 전환합니다.",
+    ActionType.SWITCH_FRAME: (
+        "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 "
+        "먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다 — 중첩 프레임은 바깥부터 한 단계씩 "
+        "부르십시오(성공 data.child_frames 의 selector_hint 가 다음 후보). "
+        "최상위 문서로 돌아가려면 {\"to_main\": true} 만 보내십시오."
+    ),
     ActionType.HANDLE_DIALOG: "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
     ActionType.UPLOAD_FILE: "파일 입력 필드에 파일을 바인딩합니다.",
     ActionType.DOWNLOAD_FILE: "다운로드를 트리거하고 파일을 저장합니다.",
@@ -322,7 +327,20 @@ class BrowserMCPServer:
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
         params: Dict[str, Any] = dict(arguments or {})
-        if model is not None:
+        to_main = False
+        if action is ActionType.SWITCH_FRAME and "to_main" in params:
+            # WS-30 추가 B: 디스패처의 메인 복귀(to_main)는 계약(동결)에 없는 키라 검증에서
+            # 버려지고 '정확히 하나' 검증에 걸려 MCP 로는 복귀할 수 없었다 — 경계 특례.
+            to_main = bool(params.pop("to_main"))
+            if to_main and any(params.get(k) for k in ("frame_selector", "shadow_root_selector")):
+                return self._error_result(
+                    action,
+                    ErrorCode.FRAME_NOT_FOUND,
+                    "to_main 과 frame_selector/shadow_root_selector 는 함께 지정할 수 없습니다.",
+                )
+        if to_main:
+            params = {"to_main": True}
+        elif model is not None:
             try:
                 validated = model(**params)
                 params = validated.model_dump(exclude_none=True)
@@ -334,6 +352,10 @@ class BrowserMCPServer:
                     else ErrorCode.INVALID_URL,
                     f"입력 검증 실패: {exc}",
                 )
+        # WS-30 항목 2: 계약 키(trigger_element_id 등)를 디스패처 키로 — 게이트도 같은 키를 본다.
+        from actions.dispatcher import normalize_action_params
+
+        params = normalize_action_params(action, params)
 
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         blocked = await self._check_hitl(action, params)
@@ -401,13 +423,40 @@ class BrowserMCPServer:
             if handle is not None:
                 element_name = handle.name
 
+        submits_form = bool(params.get("press_enter"))
+        unresolved = ""
+        selector = params.get("selector", "") or ""
+        dispatcher = self._dispatcher
+        if action is ActionType.CLICK and selector and not element_id:
+            # WS-30 추가 A: selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정한다.
+            # 0개·여러 개·읽기 실패면 판정 불가 → 고위험(fail-closed).
+            if dispatcher is None:
+                unresolved = "selector 대상을 읽을 수 없음"
+            else:
+                target = await dispatcher.describe_selector_target(selector)
+                element_name = str(target.get("name") or "")
+                unresolved = str(target.get("unresolved") or "")
+        elif action is ActionType.TYPE_TEXT and not submits_form:
+            text = str(params.get("text") or "")
+            if "\n" in text or "\r" in text:
+                # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
+                info = await dispatcher.describe_element(element_id) if dispatcher else None
+                if info is None:
+                    unresolved = "입력 대상을 읽을 수 없음"
+                elif info.get("tag") == "INPUT" and info.get("in_form"):
+                    submits_form = True
+        elif action is ActionType.PRESS_KEY:
+            submits_form, name, unresolved = await self._press_key_target(params)
+            element_name = name or element_name
+
         decision = self._hitl.evaluate(
             ActionContext(
                 action=action,
                 element_name=element_name,
-                selector=params.get("selector", "") or "",
+                selector=selector,
                 domain=self._current_domain(),
-                submits_form=bool(params.get("press_enter")),
+                submits_form=submits_form,
+                unresolved_target=unresolved,
             )
         )
         if decision.allowed:
@@ -434,6 +483,37 @@ class BrowserMCPServer:
             data["pre_approve_hint"] = hint
 
         return self._error_result(action, code, message, data=data)
+
+    async def _press_key_target(self, params: Dict[str, Any]) -> tuple:
+        """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6).
+
+        type_text(press_enter=True) 는 '폼 제출'로 막히는데 type_text 뒤 press_key("Enter") 는
+        같은 제출이 통과하던 불일치를 막는다. 반환: (submits_form, 대상 이름, 판정 불가 사유).
+        """
+        from actions.dispatcher import key_kind
+
+        kind = key_kind(str(params.get("key", "")))
+        if not kind:
+            return False, "", ""
+        dispatcher = self._dispatcher
+        info = await dispatcher.focused_target() if dispatcher is not None else None
+        if info is None:
+            return False, "", "포커스 요소를 읽을 수 없음" if kind == "enter" else ""
+        if info.get("opaque"):
+            return False, "", "포커스가 다른 출처 프레임 안에 있음"
+        tag = str(info.get("tag") or "")
+        itype = str(info.get("type") or "")
+        in_form = bool(info.get("in_form"))
+        name = str(info.get("name") or "")
+        if kind == "enter" and tag == "INPUT" and in_form and itype not in ("button", "reset"):
+            # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출.
+            return True, name if itype == "submit" else "", ""
+        if tag == "BUTTON" and in_form and itype in ("", "submit"):
+            return True, name, ""
+        if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in ("button", "submit")):
+            # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름 게이트를 탄다.
+            return False, name, ""
+        return False, "", ""
 
     def _current_domain(self) -> str:
         try:
