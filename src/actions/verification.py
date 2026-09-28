@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode
 from perception.engine import ElementHandle
+from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).
 #: `document.querySelector`는 shadow root 내부를 보지 못한다. 관찰은
@@ -87,20 +88,12 @@ STALENESS_CHECK_SCRIPT = """
            : 'textbox';
     } else role = 'generic';
   }
-  // W3C Accessible Name Computation 순서를 따른다:
-  //   aria-label > 콘텐츠 텍스트 > placeholder > title
-  //
-  // 주의: title을 텍스트보다 앞에 두면 안 된다. sanitizer(WS-6)에서
-  // 같은 버그를 고쳤는데 검증 경로에 남아 있었다. 실제 피해 —
-  // 위키백과 'Log in' 링크가 72자 title 툴팁으로 계산되어, 관찰 시점
-  // 이름('Log in')과 불일치해 NAME_CHANGED(E_TOCTOU_MISMATCH)로
-  // 오판됐다. 요소는 전혀 바뀌지 않았는데 액션이 2회 연속 차단됐다.
-  const ariaName = el.getAttribute('aria-label');
-  const textName = (el.innerText || el.textContent || '').trim();
-  const name = (ariaName && ariaName.trim() ? ariaName
-                : textName ? textName
-                : (el.getAttribute('placeholder') ||
-                   el.getAttribute('title') || '')).trim().slice(0, 200);
+  // 이름은 관찰 엔진과 **같은 규칙**(perception.sanitizer.ACCESSIBLE_NAME_JS)으로 읽는다 (WS-30b).
+  // 사본(aria-label > 텍스트 > placeholder > title)을 따로 두면 label·aria-labelledby·value·alt·
+  // name·id 로 이름이 정해지는 요소가 관찰 이름과 달라 NAME_CHANGED(불필요한 자가 치유,
+  // 실패 시 E_TOCTOU_MISMATCH)로 갔다. 과거 사고(위키백과 'Log in' title 툴팁)도 같은 원인이었다.
+  __ACCESSIBLE_NAME__
+  const name = String(accessibleName(el) || '');
 
   return {
     connected: true,
@@ -110,7 +103,9 @@ STALENESS_CHECK_SCRIPT = """
     value: el.value !== undefined ? String(el.value) : null,
   };
 }
-""".replace("__DEEP_QUERY__", DEEP_QUERY_JS)
+""".replace("__DEEP_QUERY__", DEEP_QUERY_JS).replace(
+    "__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip()
+)
 
 
 class StalenessReason(str, Enum):
