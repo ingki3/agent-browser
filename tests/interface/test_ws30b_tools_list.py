@@ -142,6 +142,25 @@ def test_compact_schema_drops_pydantic_boilerplate():
     assert "url" in build_tool_schema(ActionType.NAVIGATE)["inputSchema"]["required"]
 
 
+def test_property_named_title_or_default_is_kept():
+    """속성 이름이 title·default 인 입력 필드는 지우지 않는다(주석 키워드와 속성 이름을 구분)."""
+    from pydantic import BaseModel
+    from typing import Optional
+
+    class M(BaseModel):
+        title: str
+        default: Optional[int] = None
+
+    src = M.model_json_schema()
+    out = compact_schema(src)
+    assert set(out["properties"]) == {"title", "default"}
+    assert out["required"] == ["title"]
+    v_src, v_out = jsonschema.Draft202012Validator(src), jsonschema.Draft202012Validator(out)
+    for inst in ({}, {"title": "a"}, {"title": 1}, {"title": "a", "default": None},
+                 {"title": "a", "default": "x"}):
+        assert v_src.is_valid(inst) == v_out.is_valid(inst), inst
+
+
 def test_compact_schema_leaves_unknown_anyof_untouched():
     """두 갈래가 (T, null) 모양이 아니면 그대로 둔다 — 의미를 추측하지 않는다."""
     src = {"type": "object", "properties": {"a": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
