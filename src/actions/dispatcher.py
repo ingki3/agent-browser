@@ -276,6 +276,11 @@ class DispatchContext:
     #: `annotate_som=True`에 여전히 E_FEATURE_NOT_IMPLEMENTED를 받는다.
     #: MCP 서버가 `capabilities.experimental.som_vision` 협상 후 켠다.
     som_enabled: bool = False
+    #: 이동 대기 스위치 (WS-28). True(기본)면 페이지를 옮길 수 있는 액션 뒤 새 문서를
+    #: 기다린다(WS-25 `_NavWatch`). False 면 감시자를 붙이지 않는다 — 이동 없는
+    #: click/press_key 가 감지 창(NAV_DETECT_MS)만큼 빨라지는 대신, 이동 뒤 새 문서를
+    #: 확인할 책임(wait_for/observe)이 호출자에게 있다. `serve --nav-settle off`.
+    nav_settle: bool = True
 
 
 #: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
@@ -664,7 +669,11 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
         # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
-        watch = _NavWatch(self.ctx.page) if _may_navigate(action, params) else None
+        watch = (
+            _NavWatch(self.ctx.page)
+            if self.ctx.nav_settle and _may_navigate(action, params)
+            else None
+        )
         try:
             await self._execute_element_action(action, handle, params)
         except Exception as exc:  # noqa: BLE001
@@ -1038,11 +1047,12 @@ class ActionDispatcher:
         if action is ActionType.PRESS_KEY:
             raw_key = str(params.get("key", ""))
             key = _normalize_key(raw_key)
-            watch = _NavWatch(page)
+            watch = _NavWatch(page) if self.ctx.nav_settle else None
             try:
                 await page.keyboard.press(key)
             except Exception as exc:  # noqa: BLE001
-                watch.close()
+                if watch is not None:
+                    watch.close()
                 return self._result(
                     success=False,
                     action=action,
@@ -1052,7 +1062,8 @@ class ActionDispatcher:
                 )
             # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
             # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
-            self._nav_info = await watch.settle()
+            if watch is not None:
+                self._nav_info = await watch.settle()
             return self._result(
                 success=True, action=action, retry_safe=False, data={"key": key}
             )
@@ -1153,11 +1164,12 @@ class ActionDispatcher:
             )
 
         before = await capture_state(page)
-        watch = _NavWatch(page)
+        watch = _NavWatch(page) if self.ctx.nav_settle else None
         try:
             await page.mouse.click(x, y, button=params.get("button", "left"))
         except Exception as exc:  # noqa: BLE001
-            watch.close()
+            if watch is not None:
+                watch.close()
             return self._result(
                 success=False,
                 action=action,
@@ -1166,7 +1178,8 @@ class ActionDispatcher:
                 error_message=f"좌표 클릭 발송 실패: {exc}",
             )
         # WS-25: 좌표 클릭(mouse.click)은 이동을 기다리지 않는다 — 여기서 기다린다.
-        self._nav_info = await watch.settle()
+        if watch is not None:
+            self._nav_info = await watch.settle()
         try:
             after = await capture_state(page)
         except Exception:  # noqa: BLE001

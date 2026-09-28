@@ -158,7 +158,10 @@ class BrowserMCPServer:
         browser_mode: str = "headless",
         chrome_profile: Any = None,
         keep_open: bool = False,
+        nav_settle: bool = True,
     ) -> None:
+        #: 이동 대기 스위치 (WS-28). DispatchContext.nav_settle 로 전달된다.
+        self.nav_settle = nav_settle
         #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
         #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
         self.secrets = secrets
@@ -249,6 +252,7 @@ class BrowserMCPServer:
                 core=self._core,  # tab_control이 탭 수명주기에 접근하려면 필요
                 secrets=self.secrets,  # 자격증명 플레이스홀더 해석 (PRD 5.3)
                 som_enabled=self.som_enabled,  # Tier-2 SoM 게이트 (PRD §8-2)
+                nav_settle=self.nav_settle,  # 이동 대기 스위치 (WS-28)
             )
         )
 
@@ -459,6 +463,7 @@ def create_server(
     browser_mode: str = "headless",
     chrome_profile: Any = None,
     keep_open: bool = False,
+    nav_settle: bool = True,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -477,6 +482,7 @@ def create_server(
         browser_mode=browser_mode,
         chrome_profile=chrome_profile,
         keep_open=keep_open,
+        nav_settle=nav_settle,
     )
 
     def _build_tools() -> List[Tool]:
@@ -546,6 +552,7 @@ async def run_stdio(
     browser_mode: str = "headless",
     chrome_profile: Any = None,
     keep_open: bool = False,
+    nav_settle: bool = True,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -570,6 +577,7 @@ async def run_stdio(
         browser_mode=browser_mode,
         chrome_profile=chrome_profile,
         keep_open=keep_open,
+        nav_settle=nav_settle,
     )
     extra = ""
     if browser_mode == "user-chrome":
