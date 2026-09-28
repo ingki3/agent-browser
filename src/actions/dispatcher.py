@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
 from perception.engine import ElementHandle, PerceptionEngine
+from perception.sanitizer import ACCESSIBLE_NAME_JS
 from security.secrets import KEY_PATTERN as SECRET_KEY_PATTERN
 
 from actions.healing import (
@@ -116,8 +118,11 @@ class _NavWatch:
     이동은 잡지 않는다 — 기존 사후조건·루프 `_settle` 이 맡는다.
     """
 
-    def __init__(self, page: Any) -> None:
+    def __init__(self, page: Any, frame: Any = None) -> None:
         self.page = page
+        #: WS-30 R1 BLOCKING-5: switch_frame 안이면 그 프레임의 문서 이동도 본다(메인 프레임과 함께).
+        self._frame = frame
+        self._nav_frame: Any = None
         self.active = False
         self.started = False
         self.committed = False
@@ -128,6 +133,7 @@ class _NavWatch:
         self._handlers: List[Tuple[str, Any]] = []
         try:
             self._main = page.main_frame
+            self._watched = [self._main] + ([frame] if frame is not None else [])
             for name, fn in (
                 ("request", self._on_request),
                 ("response", self._on_response),
@@ -144,7 +150,9 @@ class _NavWatch:
 
     def _is_main_nav(self, request: Any) -> bool:
         try:
-            return bool(request.is_navigation_request()) and request.frame == self._main
+            return bool(request.is_navigation_request()) and any(
+                request.frame == f for f in self._watched
+            )
         except Exception:  # noqa: BLE001 — 서비스 워커 요청 등은 frame 이 없다
             return False
 
@@ -181,15 +189,16 @@ class _NavWatch:
             self._changed.set()
 
     def _on_nav(self, frame: Any) -> None:
-        if self.started and frame == self._main:
+        if self.started and any(frame == f for f in self._watched):
+            self._nav_frame = frame
             self.committed = True
             self.dcl = False
             self.aborted = ""
             self._changed.set()
 
     def _on_dcl(self, _page: Any) -> None:
-        # 커밋 이후의 domcontentloaded 만 새 문서의 것이다.
-        if self.committed:
+        # 커밋 이후의 domcontentloaded 만 새 문서의 것이다. Page 의 이 이벤트는 메인 프레임 것뿐이다.
+        if self.committed and self._nav_frame == self._main:
             self.dcl = True
             self._changed.set()
 
@@ -220,12 +229,25 @@ class _NavWatch:
                 return {}
             deadline = t0 + NAV_SETTLE_TIMEOUT_MS / 1000
             while not self.aborted and not (self.committed and self.dcl):
+                if self.committed and self._nav_frame is not None and self._nav_frame != self._main:
+                    # 하위 프레임 문서: 커밋 뒤에는 그 프레임의 load state 가 새 문서 기준이다.
+                    remaining = max(0.0, deadline - time.perf_counter())
+                    try:
+                        await self._nav_frame.wait_for_load_state(
+                            "domcontentloaded", timeout=remaining * 1000
+                        )
+                        self.dcl = True
+                    except Exception:  # noqa: BLE001 — 상한 초과·프레임 분리
+                        pass
+                    break
                 if not await self._wait_change(deadline):
                     break
             info: Dict[str, Any] = {
                 "nav_wait_ms": round((time.perf_counter() - t0) * 1000, 1),
                 "nav_committed": self.committed,
             }
+            if self.committed and self._nav_frame is not None and self._nav_frame != self._main:
+                info["nav_frame"] = "current_frame"
             if self.aborted:
                 info["nav_aborted"] = self.aborted
             elif not (self.committed and self.dcl):
@@ -249,6 +271,17 @@ class _NavWatch:
 _NAV_ELEMENT_ACTIONS = frozenset(
     {ActionType.CLICK, ActionType.SELECT_OPTION, ActionType.CHECK_BOX}
 )
+
+
+def _has_expected_state(action: ActionType, params: Dict[str, Any]) -> bool:
+    """기대 상태값(입력값·checked)이 있는 액션 — 값이 판정 기준이라 다른 변화로 성공하지 않는다."""
+    return (action is ActionType.TYPE_TEXT and params.get("text") is not None) or (
+        action is ActionType.CHECK_BOX and params.get("checked") is not None
+    )
+
+
+#: 최상위 문서 전후 비교에서 자발 변화와 섞이지 않는 강한 효과 신호(R1 BLOCKING-4).
+_TOP_STRONG_SIGNALS = ("url_changed", "new_tab")
 
 
 def _may_navigate(action: ActionType, params: Dict[str, Any]) -> bool:
@@ -296,25 +329,32 @@ def key_kind(key: str) -> str:
     return ""
 
 
-#: 대상 요소의 이름 — staleness 검증(STALENESS_CHECK_SCRIPT)과 같은 순서
-#: (aria-label > 텍스트 > placeholder > title) + value. 게이트가 selector 문자열 대신
-#: **페이지에서 읽은 이름**으로 판정하게 한다(WS-30 추가 A).
-_TARGET_INFO_JS = """
+#: 대상 요소의 이름 — **관찰 엔진과 같은 규칙**(perception.sanitizer.ACCESSIBLE_NAME_JS 를 그대로 끼워
+#: 넣는다). 게이트가 selector 문자열 대신 페이지에서 읽은 이름으로 판정하게 한다(WS-30 추가 A).
+#: WS-30 R1 BLOCKING-1: 예전에는 staleness 순서(aria > 텍스트 > placeholder > title)를 따로 적어
+#: `<input type=submit value=결제>`·img alt·aria-labelledby 이름을 못 읽었다 — element_id 로는 차단,
+#: selector 클릭·포커스 Space/Enter 로는 통과였다.
+_TARGET_INFO_JS = (
+    """
 (el) => {
-  const aria = el.getAttribute('aria-label');
+  __ACCESSIBLE_NAME__
   const text = (el.innerText || el.textContent || '').trim();
-  const name = (aria && aria.trim() ? aria
-                : text ? text
-                : (el.getAttribute('placeholder') || el.getAttribute('title') || '')).trim().slice(0, 200);
+  const name = String(accessibleName(el) || '').slice(0, 200);
   const value = (el.value !== undefined && el.value !== null) ? String(el.value).slice(0, 200) : '';
   return {
     tag: el.tagName, type: (el.type || '').toLowerCase(), name: name,
     text: text.slice(0, 200), value: (el.type || '').toLowerCase() === 'password' ? '' : value,
     title: (el.getAttribute('title') || '').slice(0, 200),
     in_form: !!el.form, editable: !!el.isContentEditable,
+    // 폼 연계 요소가 아니어도(사용자 정의 요소 등) 폼 조상 안에 있는가 — 판정 불가 대상의 fail-closed 용.
+    inside_form: !!(el.form || (el.closest && el.closest('form'))),
+    // 브라우저가 모르는 태그(사용자 정의 요소 포함) — 키 동작을 실측으로 확정할 수 없다.
+    unknown_tag: el.tagName.indexOf('-') !== -1
+      || Object.prototype.toString.call(el) === '[object HTMLUnknownElement]',
   };
 }
-"""
+""".replace("__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip())
+)
 
 #: 키 입력을 실제로 받는 요소(document.activeElement) — iframe(같은 출처)·open shadow 를
 #: 따라 내려간다. 다른 출처 iframe 이면 opaque(판정 불가 → 게이트는 fail-closed).
@@ -356,6 +396,82 @@ _FRAME_HINT_JS = """
 
 #: 한 dispatch 동안 기록할 다이얼로그 최대 수(무한 alert 루프 방지).
 _DIALOG_LOG_MAX = 20
+
+#: WS-30 R1 BLOCKING-4: 프레임 안 액션 뒤 최상위 문서의 텍스트·노드 변화(text_changed/dom_delta)가
+#: **액션 때문인지** 가리는 사후 관찰 창. 최상위가 스스로 바뀌는(시계·광고 로테이션) 페이지에서
+#: 프레임 안 무효과 클릭이 성공으로 판정됐다. 액션 창에서 바뀐 노드가 이 창에서 **다시** 바뀌면
+#: 자발 변화로 본다. 200ms 주기 시계를 확실히 잡으려면 주기보다 길어야 한다(여유 100ms).
+#: 비용: 프레임 안 액션이고 최상위에 약한 신호(text/dom)만 있을 때만 이만큼 기다린다.
+TOP_SPONTANEOUS_WINDOW_MS = 300
+
+#: 최상위 문서의 변화 기록기(MutationObserver). 노드마다 변화 시각을 모은다.
+#: 기록은 switch_frame 직후·액션 판정 직후 다시 시작한다 — 그래서 **액션 사이 대기 시간**(에이전트가
+#: 생각하는 동안)에 바뀐 노드는 추가 비용 없이 자발 변화의 기준선이 된다.
+_TOP_RECORDER_ARM_JS = """
+() => {
+  const prev = window.__abTopRec;
+  if (prev && prev.obs) prev.obs.disconnect();
+  const ids = new WeakMap();
+  let seq = 0;
+  const key = (n) => {
+    if (n && n.nodeType !== 1) n = n.parentNode;
+    if (!n) return 0;
+    let k = ids.get(n);
+    if (!k) { k = ++seq; ids.set(n, k); }
+    return k;
+  };
+  const rec = { times: new Map(), overflow: false, armed: performance.now() };
+  const push = (list) => {
+    const t = performance.now();
+    for (const m of list) {
+      const k = key(m.target);
+      let arr = rec.times.get(k);
+      if (!arr) {
+        if (rec.times.size >= 5000) { rec.overflow = true; continue; }
+        arr = []; rec.times.set(k, arr);
+      }
+      if (arr.length < 32) arr.push(t); else arr[31] = t;
+    }
+  };
+  rec.push = push;
+  rec.obs = new MutationObserver(push);
+  rec.obs.observe(document, { subtree: true, childList: true, characterData: true });
+  window.__abTopRec = rec;
+  return true;
+}
+"""
+
+#: 액션 시작 시각. 기록기가 없으면(새 문서) None — 기준선 없이 사후 창만으로 판정한다.
+_TOP_RECORDER_START_JS = """
+() => {
+  const r = window.__abTopRec;
+  if (!r) return null;
+  r.push(r.obs.takeRecords());
+  return performance.now();
+}
+"""
+
+#: 사후 창이 끝난 뒤 판정: 액션 창(start, end] 에서 바뀐 노드 중 기준선(≤ start)·사후 창(> end)에서
+#: 바뀌지 않은 노드 수.
+_TOP_RECORDER_READ_JS = """
+(args) => {
+  const r = window.__abTopRec;
+  if (!r) return null;
+  r.push(r.obs.takeRecords());
+  const start = args.start === null ? r.armed : args.start;
+  let act = 0, spont = 0, effect = 0;
+  for (const arr of r.times.values()) {
+    let inAct = false, outside = false;
+    for (const t of arr) {
+      if (t > start && t <= args.end) inAct = true; else outside = true;
+    }
+    if (!inAct) continue;
+    act++;
+    if (outside) spont++; else effect++;
+  }
+  return { act: act, spontaneous: spont, effect: effect, overflow: r.overflow };
+}
+"""
 
 
 @dataclass
@@ -453,6 +569,9 @@ class ActionDispatcher:
         self._dialog_arm: Optional[Dict[str, Any]] = None
         #: 다이얼로그 리스너를 단 페이지들(중복 등록 방지).
         self._dialog_pages: List[Any] = []
+        #: WS-30 R1 BLOCKING-4: 프레임 안 액션 직전 최상위 기록기 시각(performance.now), 판정 기록.
+        self._top_start: Optional[float] = None
+        self._top_attribution: Optional[Dict[str, Any]] = None
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -502,8 +621,10 @@ class ActionDispatcher:
             result.data.setdefault("opened_tab_ids", ids)
 
     def _off_popup(self, listener: Any) -> None:
+        # 붙인 곳(최상위 Page)에서 뗀다 — 프레임 안에서는 ctx.page 가 Frame 이라 떼지 못하고
+        # 리스너가 액션마다 쌓였다(WS-30 R1 NB-8).
         try:
-            self.ctx.page.remove_listener("popup", listener)
+            self._top_page().remove_listener("popup", listener)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
 
@@ -636,11 +757,60 @@ class ActionDispatcher:
             return None
 
     async def focused_target(self) -> Optional[Dict[str, Any]]:
-        """키 입력을 받을 요소(activeElement, 같은 출처 iframe·shadow 관통). 못 읽으면 None."""
+        """키 입력을 받을 요소(activeElement). 못 읽으면 None.
+
+        WS-30 R1 BLOCKING-3: press_key 는 **최상위 Page 의 키보드**로 보내므로(프레임에는 .keyboard
+        가 없다) 판정도 최상위 문서에서 시작해 실제 포커스를 따라 내려간다. 예전에는 switch_frame
+        뒤 현재 프레임의 activeElement 를 봐, 포커스가 최상위 폼 입력칸이면 판정은 '프레임 body',
+        키는 최상위 폼으로 가서 제출이 통과했다.
+
+        같은 출처 iframe·open shadow 는 JS 가 따라 내려간다. 다른 출처 iframe 에서 막히면(opaque)
+        Playwright 로 그 프레임 안에서 이어서 읽는다 — 포커스를 가진 문서 사슬(document.hasFocus)이
+        한 줄로 확정될 때만. 확정 못 하면 opaque 를 그대로 돌려준다(게이트는 fail-closed).
+        """
+        top = self._top_page()
         try:
-            return await self.ctx.page.evaluate(_FOCUS_INFO_JS)
+            info = await top.evaluate(_FOCUS_INFO_JS)
         except Exception:  # noqa: BLE001
             return None
+        if isinstance(info, dict) and info.get("opaque"):
+            deeper = await self._focus_in_focused_frame(top)
+            if deeper is not None:
+                return deeper
+        return info
+
+    async def _focus_in_focused_frame(self, top: Any) -> Optional[Dict[str, Any]]:
+        """포커스를 가진 가장 깊은 프레임에서 activeElement 를 읽는다. 확정 못 하면 None."""
+        try:
+            frames = [f for f in top.frames if f is not top.main_frame]
+        except Exception:  # noqa: BLE001 — 가짜 페이지
+            return None
+        focused: List[Any] = []
+        for frame in frames:
+            try:
+                if await frame.evaluate("document.hasFocus()"):
+                    focused.append(frame)
+            except Exception:  # noqa: BLE001 — 분리된 프레임 등: 판정 불가
+                return None
+        if not focused:
+            return None
+        depth = {f: (await self._frame_depth_path(f))[0] for f in focused}
+        deepest = max(focused, key=lambda f: depth[f])
+        # 포커스 사슬은 한 줄이어야 한다 — 같은 깊이에 둘 이상이거나 조상 관계가 아니면 판정 불가.
+        chain = []
+        cur = deepest
+        while cur is not None and cur is not top.main_frame:
+            chain.append(cur)
+            cur = cur.parent_frame
+        if any(f not in chain for f in focused):
+            return None
+        try:
+            info = await deepest.evaluate(_FOCUS_INFO_JS)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(info, dict) or info.get("opaque"):
+            return None
+        return info
 
     @staticmethod
     async def _scroll_once(page: Any, delta: int) -> bool:
@@ -728,6 +898,12 @@ class ActionDispatcher:
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"{type(exc).__name__}: {exc}",
             )
+        if self.ctx.root_page is not None:
+            # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
+            await self._arm_top_recorder()
+        if self._top_attribution is not None:
+            result.data.setdefault("top_change_attribution", self._top_attribution)
+            self._top_attribution = None
         if self._nav_info:
             # WS-25: 문서 이동을 기다렸다 — 기다린 사실을 남기고, 새 문서가 떴으면
             # 이전 관찰(요소 id)은 무효이므로 재관찰을 요구한다.
@@ -808,6 +984,24 @@ class ActionDispatcher:
         # 요소를 다루지 않는 액션은 곧바로 실행한다.
         if action in _ELEMENTLESS_ACTIONS:
             return await self._execute_elementless(action, params)
+
+        if action is ActionType.DOWNLOAD_FILE:
+            # R1 NB-5: 상대 경로는 서버 프로세스 cwd 기준이라 호출자가 모르는 곳에 조용히 썼다
+            # (검증: `reldir` → 저장소 루트, `sub/../../escape` → 정규화 없이 저장). 누르기 전에
+            # 거부하고, 절대 경로는 정규화(`..`·심볼릭 링크 해소)한 경로에 저장한다.
+            save_dir = str(params.get("save_dir") or "")
+            if not os.path.isabs(save_dir):
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,  # 발송 전
+                    error_code=ErrorCode.DOWNLOAD_FAILED,
+                    error_message=(
+                        f"save_dir 는 절대 경로여야 합니다: {save_dir!r} "
+                        "(상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없습니다)."
+                    ),
+                )
+            params = dict(params, save_dir=os.path.realpath(save_dir))
 
         element_id = params.get("element_id")
         if not element_id and action is ActionType.CLICK and params.get("x") is not None:
@@ -943,29 +1137,92 @@ class ActionDispatcher:
             is_shadow=False,
         )
 
-    async def _capture_root(self) -> Any:
-        """프레임 안이면 최상위 문서 상태도 캡처한다(WS-30 4(b)). 최상위면 None."""
+    async def _capture_root(self, *, mark_start: bool = False) -> Any:
+        """프레임 안이면 최상위 문서 상태도 캡처한다(WS-30 4(b)). 최상위면 None.
+
+        mark_start=True(액션 직전)면 최상위 변화 기록기의 액션 시작 시각도 찍는다(R1 BLOCKING-4).
+        """
         root = self.ctx.root_page
         if root is None:
             return None
         try:
-            return await capture_state(root)
+            state = await capture_state(root)
         except Exception:  # noqa: BLE001 — 문서 교체 중 등
             return None
+        if mark_start:
+            self._top_start = None
+            self._top_attribution = None
+            try:
+                started = await root.evaluate(_TOP_RECORDER_START_JS)
+                if started is None:
+                    # 기록기가 없다(새 문서 등) — 지금 붙인다. 기준선 없이 사후 창만으로 판정한다.
+                    await root.evaluate(_TOP_RECORDER_ARM_JS)
+                self._top_start = started
+            except Exception:  # noqa: BLE001
+                pass
+        return state
+
+    async def _arm_top_recorder(self) -> None:
+        """프레임 컨텍스트면 최상위 변화 기록을 새로 시작한다(액션 사이 대기 = 자발 변화 기준선)."""
+        root = self.ctx.root_page
+        if root is None:
+            return
+        try:
+            await root.evaluate(_TOP_RECORDER_ARM_JS)
+        except Exception:  # noqa: BLE001 — 문서 교체 중·가짜 페이지
+            pass
+
+    @staticmethod
+    def _top_effect_signals(root_before: Any, root_after: Any, weak_ok: bool) -> List[str]:
+        """최상위 문서 전후 비교의 효과 신호(top:…).
+
+        강한 신호(url_changed·new_tab)는 그대로 인정한다. 약한 신호(text_changed·dom_delta)는
+        weak_ok 일 때만 — 최상위가 스스로 바뀌는 문서(시계·광고 로테이션)에서는 액션 효과라는
+        근거가 있어야 한다(R1 BLOCKING-4, `_top_change_attributable`). focus_moved 는 도달
+        신호라 싣지 않는다.
+        """
+        if root_before is None or root_after is None:
+            return []
+        top = verify_post_condition(root_before, root_after)
+        if not top.satisfied:
+            return []
+        effect = [s for s in top.signals if not s.startswith("focus_moved")]
+        if any(s.startswith(_TOP_STRONG_SIGNALS) for s in effect) or weak_ok:
+            return [f"top:{s}" for s in effect]
+        return []
 
     def _effect_beyond_target(
-        self, root_before: Any, root_after: Any
+        self, root_before: Any, root_after: Any, weak_ok: bool = False
     ) -> List[str]:
         """대상 문서 밖의 효과 신호: 최상위 문서 변화(프레임 안 액션)·다이얼로그."""
-        extra: List[str] = []
-        if root_before is not None and root_after is not None:
-            top = verify_post_condition(root_before, root_after)
-            if top.satisfied:
-                extra.extend(
-                    f"top:{sig}" for sig in top.signals if not sig.startswith("focus_moved")
-                )
+        extra = self._top_effect_signals(root_before, root_after, weak_ok)
         extra.extend(self._dialog_signals())
         return extra
+
+    async def _top_change_attributable(self, root_before: Any, root_after: Any) -> bool:
+        """최상위의 약한 변화(text/dom)가 이 액션의 효과인가 (R1 BLOCKING-4).
+
+        기록기(MutationObserver)로 노드별 변화 시각을 본다. 액션 창(시작~지금)에 바뀐 노드 중
+        기준선(직전 액션 뒤 대기 시간)이나 사후 창(TOP_SPONTANEOUS_WINDOW_MS)에서도 바뀐 노드는
+        자발 변화다. 액션 창에서만 바뀐 노드가 하나라도 있어야 효과로 인정한다. 기록을 못
+        읽거나 넘치면 인정하지 않는다(판정 불가 → 효과 없음).
+        """
+        effect = self._top_effect_signals(root_before, root_after, weak_ok=True)
+        if not effect:
+            return False
+        root = self.ctx.root_page
+        try:
+            end = await root.evaluate("performance.now()")
+            await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
+            read = await root.evaluate(
+                _TOP_RECORDER_READ_JS, {"start": self._top_start, "end": end}
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        self._top_attribution = read if isinstance(read, dict) else None
+        if not isinstance(read, dict) or read.get("overflow"):
+            return False
+        return int(read.get("effect") or 0) > 0
 
     def _with_outside_effects(
         self,
@@ -974,6 +1231,7 @@ class ActionDispatcher:
         post: PostConditionResult,
         root_before: Any,
         root_after: Any,
+        top_weak_ok: bool = False,
     ) -> PostConditionResult:
         """대상 문서 스냅샷 밖에서 일어난 효과를 반영한다 (WS-30 항목 4).
 
@@ -993,11 +1251,8 @@ class ActionDispatcher:
         extra: List[str] = []
         if self._nav_info.get("nav_committed"):
             extra.append(f"navigated: {self._current_url()}")
-        has_expected = (action is ActionType.TYPE_TEXT and params.get("text") is not None) or (
-            action is ActionType.CHECK_BOX and params.get("checked") is not None
-        )
-        if not has_expected:
-            extra.extend(self._effect_beyond_target(root_before, root_after))
+        if not _has_expected_state(action, params):
+            extra.extend(self._effect_beyond_target(root_before, root_after, top_weak_ok))
         elif dialog_signals and extra:
             extra.extend(dialog_signals)
         if not extra:
@@ -1014,7 +1269,7 @@ class ActionDispatcher:
         """[2] 이벤트 발송 → [3] 사후조건 검증."""
         # --- [2] 이벤트 발송 -------------------------------------------------
         before = await capture_state(self.ctx.page, handle)
-        root_before = await self._capture_root()
+        root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
         # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
         popups: List[Any] = []
@@ -1030,8 +1285,9 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
         # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
+        frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
         watch = (
-            _NavWatch(top_page)
+            (_NavWatch(top_page, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top_page))
             if self.ctx.nav_settle and _may_navigate(action, params)
             else None
         )
@@ -1117,7 +1373,19 @@ class ActionDispatcher:
             ),
             conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
-        post = self._with_outside_effects(action, params, post, root_before, root_after)
+        top_weak_ok = False
+        if (
+            not post.satisfied
+            and root_before is not None
+            and root_after is not None
+            and not self._nav_info.get("nav_committed")
+            and not _has_expected_state(action, params)
+        ):
+            # 프레임 안 액션이 최상위에 약한 변화만 남겼다 — 자발 변화인지 가린다(이때만 비용).
+            top_weak_ok = await self._top_change_attributable(root_before, root_after)
+        post = self._with_outside_effects(
+            action, params, post, root_before, root_after, top_weak_ok
+        )
 
         if post.satisfied:
             return self._result(
@@ -1313,7 +1581,8 @@ class ActionDispatcher:
             ) as dl:
                 await target.click(timeout=5000)
             download = await dl.value
-            save_path = f"{params.get('save_dir', '.')}/{download.suggested_filename}"
+            # save_dir 는 _dispatch_inner 에서 절대 경로로 정규화됐다(R1 NB-5).
+            save_path = os.path.join(params["save_dir"], download.suggested_filename)
             await download.save_as(save_path)
             params["_downloaded_path"] = save_path
 
@@ -1417,7 +1686,11 @@ class ActionDispatcher:
             # 키보드·문서 이동은 최상위 Page 의 것이다 — 프레임 안이어도 포커스된 요소가
             # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
             top = self._top_page()
-            watch = _NavWatch(top) if self.ctx.nav_settle else None
+            frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
+            watch = None
+            if self.ctx.nav_settle:
+                # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
+                watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
             try:
                 await top.keyboard.press(key)
             except Exception as exc:  # noqa: BLE001

@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1121개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1179개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -233,7 +233,9 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 ### 고위험 액션 허용 (`serve --pre-approve`, `--mode`)
 
 무인 모드(기본)에서는 결제·주문·삭제·동의 같은 이름의 클릭, 폼 제출(`type_text(press_enter)`, 폼 안 입력칸에서 `press_key("Enter")`, 한 줄 입력칸에 줄바꿈 입력), 업로드·다운로드를 `E_HITL_UNATTENDED_BLOCKED`로 막습니다. 운영자가 서버를 띄울 때 `--pre-approve <액션>:<요소 이름>`(반복 가능, 예: `--pre-approve "click:결제 진행"`) 또는 `<액션>:*`로 미리 허용합니다. 차단 결과의 `data.pre_approve_hint`는 그 액션을 여는 값이고, 메시지 끝에 운영자용 안내가 붙습니다. `--mode interactive`는 차단 대신 승인 요청(`data.dialog`)을 돌려줍니다.
-`click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다.
+`click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다. 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
+`press_key`의 Enter·Space는 키가 실제로 가는 요소(최상위 문서부터 포커스를 따라 iframe·shadow 안까지)로 판정합니다. Chromium 실측으로 Enter가 폼을 제출하는 포커스 대상 — 폼 안 한 줄 입력칸(text·search·email·number·password·tel·url·date·time·datetime-local·month·week), checkbox·radio·range, `<select>`, 제출 버튼(`<button>`·`input[type=submit|image]`, Space 포함) — 은 모두 폼 제출로 막습니다. 다른 출처 iframe 안 포커스는 포커스를 가진 프레임 사슬이 하나로 확정될 때 그 프레임 안에서 읽고, 포커스를 읽을 수 없거나 사슬을 확정할 수 없거나 폼 안의 알 수 없는 요소(사용자 정의 요소)면 판정 불가로 막습니다.
+`download_file`의 `save_dir`는 절대 경로여야 합니다. 상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없으므로 `E_DOWNLOAD_FAILED`로 거부하고, 절대 경로의 `..`·심볼릭 링크는 정규화한 경로에 저장합니다(`downloaded_path`).
 
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
 
@@ -266,9 +268,10 @@ click         ->  element_id="@e3", epoch=0
 
 `click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
 
-요소 액션의 성공 판정(사후조건)은 대상 문서의 변화 외에 다음도 효과로 봅니다: 새 메인 문서 커밋(`signals`에 `navigated: …`, 예: `type_text(press_enter)`로 폼이 결과 페이지로 감), `switch_frame`으로 들어간 프레임 안 액션이 바꾼 최상위 문서(`top:…`)나 연 새 탭, 네이티브 다이얼로그(`dialog_opened:<type>`, `data.dialogs`에 종류·문구·`accepted`/`dismissed`). 아무 변화도 없는 클릭은 여전히 `E_TIMEOUT`입니다. `handle_dialog`를 먼저 부르지 않은 다이얼로그는 거절됩니다(beforeunload 는 수락).
+요소 액션의 성공 판정(사후조건)은 대상 문서의 변화 외에 다음도 효과로 봅니다: 새 메인 문서 커밋(`signals`에 `navigated: …`, 예: `type_text(press_enter)`로 폼이 결과 페이지로 감), `switch_frame`으로 들어간 프레임 안 액션이 바꾼 최상위 문서(`top:…`)나 연 새 탭, 네이티브 다이얼로그(`dialog_opened:<type>`, `data.dialogs`에 종류·문구·`accepted`/`dismissed`). 아무 변화도 없는 클릭은 여전히 `E_TIMEOUT`입니다. `handle_dialog`를 먼저 부르지 않은 다이얼로그는 거절됩니다(beforeunload 는 수락). 다이얼로그는 원인을 가리지 않습니다 — 액션 중(대기 창 포함) 뜬 다이얼로그는 무관한 타이머가 띄운 것이어도 효과로 기록됩니다(`data.dialogs`의 문구로 확인하십시오).
+프레임 안 액션에서 최상위 문서의 본문·노드 변화(`top:text_changed`·`top:dom_delta`)는 최상위가 스스로 바뀌지 않은 부분에서 일어났을 때만 효과로 인정합니다. 최상위의 변화 시각을 노드별로 기록해, 액션 사이 대기 동안이나 액션 뒤 0.3초 관찰 창에서도 바뀐 노드(시계·광고 로테이션)는 자발 변화로 뺍니다(`data.top_change_attribution`). 이 관찰 창 때문에 그런 경우의 프레임 안 액션은 약 0.3초 느려집니다. `top:url_changed`·새 탭은 그대로 인정합니다. 프레임 안에서 `type_text(press_enter)`·`press_key`로 **그 프레임 문서**가 이동해도 `navigated: …`로 인정하고 `data.nav_frame="current_frame"`을 붙입니다. `--nav-settle off`면 이동 대기가 없으므로 `navigated:` 신호도 붙지 않아, 폼 이동 뒤 입력값 비교가 새 문서에서 이루어져 `E_TIMEOUT`이 올 수 있습니다 — 이때는 `observe_page`로 확인하십시오.
 
-`switch_frame`의 `frame_selector`는 지금 들어가 있는 프레임 기준으로 먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다. 결과 `data`에 `frame_url`·`frame_depth`·`frame_path`·`child_frames`(`selector_hint`, `url`)가 붙고, 못 찾으면 현재 프레임 URL과 그 안의 iframe 목록을 돌려줍니다. 최상위로 돌아가려면 `{"to_main": true}`만 보냅니다. 프레임 안의 `take_screenshot`은 최상위 페이지를 찍고 `data.frame_bbox`에 프레임 영역을 싣습니다.
+`switch_frame`의 `frame_selector`는 지금 들어가 있는 프레임 기준으로 먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다. 그래서 깊은 프레임에서 현재 프레임에 없는 셀렉터를 주면 "없음"이 아니라 최상위 기준으로 찾은 더 얕은 프레임으로 되돌아갈 수 있습니다 — 결과의 `resolved_from`(`current_frame`/`root`)과 `frame_depth`로 확인하십시오. 결과 `data`에 `frame_url`·`frame_depth`·`frame_path`·`child_frames`(`selector_hint`, `url`)가 붙고, 못 찾으면 현재 프레임 URL과 그 안의 iframe 목록을 돌려줍니다. 최상위로 돌아가려면 `{"to_main": true}`만 보냅니다. 프레임 안의 `take_screenshot`은 최상위 페이지를 찍고 `data.frame_bbox`에 프레임 영역을 싣습니다.
 
 ### 차단·캡차 신호
 

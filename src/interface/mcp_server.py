@@ -102,11 +102,16 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
         "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 "
         "먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다 — 중첩 프레임은 바깥부터 한 단계씩 "
         "부르십시오(성공 data.child_frames 의 selector_hint 가 다음 후보). "
-        "최상위 문서로 돌아가려면 {\"to_main\": true} 만 보내십시오."
+        "최상위 문서로 돌아가려면 {\"to_main\": true} 만 보내십시오. "
+        "현재 프레임에 없어 최상위 기준으로 찾으면 더 얕은 프레임으로 되돌아갈 수 있습니다 — "
+        "성공 data.resolved_from(\"current_frame\"|\"root\")·frame_depth 로 확인하십시오."
     ),
     ActionType.HANDLE_DIALOG: "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
     ActionType.UPLOAD_FILE: "파일 입력 필드에 파일을 바인딩합니다.",
-    ActionType.DOWNLOAD_FILE: "다운로드를 트리거하고 파일을 저장합니다.",
+    ActionType.DOWNLOAD_FILE: (
+        "다운로드를 트리거하고 파일을 저장합니다. save_dir 는 절대 경로여야 합니다"
+        "(상대 경로는 거부, `..` 는 정규화해 저장)."
+    ),
     ActionType.TAB_CONTROL: "탭을 생성/전환/종료하거나 목록을 조회합니다.",
 }
 
@@ -158,6 +163,19 @@ def _describe(action: ActionType) -> str:
     if action in CHALLENGE_CHECK_ACTIONS:
         text += CHALLENGE_NOTE
     return text
+
+
+#: Chromium 실측(WS-30 R1, 제출 버튼 있는 폼): 포커스된 <input type=…> 에서 Enter 가 폼을 제출하는 type.
+#: text/search/email/number/password/tel/url/date/time/datetime-local/month/week/checkbox/radio/range
+#: + 버튼형 submit/image. 제출 안 함: color/file/button/reset(reset 은 폼을 비운다 — 제출은 아님).
+#: type 속성이 없거나 모르는 값이면 브라우저는 text 로 다룬다 → el.type 은 'text' 로 읽힌다.
+_ENTER_SUBMITS_INPUT_TYPES = frozenset({
+    "text", "search", "email", "number", "password", "tel", "url",
+    "date", "time", "datetime-local", "month", "week",
+    "checkbox", "radio", "range", "submit", "image",
+})
+#: 키로 누르면 그 요소를 클릭하는 input type(이름 게이트 대상).
+_BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 
 
 class BrowserMCPServer:
@@ -485,10 +503,13 @@ class BrowserMCPServer:
         return self._error_result(action, code, message, data=data)
 
     async def _press_key_target(self, params: Dict[str, Any]) -> tuple:
-        """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6).
+        """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
 
         type_text(press_enter=True) 는 '폼 제출'로 막히는데 type_text 뒤 press_key("Enter") 는
         같은 제출이 통과하던 불일치를 막는다. 반환: (submits_form, 대상 이름, 판정 불가 사유).
+
+        무엇이 제출하는지는 Chromium 실측 표(`_ENTER_SUBMITS_INPUT_TYPES` 등)를 따른다. 포커스는
+        최상위 Page 기준(키가 가는 곳)으로 읽는다 — `ActionDispatcher.focused_target`.
         """
         from actions.dispatcher import key_kind
 
@@ -498,21 +519,32 @@ class BrowserMCPServer:
         dispatcher = self._dispatcher
         info = await dispatcher.focused_target() if dispatcher is not None else None
         if info is None:
-            return False, "", "포커스 요소를 읽을 수 없음" if kind == "enter" else ""
+            # Enter·Space 모두 요소를 누를 수 있다 — 대상을 모르면 판정 불가(fail-closed).
+            return False, "", "포커스 요소를 읽을 수 없음"
         if info.get("opaque"):
             return False, "", "포커스가 다른 출처 프레임 안에 있음"
         tag = str(info.get("tag") or "")
         itype = str(info.get("type") or "")
         in_form = bool(info.get("in_form"))
         name = str(info.get("name") or "")
-        if kind == "enter" and tag == "INPUT" and in_form and itype not in ("button", "reset"):
-            # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출.
-            return True, name if itype == "submit" else "", ""
-        if tag == "BUTTON" and in_form and itype in ("", "submit"):
+        if kind == "enter":
+            if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES:
+                # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출(버튼형이면 그 버튼 이름도).
+                return True, name if itype in _BUTTON_INPUT_TYPES else "", ""
+            if in_form and tag == "SELECT":
+                return True, "", ""
+        if in_form and (
+            (tag == "BUTTON" and itype in ("", "submit"))
+            or (tag == "INPUT" and itype in ("submit", "image"))
+        ):
+            # 폼 안 제출 버튼을 키로 누름 = 폼 제출(이름이 '다음' 이어도).
             return True, name, ""
-        if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in ("button", "submit")):
+        if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in _BUTTON_INPUT_TYPES):
             # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름 게이트를 탄다.
             return False, name, ""
+        if info.get("unknown_tag") and info.get("inside_form"):
+            # 폼 안 사용자 정의 요소(폼 연계 요소일 수 있음) — 키 동작을 확정할 수 없다.
+            return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스"
         return False, "", ""
 
     def _current_domain(self) -> str:
