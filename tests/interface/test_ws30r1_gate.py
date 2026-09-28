@@ -425,10 +425,15 @@ async def test_forged_has_focus_in_two_frames_fails_closed(site, other_origin):
     async with BrowserMCPServer() as server:
         await _call(server, ActionType.NAVIGATE, {"url": site + "/two"})
         page = _page(server)
-        for f in page.frames:
-            if "/inner" in f.url:
-                await f.evaluate("document.hasFocus = () => true")
+        # 두 inner 프레임이 모두 뜬 뒤에 위조한다(전제 확인 — 안 뜬 채 위조하면 갈래가 안 생긴다).
+        await page.frame_locator("#sf").locator("#fq").wait_for()
+        await page.frame_locator("#mid").frame_locator("#deep").locator("#fq").wait_for()
+        inner = [f for f in page.frames if "/inner" in f.url]
+        assert len(inner) == 2, [f.url for f in page.frames]
         await page.frame_locator("#sf").locator("#fq").focus()
+        for f in inner:
+            await f.evaluate("document.hasFocus = () => true")
+        assert all([await f.evaluate("document.hasFocus()") for f in inner])
         r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
         await page.wait_for_timeout(300)
         submitted = any("/fdone" in f.url for f in page.frames)
