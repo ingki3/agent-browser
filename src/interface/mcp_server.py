@@ -131,6 +131,23 @@ CHALLENGE_NOTE = (
 )
 
 
+def pre_approve_hint(action: ActionType, element_name: str) -> str:
+    """`--pre-approve` 에 그대로 넣으면 이 액션을 여는 값 (HITLGate._is_pre_approved 형식).
+
+    요소 이름이 없으면(업·다운로드, press_key 등) 이름 매칭이 불가능하므로 `<action>:*`.
+    """
+    name = (element_name or "").strip()
+    return f"{action.value}:{name}" if name else f"{action.value}:*"
+
+
+def blocked_hint_text(hint: str) -> str:
+    """무인 차단 메시지 끝에 붙는 사람(운영자)용 해결 경로."""
+    return (
+        f" — 이 액션을 허용하려면 서버를 `--pre-approve \"{hint}\"` 으로 다시 띄우거나"
+        " `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요."
+    )
+
+
 def _describe(action: ActionType) -> str:
     text = _DESCRIPTIONS.get(action, f"{action.value} 액션을 실행합니다.")
     if action in CHALLENGE_CHECK_ACTIONS:
@@ -401,18 +418,22 @@ class BrowserMCPServer:
             # 대화형 모드: 클라이언트가 렌더링할 정형 모달을 함께 전달한다.
             message = decision.dialog.message
 
-        return self._error_result(
-            action,
-            decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED,
-            message,
-            data={
-                "requires_confirmation": decision.requires_confirmation,
-                "risk": decision.risk.value,
-                "dialog": (
-                    decision.dialog.model_dump(mode="json") if decision.dialog else None
-                ),
-            },
-        )
+        data: Dict[str, Any] = {
+            "requires_confirmation": decision.requires_confirmation,
+            "risk": decision.risk.value,
+            "dialog": (
+                decision.dialog.model_dump(mode="json") if decision.dialog else None
+            ),
+        }
+        code = decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED
+        if code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+            # WS-30 항목 5: 에이전트가 "어떻게 승인하나요?"로 멈추지 않게, 사람(운영자)이
+            # 할 수 있는 해결 경로만 알린다 — 다른 도구로 돌아가는 방법은 알리지 않는다.
+            hint = pre_approve_hint(action, element_name)
+            message += blocked_hint_text(hint)
+            data["pre_approve_hint"] = hint
+
+        return self._error_result(action, code, message, data=data)
 
     def _current_domain(self) -> str:
         try:
@@ -547,6 +568,7 @@ async def run_stdio(
     *,
     mode: ExecutionMode = ExecutionMode.UNATTENDED,
     allowed_domains: tuple = (),
+    pre_approved_actions: tuple = (),
     secrets_path: Optional[str] = None,
     som_enabled: bool = False,
     browser_mode: str = "headless",
@@ -572,6 +594,7 @@ async def run_stdio(
     server, backend = create_server(
         mode=mode,
         allowed_domains=allowed_domains,
+        pre_approved_actions=tuple(pre_approved_actions),
         secrets=secrets,
         som_enabled=som_enabled,
         browser_mode=browser_mode,
