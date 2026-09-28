@@ -83,7 +83,8 @@ def build_all_tools() -> List[Dict[str, Any]]:
 _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.OBSERVE_PAGE: (
         "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. "
-        "각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다."
+        "각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. "
+        "모든 툴 응답에서 빠진 필드는 계약 기본값(null/false/{})입니다."
     ),
     ActionType.TAKE_SCREENSHOT: "현재 페이지의 스크린샷을 캡처합니다.",
     ActionType.NAVIGATE: "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다.",
@@ -176,6 +177,74 @@ _ENTER_SUBMITS_INPUT_TYPES = frozenset({
 })
 #: 키로 누르면 그 요소를 클릭하는 input type(이름 게이트 대상).
 _BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
+
+
+#: 응답 봉투 규칙 (WS-30b): 계약 기본값과 같은 필드는 뺀다 — **빠진 필드 = 계약 기본값**.
+#: 계약 필수 필드(기본값 없음)와 아래 필드는 기본값이어도 항상 싣는다. reobserve_required 는
+#: 에이전트가 매 응답에서 보고 element_id 재사용 여부를 정하는 칸이라 false 도 명시한다.
+ENVELOPE_ALWAYS = frozenset({"reobserve_required"})
+#: 봉투·README 에 쓰는 규칙 한 줄.
+ENVELOPE_RULE = (
+    "응답에서 빠진 필드는 계약 기본값입니다(healed=false, downloaded_path·popup_tab_id·"
+    "error_code·error_message=null, data={}, 관찰 요소의 value=null·is_shadow=false). "
+    "data 안의 null 은 그대로 싣습니다(data.challenge: null = 차단 없음)."
+)
+
+
+def _field_default(field: Any) -> Any:
+    default = field.get_default(call_default_factory=True)
+    return default.value if hasattr(default, "value") and not isinstance(default, dict) else default
+
+
+def _compact_observation(obs: Any) -> Any:
+    """관찰 요소에서 ObservedElement 기본값(value=None, is_shadow=False)과 같은 키를 뺀다.
+
+    계약 모델로 읽히지 않는 모양이면 건드리지 않는다(다시 파싱해 같은 객체가 되는 것만 줄인다).
+    """
+    from contracts import ObserveResult, ObservedElement
+
+    if not isinstance(obs, dict) or not isinstance(obs.get("elements"), list):
+        return obs
+    try:
+        ObserveResult.model_validate(obs)
+    except Exception:  # noqa: BLE001 - 모양이 다르면 원본 그대로
+        return obs
+    defaults = {
+        name: _field_default(f)
+        for name, f in ObservedElement.model_fields.items()
+        if not f.is_required()
+    }
+    elements = []
+    for el in obs["elements"]:
+        elements.append({
+            k: v for k, v in el.items()
+            if not (k in defaults and v == defaults[k] and type(v) is type(defaults[k]))
+        })
+    return dict(obs, elements=elements)
+
+
+def envelope_dict(result: ActionResult) -> Dict[str, Any]:
+    """MCP 응답 봉투(dict). `ActionResult.model_validate(봉투)` 는 원래 결과와 같다."""
+    full = result.model_dump(mode="json")
+    out: Dict[str, Any] = {}
+    for name, field in ActionResult.model_fields.items():
+        value = full[name]
+        if not field.is_required() and name not in ENVELOPE_ALWAYS:
+            default = _field_default(field)
+            if value == default and type(value) is type(default):
+                continue
+        out[name] = value
+    data = out.get("data")
+    if isinstance(data, dict) and "observation" in data:
+        out["data"] = dict(data, observation=_compact_observation(data["observation"]))
+    return out
+
+
+def envelope_json(result: ActionResult) -> str:
+    """MCP 응답 텍스트(JSON 한 덩어리, 공백 없음)."""
+    import json
+
+    return json.dumps(envelope_dict(result), ensure_ascii=False, separators=(",", ":"))
 
 
 class BrowserMCPServer:
@@ -645,7 +714,8 @@ def create_server(
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         result = await backend.call_tool(name, arguments)
-        return [TextContent(type="text", text=result.model_dump_json())]
+        # WS-30b: 기본값 필드를 뺀 봉투(빠진 필드 = 계약 기본값, ENVELOPE_RULE).
+        return [TextContent(type="text", text=envelope_json(result))]
 
     # SDK 메이저별 등록 방식이 다르다. 2.x의 lowlevel Server에는
     # list_tools/call_tool 데코레이터가 없고 생성자 콜백을 받는다.

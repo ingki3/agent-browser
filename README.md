@@ -259,6 +259,8 @@ browser_navigate          URL 이동
 
 `observe_page`가 반환하는 `element_id`와 `epoch`을 액션에 그대로 넘깁니다.
 
+응답 형식: 응답(`ActionResult` JSON)에서 **빠진 필드는 계약 기본값**입니다(`healed=false`, `downloaded_path`·`popup_tab_id`·`error_code`·`error_message`=`null`, `data`=`{}`, 관찰 요소의 `value`=`null`·`is_shadow`=`false`). `success`·`action`·`current_url`·`snapshot_epoch`·`tab_id`·`retry_safe`·`reobserve_required`는 항상 있고, 실패면 `error_code`·`error_message`도 있습니다. `data` 안의 `null`은 그대로 싣습니다(`data.challenge: null` = 차단 없음). 계약 모델(`ActionResult.model_validate`)로 다시 읽으면 빠짐없는 결과와 같은 객체입니다.
+
 ```
 observe_page  ->  @e3 (button "로그인"), epoch=0
 click         ->  element_id="@e3", epoch=0
