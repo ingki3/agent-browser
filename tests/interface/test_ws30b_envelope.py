@@ -117,7 +117,7 @@ def test_rule_is_stated_in_tool_description():
     from interface.mcp_server import build_tool_schema
 
     desc = build_tool_schema(ActionType.OBSERVE_PAGE)["description"]
-    assert "빠진 필드는 계약 기본값" in desc
+    assert "빠진 필드=계약 기본값" in desc
 
 
 def test_envelope_is_smaller_than_full_dump():

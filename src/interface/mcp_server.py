@@ -57,19 +57,71 @@ def action_from_tool(name: str) -> Optional[ActionType]:
 
 
 def build_tool_schema(action: ActionType) -> Dict[str, Any]:
-    """단일 액션의 MCP 툴 정의를 계약에서 생성한다."""
+    """단일 액션의 MCP 툴 정의를 계약에서 생성한다.
+
+    입력 스키마는 계약 모델의 `model_json_schema()` 를 서버 경계에서 `compact_schema` 로
+    정리한 것이다(WS-30b — 같은 입력을 받아들이고 같은 입력을 거부한다, 계약 무수정).
+    """
     model = ACTION_INPUT_MAP.get(action)
     if model is None:
         # 입력이 없는 액션도 빈 스키마로 노출한다.
         schema: Dict[str, Any] = {"type": "object", "properties": {}}
     else:
-        schema = model.model_json_schema()
+        schema = compact_schema(model.model_json_schema())
 
     return {
         "name": tool_name(action),
         "description": _describe(action),
         "inputSchema": schema,
     }
+
+
+#: 스키마 정리에서 값을 그대로 두는 키워드(하위 스키마가 아니라 이름·값 목록이다).
+_SCHEMA_VALUE_KEYS = frozenset({"enum", "const", "required", "examples", "default"})
+
+
+def compact_schema(schema: Any) -> Any:
+    """pydantic 기본 JSON Schema 에서 검증 의미가 없는 군더더기를 뺀다 (WS-30b).
+
+    * `title` — 주석 키워드(검증에 쓰이지 않음). 속성 이름이 title 이어도 속성은 남는다.
+    * `anyOf: [{type: T, ...}, {type: null}]` → `{type: [T, "null"], ...}` — T 쪽 제약
+      (minimum 등)은 null 에 적용되지 않으므로(타입별 키워드) 두 형태가 받는 값이 같다.
+      두 갈래가 이 모양이 아니면($ref·여러 타입 등) 그대로 둔다.
+    * `default: null` — 주석 키워드. 다른 기본값("left", 20 …)은 에이전트가 볼 정보라 남긴다.
+    """
+    if isinstance(schema, list):
+        return [compact_schema(x) for x in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out: Dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "title":
+            continue
+        if key == "default" and value is None:
+            continue
+        if key in ("properties", "$defs", "patternProperties") and isinstance(value, dict):
+            out[key] = {name: compact_schema(sub) for name, sub in value.items()}
+        elif key in _SCHEMA_VALUE_KEYS:
+            out[key] = value
+        else:
+            out[key] = compact_schema(value)
+    branches = out.get("anyOf")
+    if isinstance(branches, list) and len(branches) == 2 and {"type": "null"} in branches:
+        other = branches[0] if branches[1] == {"type": "null"} else branches[1]
+        if (
+            isinstance(other, dict)
+            and isinstance(other.get("type"), str)
+            and other["type"] != "null"
+            and "$ref" not in other
+            and not (set(other) & set(out) - {"anyOf"})
+        ):
+            merged = {k: v for k, v in out.items() if k != "anyOf"}
+            merged.update(other)
+            merged["type"] = [other["type"], "null"]
+            if "enum" in merged:  # enum 은 타입과 별개로 값을 제한한다 — null 도 넣어야 같다
+                merged["enum"] = list(merged["enum"]) + [None]
+            return merged
+    return out
 
 
 def build_all_tools() -> List[Dict[str, Any]]:
@@ -84,7 +136,7 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.OBSERVE_PAGE: (
         "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. "
         "각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. "
-        "모든 툴 응답에서 빠진 필드는 계약 기본값(null/false/{})입니다."
+        "모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{})."
     ),
     ActionType.TAKE_SCREENSHOT: "현재 페이지의 스크린샷을 캡처합니다.",
     ActionType.NAVIGATE: "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다.",
@@ -101,11 +153,10 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.EXTRACT: "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
     ActionType.SWITCH_FRAME: (
         "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 "
-        "먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다 — 중첩 프레임은 바깥부터 한 단계씩 "
-        "부르십시오(성공 data.child_frames 의 selector_hint 가 다음 후보). "
-        "최상위 문서로 돌아가려면 {\"to_main\": true} 만 보내십시오. "
-        "현재 프레임에 없어 최상위 기준으로 찾으면 더 얕은 프레임으로 되돌아갈 수 있습니다 — "
-        "성공 data.resolved_from(\"current_frame\"|\"root\")·frame_depth 로 확인하십시오."
+        "먼저, 없으면 최상위 문서 기준으로 찾습니다(이때 더 얕은 프레임으로 돌아갈 수 있음 — "
+        "data.resolved_from(\"current_frame\"|\"root\")·frame_depth 로 확인). 중첩 프레임은 바깥부터 "
+        "한 단계씩(data.child_frames 의 selector_hint 가 다음 후보). "
+        "최상위 문서 복귀는 {\"to_main\": true} 만 보내십시오."
     ),
     ActionType.HANDLE_DIALOG: "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
     ActionType.UPLOAD_FILE: "파일 입력 필드에 파일을 바인딩합니다.",
@@ -142,6 +193,17 @@ CHALLENGE_NOTE = (
 )
 
 
+#: 차단·캡차 안내 전문(CHALLENGE_NOTE)을 싣는 **한 곳** (WS-30b). 대부분의 세션이 처음 부르는 툴이다.
+CHALLENGE_NOTE_HOME = ActionType.NAVIGATE
+
+#: 대상 툴 중 안내 전문을 싣지 않는 툴에 붙는 짧은 참조 — 의도(data.challenge 를 보고, 풀지 말고
+#: 사람에게)는 참조만으로도 읽히게 한다.
+CHALLENGE_REF = (
+    " data.challenge: null 아니면 캡차/차단 → 사람에게"
+    f"({TOOL_PREFIX}{CHALLENGE_NOTE_HOME.value} 참조)."
+)
+
+
 def pre_approve_hint(action: ActionType, element_name: str) -> str:
     """`--pre-approve` 에 그대로 넣으면 이 액션을 여는 값 (HITLGate._is_pre_approved 형식).
 
@@ -161,8 +223,10 @@ def blocked_hint_text(hint: str) -> str:
 
 def _describe(action: ActionType) -> str:
     text = _DESCRIPTIONS.get(action, f"{action.value} 액션을 실행합니다.")
-    if action in CHALLENGE_CHECK_ACTIONS:
+    if action is CHALLENGE_NOTE_HOME:
         text += CHALLENGE_NOTE
+    elif action in CHALLENGE_CHECK_ACTIONS:
+        text += CHALLENGE_REF
     return text
 
 
