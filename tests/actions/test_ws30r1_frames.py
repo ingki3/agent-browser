@@ -205,6 +205,39 @@ async def test_frame_type_value_rejected_with_top_change_is_failure():
     assert r.error_code is ErrorCode.TIMEOUT
 
 
+#: 값을 지우고 **강한 신호**(다이얼로그 / 최상위 해시 이동)를 남긴다 — 자발 변화 판정(BLOCKING-4)을
+#: 거치지 않는 신호라, 기대값 가드(has_expected) 자체를 시험한다(V5).
+V5_STRONG = {
+    "dialog": "alert('입력 알림')",
+    "top_url": "parent.location.hash='typed'",
+}
+
+
+@requires_chromium
+@pytest.mark.parametrize("kind", sorted(V5_STRONG))
+async def test_frame_type_value_rejected_with_strong_outside_signal_is_failure(kind):
+    from playwright.async_api import async_playwright
+
+    html = (
+        "<p id=msg>대기</p><iframe id=f srcdoc=\"<input id=q aria-label=&quot;거부 입력&quot; "
+        f"oninput=&quot;this.value=''; {V5_STRONG[kind]}&quot;>\"></iframe>"
+    )
+    async with async_playwright() as pw:
+        browser, page, engine, d = await _setup(pw, html=html)
+        await d.dispatch(ActionType.SWITCH_FRAME, {"frame_selector": "#f"})
+        eid = await _eid(d, "거부 입력")
+        r = await d.dispatch(ActionType.TYPE_TEXT,
+                             {"element_id": eid, "epoch": engine.epoch, "text": "abc"})
+        top_url = page.url
+        await browser.close()
+    if kind == "top_url":
+        assert top_url.endswith("#typed"), "전제: 최상위 URL 이 실제로 바뀌었다"
+    else:
+        assert r.data.get("dialogs"), "전제: 다이얼로그가 실제로 떴다"
+    assert not r.success, r.data.get("signals")
+    assert r.error_code is ErrorCode.TIMEOUT
+
+
 # ------------------------------------------------------------------ BLOCKING-5
 
 def _frame_search_pages() -> None:

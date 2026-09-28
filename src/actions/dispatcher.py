@@ -280,6 +280,11 @@ def _has_expected_state(action: ActionType, params: Dict[str, Any]) -> bool:
     )
 
 
+#: 최상위 변화 기록기를 다시 시작하지 않는 읽기 전용 액션(R1 BLOCKING-4 기준선 유지).
+_TOP_RECORDER_KEEP_ACTIONS = frozenset({
+    ActionType.OBSERVE_PAGE, ActionType.TAKE_SCREENSHOT, ActionType.EXTRACT, ActionType.WAIT_FOR,
+})
+
 #: 최상위 문서 전후 비교에서 자발 변화와 섞이지 않는 강한 효과 신호(R1 BLOCKING-4).
 _TOP_STRONG_SIGNALS = ("url_changed", "new_tab")
 
@@ -469,7 +474,8 @@ _TOP_RECORDER_READ_JS = """
     act++;
     if (outside) spont++; else effect++;
   }
-  return { act: act, spontaneous: spont, effect: effect, overflow: r.overflow };
+  return { act: act, spontaneous: spont, effect: effect, overflow: r.overflow,
+           baseline_ms: Math.round(start - r.armed), post_ms: Math.round(performance.now() - args.end) };
 }
 """
 
@@ -898,8 +904,10 @@ class ActionDispatcher:
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"{type(exc).__name__}: {exc}",
             )
-        if self.ctx.root_page is not None:
+        if self.ctx.root_page is not None and action not in _TOP_RECORDER_KEEP_ACTIONS:
             # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
+            # 읽기 전용 액션(관찰·추출·스크린샷·대기)은 기준선을 끊지 않는다 — 에이전트는 보통
+            # observe → click 순서라, 관찰마다 다시 시작하면 기준선이 그 사이 몇 ms 로 줄어든다.
             await self._arm_top_recorder()
         if self._top_attribution is not None:
             result.data.setdefault("top_change_attribution", self._top_attribution)
@@ -1204,8 +1212,9 @@ class ActionDispatcher:
 
         기록기(MutationObserver)로 노드별 변화 시각을 본다. 액션 창(시작~지금)에 바뀐 노드 중
         기준선(직전 액션 뒤 대기 시간)이나 사후 창(TOP_SPONTANEOUS_WINDOW_MS)에서도 바뀐 노드는
-        자발 변화다. 액션 창에서만 바뀐 노드가 하나라도 있어야 효과로 인정한다. 기록을 못
-        읽거나 넘치면 인정하지 않는다(판정 불가 → 효과 없음).
+        자발 변화다. 액션 창에서만 바뀐 노드가 하나라도 있어야 효과로 인정한다. 사후 창은
+        기준선이 창보다 짧을 때만 기다린다. 기록을 못 읽거나 넘치면 인정하지 않는다(판정 불가 →
+        효과 없음).
         """
         effect = self._top_effect_signals(root_before, root_after, weak_ok=True)
         if not effect:
@@ -1213,10 +1222,18 @@ class ActionDispatcher:
         root = self.ctx.root_page
         try:
             end = await root.evaluate("performance.now()")
-            await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
-            read = await root.evaluate(
-                _TOP_RECORDER_READ_JS, {"start": self._top_start, "end": end}
-            )
+            args = {"start": self._top_start, "end": end}
+            read = await root.evaluate(_TOP_RECORDER_READ_JS, args)
+            if (
+                isinstance(read, dict)
+                and int(read.get("effect") or 0) > 0
+                and int(read.get("baseline_ms") or 0) < TOP_SPONTANEOUS_WINDOW_MS
+            ):
+                # 기준선(액션 사이 대기)이 관찰 창보다 짧다 — 그 주기보다 느린 자발 변화를 기준선이
+                # 못 봤을 수 있으니 사후 창만큼 더 본다. 기준선이 충분히 길면(에이전트가 생각한
+                # 시간) 그 안에 한 번도 안 바뀐 노드는 주기 ≤ 창인 자발 변화가 아니다 — 대기 없음.
+                await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
+                read = await root.evaluate(_TOP_RECORDER_READ_JS, args)
         except Exception:  # noqa: BLE001
             return False
         self._top_attribution = read if isinstance(read, dict) else None
@@ -1331,8 +1348,10 @@ class ActionDispatcher:
             # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
             # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
             # 효과가 이미 있으면 기다리지 않는다(정상 경로 지연 0).
+            # 최상위의 약한 변화(text/dom)도 여기서는 "무언가 있음"으로 본다 — 그 경우 아래의
+            # 자발 변화 관찰 창(TOP_SPONTANEOUS_WINDOW_MS)이 이 유예 대기를 겸한다(이중 대기 방지).
             if not verify_post_condition(before, after).satisfied and not (
-                self._effect_beyond_target(root_before, root_after)
+                self._effect_beyond_target(root_before, root_after, weak_ok=True)
             ):
                 try:
                     await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
@@ -1383,6 +1402,19 @@ class ActionDispatcher:
         ):
             # 프레임 안 액션이 최상위에 약한 변화만 남겼다 — 자발 변화인지 가린다(이때만 비용).
             top_weak_ok = await self._top_change_attributable(root_before, root_after)
+            if not top_weak_ok and self._top_attribution is not None:
+                # 관찰 창이 유예 대기를 겸했다 — 대상 문서의 늦은 효과를 다시 본다.
+                try:
+                    after = await capture_state(self.ctx.page, handle)
+                    post = verify_post_condition(
+                        before,
+                        after,
+                        expected_value=None,
+                        expected_checked=None,
+                        conceal_value=bool(params.get(_CONCEAL_KEY)),
+                    )
+                except Exception:  # noqa: BLE001 — 컨텍스트 교체 중
+                    pass
         post = self._with_outside_effects(
             action, params, post, root_before, root_after, top_weak_ok
         )
