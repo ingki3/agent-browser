@@ -500,6 +500,10 @@ def test_content_text_precedes_title_in_name_computation(name, path):
     if not path.exists():
         pytest.skip(f"{path} 없음")
     src = path.read_text(encoding="utf-8")
+    if name != "sanitizer" and "__ACCESSIBLE_NAME__" in src:
+        # WS-30b: 사본 대신 sanitizer.ACCESSIBLE_NAME_JS 를 끼워 넣는다 — 순서는 sanitizer 판정과 같다.
+        assert "ACCESSIBLE_NAME_JS" in src and "accessibleName(el)" in src, name
+        return
     title_pos = src.find("getAttribute('title')")
     if title_pos < 0:
         pytest.skip("title 폴백 없음")

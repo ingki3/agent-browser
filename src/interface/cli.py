@@ -2,7 +2,7 @@
 
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
-                          [--nav-settle {on,off}]
+                          [--nav-settle {on,off}] [--max-result-chars N]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -101,6 +101,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "이동 뒤 새 문서 확인은 부르는 쪽이 wait_for/observe_page 로 해야 함."
         ),
     )
+    serve.add_argument(
+        "--max-result-chars",
+        type=_max_result_chars,
+        default=None,
+        metavar="N",
+        help=(
+            "observe_page·extract 응답 크기 상한(글자, 기본 20000 — Claude Code MCP 결과 한도 "
+            "25,000토큰, 한글 1자≈1토큰 기준). 넘으면 항목 경계에서 자르고 data.truncated 로 알림."
+        ),
+    )
 
     # --- tui ---
     tui = sub.add_parser("tui", help="Textual 대시보드를 실행합니다.")
@@ -194,6 +204,25 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _default_max_result_chars() -> int:
+    from interface.mcp_server import DEFAULT_MAX_RESULT_CHARS
+
+    return DEFAULT_MAX_RESULT_CHARS
+
+
+def _max_result_chars(raw: str) -> int:
+    """serve --max-result-chars 값(정수, 하한 MIN_MAX_RESULT_CHARS)."""
+    from interface.mcp_server import MIN_MAX_RESULT_CHARS
+
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"정수가 아닙니다: {raw}") from exc
+    if value < MIN_MAX_RESULT_CHARS:
+        raise argparse.ArgumentTypeError(f"{MIN_MAX_RESULT_CHARS} 이상이어야 합니다: {value}")
+    return value
+
+
 def _cmd_tools(as_json: bool) -> int:
     from interface.mcp_server import build_all_tools
 
@@ -228,6 +257,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 ),
                 keep_open=bool(args.keep_open),
                 nav_settle=args.nav_settle == "on",
+                max_result_chars=(
+                    args.max_result_chars
+                    if args.max_result_chars is not None
+                    else _default_max_result_chars()
+                ),
             )
         )
     except KeyboardInterrupt:

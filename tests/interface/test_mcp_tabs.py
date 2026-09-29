@@ -213,7 +213,7 @@ async def test_top_level_captcha_detected_inside_normal_iframe(site):
         assert sw.success is True, sw.error_message
         obs = await _call(server, ActionType.OBSERVE_PAGE, {})
     assert obs.data["challenge"]["kind"] == "captcha"
-    assert obs.data["challenge"]["vendor"] == "naver"
+    assert obs.data["challenge"]["vendor"] == "generic"  # WS-30b: 로컬 목업(도메인 불일치)
 
 
 @requires_chromium

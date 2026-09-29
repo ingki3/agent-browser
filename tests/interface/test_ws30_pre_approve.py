@@ -176,7 +176,8 @@ async def test_real_serve_pre_approve_specific_name(pay_site):
     out = await _serve_session(pay_site, ["--pre-approve", "click:결제 A"], ["결제 A", "결제 B"])
     a, b = out["결제 A"], out["결제 B"]
     assert a["success"], a
-    assert a["error_code"] is None
+    # WS-30b: 빠진 필드 = 계약 기본값(null) — 성공 봉투에는 error_code 가 없다.
+    assert a.get("error_code") is None
     # 다른 이름은 여전히 차단된다.
     assert not b["success"]
     assert b["error_code"] == ErrorCode.HITL_UNATTENDED_BLOCKED.value

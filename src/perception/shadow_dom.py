@@ -19,6 +19,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from perception.sanitizer import ACCESSIBLE_NAME_JS
+
 logger = logging.getLogger(__name__)
 
 #: shadow 내부 요소에서 사용 가능한 자가 치유 전략 (XPath 제외)
@@ -67,15 +69,10 @@ function() {
            : 'textbox';
     } else role = 'generic';
   }
-  // W3C accname 순서: aria-label > 콘텐츠 텍스트 > placeholder > title.
-  // sanitizer / verification과 동일 규칙을 유지해야 한다. 세 곳이
-  // 갈라지면 관찰 이름과 검증 이름이 불일치해 TOCTOU 오탐이 난다.
-  const ariaName = el.getAttribute('aria-label');
-  const textName = (el.innerText || el.textContent || '').trim();
-  const name = (ariaName && ariaName.trim() ? ariaName
-                : textName ? textName
-                : (el.getAttribute('placeholder') ||
-                   el.getAttribute('title') || '')).trim().slice(0, 200);
+  // 이름은 관찰 엔진과 같은 규칙(perception.sanitizer.ACCESSIBLE_NAME_JS)을 끼워 넣어 쓴다
+  // (WS-30b — 사본이 갈라지면 관찰·검증 이름이 달라 TOCTOU 오탐, open/closed shadow 중복 제거 실패).
+  __ACCESSIBLE_NAME__
+  const name = String(accessibleName(el) || '');
   return {
     tag: tag,
     role: String(role).toLowerCase(),
@@ -89,7 +86,7 @@ function() {
             width: Math.round(r.width), height: Math.round(r.height) }
   };
 }
-"""
+""".replace("__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip())
 
 
 @dataclass

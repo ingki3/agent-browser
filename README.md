@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1181개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1307개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -259,6 +259,10 @@ browser_navigate          URL 이동
 
 `observe_page`가 반환하는 `element_id`와 `epoch`을 액션에 그대로 넘깁니다.
 
+응답 형식: 응답(`ActionResult` JSON)에서 **빠진 필드는 계약 기본값**입니다(`healed=false`, `downloaded_path`·`popup_tab_id`·`error_code`·`error_message`=`null`, `data`=`{}`, 관찰 요소의 `value`=`null`·`is_shadow`=`false`). `success`·`action`·`current_url`·`snapshot_epoch`·`tab_id`·`retry_safe`·`reobserve_required`는 항상 있고, 실패면 `error_code`·`error_message`도 있습니다. `data` 안의 `null`은 그대로 싣습니다(`data.challenge: null` = 차단 없음). 계약 모델(`ActionResult.model_validate`)로 다시 읽으면 빠짐없는 결과와 같은 객체입니다.
+
+결과 크기 상한: `observe_page`·`extract` 응답이 `serve --max-result-chars`(기본 20,000자)를 넘으면 **항목 경계**(관찰 요소는 점수 순, 추출 행은 문서 순 앞쪽)에서 잘라 싣고 `data.truncated`에 `total_items`·`returned_items`·`total_chars`·`returned_chars`·`hint`를 붙입니다. 기본값 근거: Claude Code 는 MCP 도구 결과가 25,000 토큰을 넘으면 결과를 통째로 버리고, 한글 본문은 1자 ≈ 1토큰(cl100k 실측 0.97)이라 2만 자면 여유가 있습니다(비교 시험에서 `observe_page(force_full_tree)` 143,456자·`extract` 58,620자가 버려졌습니다). 추출 항목 **하나**가 이미 상한을 넘으면 그 항목의 `text`만 글자 묶음(이모지·결합 문자) 경계, 가능하면 공백에서 자르고 `text_truncated: true`·`text_chars`(원래 글자 수), `data.truncated.item_text_truncated: true`를 붙입니다. 더 보려면 `extract`의 `selector`를 좁히거나 `observe_page`의 `prune_top_n`을 쓰십시오.
+
 ```
 observe_page  ->  @e3 (button "로그인"), epoch=0
 click         ->  element_id="@e3", epoch=0
@@ -271,13 +275,15 @@ click         ->  element_id="@e3", epoch=0
 요소 액션의 성공 판정(사후조건)은 대상 문서의 변화 외에 다음도 효과로 봅니다: 새 메인 문서 커밋(`signals`에 `navigated: …`, 예: `type_text(press_enter)`로 폼이 결과 페이지로 감), `switch_frame`으로 들어간 프레임 안 액션이 바꾼 최상위 문서(`top:…`)나 연 새 탭, 네이티브 다이얼로그(`dialog_opened:<type>`, `data.dialogs`에 종류·문구·`accepted`/`dismissed`). 아무 변화도 없는 클릭은 여전히 `E_TIMEOUT`입니다. `handle_dialog`를 먼저 부르지 않은 다이얼로그는 거절됩니다(beforeunload 는 수락). 다이얼로그는 원인을 가리지 않습니다 — 액션 중(대기 창 포함) 뜬 다이얼로그는 무관한 타이머가 띄운 것이어도 효과로 기록됩니다(`data.dialogs`의 문구로 확인하십시오).
 프레임 안 액션에서 최상위 문서의 본문·노드 변화(`top:text_changed`·`top:dom_delta`)는 최상위가 스스로 바뀌지 않은 부분에서 일어났을 때만 효과로 인정합니다. 최상위의 변화 시각을 노드별로 기록해, 직전 액션 뒤 대기 동안(관찰·추출·스크린샷·대기 액션은 기록을 끊지 않음)이나 액션 뒤 관찰 창에서도 바뀐 노드(시계·광고 로테이션)는 자발 변화로 뺍니다(`data.top_change_attribution`). 관찰 창(0.3초)은 직전 액션과의 간격이 0.3초보다 짧을 때만 기다립니다 — 그런 연속 액션에서만 약 0.3초 느려집니다. 자발 변화와 같은 노드를 바꾼 효과는 인정하지 않아 `E_TIMEOUT`이 될 수 있습니다(거짓 성공보다 거짓 실패 쪽). `top:url_changed`·새 탭은 그대로 인정합니다. 프레임 안에서 `type_text(press_enter)`·`press_key`로 **그 프레임 문서**가 이동해도 `navigated: …`로 인정하고 `data.nav_frame="current_frame"`을 붙입니다. `--nav-settle off`면 이동 대기가 없으므로 `navigated:` 신호도 붙지 않아, 폼 이동 뒤 입력값 비교가 새 문서에서 이루어져 `E_TIMEOUT`이 올 수 있습니다 — 이때는 `observe_page`로 확인하십시오.
 
+`scroll` 결과 `data`에는 요청량 `scrolled` 외에 실제 세로 이동량 `scrolled_px`(위로는 음수)가 붙고, 움직이지 않았으면(이미 끝이거나 창 스크롤이 없는 페이지) `no_effect: true`와 `hint`가 붙습니다. 성공 판정과 `reobserve_required`(문서 높이 변화) 규칙은 그대로입니다.
+
 `switch_frame`의 `frame_selector`는 지금 들어가 있는 프레임 기준으로 먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다. 그래서 깊은 프레임에서 현재 프레임에 없는 셀렉터를 주면 "없음"이 아니라 최상위 기준으로 찾은 더 얕은 프레임으로 되돌아갈 수 있습니다 — 결과의 `resolved_from`(`current_frame`/`root`)과 `frame_depth`로 확인하십시오. 결과 `data`에 `frame_url`·`frame_depth`·`frame_path`·`child_frames`(`selector_hint`, `url`)가 붙고, 못 찾으면 현재 프레임 URL과 그 안의 iframe 목록을 돌려줍니다. 최상위로 돌아가려면 `{"to_main": true}`만 보냅니다. 프레임 안의 `take_screenshot`은 최상위 페이지를 찍고 `data.frame_bbox`에 프레임 영역을 싣습니다.
 
 ### 차단·캡차 신호
 
 `navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
 
-- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다.
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다. 사이트 고유 문구(네이버 "보안 확인을 완료해 주세요" 등)로 잡은 경우 `vendor`는 페이지 주소가 그 사이트 도메인일 때만 채우고, 아니면 `generic`입니다(`kind`·`reason`은 같음). Cloudflare·Akamai 같은 앞단 화면은 도메인과 무관하게 그 벤더입니다.
 - `data.last_http_status` — 판정한 탭이 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태(다른 탭·팝업의 응답은 섞이지 않음). 아직 없으면 `null`. 차단 판정에는 지금 주소가 그 응답 주소와 같을 때만 씁니다(`#…`만 다르면 같은 문서) — 403 뒤 `history.pushState`로 주소를 바꾼 화면은 상태코드로 막힘 판정하지 않습니다.
 
 한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.

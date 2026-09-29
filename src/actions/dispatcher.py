@@ -89,6 +89,16 @@ _SCROLL_HEIGHT_JS = (
     "(() => { const el = document.scrollingElement || document.documentElement;"
     " return el ? el.scrollHeight : 0; })()"
 )
+#: 문서 높이 + 세로 스크롤 위치(WS-30b: 스크롤이 실제로 움직였는지).
+_SCROLL_STATE_JS = (
+    "(() => { const el = document.scrollingElement || document.documentElement;"
+    " return [el ? el.scrollHeight : 0, Math.round(window.scrollY || (el ? el.scrollTop : 0) || 0)]; })()"
+)
+#: 스크롤이 움직이지 않았을 때 결과 data.hint (정보만 — 성공 판정은 그대로).
+SCROLL_NO_EFFECT_HINT = (
+    "스크롤 위치가 바뀌지 않았습니다(이미 끝이거나 이 페이지는 창 스크롤이 없음). "
+    "새 항목이 필요하면 '더 보기' 버튼 등을 observe_page 로 찾으세요."
+)
 
 #: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
 #: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
@@ -819,13 +829,28 @@ class ActionDispatcher:
         return info
 
     @staticmethod
-    async def _scroll_once(page: Any, delta: int) -> bool:
-        """한 번 스크롤하고 문서 높이가 바뀌었는지(동적 로드) 돌려준다."""
-        before_height = await page.evaluate(_SCROLL_HEIGHT_JS)
+    async def _scroll_once(page: Any, delta: int) -> Tuple[bool, Optional[int]]:
+        """한 번 스크롤하고 (문서 높이가 바뀌었는지(동적 로드), 실제 세로 이동 px) 를 돌려준다.
+
+        WS-30b: 높이만 보면 스크롤이 전혀 안 되는 페이지(본문이 창보다 짧음)도 성공으로만 보였다 —
+        scrollY 전후 차이를 함께 돌려준다(부호 있음, 위로는 음수). 위치를 읽지 못하면 None
+        (이동 없음이라고 주장하지 않는다).
+        """
+
+        def _state(v: Any) -> Tuple[Any, Optional[int]]:
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                try:
+                    return v[0], int(v[1])
+                except (TypeError, ValueError):
+                    return v[0], None
+            return v, None
+
+        before_height, before_y = _state(await page.evaluate(_SCROLL_STATE_JS))
         await page.evaluate(f"window.scrollBy(0, {delta})")
         await page.wait_for_timeout(150)
-        after_height = await page.evaluate(_SCROLL_HEIGHT_JS)
-        return after_height != before_height
+        after_height, after_y = _state(await page.evaluate(_SCROLL_STATE_JS))
+        moved = None if before_y is None or after_y is None else after_y - before_y
+        return after_height != before_height, moved
 
     def _current_url(self) -> str:
         try:
@@ -1687,7 +1712,7 @@ class ActionDispatcher:
             distance = params.get("distance", 500)
             delta = distance if params.get("direction", "down") == "down" else -distance
             try:
-                changed = await self._scroll_once(page, delta)
+                changed, moved = await self._scroll_once(page, delta)
             except Exception as exc:  # noqa: BLE001
                 # WS-24 F1: 검색 제출 직후처럼 스크롤 중 문서가 바뀌면 Playwright 가
                 # "Execution context was destroyed" 를 던진다(로컬 재현). 이 경우만
@@ -1701,13 +1726,20 @@ class ActionDispatcher:
                     )
                 except Exception:  # noqa: BLE001 - 대기 실패는 재시도 결과로 판정
                     pass
-                await self._scroll_once(page, delta)
+                _, moved = await self._scroll_once(page, delta)
                 changed = True
+            data: Dict[str, Any] = {"scrolled": delta}
+            if moved is not None:
+                data["scrolled_px"] = moved
+            if moved == 0:
+                # WS-30b: 정보만 추가 — 성공 판정·reobserve_required 규칙은 그대로다.
+                data["no_effect"] = True
+                data["hint"] = SCROLL_NO_EFFECT_HINT
             return self._result(
                 success=True,
                 action=action,
                 retry_safe=True,
-                data={"scrolled": delta},
+                data=data,
                 # 동적 노드가 로드되었거나 문서가 바뀌었으면 재관찰이 필요하다.
                 reobserve_required=changed,
             )
