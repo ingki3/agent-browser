@@ -87,8 +87,9 @@ async def test_navigate_403_short_body_is_blocked(site):
 async def test_naver_security_check_phrase_is_captcha(site):
     async with BrowserMCPServer() as server:
         r = await _nav(server, site + "/naver")
+    # WS-30b: 로컬(127.0.0.1) 목업이라 vendor 는 generic — 문구만으로 네이버라 단정하지 않는다.
     assert r.data["challenge"] == {
-        "kind": "captcha", "vendor": "naver", "reason": "네이버 보안 확인 화면",
+        "kind": "captcha", "vendor": "generic", "reason": "네이버 보안 확인 화면",
     }
     assert r.data["last_http_status"] == 200
 
@@ -284,14 +285,22 @@ def test_challenge_check_actions_list_is_exact():
 
 
 def test_target_tool_descriptions_mention_challenge():
+    """대상 툴 11개는 모두 data.challenge 를 보라고 말한다(WS-30b: 전문은 navigate 한 곳,
+    나머지는 '사람에게' 가 든 짧은 참조) — 대상이 아닌 툴은 말하지 않는다."""
     for spec in mcp_server.build_all_tools():
         action = mcp_server.action_from_tool(spec["name"])
         has = "data.challenge" in spec["description"]
         assert has is (action in CHALLENGE_CHECK_ACTIONS), spec["name"]
+        if has:
+            assert "사람에게" in spec["description"], spec["name"]
 
 
 def test_input_schemas_unchanged_by_challenge_note():
+    """설명 문구는 입력 스키마를 바꾸지 않는다 — 스키마는 계약 모델에서만 나온다
+    (WS-30b: 서버 경계 정리 compact_schema 를 거친 것과 같다)."""
     from contracts import ACTION_INPUT_MAP
 
     for action, model in ACTION_INPUT_MAP.items():
-        assert mcp_server.build_tool_schema(action)["inputSchema"] == model.model_json_schema()
+        assert mcp_server.build_tool_schema(action)["inputSchema"] == mcp_server.compact_schema(
+            model.model_json_schema()
+        )

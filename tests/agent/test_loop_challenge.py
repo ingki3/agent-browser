@@ -131,7 +131,7 @@ async def test_handler_resolves_then_loop_continues(monkeypatch):
         return on_challenge
 
     run = await _run(monkeypatch, html=BLOCKED, chat=chat, on_challenge=make)
-    assert len(seen) == 1 and seen[0].kind.value == "blocked" and seen[0].vendor == "naver"
+    assert len(seen) == 1 and seen[0].kind.value == "blocked" and seen[0].vendor == "generic"  # WS-30b: set_content(도메인 아님)
     assert run.completed, run.terminal_reason
     assert chat.calls == 1
     assert run.challenge == "blocked", "인계가 있었다는 기록은 남는다"

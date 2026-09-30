@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1080개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1307개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -230,6 +230,13 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 `off` 는 이 대기를 끕니다. 액션을 많이 보내고 이동 여부를 스스로 판단하는 에이전트가 속도를 원할 때 씁니다(로컬 실측: 이동 없는 click p50 약 219ms → 26ms).
 `off` 면 결과가 떠나는 중인 옛 문서 기준일 수 있고 `data` 에 `nav_wait_ms` 등 대기 키가 붙지 않습니다 — 이동 뒤 `wait_for`(`selector`·`network_idle`·`spa_route`)나 `observe_page` 로 새 문서를 확인할 책임이 호출자에게 있습니다(`stabilize` 는 옛 문서에서 곧바로 만족되므로 이 용도에 맞지 않습니다). 이동이 실제로 성공해도 그 액션 결과가 `E_TIMEOUT`·`E_PAGE_CRASHED` 로 올 수 있고, 그 결과의 `data.challenge`·`last_http_status` 도 옛 문서 기준입니다 — `reobserve_required` 면 다시 관찰해 판단하십시오. `run` 명령은 항상 `on` 입니다.
 
+### 고위험 액션 허용 (`serve --pre-approve`, `--mode`)
+
+무인 모드(기본)에서는 결제·주문·삭제·동의 같은 이름의 클릭, 폼 제출(`type_text(press_enter)`, 폼 안 입력칸에서 `press_key("Enter")`, 한 줄 입력칸에 줄바꿈 입력), 업로드·다운로드를 `E_HITL_UNATTENDED_BLOCKED`로 막습니다. 운영자가 서버를 띄울 때 `--pre-approve <액션>:<요소 이름>`(반복 가능, 예: `--pre-approve "click:결제 진행"`) 또는 `<액션>:*`로 미리 허용합니다. 차단 결과의 `data.pre_approve_hint`는 그 액션을 여는 값이고, 메시지 끝에 운영자용 안내가 붙습니다. `--mode interactive`는 차단 대신 승인 요청(`data.dialog`)을 돌려줍니다.
+`click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다. 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
+`press_key`의 Enter·Space는 키가 실제로 가는 요소(최상위 문서부터 포커스를 따라 iframe·shadow 안까지)로 판정합니다. Chromium 실측으로 Enter가 폼을 제출하는 포커스 대상 — 폼 안 한 줄 입력칸(text·search·email·number·password·tel·url·date·time·datetime-local·month·week), checkbox·radio·range, `<select>`, 제출 버튼(`<button>`·`input[type=submit|image]`, Space 포함) — 은 모두 폼 제출로 막습니다. 다른 출처 iframe 안 포커스는 포커스를 가진 프레임 사슬이 하나로 확정될 때 그 프레임 안에서 읽고, 포커스를 읽을 수 없거나 사슬을 확정할 수 없거나 폼 안의 알 수 없는 요소(사용자 정의 요소)면 판정 불가로 막습니다.
+`download_file`의 `save_dir`는 절대 경로여야 합니다. 상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없으므로 `E_DOWNLOAD_FAILED`로 거부하고, 절대 경로의 `..`·심볼릭 링크는 정규화한 경로에 저장합니다(`downloaded_path`).
+
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
 
 연동이 되는지 미리 확인하려면 다음을 실행하십시오. 실제 MCP 클라이언트 세션으로 `initialize → tools/list → tools/call` 왕복을 검증합니다.
@@ -252,6 +259,10 @@ browser_navigate          URL 이동
 
 `observe_page`가 반환하는 `element_id`와 `epoch`을 액션에 그대로 넘깁니다.
 
+응답 형식: 응답(`ActionResult` JSON)에서 **빠진 필드는 계약 기본값**입니다(`healed=false`, `downloaded_path`·`popup_tab_id`·`error_code`·`error_message`=`null`, `data`=`{}`, 관찰 요소의 `value`=`null`·`is_shadow`=`false`). `success`·`action`·`current_url`·`snapshot_epoch`·`tab_id`·`retry_safe`·`reobserve_required`는 항상 있고, 실패면 `error_code`·`error_message`도 있습니다. `data` 안의 `null`은 그대로 싣습니다(`data.challenge: null` = 차단 없음). 계약 모델(`ActionResult.model_validate`)로 다시 읽으면 빠짐없는 결과와 같은 객체입니다.
+
+결과 크기 상한: `observe_page`·`extract` 응답이 `serve --max-result-chars`(기본 20,000자)를 넘으면 **항목 경계**(관찰 요소는 점수 순, 추출 행은 문서 순 앞쪽)에서 잘라 싣고 `data.truncated`에 `total_items`·`returned_items`·`total_chars`·`returned_chars`·`hint`를 붙입니다. 기본값 근거: Claude Code 는 MCP 도구 결과가 25,000 토큰을 넘으면 결과를 통째로 버리고, 한글 본문은 1자 ≈ 1토큰(cl100k 실측 0.97)이라 2만 자면 여유가 있습니다(비교 시험에서 `observe_page(force_full_tree)` 143,456자·`extract` 58,620자가 버려졌습니다). 추출 항목 **하나**가 이미 상한을 넘으면 그 항목의 `text`만 글자 묶음(이모지·결합 문자) 경계, 가능하면 공백에서 자르고 `text_truncated: true`·`text_chars`(원래 글자 수), `data.truncated.item_text_truncated: true`를 붙입니다. 더 보려면 `extract`의 `selector`를 좁히거나 `observe_page`의 `prune_top_n`을 쓰십시오.
+
 ```
 observe_page  ->  @e3 (button "로그인"), epoch=0
 click         ->  element_id="@e3", epoch=0
@@ -261,11 +272,18 @@ click         ->  element_id="@e3", epoch=0
 
 `click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
 
+요소 액션의 성공 판정(사후조건)은 대상 문서의 변화 외에 다음도 효과로 봅니다: 새 메인 문서 커밋(`signals`에 `navigated: …`, 예: `type_text(press_enter)`로 폼이 결과 페이지로 감), `switch_frame`으로 들어간 프레임 안 액션이 바꾼 최상위 문서(`top:…`)나 연 새 탭, 네이티브 다이얼로그(`dialog_opened:<type>`, `data.dialogs`에 종류·문구·`accepted`/`dismissed`). 아무 변화도 없는 클릭은 여전히 `E_TIMEOUT`입니다. `handle_dialog`를 먼저 부르지 않은 다이얼로그는 거절됩니다(beforeunload 는 수락). 다이얼로그는 원인을 가리지 않습니다 — 액션 중(대기 창 포함) 뜬 다이얼로그는 무관한 타이머가 띄운 것이어도 효과로 기록됩니다(`data.dialogs`의 문구로 확인하십시오).
+프레임 안 액션에서 최상위 문서의 본문·노드 변화(`top:text_changed`·`top:dom_delta`)는 최상위가 스스로 바뀌지 않은 부분에서 일어났을 때만 효과로 인정합니다. 최상위의 변화 시각을 노드별로 기록해, 직전 액션 뒤 대기 동안(관찰·추출·스크린샷·대기 액션은 기록을 끊지 않음)이나 액션 뒤 관찰 창에서도 바뀐 노드(시계·광고 로테이션)는 자발 변화로 뺍니다(`data.top_change_attribution`). 관찰 창(0.3초)은 직전 액션과의 간격이 0.3초보다 짧을 때만 기다립니다 — 그런 연속 액션에서만 약 0.3초 느려집니다. 자발 변화와 같은 노드를 바꾼 효과는 인정하지 않아 `E_TIMEOUT`이 될 수 있습니다(거짓 성공보다 거짓 실패 쪽). `top:url_changed`·새 탭은 그대로 인정합니다. 프레임 안에서 `type_text(press_enter)`·`press_key`로 **그 프레임 문서**가 이동해도 `navigated: …`로 인정하고 `data.nav_frame="current_frame"`을 붙입니다. `--nav-settle off`면 이동 대기가 없으므로 `navigated:` 신호도 붙지 않아, 폼 이동 뒤 입력값 비교가 새 문서에서 이루어져 `E_TIMEOUT`이 올 수 있습니다 — 이때는 `observe_page`로 확인하십시오.
+
+`scroll` 결과 `data`에는 요청량 `scrolled` 외에 실제 세로 이동량 `scrolled_px`(위로는 음수)가 붙고, 움직이지 않았으면(이미 끝이거나 창 스크롤이 없는 페이지) `no_effect: true`와 `hint`가 붙습니다. 성공 판정과 `reobserve_required`(문서 높이 변화) 규칙은 그대로입니다.
+
+`switch_frame`의 `frame_selector`는 지금 들어가 있는 프레임 기준으로 먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다. 그래서 깊은 프레임에서 현재 프레임에 없는 셀렉터를 주면 "없음"이 아니라 최상위 기준으로 찾은 더 얕은 프레임으로 되돌아갈 수 있습니다 — 결과의 `resolved_from`(`current_frame`/`root`)과 `frame_depth`로 확인하십시오. 결과 `data`에 `frame_url`·`frame_depth`·`frame_path`·`child_frames`(`selector_hint`, `url`)가 붙고, 못 찾으면 현재 프레임 URL과 그 안의 iframe 목록을 돌려줍니다. 최상위로 돌아가려면 `{"to_main": true}`만 보냅니다. 프레임 안의 `take_screenshot`은 최상위 페이지를 찍고 `data.frame_bbox`에 프레임 영역을 싣습니다.
+
 ### 차단·캡차 신호
 
 `navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
 
-- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다.
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다. 사이트 고유 문구(네이버 "보안 확인을 완료해 주세요" 등)로 잡은 경우 `vendor`는 페이지 주소가 그 사이트 도메인일 때만 채우고, 아니면 `generic`입니다(`kind`·`reason`은 같음). Cloudflare·Akamai 같은 앞단 화면은 도메인과 무관하게 그 벤더입니다.
 - `data.last_http_status` — 판정한 탭이 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태(다른 탭·팝업의 응답은 섞이지 않음). 아직 없으면 `null`. 차단 판정에는 지금 주소가 그 응답 주소와 같을 때만 씁니다(`#…`만 다르면 같은 문서) — 403 뒤 `history.pushState`로 주소를 바꾼 화면은 상태코드로 막힘 판정하지 않습니다.
 
 한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.
