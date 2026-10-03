@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1307개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1477개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -235,6 +235,27 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 무인 모드(기본)에서는 결제·주문·삭제·동의 같은 이름의 클릭, 폼 제출(`type_text(press_enter)`, 폼 안 입력칸에서 `press_key("Enter")`, 한 줄 입력칸에 줄바꿈 입력), 업로드·다운로드를 `E_HITL_UNATTENDED_BLOCKED`로 막습니다. 운영자가 서버를 띄울 때 `--pre-approve <액션>:<요소 이름>`(반복 가능, 예: `--pre-approve "click:결제 진행"`) 또는 `<액션>:*`로 미리 허용합니다. 차단 결과의 `data.pre_approve_hint`는 그 액션을 여는 값이고, 메시지 끝에 운영자용 안내가 붙습니다. `--mode interactive`는 차단 대신 승인 요청(`data.dialog`)을 돌려줍니다.
 `click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다. 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
 `press_key`의 Enter·Space는 키가 실제로 가는 요소(최상위 문서부터 포커스를 따라 iframe·shadow 안까지)로 판정합니다. Chromium 실측으로 Enter가 폼을 제출하는 포커스 대상 — 폼 안 한 줄 입력칸(text·search·email·number·password·tel·url·date·time·datetime-local·month·week), checkbox·radio·range, `<select>`, 제출 버튼(`<button>`·`input[type=submit|image]`, Space 포함) — 은 모두 폼 제출로 막습니다. 다른 출처 iframe 안 포커스는 포커스를 가진 프레임 사슬이 하나로 확정될 때 그 프레임 안에서 읽고, 포커스를 읽을 수 없거나 사슬을 확정할 수 없거나 폼 안의 알 수 없는 요소(사용자 정의 요소)면 판정 불가로 막습니다.
+
+**판정 근거 — 이름 + 문맥 신호.** 이름에 위험 단어가 없어도 아래 원천 중 하나에 있으면 고위험입니다. `element_id`·`selector`·좌표 클릭과 포커스 후 Enter/Space(요소를 누르는 경우)가 같은 판정 함수를 씁니다.
+
+| 원천(`source`) | 무엇을 보나 | 매칭 |
+| :--- | :--- | :--- |
+| `name` | 접근성 이름(관찰과 같은 규칙) | 부분 문자열 |
+| `text`·`aria` | 보이는 글자와 aria-label **둘 다**(aria '확인' + 보이는 '결제' 불일치 차단) | 부분 문자열 |
+| `title`·`child_title`·`alt`·`svg_title`·`child_aria`·`value` | title(대상 자신의 title 은 이름에 글자가 없을 때만 — 아이콘 버튼 `title=결제`는 차단, '저장' 버튼의 설명 문장은 무시), 자손 title·img alt·svg `<title>`·aria-label(신호를 가진 자손만 골라 400개까지 — 빈 요소를 앞에 끼워 피할 수 없음), 버튼 value | 부분 문자열 |
+| `pseudo` | CSS `::before`/`::after`의 `content` 글자(대상·앞 자손 20개 + 스타일시트에 글자 든 `content` 규칙이 걸린 자손) | 부분 문자열 |
+| `href` | 링크 목적지의 **마지막 경로 조각**과 값 전체가 키워드인 쿼리 값(`/account/delete`, `?action=delete`) — 조회 링크(`/order/123`, `?sort=order_date`)와 권한 명사(`/admin`, `grant`)는 막지 않음 | 단어 토큰 |
+| `form_action`·`formaction` | 제출 버튼의 `formaction`, 소속 폼(`form=` 포함)의 `action` 경로 전체 — GET 제출은 쿼리를 보지 않음(`/search?type=order` 통과, `/checkout` 차단) | 단어 토큰(`/payroll-info`는 pay 아님) |
+| `id`·`class`·`name_attr`·`testid` | id·class·name·data-testid 를 camelCase·kebab·snake 로 나눈 토큰(`btn-pay`, `deleteAccount`), 아이콘 클래스 사전(`fa-trash`, `bi-credit-card` … — 장바구니 아이콘은 '보기'가 흔해 제외) | 단어 토큰. `submit`·`confirm` 같은 폼 일반어는 제외(로그인 `btn-submit` 과차단 방지) |
+
+같은 출처로 이동하는 링크(`a[href]`, download·`#`·`javascript:` 아님)는 이동일 뿐 부작용이 아니므로 `id`·`class`·`name_attr`·`testid`·`title` 원천을 적용하지 않습니다(`fa-trash` '휴지통 보기' 링크 통과). 이름·보이는 글자·aria·alt·href 는 그대로 봅니다(`/account/delete` 링크는 차단).
+
+모든 텍스트는 NFKC 정규화, 보이지 않는 서식 문자(유니코드 범주 Cf 전체 — zero-width·방향 표시·soft hyphen 등)와 U+034F 제거, 공백 정리 뒤 매칭합니다(`결\u200b제`·`결\u200f제` → 결제). 차단 결과의 `data.gate_basis`(`{name, matched_keyword, source}`)와 메시지의 `출처 <source>`로 왜 막혔는지 알 수 있습니다. 판정할 수 없으면 `source: "unresolved"`입니다.
+
+**좌표 클릭(`click(x, y)`).** 게이트 전에 최상위 화면에서 그 좌표의 요소를 찾고(같은 출처 iframe·open shadow 안까지 따라 내려감), 클릭을 실제로 받는 상호작용 조상(button, 링크, 입력칸, `role=button|link|…`, label, summary, `[onclick]`, `[tabindex]`)의 이름·문맥으로 판정합니다. 사전 승인 값은 해석된 이름(`click:<이름>`, `data.pre_approve_hint`)입니다. 좌표에 요소가 없거나, 다른 출처 iframe 위이거나, closed shadow 위(안을 읽을 수 없음)이거나, 해석 중 오류가 나거나, 폼 안의 비상호작용 요소 위면 판정 불가로 막습니다. 캔버스처럼 상호작용 조상이 없고 폼 밖이며 위험 신호도 없는 곳은 통과시키고 결과 `data.gate_basis.coordinate_target: "non_interactive"`로 알립니다(Tier-2 SoM의 본래 용도).
+
+**남은 한계.** ① `select_option`·`check_box`가 `onchange`로 폼을 자동 제출하는 페이지는 미리 알 수 없어 이름 판정만 합니다. ② 캔버스에 그린 결제 버튼은 DOM 신호가 없어 좌표 클릭이 통과합니다. ③ 서버 쪽에서만 아는 위험(무해한 이름·경로의 API 가 실제로 결제)은 알 수 없습니다. ④ 키워드 사전 기반이라 '결제 내역'·'주문 목록'·'Remove filter' 같은 조회·UI 조작도 막힙니다 — 필요한 것은 `--pre-approve`로 엽니다. ⑤ 게이트 판정과 실제 클릭 사이의 DOM·JS 변경(호버 시 글자 교체, 클릭을 아래로 전달하는 덮개)은 막지 못합니다. 캔버스 화면에서도 엄격하게 하려면 무인 모드에서 좌표 클릭을 쓰지 않거나 `--mode interactive`로 사람이 확인하게 하세요.
+
 `download_file`의 `save_dir`는 절대 경로여야 합니다. 상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없으므로 `E_DOWNLOAD_FAILED`로 거부하고, 절대 경로의 `..`·심볼릭 링크는 정규화한 경로에 저장합니다(`downloaded_path`).
 
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
