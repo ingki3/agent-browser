@@ -214,6 +214,17 @@ def pre_approve_hint(action: ActionType, element_name: str) -> str:
     return f"{action.value}:{name}" if name else f"{action.value}:*"
 
 
+def _signals_of(info: Any) -> tuple:
+    """페이지에서 읽은 대상 정보의 문맥 신호 [[원천, 텍스트], …] → 게이트 입력 튜플 (WS-31)."""
+    if not isinstance(info, dict):
+        return ()
+    out = []
+    for item in info.get("signals") or ():
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), str(item[1])))
+    return tuple(out)
+
+
 def blocked_hint_text(hint: str) -> str:
     """무인 차단 메시지 끝에 붙는 사람(운영자)용 해결 경로."""
     return (
@@ -516,6 +527,8 @@ class BrowserMCPServer:
         self._page: Any = None
         self._cdp: Any = None
         self._hitl: Any = None
+        #: 통과한 좌표 클릭의 판정 근거(WS-31) — 디스패치 결과 data.gate_basis 로 옮긴다.
+        self._pending_gate_basis: Optional[Dict[str, Any]] = None
         self._egress: Any = None
         self._started = False
         #: 세션 전역 메인 문서 상태(WS-26). 탭별 기록(_page_status)이 없을 때만 쓴다
@@ -668,11 +681,15 @@ class BrowserMCPServer:
         params = normalize_action_params(action, params)
 
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
+        self._pending_gate_basis = None
         blocked = await self._check_hitl(action, params)
         if blocked is not None:
             return blocked
 
         result = await self._dispatcher.dispatch(action, params)
+        if self._pending_gate_basis is not None:
+            result.data.setdefault("gate_basis", self._pending_gate_basis)
+            self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS:
             await self._attach_challenge(result)
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
@@ -739,7 +756,19 @@ class BrowserMCPServer:
         unresolved = ""
         selector = params.get("selector", "") or ""
         dispatcher = self._dispatcher
-        if action is ActionType.CLICK and selector and not element_id:
+        #: WS-31: 이름 밖 문맥 신호(보이는 텍스트·aria·alt·목적지·식별자·의사요소)와 근거 부가정보.
+        signals: tuple = ()
+        basis_extra: Dict[str, Any] = {}
+        #: 통과해도 결과에 gate_basis 를 싣는가(좌표 클릭 — 어떤 요소로 판정했는지 알린다).
+        report_basis = False
+        if action is ActionType.CLICK and element_id:
+            if dispatcher is None:
+                unresolved = "대상을 읽을 수 없음"
+            else:
+                target = await dispatcher.describe_element_for_gate(element_id)
+                unresolved = str(target.get("unresolved") or "")
+                signals = _signals_of(target.get("info"))
+        elif action is ActionType.CLICK and selector:
             # WS-30 추가 A: selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정한다.
             # 0개·여러 개·읽기 실패면 판정 불가 → 고위험(fail-closed).
             if dispatcher is None:
@@ -748,6 +777,11 @@ class BrowserMCPServer:
                 target = await dispatcher.describe_selector_target(selector)
                 element_name = str(target.get("name") or "")
                 unresolved = str(target.get("unresolved") or "")
+                signals = _signals_of(target.get("info"))
+        elif action is ActionType.CLICK and params.get("x") is not None:
+            # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
+            element_name, signals, unresolved, basis_extra = await self._point_target(params)
+            report_basis = True
         elif action is ActionType.TYPE_TEXT and not submits_form:
             text = str(params.get("text") or "")
             if "\n" in text or "\r" in text:
@@ -758,7 +792,7 @@ class BrowserMCPServer:
                 elif info.get("tag") == "INPUT" and info.get("in_form"):
                     submits_form = True
         elif action is ActionType.PRESS_KEY:
-            submits_form, name, unresolved = await self._press_key_target(params)
+            submits_form, name, unresolved, signals = await self._press_key_target(params)
             element_name = name or element_name
 
         decision = self._hitl.evaluate(
@@ -769,9 +803,13 @@ class BrowserMCPServer:
                 domain=self._current_domain(),
                 submits_form=submits_form,
                 unresolved_target=unresolved,
+                signals=signals,
+                basis_extra=basis_extra,
             )
         )
         if decision.allowed:
+            if report_basis:
+                self._pending_gate_basis = dict(decision.basis)
             return None
 
         message = decision.reason
@@ -785,6 +823,8 @@ class BrowserMCPServer:
             "dialog": (
                 decision.dialog.model_dump(mode="json") if decision.dialog else None
             ),
+            # WS-31: 운영자가 왜 막혔는지 — {name, matched_keyword, source, …}.
+            "gate_basis": dict(decision.basis),
         }
         code = decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED
         if code is ErrorCode.HITL_UNATTENDED_BLOCKED:
@@ -796,7 +836,7 @@ class BrowserMCPServer:
 
         return self._error_result(action, code, message, data=data)
 
-    async def _press_key_target(self, params: Dict[str, Any]) -> tuple:
+    async def _press_key_target(self, params: Dict[str, Any]) -> tuple:  # noqa: C901
         """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
 
         type_text(press_enter=True) 는 '폼 제출'로 막히는데 type_text 뒤 press_key("Enter") 는
@@ -809,37 +849,67 @@ class BrowserMCPServer:
 
         kind = key_kind(str(params.get("key", "")))
         if not kind:
-            return False, "", ""
+            return False, "", "", ()
         dispatcher = self._dispatcher
         info = await dispatcher.focused_target() if dispatcher is not None else None
         if info is None:
             # Enter·Space 모두 요소를 누를 수 있다 — 대상을 모르면 판정 불가(fail-closed).
-            return False, "", "포커스 요소를 읽을 수 없음"
+            return False, "", "포커스 요소를 읽을 수 없음", ()
         if info.get("opaque"):
-            return False, "", "포커스가 다른 출처 프레임 안에 있음"
+            return False, "", "포커스가 다른 출처 프레임 안에 있음", ()
         tag = str(info.get("tag") or "")
         itype = str(info.get("type") or "")
         in_form = bool(info.get("in_form"))
         name = str(info.get("name") or "")
+        # WS-31: 키가 그 요소를 **누르는** 경우에만 문맥 신호를 본다(클릭과 같은 판정).
+        signals = _signals_of(info)
         if kind == "enter":
             if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES:
                 # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출(버튼형이면 그 버튼 이름도).
-                return True, name if itype in _BUTTON_INPUT_TYPES else "", ""
+                return True, name if itype in _BUTTON_INPUT_TYPES else "", "", ()
             if in_form and tag == "SELECT":
-                return True, "", ""
+                return True, "", "", ()
         if in_form and (
             (tag == "BUTTON" and itype in ("", "submit"))
             or (tag == "INPUT" and itype in ("submit", "image"))
         ):
             # 폼 안 제출 버튼을 키로 누름 = 폼 제출(이름이 '다음' 이어도).
-            return True, name, ""
+            return True, name, "", signals
         if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in _BUTTON_INPUT_TYPES):
-            # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름 게이트를 탄다.
-            return False, name, ""
+            # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름·문맥 게이트를 탄다.
+            return False, name, "", signals
         if info.get("unknown_tag") and info.get("inside_form"):
             # 폼 안 사용자 정의 요소(폼 연계 요소일 수 있음) — 키 동작을 확정할 수 없다.
-            return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스"
-        return False, "", ""
+            return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스", ()
+        return False, "", "", ()
+
+    async def _point_target(self, params: Dict[str, Any]) -> tuple:
+        """좌표 클릭의 대상 해석 (WS-31). 반환: (이름, 신호, 판정 불가 사유, 근거 부가정보).
+
+        디스패처가 어차피 거부할 좌표(epoch 불일치·뷰포트 밖)는 해석하지 않는다 — 클릭이 일어나지
+        않으므로 그 오류(TOCTOU/ELEMENT_NOT_FOUND)를 그대로 받게 한다.
+
+        정책(Tier-2 SoM 의 본래 용도 — 캔버스·이름 없는 그림): 상호작용 조상이 없고, 폼 안도 아니고,
+        문맥 신호에 위험 단어도 없으면 저위험으로 통과시키고 근거(coordinate_target=non_interactive)
+        를 남긴다. 폼 안의 비상호작용 요소는 무엇이 일어날지 몰라 판정 불가(fail-closed).
+        """
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            return "", (), "좌표 대상을 읽을 수 없음", {}
+        if not dispatcher.coordinates_dispatchable(params):
+            return "", (), "", {"coordinate_target": "rejected_by_dispatcher"}
+        target = await dispatcher.describe_point(int(params["x"]), int(params["y"]))
+        if target.get("unresolved"):
+            return "", (), str(target["unresolved"]), {"coordinate_target": "unresolved"}
+        info = target.get("info") or {}
+        extra = {
+            "coordinate_target": "interactive" if info.get("interactive") else "non_interactive",
+            "tag": str(info.get("tag") or ""),
+        }
+        unresolved = ""
+        if not info.get("interactive") and info.get("inside_form"):
+            unresolved = "좌표가 폼 안의 비상호작용 요소 위(무엇이 일어날지 판정 불가)"
+        return str(target.get("name") or ""), _signals_of(info), unresolved, extra
 
     def _current_domain(self) -> str:
         try:

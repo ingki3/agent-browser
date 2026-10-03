@@ -349,10 +349,65 @@ def key_kind(key: str) -> str:
 #: WS-30 R1 BLOCKING-1: 예전에는 staleness 순서(aria > 텍스트 > placeholder > title)를 따로 적어
 #: `<input type=submit value=결제>`·img alt·aria-labelledby 이름을 못 읽었다 — element_id 로는 차단,
 #: selector 클릭·포커스 Space/Enter 로는 통과였다.
+#: WS-31: 이름 밖 문맥 신호 — 게이트(security.hitl.assess_risk)가 원천별 규칙으로 키워드를 찾는다.
+#: 이름 원천 전부(보이는 텍스트·aria-label 둘 다·title·자손 img alt·svg <title>·자손 aria-label·
+#: 버튼 value), 목적지(a[href]·formaction·소속 폼 action — **속성 원문**만: href="#" 가 현재 페이지
+#: 경로로 풀려 과차단되지 않게), 식별자(id·class·name·data-testid, 자손 class — 아이콘 <i>),
+#: CSS ::before/::after content. 원천 하나만 쓰면 aria '확인' + 보이는 글자 '결제' 같은 불일치를 놓친다.
+_GATE_SIGNALS_JS = """
+function gateSignals(el) {
+  const out = [];
+  const push = (src, v) => {
+    if (v === null || v === undefined) return;
+    const s = String(v).trim();
+    if (s) out.push([src, s.slice(0, 300)]);
+  };
+  const tag = el.tagName;
+  const type = (el.type || '').toLowerCase();
+  push('text', el.innerText || el.textContent || '');
+  push('aria', el.getAttribute('aria-label'));
+  push('title', el.getAttribute('title'));
+  push('alt', el.getAttribute('alt'));
+  if (tag === 'BUTTON' || (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].indexOf(type) !== -1)) {
+    push('value', el.value);
+  }
+  push('id', el.id);
+  push('class', el.getAttribute('class'));
+  push('name_attr', el.getAttribute('name'));
+  push('testid', el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-test'));
+  const desc = el.querySelectorAll ? Array.prototype.slice.call(el.querySelectorAll('*'), 0, 40) : [];
+  for (const d of desc) {
+    if (d.tagName === 'IMG' || d.tagName === 'AREA') push('alt', d.getAttribute('alt'));
+    if (d.tagName.toLowerCase() === 'title' && d.closest && d.closest('svg')) push('svg_title', d.textContent);
+    push('child_aria', d.getAttribute('aria-label'));
+    push('title', d.getAttribute('title'));
+    push('class', d.getAttribute('class'));
+  }
+  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+  for (const node of [el].concat(desc.slice(0, 20))) {
+    for (const p of ['::before', '::after']) {
+      let c = '';
+      try { c = view.getComputedStyle(node, p).content || ''; } catch (e) { c = ''; }
+      if (c && c !== 'none' && c !== 'normal') push('pseudo', c.replace(/^["']|["']$/g, ''));
+    }
+  }
+  const link = el.closest ? el.closest('a[href]') : null;
+  if (link) push('href', link.getAttribute('href'));
+  const submitter = (tag === 'BUTTON' && (type === '' || type === 'submit'))
+    || (tag === 'INPUT' && (type === 'submit' || type === 'image'));
+  if (submitter && el.form) {
+    if (el.hasAttribute('formaction')) push('formaction', el.getAttribute('formaction'));
+    else push('form_action', el.form.getAttribute('action'));
+  }
+  return out;
+}
+"""
+
 _TARGET_INFO_JS = (
     """
 (el) => {
   __ACCESSIBLE_NAME__
+  __GATE_SIGNALS__
   const text = (el.innerText || el.textContent || '').trim();
   const name = String(accessibleName(el) || '').slice(0, 200);
   const value = (el.value !== undefined && el.value !== null) ? String(el.value).slice(0, 200) : '';
@@ -366,9 +421,67 @@ _TARGET_INFO_JS = (
     // 브라우저가 모르는 태그(사용자 정의 요소 포함) — 키 동작을 실측으로 확정할 수 없다.
     unknown_tag: el.tagName.indexOf('-') !== -1
       || Object.prototype.toString.call(el) === '[object HTMLUnknownElement]',
+    signals: gateSignals(el),
   };
 }
 """.replace("__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip())
+    .replace("__GATE_SIGNALS__", _GATE_SIGNALS_JS.strip())
+)
+
+#: WS-31: 좌표 클릭이 실제로 누르는 요소 — 최상위 뷰포트 좌표에서 elementFromPoint 로 찾고
+#: 같은 출처 iframe(테두리·패딩만큼 좌표를 옮겨)·open shadow 를 따라 내려간다. 반환은 요소
+#: 자체(CDP 원격 객체) 또는 판정 불가 사유 문자열('opaque' 다른 출처 iframe, 'none' 요소 없음).
+_POINT_TARGET_JS = """
+(x, y) => {
+  let doc = document;
+  let el = doc.elementFromPoint(x, y);
+  for (let i = 0; el && i < 16; i++) {
+    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      let d = null;
+      try { d = el.contentDocument; } catch (e) { d = null; }
+      if (!d) return 'opaque';
+      const r = el.getBoundingClientRect();
+      const cs = el.ownerDocument.defaultView.getComputedStyle(el);
+      x -= r.left + el.clientLeft + (parseFloat(cs.paddingLeft) || 0);
+      y -= r.top + el.clientTop + (parseFloat(cs.paddingTop) || 0);
+      doc = d;
+      el = d.elementFromPoint(x, y);
+      continue;
+    }
+    if (el.shadowRoot) {
+      const inner = el.shadowRoot.elementFromPoint(x, y);
+      if (inner && inner !== el) { el = inner; continue; }
+    }
+    break;
+  }
+  return el || 'none';
+}
+"""
+
+#: 클릭을 실제로 받는 상호작용 조상(자신 포함). 입력칸·select·contenteditable 도 넣는다 — 그
+#: 자리를 누르는 것은 입력 포커스일 뿐이고, 빼면 폼 안 입력칸 클릭이 '폼 안 비상호작용'으로
+#: 판정 불가(차단)가 된다. tabindex=-1 은 뺀다(건너뛰기 링크 대상 <main tabindex=-1> 등 영역 전체).
+_POINT_INFO_JS = (
+    """
+function () {
+  const INTERACTIVE = 'button, a[href], input, textarea, select, [contenteditable=""], '
+    + '[contenteditable="true"], [role=button], [role=link], [role=menuitem], [role=tab], '
+    + '[role=checkbox], [role=switch], label, summary, [onclick], [tabindex]:not([tabindex="-1"])';
+  const info = __INFO__;
+  const hit = this;
+  let cur = hit, target = null;
+  for (let i = 0; cur && i < 60; i++) {
+    if (cur.nodeType === 1 && cur.matches && cur.matches(INTERACTIVE)) { target = cur; break; }
+    const root = cur.getRootNode ? cur.getRootNode() : null;
+    cur = cur.parentElement || (root && root.host) || null;
+  }
+  const out = info(target || hit);
+  out.interactive = !!target;
+  out.hit_tag = hit.tagName;
+  out.inside_form = !!(out.inside_form || (hit.closest && hit.closest('form')));
+  return out;
+}
+""".replace("__INFO__", _TARGET_INFO_JS.strip())
 )
 
 #: 키 입력을 실제로 받는 요소(document.activeElement) — iframe(같은 출처)·open shadow 를
@@ -771,6 +884,104 @@ class ActionDispatcher:
             return await self._locator_for(handle).evaluate(_TARGET_INFO_JS)
         except Exception:  # noqa: BLE001
             return None
+
+    async def describe_element_for_gate(self, element_id: str) -> Dict[str, Any]:
+        """element_id 클릭의 게이트 판정용 DOM 정보 (WS-31 문맥 신호).
+
+        반환: {"info": …} 읽음 / {"missing": True} 지금 DOM 에 없음(디스패처가 staleness·TOCTOU
+        로 거부하거나 치유한다 — 이름 판정만) / {"unresolved": 사유} 있는데 못 읽음(fail-closed).
+        """
+        handle = self.ctx.engine.get_handle(element_id)
+        if handle is None:
+            return {"missing": True}
+        try:
+            locator = self._locator_for(handle)
+            if await locator.count() == 0:
+                return {"missing": True}
+            info = await locator.evaluate(_TARGET_INFO_JS, timeout=2000)
+        except Exception as exc:  # noqa: BLE001
+            return {"unresolved": f"대상 문맥 읽기 실패: {type(exc).__name__}"}
+        return {"info": info}
+
+    def coordinates_dispatchable(self, params: Dict[str, Any]) -> bool:
+        """좌표 클릭이 디스패처의 사전 검사(epoch 일치·뷰포트 안)를 통과하는가.
+
+        통과 못 하면 디스패처가 클릭 없이 TOCTOU/ELEMENT_NOT_FOUND 로 거부하므로 게이트가
+        좌표를 해석할 필요가 없다(그 오류를 그대로 받게 한다). `_click_coordinates` 와 같은 검사.
+        """
+        try:
+            x, y = int(params["x"]), int(params["y"])
+            claimed = params.get("epoch")
+            if claimed is None or int(claimed) != self.ctx.engine.epoch:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        viewport = getattr(self._top_page(), "viewport_size", None) or {}
+        vw, vh = viewport.get("width", 0), viewport.get("height", 0)
+        if vw and vh and (x >= vw or y >= vh):
+            return False
+        return True
+
+    async def _gate_cdp_for(self, page: Any) -> Any:
+        """게이트 판독용 CDP 세션 (최상위 Page 마다 하나, 재사용)."""
+        cache = self.__dict__.setdefault("_gate_cdp_sessions", {})
+        key = id(page)
+        entry = cache.get(key)
+        if entry is not None and entry[0] is page:
+            return entry[1]
+        session = await page.context.new_cdp_session(page)
+        cache[key] = (page, session)
+        return session
+
+    async def describe_point(self, x: int, y: int) -> Dict[str, Any]:
+        """좌표 클릭이 누를 요소를 해석한다 (WS-31). 최상위 Page 뷰포트 좌표 기준.
+
+        반환: {"name", "info"} 해석됨 / {"unresolved": 사유} 판정 불가(게이트는 fail-closed) —
+        요소 없음, 다른 출처 iframe 위, closed shadow host 위(안을 읽을 수 없음), 해석 중 예외.
+        closed shadow 는 JS 로 알 수 없어(host 로 retarget) CDP DOM.describeNode 로 확인한다.
+        """
+        top = self._top_page()
+        try:
+            cdp = await self._gate_cdp_for(top)
+            res = await cdp.send(
+                "Runtime.evaluate",
+                {"expression": f"({_POINT_TARGET_JS.strip()})({float(x)}, {float(y)})",
+                 "returnByValue": False},
+            )
+            if res.get("exceptionDetails"):
+                return {"unresolved": "좌표 해석 스크립트 예외"}
+            obj = res.get("result") or {}
+            if obj.get("type") == "string":
+                reason = obj.get("value")
+                if reason == "opaque":
+                    return {"unresolved": "좌표가 다른 출처 iframe 위(내부를 읽을 수 없음)"}
+                return {"unresolved": "좌표에 요소 없음"}
+            object_id = obj.get("objectId")
+            if obj.get("subtype") != "node" or not object_id:
+                return {"unresolved": "좌표에 요소 없음"}
+            try:
+                node = await cdp.send("DOM.describeNode", {"objectId": object_id, "depth": 0})
+                roots = (node.get("node") or {}).get("shadowRoots") or []
+                if any(r.get("shadowRootType") == "closed" for r in roots):
+                    return {"unresolved": "좌표가 closed shadow host 위(내부를 읽을 수 없음)"}
+                called = await cdp.send(
+                    "Runtime.callFunctionOn",
+                    {"objectId": object_id, "functionDeclaration": _POINT_INFO_JS.strip(),
+                     "returnByValue": True},
+                )
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObject", {"objectId": object_id})
+                except Exception:  # noqa: BLE001
+                    pass
+            if called.get("exceptionDetails"):
+                return {"unresolved": "좌표 대상 읽기 예외"}
+            info = (called.get("result") or {}).get("value")
+            if not isinstance(info, dict):
+                return {"unresolved": "좌표 대상 읽기 실패"}
+        except Exception as exc:  # noqa: BLE001
+            return {"unresolved": f"좌표 해석 실패: {type(exc).__name__}"}
+        return {"name": str(info.get("name") or ""), "info": info}
 
     async def focused_target(self) -> Optional[Dict[str, Any]]:
         """키 입력을 받을 요소(activeElement). 못 읽으면 None.
