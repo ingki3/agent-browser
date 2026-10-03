@@ -252,7 +252,7 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 
 **좌표 클릭(`click(x, y)`).** 게이트 전에 최상위 화면에서 그 좌표의 요소를 찾고(같은 출처 iframe·open shadow 안까지 따라 내려감), 클릭을 실제로 받는 상호작용 조상(button, 링크, 입력칸, `role=button|link|…`, label, summary, `[onclick]`, `[tabindex]`)의 이름·문맥으로 판정합니다. 사전 승인 값은 해석된 이름(`click:<이름>`, `data.pre_approve_hint`)입니다. 좌표에 요소가 없거나, 다른 출처 iframe 위이거나, closed shadow 위(안을 읽을 수 없음)이거나, 해석 중 오류가 나거나, 폼 안의 비상호작용 요소 위면 판정 불가로 막습니다. 캔버스처럼 상호작용 조상이 없고 폼 밖이며 위험 신호도 없는 곳은 통과시키고 결과 `data.gate_basis.coordinate_target: "non_interactive"`로 알립니다(Tier-2 SoM의 본래 용도).
 
-**남은 한계.** ① `select_option`·`check_box`가 `onchange`로 폼을 자동 제출하는 페이지는 미리 알 수 없어 이름 판정만 합니다. ② 캔버스에 그린 결제 버튼은 DOM 신호가 없어 좌표 클릭이 통과합니다. ③ 서버 쪽에서만 아는 위험(무해한 이름·경로의 API 가 실제로 결제)은 알 수 없습니다. ④ 키워드 사전 기반이라 '결제 내역'·'주문 목록'·'Remove filter' 같은 조회·UI 조작도 막힙니다 — 필요한 것은 `--pre-approve`로 엽니다.
+**남은 한계.** ① `select_option`·`check_box`가 `onchange`로 폼을 자동 제출하는 페이지는 미리 알 수 없어 이름 판정만 합니다. ② 캔버스에 그린 결제 버튼은 DOM 신호가 없어 좌표 클릭이 통과합니다. ③ 서버 쪽에서만 아는 위험(무해한 이름·경로의 API 가 실제로 결제)은 알 수 없습니다. ④ 키워드 사전 기반이라 '결제 내역'·'주문 목록'·'Remove filter' 같은 조회·UI 조작도 막힙니다 — 필요한 것은 `--pre-approve`로 엽니다. 캔버스 화면에서도 엄격하게 하려면 무인 모드에서 좌표 클릭을 쓰지 않거나 `--mode interactive`로 사람이 확인하게 하세요.
 
 `download_file`의 `save_dir`는 절대 경로여야 합니다. 상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없으므로 `E_DOWNLOAD_FAILED`로 거부하고, 절대 경로의 `..`·심볼릭 링크는 정규화한 경로에 저장합니다(`downloaded_path`).
 
