@@ -183,6 +183,36 @@ def _match_path(url: str) -> Optional[str]:
     return _contains_keyword(decoded, _HANGUL_KEYWORDS)
 
 
+def _match_href(url: str) -> Optional[str]:
+    """링크(GET 이동) 목적지: **마지막 경로 조각**과 **값 전체가 키워드인 쿼리 값**만 본다.
+
+    링크는 대개 조회다 — `/order/123`(주문 상세), `?sort=order_date`(정렬) 를 경로 전체 토큰으로
+    보면 막힌다(WS-31 과차단 측정: 정상 표본 2건). 동작을 나타내는 링크는 대개 마지막 조각이
+    동사다(`/account/delete`, `/cart/checkout`, `/order/123/pay`) 또는 `?action=delete`.
+    폼 제출 목적지(form_action·formaction)는 실제 제출이므로 `_match_path`(경로 전체)를 쓴다.
+    """
+    raw = str(url or "")
+    try:
+        parts = urlsplit(raw)
+        path, query = parts.path, parts.query
+    except ValueError:
+        path, query = raw, ""
+    segments = [seg for seg in unquote_plus(path).split("/") if seg]
+    last = segments[-1] if segments else ""
+    hit = _match_tokens(class_tokens(last))
+    if hit:
+        return hit
+    hangul = _contains_keyword(normalize_gate_text(last), _HANGUL_KEYWORDS)
+    if hangul:
+        return hangul
+    for pair in query.split("&"):
+        value = unquote_plus(pair.partition("=")[2])
+        norm = normalize_gate_text(value)
+        if norm in _TOKEN_KEYWORDS or norm in _HANGUL_KEYWORDS:
+            return norm
+    return None
+
+
 def _match_icon_class(cls: str) -> Optional[str]:
     lowered = cls.strip().lower()
     for prefix in _ICON_PREFIXES:
@@ -214,6 +244,8 @@ def match_signal(source: str, text: str) -> Optional[str]:
     """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None."""
     if not text:
         return None
+    if source == "href":
+        return _match_href(text)
     if source in PATH_SOURCES:
         return _match_path(text)
     if source in TOKEN_SOURCES:
@@ -289,6 +321,14 @@ def _basis(ctx: ActionContext, keyword: Optional[str], source: Optional[str]) ->
     return basis
 
 
+def _first_hit(sources: Sequence[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    for source, text in sources:
+        hit = match_signal(source, text)
+        if hit:
+            return hit, source
+    return None
+
+
 def assess_risk(ctx: ActionContext) -> RiskAssessment:
     """위험 등급 + 판정 근거. 고위험 키워드는 이름·셀렉터·부가정보 다음 문맥 신호 순서로 찾는다."""
     if ctx.unresolved_target:
@@ -298,21 +338,23 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
             _basis(ctx, None, "unresolved"),
         )
 
-    sources: List[Tuple[str, str]] = [
+    # 순서: 이름·셀렉터·부가정보 → 폼 제출 → 문맥 신호. 폼 제출 판정(WS-30)이 문맥 신호보다
+    # 먼저여야 기존 사유('폼 제출 액션')가 유지된다 — 어느 쪽이든 고위험이다.
+    own: List[Tuple[str, str]] = [
         ("name", ctx.element_name), ("selector", ctx.selector), ("detail", ctx.detail),
     ]
-    sources.extend((str(src), str(text or "")) for src, text in ctx.signals)
-    for source, text in sources:
-        hit = match_signal(source, text)
-        if hit:
-            return RiskAssessment(
-                RiskLevel.HIGH,
-                f"고위험 키워드 '{hit}' 탐지(출처 {source})",
-                _basis(ctx, hit, source),
-            )
-
-    if ctx.submits_form:
+    found = _first_hit(own)
+    if found is None and ctx.submits_form:
         return RiskAssessment(RiskLevel.HIGH, "폼 제출 액션", _basis(ctx, None, "form_submit"))
+    if found is None:
+        found = _first_hit([(str(src), str(text or "")) for src, text in ctx.signals])
+    if found is not None:
+        hit, source = found
+        return RiskAssessment(
+            RiskLevel.HIGH,
+            f"고위험 키워드 '{hit}' 탐지(출처 {source})",
+            _basis(ctx, hit, source),
+        )
 
     if ctx.action in _INHERENTLY_RISKY:
         return RiskAssessment(

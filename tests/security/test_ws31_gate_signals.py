@@ -122,6 +122,34 @@ def test_path_tokens_split():
     ]
 
 
+# 링크(GET 이동)는 목적지 **마지막 경로 조각**과 **값 전체가 키워드인 쿼리 값**만 본다 —
+# 조회 링크(`/order/123` 주문 상세, `?sort=order_date` 정렬)를 막지 않기 위해(WS-31 과차단 측정).
+@pytest.mark.parametrize(
+    "href",
+    ["/order/123", "/list?page=2&sort=order_date", "/orders/123/detail", "/pay/history",
+     "/help?topic=payment"],
+)
+def test_href_view_links_are_low(href):
+    assert assess_risk(_ctx("보기", [("href", href)])).risk is RiskLevel.LOW, href
+
+
+@pytest.mark.parametrize(
+    "href,hit",
+    [("/account/delete", "delete"), ("/cart/checkout", "checkout"), ("/checkout/", "checkout"),
+     ("/api/deleteAccount", "delete"), ("/item/3?action=delete", "delete"),
+     ("/order/123/pay", "pay"), ("/%EA%B2%B0%EC%A0%9C", "결제")],
+)
+def test_href_action_links_are_high(href, hit):
+    a = assess_risk(_ctx("보기", [("href", href)]))
+    assert a.risk is RiskLevel.HIGH, href
+    assert a.basis["matched_keyword"] == hit and a.basis["source"] == "href"
+
+
+def test_form_action_keeps_full_path():
+    # 폼 제출 목적지는 링크보다 엄격 — 경로 전체 토큰.
+    assert assess_risk(_ctx("다음", [("form_action", "/order/123")])).risk is RiskLevel.HIGH
+
+
 # ------------------------------------------------------------------ id/class 토큰·아이콘
 
 @pytest.mark.parametrize(
