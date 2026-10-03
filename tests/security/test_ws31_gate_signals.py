@@ -55,11 +55,18 @@ def test_zero_width_name_is_high():
 
 # ------------------------------------------------------------------ 텍스트형 원천
 
-@pytest.mark.parametrize("source", ["text", "aria", "title", "alt", "value", "pseudo"])
+@pytest.mark.parametrize("source", ["text", "aria", "child_title", "alt", "value", "pseudo"])
 def test_text_sources_match_keyword(source):
     a = assess_risk(_ctx("다음", [(source, "결제")]))
     assert a.risk is RiskLevel.HIGH
     assert a.basis == {"name": "다음", "matched_keyword": "결제", "source": source}
+
+
+def test_own_title_matches_when_name_empty():
+    # WS-31 R1: 대상 자신의 title 은 이름에 글자가 없을 때만 본다(tests/security/test_ws31r1_gate_rules.py).
+    a = assess_risk(_ctx("", [("title", "결제")]))
+    assert a.risk is RiskLevel.HIGH
+    assert a.basis == {"name": "", "matched_keyword": "결제", "source": "title"}
 
 
 def test_aria_and_text_mismatch_both_checked():
@@ -167,7 +174,8 @@ def test_class_and_id_tokens(raw, source, hit):
     assert a.basis["matched_keyword"] == hit and a.basis["source"] == source
 
 
-@pytest.mark.parametrize("cls", ["fa fa-trash", "icon-cart", "bi bi-credit-card", "fa-trash-can"])
+# WS-31 R1: 장바구니 아이콘(icon-cart 등)은 사전에서 뺐다 — '장바구니 보기'는 결제가 아니다.
+@pytest.mark.parametrize("cls", ["fa fa-trash", "icon-credit-card", "bi bi-credit-card", "fa-trash-can"])
 def test_icon_class_dictionary(cls):
     a = assess_risk(_ctx("", [("class", cls)]))
     assert a.risk is RiskLevel.HIGH, cls

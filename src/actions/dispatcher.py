@@ -375,22 +375,97 @@ function gateSignals(el) {
   push('class', el.getAttribute('class'));
   push('name_attr', el.getAttribute('name'));
   push('testid', el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-test'));
-  const desc = el.querySelectorAll ? Array.prototype.slice.call(el.querySelectorAll('*'), 0, 40) : [];
+  // WS-31 R1 NB-1: 자손은 **신호를 가진 요소만** 고른다(수집 원천과 같은 셀렉터). 예전에는
+  // querySelectorAll('*') 앞 40개만 봐서 빈 <i> 40개를 앞에 끼우면 뒤의 아이콘·alt·svg title 을 못 봤다.
+  // 값은 원천별로 모아(중복 제거) 한 신호로 보낸다 — 상한을 올려도 결과 크기가 커지지 않게.
+  const agg = {};
+  const collect = (src, v) => {
+    if (v === null || v === undefined) return;
+    const s = String(v).trim().slice(0, 300);
+    if (!s) return;
+    (agg[src] = agg[src] || new Set()).add(s);
+  };
+  const SIGNAL_DESC = 'img[alt], area[alt], input[alt], svg title, [aria-label], [title], [class]';
+  let desc = [];
+  try { desc = Array.prototype.slice.call(el.querySelectorAll(SIGNAL_DESC), 0, 400); } catch (e) { desc = []; }
   for (const d of desc) {
-    if (d.tagName === 'IMG' || d.tagName === 'AREA') push('alt', d.getAttribute('alt'));
-    if (d.tagName.toLowerCase() === 'title' && d.closest && d.closest('svg')) push('svg_title', d.textContent);
-    push('child_aria', d.getAttribute('aria-label'));
-    push('title', d.getAttribute('title'));
-    push('class', d.getAttribute('class'));
+    const dt = d.tagName.toUpperCase();
+    if (dt === 'IMG' || dt === 'AREA' || dt === 'INPUT') collect('alt', d.getAttribute('alt'));
+    if (dt === 'TITLE' && d.closest && d.closest('svg')) collect('svg_title', d.textContent);
+    collect('child_aria', d.getAttribute('aria-label'));
+    collect('child_title', d.getAttribute('title'));
+    collect('class', d.getAttribute('class'));
   }
+  for (const src of Object.keys(agg)) {
+    // ' ¦ ' 로 잇는다 — 공백으로 이으면 '결'+'제' 나 'cancel'+'account' 가 붙어 보일 수 있다.
+    out.push([src, Array.from(agg[src]).join(' \\u00a6 ')]);
+  }
+  // ::before/::after 글자: 빈 요소에도 붙으므로 셀렉터로 거를 수 없다. 대신 **문서 스타일시트에서
+  // 글자(문자·숫자)가 든 content 를 가진 ::before/::after 규칙**을 찾아 그 셀렉터에 맞는 자손만 본다
+  // (아이콘 폰트의 PUA 글리프 규칙은 글자가 아니라 건너뛴다). 읽을 수 없는 시트(다른 출처)·해석
+  // 못 한 셀렉터가 있어도 앞 자손 20개는 예전처럼 항상 본다. 읽을 수 없는 시트(다른 출처 CSS)가
+  // 하나라도 있으면 규칙을 다 모르는 것이므로 자손 400개까지 본다(판정 불가 쪽으로 넓힌다).
   const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  for (const node of [el].concat(desc.slice(0, 20))) {
+  const pseudoNodes = [el];
+  const seen = new Set(pseudoNodes);
+  const addNode = (n) => { if (pseudoNodes.length < 400 && !seen.has(n)) { seen.add(n); pseudoNodes.push(n); } };
+  try { Array.prototype.slice.call(el.querySelectorAll('*'), 0, 20).forEach(addNode); } catch (e) { /* 없음 */ }
+  const PSEUDO_RE = /::?(before|after)\\b/i;
+  const LETTER_RE = /[\\p{L}\\p{N}]/u;
+  const walkRules = (rules, depth) => {
+    if (!rules || depth > 8) return;
+    for (const r of Array.prototype.slice.call(rules)) {
+      const st = r.selectorText;
+      if (st && PSEUDO_RE.test(st)) {
+        const c = (r.style && r.style.getPropertyValue('content')) || '';
+        if (c && c !== 'none' && c !== 'normal' && LETTER_RE.test(c)) {
+          for (const part of st.split(',')) {
+            if (!PSEUDO_RE.test(part)) continue;
+            const base = part.replace(/::?(before|after)\\b/gi, '').trim() || '*';
+            try { el.querySelectorAll(base).forEach(addNode); } catch (e) { /* 해석 못 한 셀렉터 */ }
+          }
+        }
+      }
+      if (r.cssRules) walkRules(r.cssRules, depth + 1);
+    }
+  };
+  const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+  const sheets = [];
+  for (const holder of [root, el.ownerDocument]) {
+    if (!holder) continue;
+    try { Array.prototype.forEach.call(holder.styleSheets || [], (s) => sheets.push(s)); } catch (e) { /* 없음 */ }
+    try { Array.prototype.forEach.call(holder.adoptedStyleSheets || [], (s) => sheets.push(s)); } catch (e) { /* 없음 */ }
+  }
+  let unreadable = false;
+  for (const sh of new Set(sheets)) {
+    let rules = null;
+    try { rules = sh.cssRules; } catch (e) { rules = null; unreadable = true; }
+    walkRules(rules, 0);
+  }
+  if (unreadable) {
+    try { Array.prototype.slice.call(el.querySelectorAll('*'), 0, 400).forEach(addNode); } catch (e) { /* 없음 */ }
+  }
+  for (const node of pseudoNodes) {
     for (const p of ['::before', '::after']) {
       let c = '';
       try { c = view.getComputedStyle(node, p).content || ''; } catch (e) { c = ''; }
       if (c && c !== 'none' && c !== 'normal') push('pseudo', c.replace(/^["']|["']$/g, ''));
     }
   }
+  // WS-31 R1 NB-6: 같은 출처로 **이동**하는 링크(a[href], download 아님, http(s), 같은 문서 안
+  // 앵커·'#' 아님) 표시 — 게이트는 이런 링크에 마크업 신호(class·아이콘·id·testid)와 title 을
+  // 적용하지 않는다(링크는 이동이지 부작용이 아니다). 이름·aria·href 신호는 그대로 본다.
+  try {
+    if (el.matches && el.matches('a[href]') && !el.hasAttribute('download')) {
+      const d = el.ownerDocument;
+      const u = new URL(el.getAttribute('href'), d.baseURI);
+      const loc = new URL(d.URL);
+      if ((u.protocol === 'http:' || u.protocol === 'https:') && u.origin === loc.origin
+          && !(u.pathname === loc.pathname && u.search === loc.search)) {
+        out.push(['nav_link', '1']);
+      }
+    }
+  } catch (e) { /* 판정 못 하면 링크 완화 없음 */ }
   const link = el.closest ? el.closest('a[href]') : null;
   if (link) push('href', link.getAttribute('href'));
   const submitter = (tag === 'BUTTON' && (type === '' || type === 'submit'))
@@ -398,6 +473,10 @@ function gateSignals(el) {
   if (submitter && el.form) {
     if (el.hasAttribute('formaction')) push('formaction', el.getAttribute('formaction'));
     else push('form_action', el.form.getAttribute('action'));
+    // WS-31 R1 NB-6: 실제 제출 메서드(formmethod > form method, 기본 get). GET 제출은 목적지
+    // 쿼리를 보지 않는다(검색 폼 `/search?type=order`) — POST 는 쿼리도 본다.
+    const m = (el.getAttribute('formmethod') || el.form.getAttribute('method') || 'get').trim().toLowerCase();
+    push('form_method', m);
   }
   return out;
 }

@@ -59,10 +59,21 @@ MEDIUM_RISK_KEYWORDS = (
 # WS-31: 이름 밖 문맥 신호 (보이는 텍스트·aria·alt·목적지·클래스 토큰·의사요소 글자)
 # ---------------------------------------------------------------------------
 
-#: 정규화에서 지우는 보이지 않는 문자: zero-width space/non-joiner/joiner, word joiner,
-#: BOM(zero-width no-break space), soft hyphen. `결\u200b제` 가 '결제' 키워드를 피하던 구멍.
-_INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+#: 정규화에서 지우는 보이지 않는 문자: 유니코드 범주 Cf(서식 문자) **전체** + U+034F(CGJ, 범주 Mn
+#: 이지만 글자 모양이 없음). WS-31 은 zero-width 5종+soft hyphen 만 지워 `결\u200f제`(RLM)·U+2064·
+#: U+061C·U+034F 를 끼우면 통과했다(WS-31 R1 NB-2). Cf 에는 ZWJ(U+200D)도 있어 이모지 ZWJ 시퀀스는
+#: 구성 이모지로 풀린다 — 이모지는 키워드가 아니므로 매칭에 영향이 없다(테스트로 고정).
+#: 한글 완성형(Lo)·자모(Lo)·변형 선택자(Mn)는 지우지 않는다.
+_EXTRA_INVISIBLE = frozenset({"\u034f"})
 _SPACE_RE = re.compile(r"\s+")
+
+
+def strip_invisible(text: str) -> str:
+    """서식 문자(범주 Cf)와 CGJ 를 지운다 (대소문자·정규화는 그대로)."""
+    return "".join(
+        ch for ch in text
+        if ch not in _EXTRA_INVISIBLE and unicodedata.category(ch) != "Cf"
+    )
 
 
 def normalize_gate_text(text: str) -> str:
@@ -71,19 +82,31 @@ def normalize_gate_text(text: str) -> str:
     한글 자모 분리(NFD) 같은 과한 정규화는 하지 않는다 — NFKC 는 완성형 한글을 유지한다.
     """
     text = unicodedata.normalize("NFKC", str(text or ""))
-    text = _INVISIBLE_RE.sub("", text)
+    text = strip_invisible(text)
     return _SPACE_RE.sub(" ", text).strip().lower()
 
 
 #: 문자열 원천 — 키워드를 **부분 문자열**로 찾는다(이름과 같은 규칙).
 TEXT_SOURCES = frozenset(
-    {"name", "text", "aria", "title", "alt", "svg_title", "child_aria", "value", "pseudo",
-     "selector", "detail"}
+    {"name", "text", "aria", "title", "child_title", "alt", "svg_title", "child_aria", "value",
+     "pseudo", "selector", "detail"}
 )
 #: 목적지 원천(URL) — 경로·쿼리를 **단어 경계 토큰**으로 매칭한다(`/payroll-info` ≠ pay).
 PATH_SOURCES = frozenset({"href", "formaction", "form_action"})
 #: 마크업 식별자 원천 — camelCase·kebab·snake 를 토큰으로 나눠 매칭한다.
 TOKEN_SOURCES = frozenset({"class", "id", "name_attr", "testid"})
+#: 판정 보조 사실(키워드 매칭 안 함): `nav_link` 같은 출처로 이동하는 a[href] 자신, `form_method`
+#: 제출 버튼의 실제 제출 메서드(get/post…). WS-31 R1 NB-6.
+META_SOURCES = frozenset({"nav_link", "form_method"})
+#: 같은 출처 이동 링크에서 적용하지 않는 원천 — 마크업 식별자(class·아이콘 사전·id·testid·name)와
+#: title(보조 설명). 링크는 이동이지 부작용이 아니다(WS-31 과차단: `fa-trash` '휴지통 보기',
+#: `data-testid=nav-order-history`). 이름·보이는 글자·aria·alt·svg title·pseudo·href 는 그대로 본다.
+_NAV_LINK_SKIPPED = TOKEN_SOURCES | {"title", "child_title"}
+
+#: 링크 목적지(href)에서 빼는 **권한 명사** — 링크로 그 페이지에 가는 것은 보기다(`/admin` 대시보드,
+#: `/scholarships/grant-2025`). 동사(revoke·delete·pay·transfer …)는 그대로 막는다. 버튼 이름·폼
+#: action·formaction 에는 적용하지 않는다(WS-31 R1 — 코디네이터 결정 A).
+_HREF_NOUNS = frozenset({"admin", "permission", "grant", "관리자", "권한"})
 
 #: 목적지·식별자 토큰에서 빼는 키워드 — 폼 **메커니즘**을 뜻하는 일반어라 의도를 말하지 않는다.
 #: 실측 근거: 로그인 버튼 `class="btn-submit"`·`id="submit"`, 로그인 폼 `action="/login/submit"`
@@ -104,6 +127,9 @@ _HANGUL_KEYWORDS = tuple(kw for kw in HIGH_RISK_KEYWORDS if not kw.isascii())
 #: 근거: Font Awesome(fa-trash, fa-credit-card, fa-cart-shopping), Bootstrap Icons(bi-trash,
 #: bi-credit-card, bi-cart), Material Symbols(delete, shopping_cart, payment) 의 실제 이름.
 #: 검색·홈·설정 같은 일반 아이콘은 넣지 않는다(과차단). 값은 판정 근거로 보고할 키워드.
+#: WS-31 R1: 장바구니(cart·shopping-cart·cart-shopping)는 뺐다 — 헤더의 '장바구니 보기'가 가장 흔한
+#: 쓰임이고, '장바구니 담기'도 결제가 아니라 되돌릴 수 있는 담기다(이름 '장바구니 담기'도 고위험
+#: 키워드가 아니다). 결제는 그다음 checkout 단계(이름·경로 신호)에서 막는다.
 ICON_CLASS_RISK = {
     "trash": "delete",
     "trash-can": "delete",
@@ -116,9 +142,6 @@ ICON_CLASS_RISK = {
     "payment": "pay",
     "payments": "pay",
     "wallet": "pay",
-    "cart": "checkout",
-    "shopping-cart": "checkout",
-    "cart-shopping": "checkout",
     "shopping-bag": "purchase",
     "bag-check": "purchase",
     "money-bill": "pay",
@@ -142,7 +165,7 @@ def class_tokens(text: str) -> List[str]:
     """식별자 문자열을 토큰으로: camelCase·kebab-case·snake_case 분해, 소문자."""
     out: List[str] = []
     # 대소문자는 camelCase 분해에 필요하므로 정규화는 NFKC·보이지 않는 문자 제거까지만.
-    cleaned = _INVISIBLE_RE.sub("", unicodedata.normalize("NFKC", str(text or "")))
+    cleaned = strip_invisible(unicodedata.normalize("NFKC", str(text or "")))
     for part in _TOKEN_SPLIT_RE.split(cleaned):
         if part:
             out.extend(_split_camel(part))
@@ -172,7 +195,15 @@ def _match_tokens(tokens: Sequence[str]) -> Optional[str]:
     return None
 
 
-def _match_path(url: str) -> Optional[str]:
+def _match_path(url: str, path_only: bool = False) -> Optional[str]:
+    """폼 제출 목적지: 경로 전체(+쿼리) 토큰. `path_only` 면 쿼리를 보지 않는다 — GET 제출은
+    브라우저가 action 의 쿼리를 폼 값으로 **바꿔 버려** 보내지도 않는다(`/search?type=order`)."""
+    if path_only:
+        try:
+            parts = urlsplit(str(url or ""))
+            url = parts.path
+        except ValueError:
+            url = str(url or "").split("?", 1)[0]
     hit = _match_tokens(path_tokens(url))
     if hit:
         return hit
@@ -199,15 +230,19 @@ def _match_href(url: str) -> Optional[str]:
         path, query = raw, ""
     segments = [seg for seg in unquote_plus(path).split("/") if seg]
     last = segments[-1] if segments else ""
-    hit = _match_tokens(class_tokens(last))
-    if hit:
-        return hit
-    hangul = _contains_keyword(normalize_gate_text(last), _HANGUL_KEYWORDS)
-    if hangul:
-        return hangul
+    present = set(class_tokens(last))
+    for kw in _TOKEN_KEYWORDS:
+        if kw in present and kw not in _HREF_NOUNS:
+            return kw
+    normalized_last = normalize_gate_text(last)
+    for kw in _HANGUL_KEYWORDS:
+        if kw in normalized_last and kw not in _HREF_NOUNS:
+            return kw
     for pair in query.split("&"):
         value = unquote_plus(pair.partition("=")[2])
         norm = normalize_gate_text(value)
+        if norm in _HREF_NOUNS:
+            continue
         if norm in _TOKEN_KEYWORDS or norm in _HANGUL_KEYWORDS:
             return norm
     return None
@@ -240,14 +275,17 @@ def _match_markup(source: str, text: str) -> Optional[str]:
     return _match_tokens(class_tokens(text))
 
 
-def match_signal(source: str, text: str) -> Optional[str]:
-    """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None."""
-    if not text:
+def match_signal(source: str, text: str, path_only: bool = False) -> Optional[str]:
+    """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None.
+
+    `path_only`: 폼 목적지(form_action·formaction)의 쿼리를 보지 않는다(GET 제출).
+    """
+    if not text or source in META_SOURCES:
         return None
     if source == "href":
         return _match_href(text)
     if source in PATH_SOURCES:
-        return _match_path(text)
+        return _match_path(text, path_only=path_only)
     if source in TOKEN_SOURCES:
         return _match_markup(source, text)
     return _match_text(text)
@@ -321,12 +359,41 @@ def _basis(ctx: ActionContext, keyword: Optional[str], source: Optional[str]) ->
     return basis
 
 
-def _first_hit(sources: Sequence[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+def _first_hit(
+    sources: Sequence[Tuple[str, str]], path_only: bool = False
+) -> Optional[Tuple[str, str]]:
     for source, text in sources:
-        hit = match_signal(source, text)
+        hit = match_signal(source, text, path_only=path_only)
         if hit:
             return hit, source
     return None
+
+
+def _has_letters(text: str) -> bool:
+    """글자(문자·숫자)가 있는가 — 이모지·기호만 있는 이름은 '빈 이름'으로 본다(아이콘 버튼)."""
+    return any(unicodedata.category(ch)[0] in "LN" for ch in normalize_gate_text(text))
+
+
+def _effective_signals(ctx: ActionContext) -> List[Tuple[str, str]]:
+    """원천별 적용 규칙(WS-31 R1 NB-6)을 거친 문맥 신호.
+
+    * 같은 출처 이동 링크(`nav_link`)면 마크업 식별자·title 원천을 뺀다.
+    * 대상 자신의 title 은 보조 설명이라 이름에 글자가 없을 때만 쓴다(아이콘 버튼 title='결제'
+      는 차단, '저장' 버튼의 title 문장이 '결제'를 언급하는 것은 통과). 자손 title 은 그대로.
+    """
+    raw = [(str(src), str(text or "")) for src, text in ctx.signals]
+    nav_link = any(src == "nav_link" for src, _ in raw)
+    named = _has_letters(ctx.element_name)
+    out: List[Tuple[str, str]] = []
+    for src, text in raw:
+        if src in META_SOURCES:
+            continue
+        if nav_link and src in _NAV_LINK_SKIPPED:
+            continue
+        if src == "title" and named:
+            continue
+        out.append((src, text))
+    return out
 
 
 def assess_risk(ctx: ActionContext) -> RiskAssessment:
@@ -347,7 +414,11 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
     if found is None and ctx.submits_form:
         return RiskAssessment(RiskLevel.HIGH, "폼 제출 액션", _basis(ctx, None, "form_submit"))
     if found is None:
-        found = _first_hit([(str(src), str(text or "")) for src, text in ctx.signals])
+        get_submit = any(
+            str(src) == "form_method" and str(text or "").strip().lower() == "get"
+            for src, text in ctx.signals
+        )
+        found = _first_hit(_effective_signals(ctx), path_only=get_submit)
     if found is not None:
         hit, source = found
         return RiskAssessment(
