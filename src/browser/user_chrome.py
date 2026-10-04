@@ -99,6 +99,37 @@ def prepare_profile_dir(profile_dir: Path = DEFAULT_PROFILE_DIR) -> Path:
     return path
 
 
+#: WebRTC 비프록시 UDP 차단 플래그(WS-29b). 설치된 Chrome 은 이 명령줄 플래그를 무시했다
+#: (Chrome 154 실측: 플래그가 명령줄에 있어도 STUN UDP 도달) — 프로필 설정으로도 건다.
+_WEBRTC_POLICY_FLAG = "--force-webrtc-ip-handling-policy="
+
+
+def _apply_webrtc_policy_pref(profile_path: Path, extra_args: list) -> None:
+    """extra_args 에 WebRTC 정책 플래그가 있으면 전용 프로필 Preferences 에 같은 정책을 쓴다.
+
+    다른 설정은 그대로 둔다. 읽기 실패(손상된 JSON)면 새로 쓰지 않고 그대로 둔다 — 남은 한계로
+    README 에 적는다(플래그는 여전히 넘긴다).
+    """
+    policy = next((a[len(_WEBRTC_POLICY_FLAG):] for a in extra_args
+                   if a.startswith(_WEBRTC_POLICY_FLAG)), None)
+    if not policy:
+        return
+    prefs_path = profile_path / "Default" / "Preferences"
+    prefs: dict = {}
+    if prefs_path.exists():
+        try:
+            prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(prefs, dict):
+            return
+    webrtc = prefs.get("webrtc") if isinstance(prefs.get("webrtc"), dict) else {}
+    webrtc["ip_handling_policy"] = policy
+    prefs["webrtc"] = webrtc
+    prefs_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+
+
 def pick_free_port() -> int:
     """127.0.0.1 에서 비어 있는 TCP 포트 하나."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -176,17 +207,20 @@ async def launch_user_chrome(
     port: int = 0,
     chrome_path: Optional[Path] = None,
     timeout_s: float = READY_TIMEOUT_S,
+    extra_args: Optional[list] = None,
 ) -> UserChrome:
     """사람이 쓰는 Chrome 을 자동화 플래그 없이 전용 프로필로 띄우고 준비될 때까지 기다린다.
 
     port=0 이면 127.0.0.1 빈 포트를 골라 구체 번호로 넘긴다(0 을 Chrome 에 넘기지 않는다 —
     build_chrome_args 참조). 준비 여부는 http://127.0.0.1:<port>/json/version 폴링으로 본다.
+    extra_args 는 Egress 프록시 인자(WS-29b, EgressRuntime.chrome_args)처럼 더할 플래그다.
     """
     _guard_profile(profile_dir)  # 가드가 먼저(프로세스·폴더를 만들기 전)
     if not port:
         port = pick_free_port()
-    args = build_chrome_args(profile_dir=profile_dir, port=port)
+    args = build_chrome_args(profile_dir=profile_dir, port=port) + list(extra_args or [])
     path = prepare_profile_dir(profile_dir)
+    _apply_webrtc_policy_pref(path, list(extra_args or []))
     exe = chrome_path or find_chrome()
     if exe is None:
         raise FileNotFoundError("설치된 Google Chrome 을 찾지 못했습니다")
