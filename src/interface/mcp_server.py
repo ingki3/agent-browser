@@ -597,6 +597,13 @@ class BrowserMCPServer:
         self._banner: Any = None
         #: 이번 호출에서 쓴 승인 증표 id(결과에 outcome 을 붙인다).
         self._used_approval: Optional[str] = None
+        #: 조작권 안내 띠 문구(코드 표시 중에는 미뤄 두었다가 코드를 내린 뒤 다시 띄운다).
+        self._control_banner: Optional[str] = None
+        #: 창 오버레이에 확인 코드가 떠 있다(또는 내렸는지 확인하지 못했다) — 그동안 화면 캡처 거부.
+        #: 코드 평문은 여기에도 두지 않는다(표시 직후 버린다).
+        self._code_on_overlay = False
+        #: 사람이 에이전트 활성 탭을 닫았음(조작권 반납 때 확인, NB-3) — control_wait/status 로 알린다.
+        self._tab_notice: Optional[Dict[str, Any]] = None
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
         self.allow_private_network = allow_private_network
         self.block_loopback = block_loopback
@@ -725,34 +732,126 @@ class BrowserMCPServer:
                 # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
                 if self._engine is not None:
                     self._engine.bump_epoch("control_release")
-                await self._set_banner(None)
+                await self._recover_closed_tab()
+                await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
-                await self._set_banner("사람이 조작 중 — 끝나면 `agent-browser control release`")
+                await self._show_control_banner(
+                    "사람이 조작 중 — 끝나면 `agent-browser control release`")
                 _stderr_line("agent-browser serve: 조작권을 사람이 가져감")
+        await self._sync_code_overlay()
         return events
+
+    # -- 확인 코드 오버레이 (WS-29 R1) ------------------------------------------
+
+    async def _sync_code_overlay(self) -> None:
+        """hub 가 내준 확인 코드를 창 오버레이에 띄우고, 만료·입력·폐기되면 내린다.
+
+        코드는 **창 오버레이에만** 간다 — MCP 응답·stderr·로그·상태 파일에는 쓰지 않는다. 표시가
+        실패하면 hub 에 알려 코드를 무효로 한다(창에 없는 코드로는 승인할 수 없다).
+        """
+        job = self.hub.take_code_job()
+        if job is not None:
+            shown = False
+            if self._human_can_see():
+                from interface.handoff import CODE_TTL_S, display_safe
+
+                ap = self.hub.approvals.get(job.approval_id)
+                target = display_safe((ap.summary or {}).get("target", "") if ap else "", 40)
+                # 표시 시도 전에 켠다 — 표시 성공 여부를 모르는 동안에도 화면 캡처를 거부(fail-closed).
+                self._code_on_overlay = True
+                shown = bool(await self._set_banner(
+                    f"agent-browser 승인 확인 코드 {job.code}  (대상: {target}, "
+                    f"{int(CODE_TTL_S)}초) — 터미널의 approve 에 입력"))
+            self.hub.code_shown(job.nonce, shown)
+            del job  # 평문을 붙잡지 않는다
+        if self._code_on_overlay and not self.hub.code_displayed():
+            if await self._set_banner(self._control_banner):
+                self._code_on_overlay = False
+
+    def _pixels_blocked(self) -> bool:
+        """확인 코드가 창에 떠 있을 수 있는 동안 화면 픽셀을 에이전트에게 주지 않는다."""
+        return self._code_on_overlay or self.hub.code_displayed()
+
+    async def _show_control_banner(self, text: Optional[str]) -> None:
+        self._control_banner = text
+        if not self._code_on_overlay:  # 코드가 떠 있으면 코드를 덮지 않는다(내린 뒤 다시 띄움)
+            await self._set_banner(text)
+
+    async def _recover_closed_tab(self) -> None:
+        """조작권 반납 때 에이전트 활성 탭이 살아 있는지 확인(NB-3). 사람이 닫았으면 남은 탭(없으면
+        새 탭)으로 바꾸고 알린다 — 닫힌 탭을 관찰해 PAGE_CRASHED 가 나지 않게."""
+        core, dispatcher = self._core, self._dispatcher
+        ctx = getattr(dispatcher, "ctx", None)
+        if core is None or ctx is None or not hasattr(core, "get_tab"):
+            return
+        closed_id = getattr(ctx, "tab_id", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
+        alive = core.get_tab(closed_id) is not None
+        try:
+            alive = alive and not page.is_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        if alive:
+            return
+        try:
+            tabs = core.tabs()
+            tab = tabs[0] if tabs else await core.new_tab("mcp-session")
+            core.set_active_tab(tab.tab_id)
+            dispatcher._set_active_page(tab.page, tab.tab_id)
+            ctx.cdp = await core.new_cdp_session(tab.tab_id)
+            if self._page is None or self._page.is_closed():
+                self._page = tab.page
+                self._cdp = ctx.cdp
+            if self._engine is not None:
+                self._engine.bump_epoch("tab_closed_by_human")
+        except Exception:  # noqa: BLE001
+            logger.warning("사람이 닫은 탭 복구 실패", exc_info=True)
+            return
+        self._tab_notice = {
+            "closed_tab_id": closed_id,
+            "active_tab_id": tab.tab_id,
+            "hint": ("사람이 에이전트가 쓰던 탭을 닫았습니다 — 남은 탭으로 바꿨습니다. "
+                     "browser_tab_control(command=\"list\") 로 탭을 확인하고 다시 관찰하세요."),
+        }
 
     def _human_can_see(self) -> bool:
         """사람이 볼 브라우저 창이 있는가(headless 면 없다)."""
         return self.browser_mode != "headless" or not self.headless
 
-    async def _set_banner(self, text: Optional[str]) -> None:
+    async def _set_banner(self, text: Optional[str]) -> bool:
         """창 위 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나
-        누를 수 없다). 창이 없거나 실패하면 조용히 넘어간다(안내는 stderr 에도 나간다)."""
+        누를 수 없다). 성공하면 True. 창이 없거나 실패하면 False(안내는 stderr 에도 나간다).
+
+        지울 때는 띄웠던 그 탭의 세션으로 지운다(활성 탭이 바뀌었어도 옛 탭에 남지 않게). 띄우기 전
+        DOM.enable 이 필요하다(Chromium: 'DOM should be enabled first').
+        주의: headed 창에서는 이 오버레이가 Page 스크린샷에 찍힌다(R1 실측) — 확인 코드가 떠 있는
+        동안 화면 캡처를 거부하는 이유(_pixels_blocked).
+        """
         if not self._human_can_see() or self._core is None:
-            return
+            return False
         try:
+            if not text:
+                if self._banner is not None:
+                    cdp = self._banner[1]
+                    await cdp.send("Overlay.setPausedInDebuggerMessage", {})
+                    await cdp.send("Overlay.disable")
+                return True
             tab_id = self._core.active_tab_id
-            if self._banner is None or self._banner[0] != tab_id:
+            if self._banner is not None and self._banner[0] != tab_id:
+                old = self._banner[1]
+                await old.send("Overlay.setPausedInDebuggerMessage", {})
+                self._banner = None
+            if self._banner is None:
                 self._banner = (tab_id, await self._core.new_cdp_session(tab_id))
             cdp = self._banner[1]
+            await cdp.send("DOM.enable")
             await cdp.send("Overlay.enable")
-            await cdp.send("Overlay.setPausedInDebuggerMessage",
-                           {"message": text} if text else {})
-            if not text:
-                await cdp.send("Overlay.disable")
+            await cdp.send("Overlay.setPausedInDebuggerMessage", {"message": text})
+            return True
         except Exception:  # noqa: BLE001
             logger.debug("안내 띠 표시 실패", exc_info=True)
+            return False
 
     def _current_origin(self) -> str:
         from urllib.parse import urlsplit
@@ -779,7 +878,10 @@ class BrowserMCPServer:
         await self._poll_handoff()
         short = name[len(TOOL_PREFIX):]
         if short == "control_status":
-            return {"success": True, "data": {"control": self.hub.status()}}
+            data: Dict[str, Any] = {"control": self.hub.status()}
+            if self._tab_notice is not None:
+                data["tab_closed_by_human"] = self._tab_notice
+            return {"success": True, "data": data}
         if short == "control_request":
             return await self._control_request(args)
         timeout = _wait_timeout(args.get("timeout_s"))
@@ -811,9 +913,11 @@ class BrowserMCPServer:
             await page.bring_to_front()
         except Exception:  # noqa: BLE001
             pass
-        await self._set_banner(f"에이전트가 사람 조작을 요청: {reason[:80]} — "
-                               f"`agent-browser control take`")
-        _stderr_line(f"agent-browser serve: [사람 조작 요청] {reason} "
+        from interface.handoff import display_safe
+
+        await self._show_control_banner(f"에이전트가 사람 조작을 요청: {display_safe(reason, 80)} — "
+                                        f"`agent-browser control take`")
+        _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         return {"success": True, "data": out}
 
@@ -839,6 +943,8 @@ class BrowserMCPServer:
         if changed == "released":
             data["hint"] = _RELEASE_HINT
             data["snapshot_epoch"] = self._engine.epoch if self._engine else 0
+            if self._tab_notice is not None:
+                data["tab_closed_by_human"], self._tab_notice = self._tab_notice, None
         return {"success": True, "data": data}
 
     async def _approval_wait(self, approval_id: str, timeout: float) -> Dict[str, Any]:
@@ -960,6 +1066,18 @@ class BrowserMCPServer:
                 "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
                 data={"control": control},
             )
+        if action is ActionType.TAKE_SCREENSHOT and self._pixels_blocked():
+            # WS-29 R1: 사람용 확인 코드가 창 오버레이에 떠 있다. headed 창에서는 오버레이가
+            # 스크린샷에 찍히므로(실측) 그동안 화면 픽셀(일반·전체·SoM)을 주지 않는다.
+            from interface.handoff import CODE_TTL_S
+
+            return self._error_result(
+                action,
+                ErrorCode.SCREENSHOT_FAILED,
+                "사람이 승인 확인 중이라(창에 확인 코드 표시) 잠시 화면 캡처를 할 수 없습니다. "
+                "observe_page·extract 는 쓸 수 있습니다. 잠시 뒤 다시 시도하세요.",
+                data={"blocked_by": "approval_code_displayed", "retry_after_s": int(CODE_TTL_S)},
+            )
 
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
@@ -1004,12 +1122,18 @@ class BrowserMCPServer:
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
         used, self._used_approval = self._used_approval, None
+        if used is not None:
+            # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
+            self._dispatcher.heal_disabled = True
         try:
             result = await self._dispatcher.dispatch(action, params)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
+        finally:
+            if used is not None:
+                self._dispatcher.heal_disabled = False
         if used is not None:
             self._attach_approval_outcome(used, result)
         result = self._attach_egress_block(action, params, result, blocks_before)
@@ -1187,6 +1311,41 @@ class BrowserMCPServer:
             "snapshot_epoch": self._engine.epoch if self._engine else 0,
         }
 
+    async def _use_approval(self, approval_id: str, action: ActionType, params: Dict[str, Any],
+                            components: Dict[str, Any]) -> Any:
+        """승인 증표 사용(WS-29 R1 NB-1). True = 통과(증표 소모, 이번 호출은 치유 끔),
+        ActionResult = 대상이 승인 때와 달라 거부(증표는 승인 상태로 남음), dict = 증표 거부 사유.
+
+        digest(대상 이름·문맥 근거·탭·origin·epoch 재계산)가 같아야 하고, element_id 대상이 관찰 때 그
+        요소 그대로(연결·role·이름)여야 한다 — 같은 이름의 다른 버튼으로 바뀌었으면 누르지 않는다.
+        """
+        ok, why, reason_code = self.hub.check_approval(approval_id, components)
+        if not ok:
+            return {"approval_id": approval_id, "reason": why, "reason_code": reason_code}
+        check = getattr(self._dispatcher, "approval_target_check", None)
+        if check is None:
+            target = {"fresh": False, "detail": "대상 확인 불가"}  # fail-closed
+        else:
+            try:
+                target = await check(params)
+            except Exception as exc:  # noqa: BLE001
+                target = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
+        if not target.get("fresh"):
+            return self._error_result(
+                action,
+                ErrorCode.TOCTOU_MISMATCH,
+                "승인한 대상이 바뀌어 실행하지 않았습니다(" + str(target.get("detail") or "") + "). "
+                "다시 관찰하세요 — 같은 대상이면 이 승인으로 다시 호출할 수 있고, 다르면 새 승인이 필요합니다.",
+                data={"approval": {"approval_id": approval_id, "status": "approved",
+                                   "reason": "target_changed",
+                                   "detail": str(target.get("detail") or "")}},
+            )
+        ok, why = self.hub.consume_approval(approval_id, components)
+        if not ok:  # 그사이 다른 호출이 썼다
+            return {"approval_id": approval_id, "reason": why, "reason_code": "used"}
+        self._used_approval = approval_id
+        return True
+
     async def _check_hitl(
         self, action: ActionType, params: Dict[str, Any], approval_id: Any = None
     ) -> Optional[ActionResult]:
@@ -1260,30 +1419,41 @@ class BrowserMCPServer:
                 self._pending_gate_basis = dict(decision.basis)
             return None
 
-        # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve`)에서 승인한 바로 그 행동만 통과.
-        components = self._approval_components(action, params, dict(decision.basis))
-        rejected: Optional[Dict[str, Any]] = None
-        if approval_id:
-            ok, why = self.hub.consume_approval(str(approval_id), components)
-            if ok:
-                self._used_approval = str(approval_id)
-                if report_basis:
-                    self._pending_gate_basis = dict(decision.basis)
-                return None
-            rejected = {"approval_id": str(approval_id), "reason": why}
-        ap = self.hub.issue_approval(components, {
-            "target": element_name or selector,
-            "reason": decision.reason,
-            "domain": self._current_domain(),
-        })
-        approval = {
-            "approval_id": ap.approval_id,
-            "action_digest": ap.digest,
-            "expires_at": _iso(ap.expires),
-            "how_to_approve": f"사람이 터미널에서: agent-browser approve {ap.approval_id}",
-        }
-        if rejected is not None:
-            approval["rejected"] = rejected
+        # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve` + 창의 확인 코드)에서 승인한
+        # 바로 그 행동만 통과. R1: 사람이 볼 창이 없으면(headless) 증표를 발급하지 않는다 —
+        # 확인 코드를 띄울 곳이 없어 사람만 승인할 수 있다는 보장이 없다.
+        ap: Any = None
+        approval: Optional[Dict[str, Any]] = None
+        if self._human_can_see():
+            components = self._approval_components(action, params, dict(decision.basis))
+            rejected: Optional[Dict[str, Any]] = None
+            if approval_id:
+                passed = await self._use_approval(str(approval_id), action, params, components)
+                if passed is True:
+                    if report_basis:
+                        self._pending_gate_basis = dict(decision.basis)
+                    return None
+                if isinstance(passed, ActionResult):
+                    return passed
+                rejected = passed
+            ap = self.hub.issue_approval(components, {
+                "target": element_name or selector,
+                "reason": decision.reason,
+                "domain": self._current_domain(),
+            })
+            # NB-7: action_digest 는 싣지 않는다 — 사람 CLI 가 상태 파일에서 읽는다.
+            approval = {
+                "approval_id": ap.approval_id,
+                "expires_at": _iso(ap.expires),
+                "how_to_approve": (f"사람이 터미널에서: agent-browser approve {ap.approval_id} "
+                                   "(브라우저 창에 뜨는 확인 코드 입력)"),
+            }
+            if rejected is not None:
+                approval["rejected"] = rejected
+                if rejected.get("reason_code") == "target_changed":
+                    approval["reason"] = "target_changed"
+        else:
+            rejected = None
 
         message = decision.reason
         if decision.requires_confirmation and decision.dialog is not None:
@@ -1300,17 +1470,19 @@ class BrowserMCPServer:
             ),
             # WS-31: 운영자가 왜 막혔는지 — {name, matched_keyword, source, …}.
             "gate_basis": dict(decision.basis),
-            "approval": approval,
         }
+        if approval is not None:
+            data["approval"] = approval
+        approval_id_hint = ap.approval_id if ap is not None else ""
         code = decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED
         if code is ErrorCode.HITL_UNATTENDED_BLOCKED:
             # WS-30 항목 5: 에이전트가 "어떻게 승인하나요?"로 멈추지 않게, 사람(운영자)이
             # 할 수 있는 해결 경로만 알린다 — 다른 도구로 돌아가는 방법은 알리지 않는다.
             hint = pre_approve_hint(action, element_name)
-            message += blocked_hint_text(hint, ap.approval_id)
+            message += blocked_hint_text(hint, approval_id_hint)
             data["pre_approve_hint"] = hint
-        else:
-            message += approve_hint_text(ap.approval_id)
+        elif approval_id_hint:
+            message += approve_hint_text(approval_id_hint)
 
         return self._error_result(action, code, message, data=data)
 
@@ -1664,9 +1836,15 @@ SHUTDOWN_SIGNALS = tuple(
 
 
 def _stderr_line(text: str) -> None:
-    """stderr 에 한 줄(신호 처리기 안에서도 안전하게 os.write). stdout 은 MCP 전용."""
+    """stderr 에 한 줄(신호 처리기 안에서도 안전하게 os.write). stdout 은 MCP 전용.
+
+    한 줄 보장: 외부 유래 문자열(에이전트 reason·URL·예외 문구)이 섞여도 제어문자·개행·양방향
+    제어를 보이는 표기로 바꾼다(WS-29 R1 BLOCKING-1 — 운영자 터미널 위조 방지).
+    """
+    from interface.handoff import display_safe
+
     try:
-        os.write(2, (text + "\n").encode("utf-8", "replace"))
+        os.write(2, (display_safe(text, 4000) + "\n").encode("utf-8", "replace"))
     except OSError:
         pass
 

@@ -25,6 +25,7 @@ from interface import cli, handoff, mcp_server
 from interface.mcp_server import SERVER_TOOLS, BrowserMCPServer, tool_name
 
 from test_run_cli import fake_llm, requires_chromium, server  # noqa: F401 - 픽스처·판정 재사용
+from ws29_helpers import code_from_banner, srv_approve
 
 MANIPULATION_ARGS: Dict[ActionType, Dict[str, Any]] = {
     ActionType.CLICK: {"element_id": "@e1", "epoch": 0},
@@ -97,6 +98,9 @@ class _Dispatcher:
     async def describe_element_for_gate(self, element_id: str) -> Dict[str, Any]:
         return {"info": {"signals": []}}
 
+    async def approval_target_check(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"fresh": True, "detail": ""}
+
     async def dispatch(self, action: ActionType, params: Dict[str, Any]) -> ActionResult:
         self.calls.append(action)
         err = self.next_error
@@ -107,10 +111,21 @@ class _Dispatcher:
         )
 
 
-def _server(tmp_path: Path, **kw: Any) -> BrowserMCPServer:
+def _server(tmp_path: Path, visible: bool = True, **kw: Any) -> BrowserMCPServer:
+    """브라우저 없는 서버. visible=True 면 '사람이 볼 창이 있다'(승인 증표 켜짐, R1)로 두고
+    창 오버레이 문구를 srv.banners 로 가로챈다(사람의 눈 역할 — 확인 코드를 여기서 읽는다)."""
     from security import HITLGate
 
     srv = BrowserMCPServer(handoff_root=tmp_path / "servers", **kw)
+    srv.banners = []
+    if visible:
+        srv._human_can_see = lambda: True
+
+        async def _banner(text: Any) -> bool:
+            srv.banners.append(text)
+            return True
+
+        srv._set_banner = _banner
     srv._started = True
     srv._engine = _Engine()
     srv._page = _Page()
@@ -214,11 +229,15 @@ async def test_control_wait_timeout_and_cap(srv, monkeypatch):
     assert mcp_server._wait_timeout(-5) == 0.0
 
 
-async def test_headless_control_request_refused(srv):
-    out = await srv.call_server_tool("browser_control_request", {"reason": "캡차"})
-    assert not out["success"]
-    assert "--browser human" in out["error_message"] and "user-chrome" in out["error_message"]
-    assert srv.hub.status()["requested"] is False
+async def test_headless_control_request_refused(tmp_path):
+    srv = _server(tmp_path, visible=False)
+    try:
+        out = await srv.call_server_tool("browser_control_request", {"reason": "캡차"})
+        assert not out["success"]
+        assert "--browser human" in out["error_message"] and "user-chrome" in out["error_message"]
+        assert srv.hub.status()["requested"] is False
+    finally:
+        srv.hub.close()
 
 
 async def test_control_status_tool(srv):
@@ -238,7 +257,8 @@ async def test_block_carries_approval_and_message(srv):
     r = await _blocked(srv)
     assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED
     ap = r.data["approval"]
-    assert set(ap) >= {"approval_id", "action_digest", "expires_at", "how_to_approve"}
+    assert set(ap) >= {"approval_id", "expires_at", "how_to_approve"}
+    assert "action_digest" not in ap  # R1 NB-7
     assert f"agent-browser approve {ap['approval_id']}" in r.error_message
     assert r.data["pre_approve_hint"] == "click:결제하기"  # 기존 안내 유지
     # 우회 안내 없음
@@ -271,15 +291,14 @@ async def test_approval_id_alone_never_executes(srv):
     assert srv._dispatcher.calls == []
 
 
-def _approve(srv: BrowserMCPServer, aid: str) -> None:
-    shown = handoff.read_pending_approval(srv.hub.root, srv.hub.server_id, aid)
-    handoff.write_command(srv.hub.root, srv.hub.server_id, "approve", approval_id=aid,
-                          action_digest=shown["action_digest"])
+async def _approve(srv: BrowserMCPServer, aid: str) -> None:
+    """사람: 코드 표시 요청 → 창 오버레이의 코드를 읽어 승인(R1)."""
+    await srv_approve(srv, aid)
 
 
 async def test_approved_then_single_use(srv):
     aid = (await _blocked(srv)).data["approval"]["approval_id"]
-    _approve(srv, aid)
+    await _approve(srv, aid)
     ok = await _blocked(srv, approval_id=aid)
     assert ok.success, ok
     assert ok.data["approval"] == {"approval_id": aid, "status": "used", "outcome": "succeeded"}
@@ -291,7 +310,7 @@ async def test_approved_then_single_use(srv):
 @pytest.mark.parametrize("mutate", ["epoch", "tab", "origin", "param"])
 async def test_digest_bound_to_context(srv, mutate):
     aid = (await _blocked(srv)).data["approval"]["approval_id"]
-    _approve(srv, aid)
+    await _approve(srv, aid)
     args: Dict[str, Any] = {"approval_id": aid}
     if mutate == "epoch":
         srv._engine.epoch = 1
@@ -316,7 +335,7 @@ async def test_digest_bound_to_context(srv, mutate):
                                   ErrorCode.NAVIGATE_TIMEOUT])
 async def test_uncertain_result_is_outcome_unknown(srv, code):
     aid = (await _blocked(srv)).data["approval"]["approval_id"]
-    _approve(srv, aid)
+    await _approve(srv, aid)
     srv._dispatcher.next_error = code
     r = await _blocked(srv, approval_id=aid)
     assert r.data["approval"]["outcome"] == "outcome_unknown"
@@ -332,7 +351,7 @@ async def test_approval_wait_returns_on_approve(srv):
     waiter = asyncio.ensure_future(srv.call_server_tool(
         "browser_approval_wait", {"approval_id": aid, "timeout_s": 5}))
     await asyncio.sleep(0.1)
-    _approve(srv, aid)
+    await _approve(srv, aid)
     out = await waiter
     assert out["data"]["approval"]["status"] == "approved"
 
@@ -484,10 +503,25 @@ async def test_demo_captcha_handoff(mock_site, tmp_path, monkeypatch):
         assert "3,000원" in json.dumps(price.data, ensure_ascii=False)
 
 
+def _watch_overlay(s: BrowserMCPServer) -> List[Any]:
+    """headless 로 돌리되 사람이 볼 창이 있다고 두고 창 오버레이 문구를 가로챈다(사람의 눈)."""
+    s._human_can_see = lambda: True
+    seen: List[Any] = []
+    real = s._set_banner
+
+    async def spy(text: Any) -> bool:
+        seen.append(text)
+        return await real(text)
+
+    s._set_banner = spy
+    return seen
+
+
 @requires_chromium
 async def test_demo_payment_approval(mock_site, monkeypatch):
     monkeypatch.setattr(handoff, "_stdin_is_tty", lambda: False)
     async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
+        banners = _watch_overlay(s)
         await s.call_tool("browser_navigate", {"url": mock_site + "/pay"})
         obs = await s.call_tool("browser_observe_page", {})
         ep = obs.data["observation"]["snapshot_epoch"]
@@ -503,8 +537,10 @@ async def test_demo_payment_approval(mock_site, monkeypatch):
         r2 = await s.call_tool("browser_click", {**pay, "approval_id": aid})
         assert not r2.success and r2.data["approval"]["rejected"]["approval_id"] == aid
         assert await out_text() == "대기"
-        # 3) 사람: CLI 승인(--yes, 스크립트용) — 서버 감시 태스크가 처리
-        assert await _human_cli("approve", aid, "--yes") == 0
+        # 3) 사람: CLI 승인 — 창에 코드 띄우기 → 창에서 읽은 코드 입력(서버 감시 태스크가 처리)
+        assert await _human_cli("approve", aid, "--yes") == 2  # --yes 만으로는 안 됨(R1)
+        assert await _human_cli("approve", aid) == 2  # 코드 표시, 비TTY 라 --code 로 다시
+        assert await _human_cli("approve", aid, "--code", code_from_banner(banners)) == 0
         # 4) 재호출 성공
         r4 = await s.call_tool("browser_click", {**pay, "approval_id": aid})
         assert r4.success, r4
@@ -518,7 +554,8 @@ async def test_demo_payment_approval(mock_site, monkeypatch):
         r6 = await s.call_tool("browser_click", dict(pay))
         aid2 = r6.data["approval"]["approval_id"]
         assert aid2 != aid
-        assert await _human_cli("approve", aid2, "--yes") == 0
+        assert await _human_cli("approve", aid2) == 2
+        assert await _human_cli("approve", aid2, "--code", code_from_banner(banners)) == 0
         await s.call_tool("browser_reload", {})
         obs2 = await s.call_tool("browser_observe_page", {})
         ep2 = obs2.data["observation"]["snapshot_epoch"]

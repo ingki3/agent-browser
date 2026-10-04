@@ -9,7 +9,7 @@
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
     agent-browser run --url <주소> --goal <목표> [--human|--user-chrome] [--handoff]  # 목표 1개 실행
     agent-browser control take|release|status [--server ID]   # 사람: serve 의 조작권 (WS-29)
-    agent-browser approve <approval_id> [--server ID] [--yes|--deny]  # 사람: 고위험 행동 승인
+    agent-browser approve <approval_id> [--server ID] [--code N|--deny]  # 사람: 고위험 행동 승인(창의 확인 코드)
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -145,7 +145,10 @@ def _build_parser() -> argparse.ArgumentParser:
     approve = sub.add_parser("approve", help="사람: 에이전트가 요청한 고위험 행동 하나를 승인합니다.")
     approve.add_argument("approval_id")
     approve.add_argument("--server", default=None, metavar="ID", help="서버 id (생략 시 자동 탐색)")
-    approve.add_argument("--yes", action="store_true", help="확인 질문 없이 승인(스크립트용)")
+    approve.add_argument("--code", default=None, metavar="N",
+                         help="브라우저 창에 뜬 6자리 확인 코드(생략하면 창에 코드를 띄우고 입력받음)")
+    approve.add_argument("--yes", action="store_true",
+                         help="(호환용) 코드를 대신하지 못함 — 승인에는 --code 가 필요")
     approve.add_argument("--deny", action="store_true", help="승인하지 않고 거절로 기록")
 
     # --- tui ---
@@ -404,7 +407,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.yes and args.deny:
             parser.error("--yes 와 --deny 는 함께 쓸 수 없습니다")
-        return handoff.cli_approve(args.approval_id, args.server, args.yes, deny=args.deny)
+        if args.code is not None and args.deny:
+            parser.error("--code 와 --deny 는 함께 쓸 수 없습니다")
+        return handoff.cli_approve(args.approval_id, args.server, args.yes, deny=args.deny,
+                                   code=args.code)
     if args.command == "llm-check":
         return _cmd_llm_check(args)
     if args.command == "session":

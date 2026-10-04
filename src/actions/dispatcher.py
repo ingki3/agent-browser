@@ -780,6 +780,9 @@ class ActionDispatcher:
         #: WS-30 R1 BLOCKING-4: 프레임 안 액션 직전 최상위 기록기 시각(performance.now), 판정 기록.
         self._top_start: Optional[float] = None
         self._top_attribution: Optional[Dict[str, Any]] = None
+        #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
+        #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
+        self.heal_disabled = False
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -963,6 +966,24 @@ class ActionDispatcher:
             return await self._locator_for(handle).evaluate(_TARGET_INFO_JS)
         except Exception:  # noqa: BLE001
             return None
+
+    async def approval_target_check(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """승인 증표 실행 직전: element_id 대상이 관찰 때 그 요소(연결·role·이름·epoch)인가 (WS-29 R1).
+
+        {"fresh": bool, "detail": str}. 확인 실패는 fresh=False(fail-closed). element_id 가 없는
+        액션(selector·좌표·키)은 게이트가 지금 DOM 에서 대상을 다시 읽어 digest 로 비교하므로 True.
+        """
+        element_id = params.get("element_id")
+        if not element_id:
+            return {"fresh": True, "detail": ""}
+        handle = self.ctx.engine.get_handle(element_id)
+        if handle is None:
+            return {"fresh": False, "detail": "요소 핸들 없음"}
+        try:
+            st = await verify_staleness(self.ctx.page, handle, self.ctx.engine.epoch)
+        except Exception as exc:  # noqa: BLE001
+            return {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
+        return {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
 
     async def describe_element_for_gate(self, element_id: str) -> Dict[str, Any]:
         """element_id 클릭의 게이트 판정용 DOM 정보 (WS-31 문맥 신호).
@@ -1400,6 +1421,17 @@ class ActionDispatcher:
         )
 
         healed_flag = False
+        if not staleness.fresh and self.heal_disabled:
+            # 승인 증표 호출: 다른(비슷한) 요소로 바꿔 누르지 않는다.
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=f"승인한 대상이 바뀜({staleness.detail}) — 자가 치유하지 않음",
+                reobserve_required=True,
+                data={"heal_disabled": True},
+            )
         if not staleness.fresh:
             # 부작용이 없는 시점이므로 치유가 안전하다.
             healing = await self._attempt_heal(handle)

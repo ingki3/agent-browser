@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1731개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1790개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -328,22 +328,27 @@ agent-browser control take
 agent-browser control release
 ```
 
-4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다.
+4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다. 사람이 에이전트가 쓰던 탭을 닫았으면 반납 때 남은 탭으로 바꾸고 `data.tab_closed_by_human={closed_tab_id, active_tab_id, hint}`로 알립니다(`browser_tab_control(command="list")`로 확인).
 
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 
-**결제 버튼 예시(승인 증표).** 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, action_digest, expires_at, how_to_approve}`가 붙습니다. `action_digest`는 액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거(`gate_basis`) + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256 입니다.
+**결제 버튼 예시(승인 증표).** 창이 보이는 서버(`--browser human`·`user-chrome`)에서 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, expires_at, how_to_approve}`가 붙습니다. 서버는 이 증표를 행동 내용의 해시(액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거 `gate_basis` + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256)에 묶어 두고, 해시는 사람 CLI 만 상태 파일에서 읽습니다(에이전트 응답에는 싣지 않음). **headless 서버는 승인 증표를 발급하지 않습니다** — 사람이 볼 창이 없어 확인 코드를 띄울 곳이 없기 때문입니다. 그때는 기존처럼 `--pre-approve`·`--mode interactive` 안내만 나가며, 대화형 모드의 확인도 같은 이유로 창(확인 코드)이 있어야 완료할 수 있습니다.
 
 1. 에이전트: `browser_click(element_id="@e5", epoch=3)` → 차단, `approval_id=ap_…`. 메시지는 "사람에게 `agent-browser approve ap_…` 실행을 요청"하라고 안내합니다.
-2. 사람: 내용(액션·대상·근거·origin·탭·epoch·파라미터·만료)을 보고 y 로 승인합니다(`--yes`는 스크립트용, `--deny`는 거절). 터미널이 아니면 `--yes` 없이는 승인하지 않습니다.
+2. 사람: 터미널에서 `agent-browser approve ap_…`를 치면 내용(액션·대상·근거·origin·탭·epoch·파라미터·만료)이 나오고, **브라우저 창 위(오버레이)에 6자리 확인 코드**가 뜹니다(120초 유효). 그 코드를 프롬프트에 입력하거나 `--code`로 다시 실행합니다. `--deny`는 거절, 빈 입력은 취소입니다. 페이지·에이전트가 정한 문자열(요소 이름·사유·URL)은 제어문자·개행·양방향 제어를 `\x1b`·`\u202e` 같은 보이는 표기로 바꿔 보여 줍니다(화면 위조 방지).
 
 ```text
-agent-browser approve ap_XXXX
+agent-browser approve ap_XXXX            # 창에 코드가 뜸 → 터미널이면 그 자리에서 입력
+agent-browser approve ap_XXXX --code 123456
 ```
+
+확인 코드는 서버가 `secrets`로 만들어 창 오버레이에만 띄우고, 서버 메모리에는 HMAC 만 둡니다 — 상태 파일·MCP 응답·serve stderr·로그·ack 어디에도 쓰지 않습니다. 틀리면 거부, 연속 3회 틀리거나 코드 표시를 5회 넘게 요청하면 그 증표를 폐기합니다(새로 막히면 새 id). headed 창에서는 오버레이가 화면 캡처에 찍히므로 **코드가 떠 있는 동안 `take_screenshot`(일반·전체·SoM)은 `E_SCREENSHOT_FAILED`, `data.blocked_by="approval_code_displayed"`로 거부**합니다(관찰·추출은 그대로). `--yes`는 더 이상 코드를 대신하지 못합니다. 터미널(TTY) 여부는 프롬프트를 띄울지 정하는 편의일 뿐 보안 근거가 아닙니다(pty 로 흉내 낼 수 있음).
 
 3. 에이전트: `browser_approval_wait(approval_id)`로 기다린 뒤 **같은 인자에 `approval_id`를 더해** 다시 호출합니다: `browser_click(element_id="@e5", epoch=3, approval_id="ap_…")`.
 
-서버는 (사람이 승인함 ∧ 만료 전(기본 30분, `serve --approval-ttl SEC`) ∧ 다시 계산한 digest 가 같음 ∧ 처음 씀)일 때만 통과시킵니다. 승인 전·다른 서버의 id·만료·재사용·파라미터/대상/탭/origin/epoch 가 달라진 호출은 거부하고 이유를 `data.approval.rejected`에 싣습니다. **에이전트가 가진 `approval_id`만으로는 실행되지 않습니다** — 승인은 사람이 대역 밖에서만 할 수 있고, 서버는 디스크의 승인 파일이 아니라 자기 메모리의 상태만 믿습니다(명령 파일은 같은 사용자 소유·0600·server_id 일치·digest 일치일 때만 처리). 증표로 실행했는데 결과가 불확실하면(`E_TIMEOUT`·`E_PAGE_CRASHED`·`E_NAVIGATE_TIMEOUT`) `data.approval.outcome="outcome_unknown"`, `retry_safe=false`로 알리고 같은 증표는 다시 쓸 수 없습니다 — 자동으로 다시 시도하지 말고 관찰해 확인하십시오. 운영자 정적 허용 `--pre-approve`는 그대로 동작합니다.
+서버는 (사람이 승인함 ∧ 만료 전(기본 30분, `serve --approval-ttl SEC`) ∧ 다시 계산한 digest 가 같음 ∧ 처음 씀)일 때만 통과시킵니다. 증표로 실행하는 호출은 **자가 치유(비슷한 이름의 요소로 대체)를 끄고**, `element_id` 대상이 관찰 때 그 요소 그대로(연결·role·이름)일 때만 누릅니다 — 승인 뒤 같은 이름의 다른 버튼으로 바뀌었으면 `E_TOCTOU_MISMATCH`, `data.approval.reason="target_changed"`로 거부합니다(증표는 승인 상태로 남음). 끝난 증표(사용·거절·만료·폐기)는 10분 뒤 메모리·파일에서 지우고, 증표 수는 200개로 제한합니다. 승인 전·다른 서버의 id·만료·재사용·파라미터/대상/탭/origin/epoch 가 달라진 호출은 거부하고 이유를 `data.approval.rejected`에 싣습니다. **에이전트가 가진 `approval_id`만으로는 실행되지 않습니다** — 승인은 사람이 대역 밖에서만 할 수 있고, 서버는 디스크의 승인 파일이 아니라 자기 메모리의 상태만 믿습니다(명령 파일은 같은 사용자 소유·0600·server_id 일치·digest 일치일 때만 처리). 증표로 실행했는데 결과가 불확실하면(`E_TIMEOUT`·`E_PAGE_CRASHED`·`E_NAVIGATE_TIMEOUT`) `data.approval.outcome="outcome_unknown"`, `retry_safe=false`로 알리고 같은 증표는 다시 쓸 수 없습니다 — 자동으로 다시 시도하지 말고 관찰해 확인하십시오. 운영자 정적 허용 `--pre-approve`는 그대로 동작합니다.
+
+**한계.** ① 확인 코드는 "MCP 만 가진 에이전트는 승인할 수 없다"를 보장합니다. **같은 OS 사용자로 셸을 쓰는 에이전트**는 화면 녹화 권한(macOS 화면 기록 등)까지 얻으면 창의 코드를 볼 수 있고, 같은 사용자 권한으로 상태 디렉터리도 다룰 수 있습니다 — 근본 해법은 **에이전트를 다른 OS 사용자로 돌리는 것**입니다. 코드가 떠 있는 동안 화면 캡처 도구는 거부하지만, OS 화면 녹화 권한을 가진 같은 uid 프로세스는 볼 수 있습니다. ② digest 의 origin 은 최상위 문서 기준입니다 — 프레임 안(결제 iframe 등)의 origin 변화는 잡지 않습니다(후속). ③ 서버 생존 판정은 server.json 의 uid·pid·시작 시각으로 합니다(다른 사용자 프로세스가 pid 를 재사용하면 죽은 서버로 봄).
 
 ---
 

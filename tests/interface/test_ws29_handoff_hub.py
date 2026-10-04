@@ -18,6 +18,8 @@ from contracts import ActionType
 from interface import handoff
 from interface.handoff import HandoffHub, action_digest, write_command
 
+from ws29_helpers import hub_approve
+
 
 def _mode(p: Path) -> int:
     return stat.S_IMODE(os.lstat(p).st_mode)
@@ -50,11 +52,8 @@ def _components(**over: Any) -> Dict[str, Any]:
 
 
 def _approve_via_cli_file(hub: HandoffHub, approval_id: str) -> None:
-    """사람(CLI)이 승인 파일을 보고 그 digest 로 승인 명령을 쓴다 — CLI 와 같은 함수."""
-    shown = handoff.read_pending_approval(hub.root, hub.server_id, approval_id)
-    write_command(hub.root, hub.server_id, "approve",
-                  approval_id=approval_id, action_digest=shown["action_digest"])
-    hub.poll()
+    """사람(CLI)이 승인 파일을 보고 그 digest 로 코드 표시 → 창의 코드로 승인 명령을 쓴다(R1)."""
+    hub_approve(hub, approval_id)
 
 
 # ------------------------------------------------------------------ 상태 디렉터리
@@ -426,8 +425,9 @@ def test_approval_ids_are_unguessable(hub: HandoffHub):
 # ------------------------------------------------------------------ CLI (사람 쪽)
 
 
-def _start_poller(hub: HandoffHub):
-    """서버 쪽 감시 루프 흉내(실서버는 asyncio 태스크로 같은 hub.poll 을 돈다)."""
+def _start_poller(hub: HandoffHub, codes=None):
+    """서버 쪽 감시 루프 흉내(실서버는 asyncio 태스크로 같은 hub.poll 을 돈다). 코드 표시 요청은
+    '창에 띄웠다'고 답하고 그 코드를 codes 에 넣는다(사람의 눈 역할)."""
     import threading
 
     stop = threading.Event()
@@ -435,6 +435,11 @@ def _start_poller(hub: HandoffHub):
     def _loop():
         while not stop.is_set():
             hub.poll()
+            job = hub.take_code_job()
+            if job is not None:
+                if codes is not None:
+                    codes.append(job.code)
+                hub.code_shown(job.nonce, True)
             time.sleep(0.02)
 
     t = threading.Thread(target=_loop, daemon=True)
@@ -460,30 +465,37 @@ def test_cli_control_take_status_release(hub: HandoffHub, root: Path, monkeypatc
         t.join()
 
 
-def test_cli_approve_yes_and_prompt(hub: HandoffHub, root: Path, monkeypatch, capsys):
+def test_cli_approve_prompt_deny_and_code(hub: HandoffHub, root: Path, monkeypatch, capsys):
+    """R1: 승인은 창의 확인 코드로만. --yes 만으로는 안 되고, 빈 입력은 취소, --deny 는 거절."""
     from interface import cli
 
     monkeypatch.setenv(handoff.STATE_ROOT_ENV, str(root))
-    stop, t = _start_poller(hub)
+    codes = []
+    stop, t = _start_poller(hub, codes)
     try:
         ap = hub.issue_approval(_components(), {"action": "click", "target": "결제하기"})
-        # 대화형: N 이면 승인하지 않는다(그리고 거절로 기록)
-        monkeypatch.setattr("builtins.input", lambda *_: "n")
+        # 대화형: 빈 입력 → 취소(승인 아님)
+        monkeypatch.setattr("builtins.input", lambda *_: "")
         monkeypatch.setattr(handoff, "_stdin_is_tty", lambda: True)
         assert cli.main(["approve", ap.approval_id]) == 1
+        assert hub.approval_status(ap.approval_id)["status"] == "pending"
+        assert cli.main(["approve", ap.approval_id, "--deny"]) == 1
         assert hub.approval_status(ap.approval_id)["status"] == "denied"
         ap2 = hub.issue_approval(_components(snapshot_epoch=5), {"action": "click"})
-        monkeypatch.setattr("builtins.input", lambda *_: "y")
+        monkeypatch.setattr("builtins.input", lambda *_: codes[-1])
         assert cli.main(["approve", ap2.approval_id]) == 0
         assert hub.approval_status(ap2.approval_id)["status"] == "approved"
         out = capsys.readouterr().out
         assert "click" in out  # 내용을 보여 준다
         ap3 = hub.issue_approval(_components(snapshot_epoch=6), {"action": "click"})
         monkeypatch.setattr(handoff, "_stdin_is_tty", lambda: False)
-        # TTY 아님 + --yes 없음 → 거부(스크립트가 실수로 승인하지 않게)
+        # TTY 아님 + 코드 없음 → 창에 코드만 띄우고 거부
         assert cli.main(["approve", ap3.approval_id]) == 2
         assert hub.approval_status(ap3.approval_id)["status"] == "pending"
-        assert cli.main(["approve", ap3.approval_id, "--yes"]) == 0
+        # --yes 는 코드를 대신하지 못한다
+        assert cli.main(["approve", ap3.approval_id, "--yes"]) == 2
+        assert hub.approval_status(ap3.approval_id)["status"] == "pending"
+        assert cli.main(["approve", ap3.approval_id, "--code", codes[-1]]) == 0
         assert hub.approval_status(ap3.approval_id)["status"] == "approved"
     finally:
         stop.set()
