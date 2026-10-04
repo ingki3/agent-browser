@@ -115,12 +115,24 @@ async def test_proxy_does_not_relay_to_itself():
     b"GET http://127.0.0.1/ HTTP/1.1\r\n bad-fold: x\r\n\r\n",
 ])
 async def test_unjudgeable_requests_are_refused(raw):
-    px = await EgressProxy(_guard(), token=None).start()
+    """판정 불가 요청은 가드에 묻기 전에 형식 오류(400)로 거절한다 — 응답 없이 끊기거나
+    가드 판정(403)으로 넘어가지 않는다(R1 NB-2, 검증자 V8)."""
+    g = _guard()
+    asked: List[str] = []
+    orig = g.evaluate_async
+
+    async def spy(url: str):
+        asked.append(url)
+        return await orig(url)
+
+    g.evaluate_async = spy  # type: ignore[method-assign]
+    px = await EgressProxy(g, token=None).start()
     try:
         r = await _ask(px, raw)
     finally:
         await px.close()
-    assert r.startswith(b"HTTP/1.1 4"), r[:40]
+    assert r.startswith(b"HTTP/1.1 400"), r[:40]
+    assert asked == []
 
 
 async def test_connects_only_to_verified_ip_not_reresolved():
@@ -174,3 +186,124 @@ async def test_connect_tunnel_to_allowed_target_relays_bytes():
         await up.close()
     assert established.startswith(b"HTTP/1.1 200")
     assert body.endswith(b"ok")
+
+
+# -- WS-29b R1 (NB-2: 검증자 V4·V7, NB-1: 프록시가 만든 502 표시) ----------------------
+
+
+@pytest.mark.parametrize("value", [
+    "Basic " + base64.b64encode(b"intruder:t0k").decode(),  # 다른 사용자 + 같은 토큰
+    "Basic xxxxxxxxxxxx" + _auth("t0k")[-8:],  # 접미만 같음
+    _auth("t0k") + "x",
+    "Bearer t0k",
+])
+async def test_proxy_auth_requires_exact_credentials(value):
+    up = await _Upstream().start()
+    px = await EgressProxy(_guard(), token="t0k").start()
+    try:
+        r = await _ask(px, (f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n"
+                            f"Proxy-Authorization: {value}\r\n\r\n").encode())
+    finally:
+        await px.close()
+        await up.close()
+    assert r.startswith(b"HTTP/1.1 407"), r[:40]
+    assert up.conns == []
+
+
+@pytest.mark.parametrize("raw", [
+    b"CONNECT nowhere.test:443 HTTP/1.1\r\n\r\n",
+    b"GET http://nowhere.test/a?token=SECRET HTTP/1.1\r\nHost: nowhere.test\r\n\r\n",
+])
+async def test_resolution_failure_never_opens_a_socket(monkeypatch, raw):
+    """해석 실패면 이름으로라도 접속을 시도하지 않는다 — 소켓 열기 자체가 없다(V4).
+
+    프록시가 만든 502 에는 표시 머리가 붙고 가드에 resolve_failed 로 기록된다(NB-1).
+    """
+    from security import egress_proxy
+
+    opened: List[Tuple[str, int]] = []
+
+    async def no_open(host, port, *a, **kw):
+        opened.append((host, port))
+        raise OSError("열면 안 됨")
+
+    monkeypatch.setattr(egress_proxy.asyncio, "open_connection", no_open)
+
+    async def resolver(host: str) -> List[str]:
+        raise OSError("NXDOMAIN")
+
+    g = _guard(resolver=resolver)
+    px = await EgressProxy(g, token=None).start()
+    try:
+        r = await _ask_raw(px.port, raw)
+    finally:
+        await px.close()
+    assert opened == []
+    assert r.startswith(b"HTTP/1.1 502")
+    assert b"X-Agent-Browser-Egress: upstream-failed; code=resolve_failed" in r
+    fails = g.upstream_failures_since(0)
+    assert [(f.host, f.code) for f in fails] == [("nowhere.test", "resolve_failed")]
+    assert all("SECRET" not in f.url for f in fails)
+
+
+async def test_connect_failure_to_allowed_target_is_marked_and_recorded():
+    """검증 통과 목적지에 접속 실패(닫힌 포트)도 프록시가 만든 502 로 표시·기록한다."""
+    import socket as _s
+
+    probe = _s.socket()
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+    g = _guard()
+    px = await EgressProxy(g, token=None).start()
+    try:
+        r = await _ask(px, f"GET http://127.0.0.1:{closed_port}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    finally:
+        await px.close()
+    assert r.startswith(b"HTTP/1.1 502")
+    assert b"upstream-failed; code=connect_failed" in r
+    assert [(f.host, f.code, f.port) for f in g.upstream_failures_since(0)] == [
+        ("127.0.0.1", "connect_failed", closed_port)]
+
+
+async def test_upstream_502_from_real_site_is_not_recorded():
+    """사이트가 실제로 준 502 는 프록시 기록이 없다 — 이동 실패로 바꾸지 않는 근거."""
+
+    async def on(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await r.readuntil(b"\r\n\r\n")
+        w.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+        await w.drain()
+        w.close()
+
+    server = await asyncio.start_server(on, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    g = _guard()
+    px = await EgressProxy(g, token=None).start()
+    try:
+        r = await _ask(px, f"GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    finally:
+        await px.close()
+        server.close()
+        await server.wait_closed()
+    assert r.startswith(b"HTTP/1.1 502")
+    assert b"X-Agent-Browser-Egress" not in r
+    assert g.upstream_total == 0
+
+
+async def _ask_raw(port: int, raw: bytes) -> bytes:
+    """asyncio.open_connection 을 바꿔 끼운 시험용 — 소켓을 직접 연다."""
+    import socket as _s
+
+    loop = asyncio.get_running_loop()
+    sock = _s.socket()
+    sock.setblocking(False)
+    await loop.sock_connect(sock, ("127.0.0.1", port))
+    await loop.sock_sendall(sock, raw)
+    chunks = []
+    while True:
+        data = await asyncio.wait_for(loop.sock_recv(sock, 65536), 5)
+        if not data:
+            break
+        chunks.append(data)
+    sock.close()
+    return b"".join(chunks)

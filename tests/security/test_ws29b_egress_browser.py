@@ -77,6 +77,8 @@ def _handler(sink: _Sink):
             q = parse_qs(u.query)
             if u.path == "/redir":
                 self._send(302, b"", {"Location": q["to"][0]})
+            elif u.path == "/bad502":
+                self._send(502, b"<html><body>upstream app down</body></html>")
             elif u.path == "/page":
                 self._send(200, q["h"][0].encode())
             elif u.path == "/sw.js":
@@ -307,3 +309,83 @@ async def test_proxy_death_does_not_fall_back_to_direct(sink):
         await srv.close()
     assert r.success is False
     assert _reached(sink, "/p/after_death") == []
+
+
+# -- WS-29b R1: 업스트림 실패를 이동 실패로 (NB-1), 쿼리 비밀 미노출 (NB-4) ------------
+
+
+def _nx_resolve(monkeypatch):
+    from security import egress
+
+    orig = egress._system_resolve
+
+    def fake(h):
+        if h.endswith(".invalid"):
+            raise socket.gaierror(8, "nodename nor servname provided")
+        return orig(h)
+
+    monkeypatch.setattr(egress, "_system_resolve", fake)
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_unresolvable_domain_navigate_fails_like_base(sink, monkeypatch, caplog, scheme):
+    """해석 실패 도메인 navigate 는 base 처럼 이동 실패 — 프록시 502 를 성공으로 보이지 않는다."""
+    import logging
+
+    _nx_resolve(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    srv = BrowserMCPServer()
+    try:
+        r = await _nav(srv, f"{scheme}://nx-does-not-exist-zz.invalid/x?token=SECRET#frag")
+    finally:
+        await srv.close()
+    assert r.success is False
+    assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+    assert r.data["egress"] == {"code": "resolve_failed", "host": "nx-does-not-exist-zz.invalid"}
+    assert "SECRET" not in caplog.text
+
+
+async def test_connect_failure_navigate_fails(sink):
+    """검증 통과 목적지(루프백 닫힌 포트) 접속 실패도 이동 실패(connect_failed)."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    closed = probe.getsockname()[1]
+    probe.close()
+    srv = BrowserMCPServer()
+    try:
+        r = await _nav(srv, f"http://127.0.0.1:{closed}/x")
+    finally:
+        await srv.close()
+    assert r.success is False
+    assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+    assert r.data["egress"]["code"] == "connect_failed"
+
+
+async def test_site_returning_real_502_still_navigates(sink):
+    """사이트가 실제로 준 502 는 이동 성공 그대로(last_http_status 로 보인다) — 프록시 기록 없음."""
+    srv = BrowserMCPServer()
+    try:
+        r = await _nav(srv, f"http://127.0.0.1:{sink.port}/bad502")
+    finally:
+        await srv.close()
+    assert r.success is True
+    assert "egress" not in r.data
+    assert r.data.get("last_http_status") == 502
+    assert _reached(sink, "/bad502")
+
+
+async def test_blocked_navigate_query_secret_not_in_result_or_log(sink, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    srv = BrowserMCPServer(allowed_domains=("localhost",))
+    try:
+        r = await _nav(srv, f"http://127.0.0.1:{sink.port}/p/q?token=SECRET#frag")
+        recs = srv._egress.blocked_requests
+    finally:
+        await srv.close()
+    assert r.success is False
+    assert "SECRET" not in json.dumps(r.data["egress"])
+    assert recs and all("SECRET" not in d.url for d in recs)
+    assert "SECRET" not in caplog.text
+    assert _reached(sink, "/p/q") == []

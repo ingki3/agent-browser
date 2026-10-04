@@ -202,3 +202,76 @@ def test_existing_harness_semantics_kept():
     assert g.is_allowed("https://api.example.com/")
     assert not g.is_allowed("http://127.0.0.1/")
     assert not g.is_allowed("http://localhost/")
+
+
+# -- WS-29b R1 (NB-2: 검증자 뮤턴트 V2·V3·V6, NB-4: URL 비밀 제거, NB-5: 기록 상한) ------
+
+
+@pytest.mark.parametrize("url", ["http://[fd00:ec2::254]/latest/", "http://[64:ff9b::a9fe:a9fe]/"])
+def test_metadata_ipv6_forms_stay_metadata_even_with_private_open(url):
+    """AWS IMDS IPv6·NAT64 로 감싼 메타데이터는 사설이 아니라 메타데이터 — 옵션으로 못 연다(V3·V6)."""
+    g = _mcp_default(allow_private_network=True)
+    d = g.evaluate(url)
+    assert d.allowed is False, url
+    assert d.category == "metadata"
+
+
+def test_nat64_wrapped_private_ipv4_is_private():
+    """NAT64(64:ff9b::/96) 안의 사설 IPv4 는 사설로 판정한다(V6)."""
+    d = _mcp_default().evaluate("http://[64:ff9b::c0a8:101]/")
+    assert d.allowed is False and d.category == "private"
+
+
+async def test_unparseable_resolved_ip_blocks_fail_closed():
+    """해석 결과에 IP 가 아닌 값이 섞이면 판정 불가 — 막는다(V2)."""
+    r = FakeResolver({"weird.example": ["93.184.216.34", "garbage"]})
+    d = await _mcp_default(resolver=r).evaluate_async("https://weird.example/")
+    assert d.allowed is False
+    assert d.category == "malformed"
+
+
+def test_blocked_log_url_has_no_query_fragment_or_userinfo():
+    """차단 기록 URL 은 스킴+호스트+포트+경로까지만 — 쿼리 비밀이 남지 않는다(NB-4)."""
+    g = _mcp_default()
+    assert g.is_allowed("http://user:pw@192.168.1.1:8080/a/b?token=SECRET#frag") is False
+    rec = g.blocked_requests[-1]
+    assert rec.url == "http://192.168.1.1:8080/a/b"
+    assert "SECRET" not in repr(rec) and "pw" not in rec.url
+    assert "SECRET" not in repr(rec.to_agent())
+
+
+def test_guard_records_are_bounded():
+    """장시간 세션에서 기록이 무한히 늘지 않는다(NB-5). 최근 것은 남는다."""
+    from security import egress
+
+    g = _mcp_default()
+    n = egress.MAX_GUARD_RECORDS + 50
+    for i in range(n):
+        g.is_allowed(f"http://10.0.0.{i % 250}/x{i}")
+    assert len(g.blocked_requests) == egress.MAX_GUARD_RECORDS
+    assert g.blocked_requests[-1].url.endswith(f"/x{n - 1}")
+    assert egress.MAX_GUARD_RECORDS <= 1000
+
+
+async def test_resolve_failures_are_bounded():
+    from security import egress
+
+    g = _mcp_default(resolver=FakeResolver({}))
+    for i in range(egress.MAX_GUARD_RECORDS + 20):
+        await g.evaluate_async(f"https://nx{i}.example/")
+    assert len(g.resolve_failures) == egress.MAX_GUARD_RECORDS
+    assert g.resolve_failures[-1][0] == f"nx{egress.MAX_GUARD_RECORDS + 19}.example"
+
+
+def test_blocked_since_counts_new_entries_after_cap():
+    """상한을 넘긴 뒤에도 '이번 호출 이후 신규 차단' 을 정확히 돌려준다(MCP data.egress 첨부용)."""
+    from security import egress
+
+    g = _mcp_default()
+    for i in range(egress.MAX_GUARD_RECORDS + 5):
+        g.is_allowed(f"http://10.0.0.1/old{i}")
+    before = g.blocked_total
+    assert g.blocked_since(before) == []
+    g.is_allowed("http://192.168.1.1/new")
+    new = g.blocked_since(before)
+    assert [d.url for d in new] == ["http://192.168.1.1/new"]

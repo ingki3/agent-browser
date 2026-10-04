@@ -716,9 +716,12 @@ class BrowserMCPServer:
         if blocked is not None:
             return blocked
 
-        blocks_before = len(self._egress.blocked_requests) if self._egress is not None else 0
+        # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
+        blocks_before = self._egress.blocked_total if self._egress is not None else 0
+        upstream_before = self._egress.upstream_total if self._egress is not None else 0
         result = await self._dispatcher.dispatch(action, params)
         result = self._attach_egress_block(action, params, result, blocks_before)
+        result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
@@ -740,7 +743,7 @@ class BrowserMCPServer:
         """
         if self._egress is None:
             return result
-        new = self._egress.blocked_requests[before:]
+        new = self._egress.blocked_since(before)
         if not new:
             return result
         from urllib.parse import urlparse
@@ -765,6 +768,63 @@ class BrowserMCPServer:
                 ErrorCode.INVALID_URL,
                 f"egress_blocked: {info['host']} ({info['category']})",
                 data={"egress": info, "url": getattr(self._page, "url", "")},
+            )
+        result.data["egress"] = info
+        return result
+
+    def _attach_upstream_failure(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+    ) -> ActionResult:
+        """프록시가 업스트림에 닿지 못해 스스로 만든 502 문서를 이동 실패로 알린다 (WS-29b R1).
+
+        프록시 없이는 브라우저가 이름 해석·접속 실패로 이동 자체를 실패시킨다(base 실측:
+        E_NAVIGATE_TIMEOUT). 프록시를 거치면 그 실패가 502 문서로 바뀌어 '열렸다'로 보였다.
+        이번 호출 중 프록시가 기록한 업스트림 실패(호스트·포트)가 이동 대상과 같고, 탭의 메인
+        문서가 502 일 때만 해당한다 — 사이트가 실제로 준 502 는 프록시 기록이 없어 그대로 둔다.
+        이미 실패한 이동(https CONNECT 실패 등)에는 이유만 싣는다.
+        """
+        if self._egress is None or self._dispatcher is None:
+            return result
+        new = self._egress.upstream_failures_since(before)
+        if not new:
+            return result
+        if result.data.get("egress") is not None:
+            return result  # 차단 이유가 먼저다
+        from urllib.parse import urlsplit
+
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None) or self._page
+        targets = set()
+        for raw in (params.get("url") if action is ActionType.NAVIGATE else None,
+                    getattr(page, "url", None), result.current_url):
+            try:
+                parts = urlsplit(raw or "")
+                host = (parts.hostname or "").lower()
+                port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
+            except ValueError:
+                continue
+            if host:
+                targets.add((host, port))
+        hit = next((f for f in reversed(new)
+                    if (f.host.lower().strip("[]"), f.port) in targets), None)
+        if hit is None:
+            return result
+        if result.success:
+            status: Optional[int] = None
+            try:
+                if self._page_status is not None:
+                    status = self._page_status.status_for(page)
+            except Exception:  # noqa: BLE001
+                status = None
+            if status != 502:
+                return result  # 메인 문서는 정상 — 하위 요청 실패일 뿐
+        info = hit.to_agent()
+        if action is ActionType.NAVIGATE:
+            return self._error_result(
+                action,
+                ErrorCode.NAVIGATE_TIMEOUT,
+                f"이동 실패: {info['code']}: {info['host']}",
+                data={"egress": info, "url": getattr(page, "url", "")},
             )
         result.data["egress"] = info
         return result
@@ -1278,6 +1338,14 @@ def _install_shutdown_signals(loop: Any, stop: Any, received: List[int]) -> Dict
             previous[sig] = signal.signal(sig, _handler)
         except (ValueError, OSError):  # 메인 스레드가 아니면 등록 불가 — 기존 동작 유지
             continue
+    # 신호 마스크는 부모에게서 상속되고 signal.signal 은 마스크를 풀지 않는다 — 부모가 막아 둔
+    # 채로 띄우면 처리기를 달아도 신호가 전달되지 않아 serve 가 끝나지 않았다(WS-29b R1 실측).
+    # 처리기를 단 신호만 이 스레드에서 푼다(stdin 리더 등 이후 만든 스레드도 이 마스크를 받는다).
+    if previous and hasattr(signal, "pthread_sigmask"):
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, set(previous))
+        except (ValueError, OSError):
+            pass
     return previous
 
 

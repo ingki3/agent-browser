@@ -31,7 +31,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from security.egress import EgressDecision, EgressGuard
+from security.egress import (
+    UPSTREAM_CONNECT_FAILED,
+    UPSTREAM_RESOLVE_FAILED,
+    EgressDecision,
+    EgressGuard,
+    UpstreamFailure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,19 @@ CONNECT_TIMEOUT_S = 10.0
 HEAD_TIMEOUT_S = 30.0
 #: 응답 머리 — 차단 이유를 브라우저 쪽 진단에 남긴다(에이전트용 이유는 가드 기록으로 간다).
 BLOCK_HEADER = "X-Agent-Browser-Egress"
+#: 프록시가 스스로 만든 업스트림 실패(502) 표시 머리 값의 접두. 사이트가 실제로 준 502 와
+#: 구별한다(가드의 업스트림 실패 기록과 함께, WS-29b R1).
+UPSTREAM_FAIL_MARK = "upstream-failed"
+
+
+class UpstreamError(ConnectionError):
+    """검증은 통과했지만 업스트림에 닿지 못함. code 는 resolve_failed | connect_failed."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 #: 업스트림에 넘기지 않는 hop-by-hop 머리
 _HOP_HEADERS = frozenset({
     "proxy-authorization", "proxy-connection", "connection", "keep-alive",
@@ -194,13 +213,30 @@ class EgressProxy:
 
     async def _open_upstream(self, decision: EgressDecision, port: int):
         """검증한 IP 로만 접속한다. 검증한 IP 가 없으면(해석 실패) 접속하지 않는다."""
+        if not decision.resolved:
+            raise UpstreamError(f"업스트림 해석 실패: {decision.host}", UPSTREAM_RESOLVE_FAILED)
         last: Optional[BaseException] = None
         for ip in decision.resolved:
             try:
                 return await asyncio.wait_for(asyncio.open_connection(ip, port), CONNECT_TIMEOUT_S)
             except (OSError, asyncio.TimeoutError) as exc:
                 last = exc
-        raise ConnectionError(f"업스트림 접속 실패: {decision.host} ({type(last).__name__ if last else '해석 없음'})")
+        raise UpstreamError(f"업스트림 접속 실패: {decision.host} ({type(last).__name__})",
+                            UPSTREAM_CONNECT_FAILED)
+
+    async def _reply_upstream_failure(self, writer, decision: EgressDecision, port: int,
+                                      exc: UpstreamError) -> None:
+        """업스트림 실패를 가드에 기록하고 프록시 표시 머리를 단 502 를 돌려준다.
+
+        에이전트에게는 MCP 경계가 이 기록으로 이동 실패(data.egress.code)를 알린다 —
+        사이트가 실제로 준 502 는 기록이 없으므로 구별된다.
+        """
+        self.guard.record_upstream_failure(
+            UpstreamFailure(host=decision.host, code=exc.code, url=decision.url, port=port)
+        )
+        logger.info("Egress 프록시 업스트림 실패: %s (%s)", decision.host, exc.code)
+        await self._reply(writer, 502, "Bad Gateway", exc.code,
+                          extra={BLOCK_HEADER: f"{UPSTREAM_FAIL_MARK}; code={exc.code}"})
 
     async def _connect(self, target: str, reader, writer) -> None:
         host, port = _split_authority(target, default_port=443)
@@ -215,8 +251,8 @@ class EgressProxy:
             return
         try:
             up_reader, up_writer = await self._open_upstream(decision, port)
-        except ConnectionError:
-            await self._reply(writer, 502, "Bad Gateway", "")
+        except UpstreamError as exc:
+            await self._reply_upstream_failure(writer, decision, port, exc)
             return
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
@@ -243,8 +279,8 @@ class EgressProxy:
             return
         try:
             up_reader, up_writer = await self._open_upstream(decision, port)
-        except ConnectionError:
-            await self._reply(writer, 502, "Bad Gateway", "")
+        except UpstreamError as exc:
+            await self._reply_upstream_failure(writer, decision, port, exc)
             return
         path = parts.path or "/"
         if parts.query:

@@ -117,6 +117,28 @@ async def test_server_start_gives_core_an_egress_runtime(monkeypatch, tmp_path, 
     assert srv._egress_runtime is None
 
 
+async def test_server_start_fails_closed_when_proxy_cannot_start(monkeypatch):
+    """검증 프록시가 못 뜨면 serve 는 브라우저를 띄우지 않고 실패한다(R1 NB-2, 검증자 V5)."""
+    import browser
+
+    from interface.mcp_server import BrowserMCPServer
+    from security import egress_runtime
+
+    _RecordingCore.seen = []
+    monkeypatch.setattr(browser, "BrowserCore", _RecordingCore)
+
+    async def boom(self):  # noqa: ANN001
+        raise OSError("bind 실패")
+
+    monkeypatch.setattr(egress_runtime.EgressRuntime, "start", boom)
+    srv = BrowserMCPServer()
+    with pytest.raises(OSError, match="bind"):
+        await srv.start()
+    assert _RecordingCore.seen == []  # 브라우저(코어)를 만들지 않았다
+    assert srv.started is False
+    assert srv._core is None
+
+
 async def test_core_launch_uses_proxy_and_flags(monkeypatch):
     """BrowserCore 가 Playwright Chromium 을 프록시·QUIC 끔·WebRTC 정책으로 띄운다."""
     import playwright.async_api as pw_api
@@ -355,3 +377,73 @@ def test_user_chrome_without_egress_does_not_touch_prefs(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         asyncio.run(user_chrome.launch_user_chrome(profile_dir=prof, chrome_path=Path("/bin/false")))
     assert not (prof / "Default" / "Preferences").exists()
+
+
+# -- WS-29b R1 NB-1: 프록시 업스트림 실패 → 이동 실패 판정(브라우저 없이) ---------------
+
+
+class _StatusStub:
+    def __init__(self, status: Any) -> None:
+        self.status = status
+
+    def status_for(self, page: Any) -> Any:
+        return self.status
+
+
+def _upstream_server(status: Any):
+    from types import SimpleNamespace
+
+    from interface.mcp_server import BrowserMCPServer
+    from security import EgressGuard, EgressPolicy
+    from security.egress import UpstreamFailure
+
+    srv = BrowserMCPServer()
+    page = SimpleNamespace(url="http://svc.test:8080/x")
+    srv._page = page
+    srv._dispatcher = SimpleNamespace(ctx=SimpleNamespace(page=page))
+    srv._page_status = _StatusStub(status)
+    srv._egress = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
+    before = srv._egress.upstream_total
+    srv._egress.record_upstream_failure(
+        UpstreamFailure(host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080))
+    return srv, before
+
+
+def _ok(action: Any) -> Any:
+    from contracts import ActionResult
+
+    return ActionResult(success=True, action=action, current_url="http://svc.test:8080/x",
+                        snapshot_epoch=0, tab_id="t", retry_safe=True, data={})
+
+
+def test_upstream_failure_with_proxy_502_document_turns_navigate_into_failure():
+    from contracts import ActionType, ErrorCode
+
+    srv, before = _upstream_server(502)
+    r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
+                                     _ok(ActionType.NAVIGATE), before)
+    assert r.success is False and r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+    assert r.data["egress"] == {"code": "connect_failed", "host": "svc.test"}
+
+
+@pytest.mark.parametrize("status", [200, None])
+def test_upstream_failure_of_subrequest_keeps_successful_document(status):
+    """같은 호스트의 하위 요청만 실패하고 메인 문서는 정상이면 이동 성공 그대로."""
+    from contracts import ActionType
+
+    srv, before = _upstream_server(status)
+    r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
+                                     _ok(ActionType.NAVIGATE), before)
+    assert r.success is True and "egress" not in r.data
+
+
+def test_upstream_failure_other_port_is_not_attached():
+    """기록된 실패(8080)와 다른 포트로의 이동은 그 실패와 무관하다."""
+    from contracts import ActionType
+
+    srv, before = _upstream_server(502)
+    srv._page.url = "http://svc.test:9090/x"
+    r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:9090/x"},
+                                     _ok(ActionType.NAVIGATE).model_copy(update={"current_url": "http://svc.test:9090/x"}),
+                                     before)
+    assert r.success is True

@@ -30,10 +30,11 @@ import ipaddress
 import logging
 import socket
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlparse
+from typing import Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +96,48 @@ DNS_CACHE_TTL_S = 30.0
 #: 해석 대기 상한(초). 넘으면 해석 실패로 기록하고 브라우저에 맡긴다.
 DNS_TIMEOUT_S = 5.0
 
+#: 가드 기록(차단·해석 실패·프록시 업스트림 실패) 보관 상한 — 장시간 세션 메모리 (WS-29b R1).
+MAX_GUARD_RECORDS = 500
+
+#: 프록시 업스트림 실패 코드(data.egress.code). 차단이 아니라 이동 실패다.
+UPSTREAM_RESOLVE_FAILED = "resolve_failed"
+UPSTREAM_CONNECT_FAILED = "connect_failed"
+
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 Resolver = Callable[[str], Awaitable[List[str]]]
+
+
+def redact_url(url: str) -> str:
+    """기록·로그용 URL — 스킴+호스트+포트+경로까지만(쿼리·조각·사용자정보 제거, WS-29b R1).
+
+    쿼리에 토큰 같은 비밀이 실릴 수 있다. 파싱할 수 없으면 원문을 남기지 않는다.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "<판정 불가 URL>"
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+@dataclass
+class UpstreamFailure:
+    """프록시가 검증은 통과했지만 업스트림에 닿지 못해 스스로 만든 실패 응답(502) 기록."""
+
+    host: str
+    code: str  # UPSTREAM_RESOLVE_FAILED | UPSTREAM_CONNECT_FAILED
+    url: str = ""
+    port: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.url = redact_url(self.url)
+
+    def to_agent(self) -> Dict[str, object]:
+        return {"code": self.code, "host": self.host}
 
 
 @dataclass
@@ -112,6 +153,10 @@ class EgressDecision:
     category: str = ""
     #: 해석으로 판정했으면 해석된 IP 목록, 검증한 접속 대상 IP(프록시 고정용)
     resolved: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # 판정 기록에는 쿼리·조각·사용자정보를 남기지 않는다(NB-4) — 로그·blocked_requests 공통.
+        self.url = redact_url(self.url)
 
     def to_agent(self) -> Dict[str, object]:
         """에이전트에 보일 차단 이유(MCP data.egress 항목). 우회 방법은 담지 않는다."""
@@ -279,16 +324,23 @@ class EgressGuard:
     resolver: Optional[Resolver] = None
     dns_cache_ttl_s: float = DNS_CACHE_TTL_S
 
-    _blocked_log: List[EgressDecision] = field(
-        default_factory=list, init=False, repr=False
+    _blocked_log: Deque[EgressDecision] = field(
+        default_factory=lambda: deque(maxlen=MAX_GUARD_RECORDS), init=False, repr=False
     )
+    #: 지금까지 기록한 차단 수(상한으로 버린 것 포함) — 호출 단위 신규분 계산용
+    _blocked_total: int = field(default=0, init=False, repr=False)
     _dns_cache: Dict[str, Tuple[float, Tuple[str, ...]]] = field(
         default_factory=dict, init=False, repr=False
     )
     #: 해석 실패 기록(호스트, 사유) — 막지는 않는다.
-    resolve_failures: List[Tuple[str, str]] = field(
-        default_factory=list, init=False, repr=False
+    resolve_failures: Deque[Tuple[str, str]] = field(
+        default_factory=lambda: deque(maxlen=MAX_GUARD_RECORDS), init=False, repr=False
     )
+    #: 프록시 업스트림 실패(프록시가 만든 502) 기록과 누적 수 (WS-29b R1)
+    _upstream_failures: Deque[UpstreamFailure] = field(
+        default_factory=lambda: deque(maxlen=MAX_GUARD_RECORDS), init=False, repr=False
+    )
+    _upstream_total: int = field(default=0, init=False, repr=False)
 
     # -- 판정 ---------------------------------------------------------------
 
@@ -423,11 +475,16 @@ class EgressGuard:
         """`harness.egress_test`가 사용하는 단순 판정 인터페이스."""
         decision = self.evaluate(url)
         if not decision.allowed:
-            self._blocked_log.append(decision)
+            self.record_block(decision)
         return decision.allowed
 
     def record_block(self, decision: EgressDecision) -> None:
         self._blocked_log.append(decision)
+        self._blocked_total += 1
+
+    def record_upstream_failure(self, failure: UpstreamFailure) -> None:
+        self._upstream_failures.append(failure)
+        self._upstream_total += 1
 
     # -- 내부 판정 로직 ------------------------------------------------------
 
@@ -462,6 +519,28 @@ class EgressGuard:
     def blocked_requests(self) -> List[EgressDecision]:
         return list(self._blocked_log)
 
+    @property
+    def blocked_total(self) -> int:
+        """지금까지 기록한 차단 수(상한으로 버린 것 포함)."""
+        return self._blocked_total
+
+    def blocked_since(self, total: int) -> List[EgressDecision]:
+        """누적 수가 total 이었던 뒤에 기록된 차단(상한 안에 남은 것)."""
+        n = self._blocked_total - total
+        if n <= 0:
+            return []
+        return list(self._blocked_log)[-n:]
+
+    @property
+    def upstream_total(self) -> int:
+        return self._upstream_total
+
+    def upstream_failures_since(self, total: int) -> List[UpstreamFailure]:
+        n = self._upstream_total - total
+        if n <= 0:
+            return []
+        return list(self._upstream_failures)[-n:]
+
     def clear_log(self) -> None:
         self._blocked_log.clear()
 
@@ -480,9 +559,9 @@ class EgressGuard:
             if decision.allowed:
                 await route.continue_()
                 return
-            self._blocked_log.append(decision)
+            self.record_block(decision)
             logger.info(
-                "Egress 차단: %s (%s)", request.url, decision.reason.value if decision.reason else "?"
+                "Egress 차단: %s (%s)", decision.url, decision.reason.value if decision.reason else "?"
             )
             await route.abort("blockedbyclient")
 

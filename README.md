@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1571개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1600개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -349,9 +349,9 @@ src/
 
 IPv4-mapped IPv6(`[::ffff:192.168.1.1]`)·정수(`3232235777`)·16진(`0xc0.0xa8.1.1`)·8진·축약(`192.168.257`) 표기는 브라우저와 같은 규칙으로 정규화해 판정하고, 숫자로 끝나는데 해석할 수 없는 호스트는 막습니다. 도메인 해석 결과는 최대 30초 캐시하며, 해석이 실패하면 막지 않고 기록만 합니다(브라우저도 같은 이름을 찾지 못합니다). Chromium 은 `--disable-quic`(HTTP/3 끔)과 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`(프록시 밖 WebRTC UDP 끔)로 띄웁니다 — 영상 통화 같은 P2P WebRTC 는 동작하지 않습니다. 프록시가 죽으면 브라우저는 직접 접속으로 빠지지 않고 실패합니다.
 
-차단된 문서 이동은 MCP 결과 `data.egress` 에 `{"code": "egress_blocked", "host", "category", "reason", "open_with"}` 로 알립니다(`navigate` 는 `success: false`, `E_INVALID_URL`). `open_with` 는 운영자 옵션 이름이며, 메타데이터처럼 열 수 없는 대역은 `null` 입니다.
+차단된 문서 이동은 MCP 결과 `data.egress` 에 `{"code": "egress_blocked", "host", "category", "reason", "open_with"}` 로 알립니다(`navigate` 는 `success: false`, `E_INVALID_URL`). `open_with` 는 운영자 옵션 이름이며, 메타데이터처럼 열 수 없는 대역은 `null` 입니다. 허용된 목적지라도 프록시가 닿지 못하면(이름 해석 실패·접속 실패) 프록시 없이와 같이 이동 실패로 알립니다(`navigate` 는 `success: false`, `E_NAVIGATE_TIMEOUT`, `data.egress={"code": "resolve_failed"|"connect_failed", "host"}`). 사이트가 실제로 돌려준 502 는 그대로 이동 성공입니다(`data.last_http_status`). 차단 기록·로그의 URL 은 스킴·호스트·포트·경로까지만 남깁니다(쿼리·조각·사용자정보 제외).
 
-**남은 한계.** ① `user-chrome` 은 Chrome 명령줄로 프록시 자격증명을 줄 수 없어 토큰 없는 프록시를 씁니다 — 같은 컴퓨터의 다른 프로세스도 그 포트를 쓸 수 있으나 가드가 허용한 목적지로만 중계됩니다. 설치된 Chrome 은 WebRTC 플래그를 무시해(Chrome 154 실측) 전용 프로필의 `webrtc.ip_handling_policy` 설정으로도 겁니다. 우리가 띄우지 않은(이미 떠 있는) Chrome 에 붙는 경로는 Egress 정책 밖입니다(`serve`·`run` 에는 그런 경로가 없습니다). ② 프록시는 해석한 IP 로 접속하므로 같은 IP 안의 가상 호스트는 구분하지 않습니다(HTTPS SNI·Host 는 브라우저가 보낸 그대로). ③ 하위 요청(이미지·비콘 등) 차단은 `data.egress` 에 싣지 않습니다(문서 이동만). ④ `session login`(사람이 직접 로그인하는 창)에는 Egress 정책을 걸지 않습니다.
+**남은 한계.** ① `user-chrome` 은 Chrome 명령줄로 프록시 자격증명을 줄 수 없어 토큰 없는 프록시를 씁니다 — 같은 컴퓨터의 다른 프로세스도 그 포트를 쓸 수 있으나 가드가 허용한 목적지로만 중계됩니다. 설치된 Chrome 은 WebRTC 플래그를 무시해(Chrome 154 실측) 전용 프로필의 `webrtc.ip_handling_policy` 설정으로도 겁니다. 우리가 띄우지 않은(이미 떠 있는) Chrome 에 붙는 경로는 Egress 정책 밖입니다(`serve`·`run` 에는 그런 경로가 없습니다). ② 프록시는 해석한 IP 로 접속하므로 같은 IP 안의 가상 호스트는 구분하지 않습니다(HTTPS SNI·Host 는 브라우저가 보낸 그대로). ③ 하위 요청(이미지·비콘 등) 차단은 `data.egress` 에 싣지 않습니다(문서 이동만). ④ `session login`(사람이 직접 로그인하는 창)에는 Egress 정책을 걸지 않습니다. ⑤ 루프백은 포트와 무관하게 허용됩니다 — SSH 등 같은 컴퓨터의 로컬 서비스로도 터널이 열릴 수 있습니다. 막으려면 `--block-loopback` 을 쓰십시오.
 
 **프롬프트 주입 격리** — 웹에서 온 텍스트는 신뢰 경계 밖에 둡니다. 차단율 1.0, 오탐률 0.0으로 측정됩니다.
 
