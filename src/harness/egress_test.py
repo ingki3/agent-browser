@@ -52,6 +52,32 @@ UNAUTHORIZED_TARGETS: Tuple[Tuple[str, str], ...] = (
     ("javascript:alert(1)", "자바스크립트 스킴"),
 )
 
+#: serve 기본 가드(open_sandbox + 루프백 허용, WS-29b)에서 막혀야 하는 목적지.
+#: allowlist 가드로는 이 축을 잴 수 없다 — 사설 IP 는 allowlist 밖이라 어차피 막혀
+#: 대역 판정이 망가져도 통과한다. 실측(base): serve 의 allow_loopback=True 가 아래를 모두 열었다.
+SERVE_DEFAULT_UNAUTHORIZED: Tuple[Tuple[str, str], ...] = (
+    ("http://10.0.0.5/internal", "사설 대역 10/8"),
+    ("http://192.168.1.1/admin", "사설 대역 192.168/16"),
+    ("http://100.73.27.9/", "CGNAT 100.64/10"),
+    ("http://[fd7a:115c:a1e0::1]/", "IPv6 ULA"),
+    ("http://[::ffff:192.168.1.1]/", "IPv4-mapped IPv6"),
+    ("http://3232235777/", "정수 표기 사설 IP"),
+    ("http://0xc0.0xa8.1.1/", "16진 표기 사설 IP"),
+    ("http://192.168.257/", "축약 표기 사설 IP"),
+    ("http://2852039166/latest/meta-data/", "정수 표기 메타데이터"),
+    ("http://[::ffff:a9fe:a9fe]/", "mapped 메타데이터"),
+    ("http://0.0.0.0/", "미지정 주소"),
+    ("http://[::]/", "IPv6 미지정 주소"),
+)
+
+#: serve 기본 가드에서 허용되어야 하는 목적지(로컬 Mock·개발 서버·공개 사이트).
+SERVE_DEFAULT_AUTHORIZED: Tuple[Tuple[str, str], ...] = (
+    ("http://127.0.0.1:8080/", "루프백 Mock"),
+    ("http://localhost:3000/", "localhost 개발 서버"),
+    ("http://[::1]:8080/", "IPv6 루프백"),
+    ("https://example.org/", "공개 도메인"),
+)
+
 #: 허용되어야 하는 목적지. 과차단(전부 막기)을 탐지한다.
 AUTHORIZED_TARGETS: Tuple[Tuple[str, str], ...] = (
     ("https://example.com/page", "허용 도메인 루트"),
@@ -76,21 +102,49 @@ def main() -> None:
         )
 
     guard = EgressGuard(allowed_domains=ALLOWED_DOMAINS)
+    try:
+        from security import EgressPolicy  # type: ignore[import-not-found]
+
+        serve_guard = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
+    except ImportError:
+        serve_guard = None
 
     leaks: List[str] = []
     for url, attack in UNAUTHORIZED_TARGETS:
         if guard.is_allowed(url):
             leaks.append(f"{url} ({attack})")
+    serve_samples = 0
+    if serve_guard is not None:
+        for url, attack in SERVE_DEFAULT_UNAUTHORIZED:
+            serve_samples += 1
+            if serve_guard.is_allowed(url):
+                leaks.append(f"[serve 기본] {url} ({attack})")
 
     over_blocked: List[str] = []
     for url, note in AUTHORIZED_TARGETS:
         if not guard.is_allowed(url):
             over_blocked.append(f"{url} ({note})")
+    if serve_guard is not None:
+        for url, note in SERVE_DEFAULT_AUTHORIZED:
+            if not serve_guard.is_allowed(url):
+                over_blocked.append(f"[serve 기본] {url} ({note})")
 
     for leak in leaks:
         print(f"[-] 유출 허용: {leak}", file=sys.stderr)
     for blocked in over_blocked:
         print(f"[-] 과차단: {blocked}", file=sys.stderr)
+
+    # serve 기본 가드 축을 재지 못했으면 측정이 무효다(대역 판정 미측정 — WS-29b).
+    if serve_samples < len(SERVE_DEFAULT_UNAUTHORIZED):
+        sys.exit(
+            int(
+                emit_error(
+                    "egress_leak_count",
+                    "serve 기본 가드(open_sandbox + 루프백 허용) 표본을 재지 못했습니다 — "
+                    "사설 대역 판정이 미측정입니다.",
+                )
+            )
+        )
 
     # 과차단은 유출 지표에 잡히지 않는다. "전부 차단"으로 만들면
     # 유출 0건이 되지만 브라우저가 동작하지 않으므로 별도로 실패시킨다.
@@ -109,11 +163,12 @@ def main() -> None:
         metric="egress_leak_count",
         value=float(len(leaks)),
         threshold=0.0,
-        samples=len(UNAUTHORIZED_TARGETS),
+        samples=len(UNAUTHORIZED_TARGETS) + serve_samples,
         comparison="lte",
         extra={
             "leaked_targets": leaks or None,
-            "authorized_checked": len(AUTHORIZED_TARGETS),
+            "authorized_checked": len(AUTHORIZED_TARGETS) + len(SERVE_DEFAULT_AUTHORIZED),
+            "serve_default_samples": serve_samples,
             "attack_categories": len({a for _, a in UNAUTHORIZED_TARGETS}),
         },
     )

@@ -600,7 +600,7 @@ def test_max_steps_value_reaches_agent_loop_ctor(monkeypatch, tmp_path):
         async def close(self):
             return None
 
-    async def fake_open(pw, args, record):
+    async def fake_open(pw, args, record, **_):
         return Br(), Ctx(), Page(), None
 
     async def body(page):

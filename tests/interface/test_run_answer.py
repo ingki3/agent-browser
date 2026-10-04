@@ -139,7 +139,7 @@ def _install(monkeypatch, *, run_obj=None, raises=None, sleep=0.0, read_texts=()
                 await self._run_step(None, goal, i + 1, [], [])
             return run_obj
 
-    async def fake_open(pw, args, record):
+    async def fake_open(pw, args, record, **_):
         return _Br(), _Ctx(), _Page(), None
 
     async def fake_body(page):

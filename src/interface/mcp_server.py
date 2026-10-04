@@ -500,7 +500,12 @@ class BrowserMCPServer:
         keep_open: bool = False,
         nav_settle: bool = True,
         max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
+        allow_private_network: bool = False,
+        block_loopback: bool = False,
     ) -> None:
+        #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
+        self.allow_private_network = allow_private_network
+        self.block_loopback = block_loopback
         #: 이동 대기 스위치 (WS-28). DispatchContext.nav_settle 로 전달된다.
         self.nav_settle = nav_settle
         #: observe_page·extract 응답 봉투 크기 상한(글자, WS-30b). cap_result_size 참조.
@@ -530,6 +535,8 @@ class BrowserMCPServer:
         #: 통과한 좌표 클릭의 판정 근거(WS-31) — 디스패치 결과 data.gate_basis 로 옮긴다.
         self._pending_gate_basis: Optional[Dict[str, Any]] = None
         self._egress: Any = None
+        #: 검증 프록시 묶음(WS-29b, security.egress_runtime.EgressRuntime)
+        self._egress_runtime: Any = None
         self._started = False
         #: 세션 전역 메인 문서 상태(WS-26). 탭별 기록(_page_status)이 없을 때만 쓴다
         #: (브라우저 없이 디스패처를 바꿔 끼운 단위 테스트 등).
@@ -545,14 +552,29 @@ class BrowserMCPServer:
             return
 
         from browser import BrowserCore
+        from security.egress_runtime import EgressRuntime
 
-        core = BrowserCore(
-            headless=self.headless,
-            browser_mode=self.browser_mode,
-            chrome_profile=self.chrome_profile,
-            keep_open=self.keep_open,
+        # WS-29b: 브라우저보다 검증 프록시를 먼저 띄운다 — 브라우저는 프록시로만 나간다.
+        runtime = EgressRuntime(
+            allowed_domains=self.allowed_domains,
+            allow_private_network=self.allow_private_network,
+            block_loopback=self.block_loopback,
+            tokenless=self.browser_mode == "user-chrome",
         )
-        self._core = await core.start()
+        await runtime.start()
+        self._egress_runtime = runtime
+        try:
+            core = BrowserCore(
+                headless=self.headless,
+                browser_mode=self.browser_mode,
+                chrome_profile=self.chrome_profile,
+                keep_open=self.keep_open,
+                egress=runtime,
+            )
+            self._core = await core.start()
+        except BaseException:
+            await self._close_egress()
+            raise
         try:
             await self._init_session()
         except BaseException:
@@ -564,6 +586,7 @@ class BrowserMCPServer:
             except Exception:  # noqa: BLE001
                 logger.warning("시작 실패 뒤 브라우저 정리 실패", exc_info=True)
             self._core = None
+            await self._close_egress()
             raise
         self._started = True
         logger.info(
@@ -574,7 +597,7 @@ class BrowserMCPServer:
         """컨텍스트·첫 탭·디스패처·Egress 가드·HITL 을 준비한다(세 방식 공통)."""
         from actions import ActionDispatcher, DispatchContext
         from perception import PerceptionEngine
-        from security import EgressGuard, EgressPolicy, HITLGate
+        from security import HITLGate
 
         await self._core.new_context("mcp-session")
         # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
@@ -601,15 +624,9 @@ class BrowserMCPServer:
             )
         )
 
-        self._egress = EgressGuard(
-            allowed_domains=self.allowed_domains,
-            policy=(
-                EgressPolicy.STRICT
-                if self.allowed_domains
-                else EgressPolicy.OPEN_SANDBOX
-            ),
-            allow_loopback=True,  # 로컬 Mock/개발 서버 허용
-        )
+        # WS-29b: 루프백만 기본 허용(이전 allow_loopback=True 는 사설 대역 전체를 열었다).
+        # 같은 가드를 프록시(리다이렉트 홉·WebSocket·재바인딩)와 route(조기 차단)가 공유한다.
+        self._egress = self._egress_runtime.guard
         await self._egress.install(self._core.context_for("mcp-session"))
 
         self._hitl = HITLGate(
@@ -619,7 +636,20 @@ class BrowserMCPServer:
     async def close(self) -> None:
         if self._core is not None:
             await self._core.close()
+        await self._close_egress()
         self._started = False
+
+    async def _close_egress(self) -> None:
+        runtime, self._egress_runtime = self._egress_runtime, None
+        if runtime is not None:
+            try:
+                await runtime.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("Egress 프록시 정리 실패", exc_info=True)
+
+    @property
+    def _egress_proxy(self) -> Any:
+        return self._egress_runtime.proxy if self._egress_runtime is not None else None
 
     async def __aenter__(self) -> "BrowserMCPServer":
         await self.start()
@@ -686,7 +716,12 @@ class BrowserMCPServer:
         if blocked is not None:
             return blocked
 
+        # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
+        blocks_before = self._egress.blocked_total if self._egress is not None else 0
+        upstream_before = self._egress.upstream_total if self._egress is not None else 0
         result = await self._dispatcher.dispatch(action, params)
+        result = self._attach_egress_block(action, params, result, blocks_before)
+        result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
@@ -694,6 +729,104 @@ class BrowserMCPServer:
             await self._attach_challenge(result)
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         cap_result_size(result, self.max_result_chars)
+        return result
+
+    def _attach_egress_block(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+    ) -> ActionResult:
+        """이번 호출 중 Egress 가 막은 이동을 에이전트에게 알린다 (WS-29b).
+
+        활성 탭의 문서 이동(요청 주소·리다이렉트 홉·현재 주소의 호스트)이 막혔으면
+        data.egress 에 이유(code=egress_blocked, host, category, reason, open_with)를 싣는다.
+        navigate 가 막혔으면 실패(E_INVALID_URL)로 돌려준다 — 막힌 문서를 성공으로 보고하지
+        않는다. 하위 요청(이미지·비콘 등) 차단은 싣지 않는다(문서 이동만).
+        """
+        if self._egress is None:
+            return result
+        new = self._egress.blocked_since(before)
+        if not new:
+            return result
+        from urllib.parse import urlparse
+
+        hosts = set()
+        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url):
+            try:
+                h = urlparse(raw or "").hostname
+            except ValueError:
+                h = None
+            if h:
+                hosts.add(h.lower())
+        hit = next((d for d in reversed(new) if d.host and d.host.lower() in hosts), None)
+        if hit is None and action is ActionType.NAVIGATE and not result.success:
+            hit = new[-1]
+        if hit is None:
+            return result
+        info = hit.to_agent()
+        if action is ActionType.NAVIGATE:
+            return self._error_result(
+                action,
+                ErrorCode.INVALID_URL,
+                f"egress_blocked: {info['host']} ({info['category']})",
+                data={"egress": info, "url": getattr(self._page, "url", "")},
+            )
+        result.data["egress"] = info
+        return result
+
+    def _attach_upstream_failure(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+    ) -> ActionResult:
+        """프록시가 업스트림에 닿지 못해 스스로 만든 502 문서를 이동 실패로 알린다 (WS-29b R1).
+
+        프록시 없이는 브라우저가 이름 해석·접속 실패로 이동 자체를 실패시킨다(base 실측:
+        E_NAVIGATE_TIMEOUT). 프록시를 거치면 그 실패가 502 문서로 바뀌어 '열렸다'로 보였다.
+        이번 호출 중 프록시가 기록한 업스트림 실패(호스트·포트)가 이동 대상과 같고, 탭의 메인
+        문서가 502 일 때만 해당한다 — 사이트가 실제로 준 502 는 프록시 기록이 없어 그대로 둔다.
+        이미 실패한 이동(https CONNECT 실패 등)에는 이유만 싣는다.
+        """
+        if self._egress is None or self._dispatcher is None:
+            return result
+        new = self._egress.upstream_failures_since(before)
+        if not new:
+            return result
+        if result.data.get("egress") is not None:
+            return result  # 차단 이유가 먼저다
+        from urllib.parse import urlsplit
+
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None) or self._page
+        targets = set()
+        for raw in (params.get("url") if action is ActionType.NAVIGATE else None,
+                    getattr(page, "url", None), result.current_url):
+            try:
+                parts = urlsplit(raw or "")
+                host = (parts.hostname or "").lower()
+                port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
+            except ValueError:
+                continue
+            if host:
+                targets.add((host, port))
+        hit = next((f for f in reversed(new)
+                    if (f.host.lower().strip("[]"), f.port) in targets), None)
+        if hit is None:
+            return result
+        if result.success:
+            status: Optional[int] = None
+            try:
+                if self._page_status is not None:
+                    status = self._page_status.status_for(page)
+            except Exception:  # noqa: BLE001
+                status = None
+            if status != 502:
+                return result  # 메인 문서는 정상 — 하위 요청 실패일 뿐
+        info = hit.to_agent()
+        if action is ActionType.NAVIGATE:
+            return self._error_result(
+                action,
+                ErrorCode.NAVIGATE_TIMEOUT,
+                f"이동 실패: {info['code']}: {info['host']}",
+                data={"egress": info, "url": getattr(page, "url", "")},
+            )
+        result.data["egress"] = info
         return result
 
     async def _attach_challenge(self, result: ActionResult) -> None:
@@ -962,6 +1095,8 @@ def create_server(
     keep_open: bool = False,
     nav_settle: bool = True,
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
+    allow_private_network: bool = False,
+    block_loopback: bool = False,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -982,6 +1117,8 @@ def create_server(
         keep_open=keep_open,
         nav_settle=nav_settle,
         max_result_chars=max_result_chars,
+        allow_private_network=allow_private_network,
+        block_loopback=block_loopback,
     )
 
     def _build_tools() -> List[Tool]:
@@ -1055,6 +1192,8 @@ async def run_stdio(
     keep_open: bool = False,
     nav_settle: bool = True,
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
+    allow_private_network: bool = False,
+    block_loopback: bool = False,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -1082,10 +1221,19 @@ async def run_stdio(
         keep_open=keep_open,
         nav_settle=nav_settle,
         max_result_chars=max_result_chars,
+        allow_private_network=allow_private_network,
+        block_loopback=block_loopback,
     )
     extra = ""
     if browser_mode == "user-chrome":
         extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
+    extra += (
+        f" egress(loopback={'blocked' if block_loopback else 'allowed'},"
+        f" private={'allowed' if allow_private_network else 'blocked'})"
+    )
+    if browser_mode == "user-chrome":
+        # WS-29b: 우리가 띄운 Chrome 에만 프록시 플래그를 줄 수 있다 — 한 줄로 알린다.
+        extra += " [egress 프록시는 우리가 띄운 Chrome 에만 적용, README 보안 절]"
     print(
         f"agent-browser serve: browser={browser_mode} mode={mode.value}{extra}"
         " (브라우저는 첫 툴 호출 때 시작)",
@@ -1190,6 +1338,14 @@ def _install_shutdown_signals(loop: Any, stop: Any, received: List[int]) -> Dict
             previous[sig] = signal.signal(sig, _handler)
         except (ValueError, OSError):  # 메인 스레드가 아니면 등록 불가 — 기존 동작 유지
             continue
+    # 신호 마스크는 부모에게서 상속되고 signal.signal 은 마스크를 풀지 않는다 — 부모가 막아 둔
+    # 채로 띄우면 처리기를 달아도 신호가 전달되지 않아 serve 가 끝나지 않았다(WS-29b R1 실측).
+    # 처리기를 단 신호만 이 스레드에서 푼다(stdin 리더 등 이후 만든 스레드도 이 마스크를 받는다).
+    if previous and hasattr(signal, "pthread_sigmask"):
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, set(previous))
+        except (ValueError, OSError):
+            pass
     return previous
 
 
