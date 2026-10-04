@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1600개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1731개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -164,7 +164,7 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 
 ## MCP 클라이언트 연동
 
-19종 툴을 stdio로 노출합니다. Claude Desktop 설정 예시입니다.
+19종 툴(과 사람 인계용 서버 도구)을 stdio로 노출합니다. Claude Desktop 설정 예시입니다.
 
 ```json
 {
@@ -312,6 +312,38 @@ click         ->  element_id="@e3", epoch=0
 탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다.
 
 agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
+
+### 사람 인계 — 조작권과 승인 (MCP)
+
+액션 툴 19종 외에 계약 밖 **서버 도구 4개**(`browser_control_request`·`browser_control_status`·`browser_control_wait`·`browser_approval_wait`)가 tools/list 에 함께 실립니다. 사람은 같은 컴퓨터의 터미널에서 `agent-browser control …`·`agent-browser approve …`로 답합니다. `serve`는 시작할 때 stderr 에 `server_id=<id>`를 한 줄 씁니다. 서버별 상태는 `~/.agent-browser/servers/<server_id>/`(0700, 파일 0600)에 있고 서버가 끝나면 지웁니다(프로세스가 없는 옛 디렉터리는 다음 서버가 시작할 때 청소). 서버가 하나만 떠 있으면 `--server`를 생략할 수 있고, 둘 이상이면 목록을 보여 주고 거부합니다.
+
+**캡차 예시(조작권).** 창이 보이는 서버(`serve --browser human` 또는 `--browser user-chrome`)에서만 됩니다 — headless 서버의 `browser_control_request`는 사람이 볼 창이 없어 거부하고 이 옵션을 안내합니다.
+
+1. 에이전트: `browser_navigate` 결과에 `data.challenge`가 있음 → `browser_control_request(reason="캡차 확인")`. 창이 앞으로 오고 창 위에 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나 누를 수 없음)가 뜨며, 서버 stderr 에도 안내가 나갑니다.
+2. 에이전트: `browser_control_wait(timeout_s=120)` — 사람이 가져가거나 돌려줄 때까지 기다립니다(상한 120초, 다시 부르면 이어서 기다림).
+3. 사람: 터미널에서 아래를 치고, 브라우저 창에서 직접 캡차를 풉니다.
+
+```text
+agent-browser control take
+agent-browser control release
+```
+
+4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다.
+
+`holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
+
+**결제 버튼 예시(승인 증표).** 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, action_digest, expires_at, how_to_approve}`가 붙습니다. `action_digest`는 액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거(`gate_basis`) + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256 입니다.
+
+1. 에이전트: `browser_click(element_id="@e5", epoch=3)` → 차단, `approval_id=ap_…`. 메시지는 "사람에게 `agent-browser approve ap_…` 실행을 요청"하라고 안내합니다.
+2. 사람: 내용(액션·대상·근거·origin·탭·epoch·파라미터·만료)을 보고 y 로 승인합니다(`--yes`는 스크립트용, `--deny`는 거절). 터미널이 아니면 `--yes` 없이는 승인하지 않습니다.
+
+```text
+agent-browser approve ap_XXXX
+```
+
+3. 에이전트: `browser_approval_wait(approval_id)`로 기다린 뒤 **같은 인자에 `approval_id`를 더해** 다시 호출합니다: `browser_click(element_id="@e5", epoch=3, approval_id="ap_…")`.
+
+서버는 (사람이 승인함 ∧ 만료 전(기본 30분, `serve --approval-ttl SEC`) ∧ 다시 계산한 digest 가 같음 ∧ 처음 씀)일 때만 통과시킵니다. 승인 전·다른 서버의 id·만료·재사용·파라미터/대상/탭/origin/epoch 가 달라진 호출은 거부하고 이유를 `data.approval.rejected`에 싣습니다. **에이전트가 가진 `approval_id`만으로는 실행되지 않습니다** — 승인은 사람이 대역 밖에서만 할 수 있고, 서버는 디스크의 승인 파일이 아니라 자기 메모리의 상태만 믿습니다(명령 파일은 같은 사용자 소유·0600·server_id 일치·digest 일치일 때만 처리). 증표로 실행했는데 결과가 불확실하면(`E_TIMEOUT`·`E_PAGE_CRASHED`·`E_NAVIGATE_TIMEOUT`) `data.approval.outcome="outcome_unknown"`, `retry_safe=false`로 알리고 같은 증표는 다시 쓸 수 없습니다 — 자동으로 다시 시도하지 말고 관찰해 확인하십시오. 운영자 정적 허용 `--pre-approve`는 그대로 동작합니다.
 
 ---
 

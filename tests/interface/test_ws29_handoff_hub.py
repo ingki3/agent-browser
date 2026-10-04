@@ -235,18 +235,21 @@ def test_command_owned_by_other_user_ignored(hub: HandoffHub):
 
 def test_symlinked_command_rejected(hub: HandoffHub, tmp_path: Path):
     target = tmp_path / "elsewhere.json"
-    target.write_text(json.dumps({"op": "take", "server_id": hub.server_id, "nonce": "s1"}))
+    target.write_text(json.dumps({"op": "take", "server_id": hub.server_id, "nonce": "sym1"}))
     os.chmod(target, 0o600)
-    (hub.dir / "cmd-s1.json").symlink_to(target)
+    (hub.dir / "cmd-sym1.json").symlink_to(target)
     assert hub.poll() == []
     assert hub.status()["holder"] == "agent"
+    # 이름 규칙에 맞는 파일이 실제로 검사됐다(이름 때문에 무시된 것이 아님).
+    assert hub.rejected and hub.rejected[-1][0] == "cmd-sym1.json"
 
 
 def test_unknown_op_and_nonce_mismatch_rejected(hub: HandoffHub):
     _forge(hub, {"op": "sudo", "server_id": hub.server_id})
-    _forge(hub, {"op": "take", "server_id": hub.server_id, "nonce": "zzz"}, name="cmd-aaa.json")
+    _forge(hub, {"op": "take", "server_id": hub.server_id, "nonce": "zzzz"}, name="cmd-aaaa.json")
     assert hub.poll() == []
     assert hub.status()["holder"] == "agent"
+    assert {name for name, _ in hub.rejected} == {"cmd-forged1.json", "cmd-aaaa.json"}
 
 
 def test_processed_commands_are_removed_and_acked(hub: HandoffHub):

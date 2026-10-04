@@ -734,7 +734,7 @@ class BrowserMCPServer:
 
     def _human_can_see(self) -> bool:
         """사람이 볼 브라우저 창이 있는가(headless 면 없다)."""
-        return self.browser_mode != "headless"
+        return self.browser_mode != "headless" or not self.headless
 
     async def _set_banner(self, text: Optional[str]) -> None:
         """창 위 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나
