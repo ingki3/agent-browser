@@ -133,6 +133,50 @@ def build_all_tools() -> List[Dict[str, Any]]:
     return [build_tool_schema(action) for action in ActionType]
 
 
+#: 계약 밖 서버 도구 (WS-29 사람 인계). 액션 툴(19종)과 **별도 목록** — 계약·ActionType 과 무관하다.
+#: tools/list = build_all_tools() + build_server_tools(). 설명은 짧게(WS-30b 토큰 예산).
+_WAIT_SCHEMA = {"type": "number", "maximum": 120}
+SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
+    f"{TOOL_PREFIX}control_request": {
+        "description": (
+            "사람에게 조작권 요청(캡차·로그인). 창 있는 serve 만. secret_wanted=true 면 관찰도 막힘. "
+            "다음: control_wait"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"reason": {"type": "string"}, "secret_wanted": {"type": "boolean"}},
+            "required": ["reason"],
+        },
+    },
+    f"{TOOL_PREFIX}control_status": {
+        "description": "조작권 상태(holder agent|human)",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    f"{TOOL_PREFIX}control_wait": {
+        "description": "사람의 take/release 까지 대기(초, 기본 60)",
+        "inputSchema": {"type": "object", "properties": {"timeout_s": _WAIT_SCHEMA}},
+    },
+    f"{TOOL_PREFIX}approval_wait": {
+        "description": "data.approval 을 사람이 승인/거절할 때까지 대기",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"approval_id": {"type": "string"}, "timeout_s": _WAIT_SCHEMA},
+            "required": ["approval_id"],
+        },
+    },
+}
+
+
+def build_server_tools() -> List[Dict[str, Any]]:
+    """계약 밖 서버 도구 정의(WS-29). 액션 툴 목록(build_all_tools)과 합쳐 tools/list 가 된다."""
+    return [{"name": name, **spec} for name, spec in SERVER_TOOLS.items()]
+
+
+def build_listed_tools() -> List[Dict[str, Any]]:
+    """MCP tools/list 전체 = 액션 툴 19종 + 서버 도구."""
+    return build_all_tools() + build_server_tools()
+
+
 _DESCRIPTIONS: Dict[ActionType, str] = {
     ActionType.OBSERVE_PAGE: (
         "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. "
@@ -225,11 +269,22 @@ def _signals_of(info: Any) -> tuple:
     return tuple(out)
 
 
-def blocked_hint_text(hint: str) -> str:
+def blocked_hint_text(hint: str, approval_id: str = "") -> str:
     """무인 차단 메시지 끝에 붙는 사람(운영자)용 해결 경로."""
-    return (
+    text = ""
+    if approval_id:
+        text += approve_hint_text(approval_id)
+    return text + (
         f" — 이 액션을 허용하려면 서버를 `--pre-approve \"{hint}\"` 으로 다시 띄우거나"
         " `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요."
+    )
+
+
+def approve_hint_text(approval_id: str) -> str:
+    """승인 증표 해결 경로 (WS-29): 사람만 승인할 수 있다 — 에이전트에게 승인 도구는 없다."""
+    return (
+        f" — 사람에게 `agent-browser approve {approval_id}` 실행을 요청하세요"
+        f"(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기)"
     )
 
 
@@ -321,6 +376,30 @@ def envelope_json(result: ActionResult) -> str:
     import json
 
     return json.dumps(envelope_dict(result), ensure_ascii=False, separators=(",", ":"))
+
+
+from interface.handoff import DEFAULT_APPROVAL_TTL_S, WAIT_DEFAULT_S, WAIT_MAX_S  # noqa: E402
+
+#: 승인 증표로 실행했는데 결과가 이 코드면 실행 여부가 불확실하다(outcome_unknown, 재시도 금지).
+_UNCERTAIN_CODES = frozenset({
+    ErrorCode.TIMEOUT, ErrorCode.PAGE_CRASHED, ErrorCode.NAVIGATE_TIMEOUT,
+})
+#: 조작권 반납 뒤 안내.
+_RELEASE_HINT = "사람이 화면을 바꿨을 수 있습니다 — 이전 element_id 는 무효. browser_observe_page 로 다시 관찰하세요."
+
+
+def _wait_timeout(raw: Any) -> float:
+    try:
+        value = float(raw) if raw is not None else WAIT_DEFAULT_S
+    except (TypeError, ValueError):
+        value = WAIT_DEFAULT_S
+    return max(0.0, min(WAIT_MAX_S, value))
+
+
+def _iso(ts: float) -> str:
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).isoformat(timespec="seconds")
 
 
 #: 응답 봉투 크기 상한(글자) 기본값 (WS-30b). 근거: Claude Code 는 MCP 도구 결과가 기본
@@ -502,7 +581,22 @@ class BrowserMCPServer:
         max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
         allow_private_network: bool = False,
         block_loopback: bool = False,
+        approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
+        handoff_root: Any = None,
     ) -> None:
+        from interface.handoff import HandoffHub, state_root
+
+        #: 사람 인계 통로(조작권·승인 증표, WS-29). 디스크 상태는 open_handoff() 에서 만든다.
+        self.hub = HandoffHub(
+            root=handoff_root if handoff_root is not None else state_root(),
+            browser_mode=browser_mode,
+            approval_ttl_s=approval_ttl_s,
+        )
+        self._hub_task: Any = None
+        #: 안내 띠를 띄운 (탭 id, CDP 세션) — 같은 세션으로 지운다.
+        self._banner: Any = None
+        #: 이번 호출에서 쓴 승인 증표 id(결과에 outcome 을 붙인다).
+        self._used_approval: Optional[str] = None
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
         self.allow_private_network = allow_private_network
         self.block_loopback = block_loopback
@@ -589,9 +683,176 @@ class BrowserMCPServer:
             await self._close_egress()
             raise
         self._started = True
+        self.open_handoff()
         logger.info(
             "MCP 브라우저 세션 시작 (mode=%s, browser=%s)", self.mode.value, self.browser_mode
         )
+
+    # -- 사람 인계 통로 (WS-29) -------------------------------------------------
+
+    def open_handoff(self) -> Optional[str]:
+        """서버 상태 디렉터리를 열고 감시 태스크를 띄운다. 실패하면 None(통로 없음 — fail-closed:
+        사람이 승인·조작권을 줄 수 없으므로 고위험 액션은 계속 막힌다)."""
+        if not self.hub.opened:
+            try:
+                self.hub.open()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("사람 인계 상태 디렉터리를 열 수 없음: %r", exc)
+                return None
+        if self._hub_task is None:
+            try:
+                self._hub_task = asyncio.get_running_loop().create_task(self._watch_handoff())
+            except RuntimeError:
+                self._hub_task = None
+        return self.hub.server_id
+
+    async def _watch_handoff(self) -> None:
+        from interface.handoff import POLL_INTERVAL_S
+
+        while True:
+            try:
+                await self._poll_handoff()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 감시는 죽지 않는다
+                logger.warning("사람 인계 감시 실패", exc_info=True)
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    async def _poll_handoff(self) -> List[str]:
+        events = self.hub.poll()
+        for event in events:
+            if event == "released":
+                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
+                if self._engine is not None:
+                    self._engine.bump_epoch("control_release")
+                await self._set_banner(None)
+                _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
+            elif event == "taken":
+                await self._set_banner("사람이 조작 중 — 끝나면 `agent-browser control release`")
+                _stderr_line("agent-browser serve: 조작권을 사람이 가져감")
+        return events
+
+    def _human_can_see(self) -> bool:
+        """사람이 볼 브라우저 창이 있는가(headless 면 없다)."""
+        return self.browser_mode != "headless"
+
+    async def _set_banner(self, text: Optional[str]) -> None:
+        """창 위 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나
+        누를 수 없다). 창이 없거나 실패하면 조용히 넘어간다(안내는 stderr 에도 나간다)."""
+        if not self._human_can_see() or self._core is None:
+            return
+        try:
+            tab_id = self._core.active_tab_id
+            if self._banner is None or self._banner[0] != tab_id:
+                self._banner = (tab_id, await self._core.new_cdp_session(tab_id))
+            cdp = self._banner[1]
+            await cdp.send("Overlay.enable")
+            await cdp.send("Overlay.setPausedInDebuggerMessage",
+                           {"message": text} if text else {})
+            if not text:
+                await cdp.send("Overlay.disable")
+        except Exception:  # noqa: BLE001
+            logger.debug("안내 띠 표시 실패", exc_info=True)
+
+    def _current_origin(self) -> str:
+        from urllib.parse import urlsplit
+
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+        try:
+            parts = urlsplit(getattr(page, "url", "") or "")
+            return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme else ""
+        except ValueError:
+            return ""
+
+    async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
+        args = dict(arguments or {})
+        if name not in SERVER_TOOLS:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": f"알 수 없는 툴: {name}"}
+        if not self.hub.opened:
+            self.open_handoff()
+        if not self.hub.opened:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "사람 인계 통로(상태 디렉터리)를 열 수 없습니다 — 서버 stderr 참조."}
+        await self._poll_handoff()
+        short = name[len(TOOL_PREFIX):]
+        if short == "control_status":
+            return {"success": True, "data": {"control": self.hub.status()}}
+        if short == "control_request":
+            return await self._control_request(args)
+        timeout = _wait_timeout(args.get("timeout_s"))
+        if short == "control_wait":
+            return await self._control_wait(timeout)
+        return await self._approval_wait(str(args.get("approval_id") or ""), timeout)
+
+    async def _control_request(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        reason = str(args.get("reason") or "").strip()
+        if not reason:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "reason 이 필요합니다."}
+        if not self._human_can_see():
+            # 사람이 볼 창이 없다 — 운영자가 창 보이는 방식으로 띄워야 한다(우회 아님).
+            return {
+                "success": False,
+                "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                "error_message": (
+                    "headless 서버라 사람이 볼 창이 없습니다. 운영자에게 `agent-browser serve "
+                    "--browser human` 또는 `--browser user-chrome` 으로 다시 띄우도록 요청하세요."
+                ),
+                "data": {"control": self.hub.status(), "browser_mode": self.browser_mode},
+            }
+        if not self._started:
+            await self.start()
+        out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
+        page = getattr(getattr(self._dispatcher, "ctx", None), "page", None) or self._page
+        try:
+            await page.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+        await self._set_banner(f"에이전트가 사람 조작을 요청: {reason[:80]} — "
+                               f"`agent-browser control take`")
+        _stderr_line(f"agent-browser serve: [사람 조작 요청] {reason} "
+                     f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
+        return {"success": True, "data": out}
+
+    async def _control_wait(self, timeout: float) -> Dict[str, Any]:
+        st = self.hub.status()
+        if st["holder"] == "agent" and not st["requested"]:
+            return {"success": True, "data": {"control": st, "changed": "none_pending",
+                                              "hint": _RELEASE_HINT}}
+        start_version = self.hub.version
+        deadline = time.monotonic() + timeout
+        changed = "timeout"
+        while time.monotonic() < deadline:
+            events = await self._poll_handoff()
+            hit = [e for e in events if e in ("taken", "released")]
+            if hit:
+                changed = hit[-1]
+                break
+            if self.hub.version != start_version and self.hub.last_event in ("taken", "released"):
+                changed = self.hub.last_event
+                break
+            await asyncio.sleep(0.05)
+        data: Dict[str, Any] = {"control": self.hub.status(), "changed": changed}
+        if changed == "released":
+            data["hint"] = _RELEASE_HINT
+            data["snapshot_epoch"] = self._engine.epoch if self._engine else 0
+        return {"success": True, "data": data}
+
+    async def _approval_wait(self, approval_id: str, timeout: float) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            st = self.hub.approval_status(approval_id)
+            if st["status"] != "pending" or time.monotonic() >= deadline:
+                break
+            await self._poll_handoff()
+            await asyncio.sleep(0.05)
+        out = dict(st)
+        if out["status"] == "approved":
+            out["next"] = "같은 툴을 같은 인자 + approval_id 로 다시 호출하세요(1회용)."
+        return {"success": out["status"] != "unknown", "data": {"approval": out}}
 
     async def _init_session(self) -> None:
         """컨텍스트·첫 탭·디스패처·Egress 가드·HITL 을 준비한다(세 방식 공통)."""
@@ -634,10 +895,16 @@ class BrowserMCPServer:
         )
 
     async def close(self) -> None:
-        if self._core is not None:
-            await self._core.close()
-        await self._close_egress()
-        self._started = False
+        task, self._hub_task = self._hub_task, None
+        if task is not None:
+            task.cancel()
+        try:
+            if self._core is not None:
+                await self._core.close()
+            await self._close_egress()
+        finally:
+            self.hub.close()  # 상태 디렉터리 정리(사람 CLI 가 죽은 서버를 고르지 않게)
+            self._started = False
 
     async def _close_egress(self) -> None:
         runtime, self._egress_runtime = self._egress_runtime, None
@@ -677,9 +944,25 @@ class BrowserMCPServer:
         if not self._started:
             await self.start()
 
+        params: Dict[str, Any] = dict(arguments or {})
+        # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
+        approval_id = params.pop("approval_id", None)
+        # WS-29: 사람이 조작권을 가진 동안(또는 비밀 입력 요청 중) 에이전트 액션 거부.
+        if self.hub.opened:
+            await self._poll_handoff()
+        control = self.hub.control_blocks(action, params)
+        if control is not None:
+            what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
+            return self._error_result(
+                action,
+                ErrorCode.HITL_UNATTENDED_BLOCKED,
+                f"사람이 브라우저를 다루는 중이라 {what}을 거부했습니다({control['reason']}). "
+                "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
+                data={"control": control},
+            )
+
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
-        params: Dict[str, Any] = dict(arguments or {})
         to_main = False
         if action is ActionType.SWITCH_FRAME and "to_main" in params:
             # WS-30 추가 B: 디스패처의 메인 복귀(to_main)는 계약(동결)에 없는 키라 검증에서
@@ -712,14 +995,23 @@ class BrowserMCPServer:
 
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         self._pending_gate_basis = None
-        blocked = await self._check_hitl(action, params)
+        self._used_approval = None
+        blocked = await self._check_hitl(action, params, approval_id=approval_id)
         if blocked is not None:
             return blocked
 
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
-        result = await self._dispatcher.dispatch(action, params)
+        used, self._used_approval = self._used_approval, None
+        try:
+            result = await self._dispatcher.dispatch(action, params)
+        except BaseException:
+            if used is not None:
+                self.hub.set_outcome(used, "outcome_unknown")
+            raise
+        if used is not None:
+            self._attach_approval_outcome(used, result)
         result = self._attach_egress_block(action, params, result, blocks_before)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
@@ -872,8 +1164,31 @@ class BrowserMCPServer:
         result.data.setdefault("challenge", challenge)
         result.data.setdefault("last_http_status", last_status)
 
+    def _attach_approval_outcome(self, approval_id: str, result: ActionResult) -> None:
+        """승인 증표로 실행한 결과에 outcome 을 붙인다. 불확실하면 outcome_unknown(자동 재시도 금지)."""
+        unknown = (not result.success) and result.error_code in _UNCERTAIN_CODES
+        outcome = "outcome_unknown" if unknown else ("succeeded" if result.success else "failed")
+        self.hub.set_outcome(approval_id, outcome)
+        info: Dict[str, Any] = {"approval_id": approval_id, "status": "used", "outcome": outcome}
+        if unknown:
+            result.retry_safe = False
+            info["note"] = ("실행 결과가 불확실합니다(이미 실행됐을 수 있음). 자동으로 다시 시도하지 말고 "
+                            "화면을 관찰해 확인하세요. 이 증표는 다시 쓸 수 없습니다.")
+        result.data["approval"] = info
+
+    def _approval_components(self, action: ActionType, params: Dict[str, Any],
+                             basis: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "action": action.value,
+            "params": params,
+            "gate_basis": basis,
+            "tab_id": self._core.active_tab_id if self._core else "",
+            "origin": self._current_origin(),
+            "snapshot_epoch": self._engine.epoch if self._engine else 0,
+        }
+
     async def _check_hitl(
-        self, action: ActionType, params: Dict[str, Any]
+        self, action: ActionType, params: Dict[str, Any], approval_id: Any = None
     ) -> Optional[ActionResult]:
         """고위험 액션 승인 게이트. 차단 시 ActionResult를 반환한다."""
         from security import ActionContext
@@ -945,10 +1260,37 @@ class BrowserMCPServer:
                 self._pending_gate_basis = dict(decision.basis)
             return None
 
+        # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve`)에서 승인한 바로 그 행동만 통과.
+        components = self._approval_components(action, params, dict(decision.basis))
+        rejected: Optional[Dict[str, Any]] = None
+        if approval_id:
+            ok, why = self.hub.consume_approval(str(approval_id), components)
+            if ok:
+                self._used_approval = str(approval_id)
+                if report_basis:
+                    self._pending_gate_basis = dict(decision.basis)
+                return None
+            rejected = {"approval_id": str(approval_id), "reason": why}
+        ap = self.hub.issue_approval(components, {
+            "target": element_name or selector,
+            "reason": decision.reason,
+            "domain": self._current_domain(),
+        })
+        approval = {
+            "approval_id": ap.approval_id,
+            "action_digest": ap.digest,
+            "expires_at": _iso(ap.expires),
+            "how_to_approve": f"사람이 터미널에서: agent-browser approve {ap.approval_id}",
+        }
+        if rejected is not None:
+            approval["rejected"] = rejected
+
         message = decision.reason
         if decision.requires_confirmation and decision.dialog is not None:
             # 대화형 모드: 클라이언트가 렌더링할 정형 모달을 함께 전달한다.
             message = decision.dialog.message
+        if rejected is not None:
+            message = f"승인 증표 거부: {rejected['reason']}. " + message
 
         data: Dict[str, Any] = {
             "requires_confirmation": decision.requires_confirmation,
@@ -958,14 +1300,17 @@ class BrowserMCPServer:
             ),
             # WS-31: 운영자가 왜 막혔는지 — {name, matched_keyword, source, …}.
             "gate_basis": dict(decision.basis),
+            "approval": approval,
         }
         code = decision.error_code or ErrorCode.HITL_UNATTENDED_BLOCKED
         if code is ErrorCode.HITL_UNATTENDED_BLOCKED:
             # WS-30 항목 5: 에이전트가 "어떻게 승인하나요?"로 멈추지 않게, 사람(운영자)이
             # 할 수 있는 해결 경로만 알린다 — 다른 도구로 돌아가는 방법은 알리지 않는다.
             hint = pre_approve_hint(action, element_name)
-            message += blocked_hint_text(hint)
+            message += blocked_hint_text(hint, ap.approval_id)
             data["pre_approve_hint"] = hint
+        else:
+            message += approve_hint_text(ap.approval_id)
 
         return self._error_result(action, code, message, data=data)
 
@@ -1097,6 +1442,7 @@ def create_server(
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
     allow_private_network: bool = False,
     block_loopback: bool = False,
+    approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -1119,6 +1465,7 @@ def create_server(
         max_result_chars=max_result_chars,
         allow_private_network=allow_private_network,
         block_loopback=block_loopback,
+        approval_ttl_s=approval_ttl_s,
     )
 
     def _build_tools() -> List[Tool]:
@@ -1134,7 +1481,7 @@ def create_server(
         """
         field = "input_schema" if "input_schema" in Tool.model_fields else "inputSchema"
         out: List[Tool] = []
-        for spec in build_all_tools():
+        for spec in build_listed_tools():  # 액션 툴 19종 + 서버 도구(WS-29)
             kwargs = {
                 "name": spec["name"],
                 "description": spec["description"],
@@ -1147,6 +1494,12 @@ def create_server(
         return _build_tools()
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+        if name in SERVER_TOOLS:
+            import json
+
+            payload = await backend.call_server_tool(name, arguments)
+            return [TextContent(type="text", text=json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")))]
         result = await backend.call_tool(name, arguments)
         # WS-30b: 기본값 필드를 뺀 봉투(빠진 필드 = 계약 기본값, ENVELOPE_RULE).
         return [TextContent(type="text", text=envelope_json(result))]
@@ -1194,6 +1547,7 @@ async def run_stdio(
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
     allow_private_network: bool = False,
     block_loopback: bool = False,
+    approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -1223,7 +1577,10 @@ async def run_stdio(
         max_result_chars=max_result_chars,
         allow_private_network=allow_private_network,
         block_loopback=block_loopback,
+        approval_ttl_s=approval_ttl_s,
     )
+    # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
+    server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None
     extra = ""
     if browser_mode == "user-chrome":
         extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
@@ -1240,6 +1597,14 @@ async def run_stdio(
         file=sys.stderr,
         flush=True,
     )
+    if server_id:
+        print(
+            f"agent-browser serve: server_id={server_id} — 사람 인계: "
+            f"`agent-browser control take|release --server {server_id}`, "
+            f"승인: `agent-browser approve <approval_id>`",
+            file=sys.stderr,
+            flush=True,
+        )
     async def _serve() -> None:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(

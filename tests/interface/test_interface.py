@@ -269,7 +269,10 @@ def test_cli_tools_lists_all_19(capsys):
 def test_cli_tools_json_is_valid(capsys):
     assert cli_main(["tools", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert len(payload) == 19
+    # WS-29: tools/list 전체 = 액션 툴 19종(계약) + 계약 밖 서버 도구(사람 인계 4개).
+    actions = [s for s in payload if action_from_tool(s["name"]) is not None]
+    assert len(actions) == 19
+    assert len(payload) == 19 + 4
     assert all("inputSchema" in spec for spec in payload)
 
 

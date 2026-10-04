@@ -8,6 +8,8 @@
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
     agent-browser run --url <주소> --goal <목표> [--human|--user-chrome] [--handoff]  # 목표 1개 실행
+    agent-browser control take|release|status [--server ID]   # 사람: serve 의 조작권 (WS-29)
+    agent-browser approve <approval_id> [--server ID] [--yes|--deny]  # 사람: 고위험 행동 승인
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -126,6 +128,25 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="루프백(127/8·::1·localhost)도 차단(기본 허용 — 로컬 Mock·개발 서버용).",
     )
+    serve.add_argument(
+        "--approval-ttl",
+        type=_approval_ttl,
+        default=None,
+        metavar="SEC",
+        help="고위험 행동 승인 증표 수명(초, 기본 1800). 사람이 `agent-browser approve` 로 승인.",
+    )
+
+    # --- control / approve (WS-29: 사람 쪽 신호 통로) ---
+    control = sub.add_parser("control", help="사람: 실행 중인 serve 의 조작권을 가져오거나 돌려줍니다.")
+    control.add_argument("op", choices=["take", "release", "status"])
+    control.add_argument("--server", default=None, metavar="ID",
+                         help="서버 id (serve 시작 때 stderr 에 출력). 하나만 떠 있으면 생략 가능.")
+    control.add_argument("--json", action="store_true", help="status 를 JSON 으로 출력")
+    approve = sub.add_parser("approve", help="사람: 에이전트가 요청한 고위험 행동 하나를 승인합니다.")
+    approve.add_argument("approval_id")
+    approve.add_argument("--server", default=None, metavar="ID", help="서버 id (생략 시 자동 탐색)")
+    approve.add_argument("--yes", action="store_true", help="확인 질문 없이 승인(스크립트용)")
+    approve.add_argument("--deny", action="store_true", help="승인하지 않고 거절로 기록")
 
     # --- tui ---
     tui = sub.add_parser("tui", help="Textual 대시보드를 실행합니다.")
@@ -238,12 +259,24 @@ def _max_result_chars(raw: str) -> int:
     return value
 
 
+def _approval_ttl(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"정수가 아닙니다: {raw}") from exc
+    if value < 10:
+        raise argparse.ArgumentTypeError(f"10 이상이어야 합니다: {value}")
+    return value
+
+
 def _cmd_tools(as_json: bool) -> int:
-    from interface.mcp_server import build_all_tools
+    from interface.mcp_server import build_all_tools, build_server_tools
 
     specs = build_all_tools()
+    extra = build_server_tools()
     if as_json:
-        print(json.dumps(specs, ensure_ascii=False, indent=2))
+        # tools/list 와 같은 목록(액션 툴 + 계약 밖 서버 도구).
+        print(json.dumps(specs + extra, ensure_ascii=False, indent=2))
         return 0
 
     print(f"노출 툴 {len(specs)}종:")
@@ -251,6 +284,9 @@ def _cmd_tools(as_json: bool) -> int:
         required = spec["inputSchema"].get("required", [])
         hint = f" (필수: {', '.join(required)})" if required else ""
         print(f"  {spec['name']:28}{hint}")
+    print(f"서버 도구(계약 밖, 사람 인계) {len(extra)}개:")
+    for spec in extra:
+        print(f"  {spec['name']}")
     return 0
 
 
@@ -279,6 +315,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 ),
                 allow_private_network=bool(args.allow_private_network),
                 block_loopback=bool(args.block_loopback),
+                **({"approval_ttl_s": args.approval_ttl} if args.approval_ttl else {}),
             )
         )
     except KeyboardInterrupt:
@@ -358,6 +395,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_serve(args)
     if args.command == "tui":
         return _cmd_tui(args)
+    if args.command == "control":
+        from interface import handoff
+
+        return handoff.cli_control(args.op, args.server, as_json=args.json)
+    if args.command == "approve":
+        from interface import handoff
+
+        if args.yes and args.deny:
+            parser.error("--yes 와 --deny 는 함께 쓸 수 없습니다")
+        return handoff.cli_approve(args.approval_id, args.server, args.yes, deny=args.deny)
     if args.command == "llm-check":
         return _cmd_llm_check(args)
     if args.command == "session":
