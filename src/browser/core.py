@@ -76,8 +76,13 @@ class BrowserCore:
         browser_mode: str = "headless",
         chrome_profile: Optional[Path] = None,
         keep_open: bool = False,
+        egress: Any = None,
     ) -> None:
         """
+        egress (WS-29b): security.egress_runtime.EgressRuntime(시작된 것). 주면 브라우저를
+        검증 프록시에 묶어 띄운다(Playwright Chromium: launch(proxy=, args=), user-chrome:
+        Chrome 명령줄 인자). None 이면 기존 동작(프록시 없음).
+
         human_like=True 이면 사람이 쓰는 브라우저와 같은 기본값을 쓴다(위장 없음):
           - viewport 고정 대신 no_viewport (창 크기 = 실제 창, screen 위장 없음)
           - locale="ko-KR" (Accept-Language 헤더와 navigator.languages 채움)
@@ -103,6 +108,7 @@ class BrowserCore:
         self.browser_mode = browser_mode
         self.chrome_profile = chrome_profile
         self.keep_open = keep_open
+        self.egress = egress
         self.headless = headless
         self.human_like = human_like
         self.session_store = session_store or SessionStore()
@@ -133,7 +139,10 @@ class BrowserCore:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless)
+        launch_kw: Dict[str, Any] = {"headless": self.headless}
+        if self.egress is not None:
+            launch_kw.update(self.egress.launch_kwargs())
+        self._browser = await self._playwright.chromium.launch(**launch_kw)
         return self
 
     async def _start_user_chrome(self) -> "BrowserCore":
@@ -147,7 +156,12 @@ class BrowserCore:
 
         profile = self.chrome_profile or user_chrome.DEFAULT_PROFILE_DIR
         user_chrome._guard_profile(Path(profile))  # ValueError: 평소 프로필
-        uc = await user_chrome.launch_user_chrome(profile_dir=profile)
+        if self.egress is not None:
+            uc = await user_chrome.launch_user_chrome(
+                profile_dir=profile, extra_args=self.egress.chrome_args()
+            )
+        else:
+            uc = await user_chrome.launch_user_chrome(profile_dir=profile)
         try:
             from playwright.async_api import async_playwright
 

@@ -3,6 +3,7 @@
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
+                          [--allow-private-network] [--block-loopback]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -110,6 +111,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "observe_page·extract 응답 크기 상한(글자, 기본 20000 — Claude Code MCP 결과 한도 "
             "25,000토큰, 한글 1자≈1토큰 기준). 넘으면 항목 경계에서 자르고 data.truncated 로 알림."
         ),
+    )
+
+    serve.add_argument(
+        "--allow-private-network",
+        action="store_true",
+        help=(
+            "사설·링크로컬·CGNAT(100.64/10)·IPv6 ULA 대역 접속 허용(기본 차단). 로컬 NAS·사내망용. "
+            "클라우드 메타데이터·0.0.0.0 은 이 옵션과 무관하게 차단."
+        ),
+    )
+    serve.add_argument(
+        "--block-loopback",
+        action="store_true",
+        help="루프백(127/8·::1·localhost)도 차단(기본 허용 — 로컬 Mock·개발 서버용).",
     )
 
     # --- tui ---
@@ -262,6 +277,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                     if args.max_result_chars is not None
                     else _default_max_result_chars()
                 ),
+                allow_private_network=bool(args.allow_private_network),
+                block_loopback=bool(args.block_loopback),
             )
         )
     except KeyboardInterrupt:

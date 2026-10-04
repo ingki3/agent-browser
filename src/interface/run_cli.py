@@ -71,6 +71,10 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
                    help=f"사람 해결 신호 파일(기본 {DEFAULT_HANDOFF_FILE})")
     p.add_argument("--no-answer", action="store_true",
                    help="끝난 뒤 답 생성(final_answer)을 하지 않음")
+    p.add_argument("--allow-private-network", action="store_true",
+                   help="사설·링크로컬·CGNAT·IPv6 ULA 대역 접속 허용(기본 차단, 로컬 NAS·사내망용)")
+    p.add_argument("--block-loopback", action="store_true",
+                   help="루프백(127/8·::1·localhost)도 차단(기본 허용)")
     return p
 
 
@@ -288,13 +292,40 @@ def make_handoff(record: Dict[str, Any], wait_s: float, done_file: Path, *, stdi
     return on_challenge
 
 
-async def _open_browser(pw: Any, args: argparse.Namespace, record: Dict[str, Any]):
-    """(browser, context, page, user_chrome_or_None)."""
+async def _start_egress(args: argparse.Namespace, record: Dict[str, Any]) -> Any:
+    """serve 와 같은 Egress 정책(검증 프록시 + route 가드)을 시작한다 (WS-29b).
+
+    이전에는 run 에 Egress 가드가 없었다(사설망·메타데이터까지 열림, 실측).
+    """
+    from security.egress_runtime import USER_CHROME_NOTICE, EgressRuntime
+
+    egress = EgressRuntime(
+        allow_private_network=bool(getattr(args, "allow_private_network", False)),
+        block_loopback=bool(getattr(args, "block_loopback", False)),
+        tokenless=bool(args.user_chrome),
+    )
+    await egress.start()
+    record["egress"] = egress.summary()
+    if args.user_chrome:
+        print(USER_CHROME_NOTICE, file=sys.stderr)
+    return egress
+
+
+async def _open_browser(pw: Any, args: argparse.Namespace, record: Dict[str, Any], *,
+                        egress: Any = None):
+    """(browser, context, page, user_chrome_or_None).
+
+    egress(WS-29b, 시작된 EgressRuntime)를 주면 브라우저를 검증 프록시에 묶어 띄운다.
+    """
     if args.user_chrome:
         from browser.user_chrome import DEFAULT_PROFILE_DIR, connect_user_chrome, launch_user_chrome
 
+        uc_kw: Dict[str, Any] = {}
+        if egress is not None:
+            uc_kw["extra_args"] = egress.chrome_args()
         uc = await launch_user_chrome(
             profile_dir=Path(args.chrome_profile) if args.chrome_profile else DEFAULT_PROFILE_DIR,
+            **uc_kw,
         )
         record["user_chrome"] = {"port": uc.port, "keep_open": bool(args.keep_open)}
         try:
@@ -303,11 +334,12 @@ async def _open_browser(pw: Any, args: argparse.Namespace, record: Dict[str, Any
             uc.close()
             raise
         return browser, context, page, uc
+    launch_kw: Dict[str, Any] = egress.launch_kwargs() if egress is not None else {}
     if args.human:
-        browser = await pw.chromium.launch(headless=False)
+        browser = await pw.chromium.launch(headless=False, **launch_kw)
         context = await browser.new_context(no_viewport=True, locale="ko-KR")
     else:
-        browser = await pw.chromium.launch(headless=not args.headed)
+        browser = await pw.chromium.launch(headless=not args.headed, **launch_kw)
         context = await browser.new_context(viewport={"width": 1280, "height": 720})
     return browser, context, await context.new_page(), None
 
@@ -341,7 +373,14 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
     answer_ok = False
     started = time.perf_counter()
     async with async_playwright() as pw:
-        browser, context, page, uc = await _open_browser(pw, args, record)
+        egress = await _start_egress(args, record)
+        try:
+            browser, context, page, uc = await _open_browser(pw, args, record, egress=egress)
+            if callable(getattr(context, "route", None)):
+                await egress.install(context)
+        except BaseException:
+            await egress.close()
+            raise
         status_target = context if callable(getattr(context, "on", None)) else page
         status_listener = _track_main_document_status(status_target, record)
         try:
@@ -416,16 +455,19 @@ async def run_goal(args: argparse.Namespace, *, stdin: Any = None) -> Dict[str, 
                     status_target.remove_listener("response", status_listener)
                 except Exception:  # noqa: BLE001
                     pass
-            if uc is not None:
-                # CDP 연결만 끊는다(사용자 창의 기본 context 는 닫지 않는다).
-                try:
+            try:
+                if uc is not None:
+                    # CDP 연결만 끊는다(사용자 창의 기본 context 는 닫지 않는다).
+                    try:
+                        await browser.close()
+                    finally:
+                        if not args.keep_open:
+                            uc.close()  # 우리가 띄운 Chrome 만 종료
+                else:
+                    await context.close()
                     await browser.close()
-                finally:
-                    if not args.keep_open:
-                        uc.close()  # 우리가 띄운 Chrome 만 종료
-            else:
-                await context.close()
-                await browser.close()
+            finally:
+                await egress.close()
     # 답 생성(WS-23) — 브라우저를 닫은 뒤, 완료(completed)일 때만. 포기·차단·시간 초과·
     # 실행 오류면 만들지 않는다(차단 화면을 요약하지 않게). 루프와 같은 config·예산.
     if answer_ok and not getattr(args, "no_answer", False):

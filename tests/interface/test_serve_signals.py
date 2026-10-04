@@ -199,6 +199,30 @@ def test_stdin_eof_still_closes_once_and_exits_zero():
     assert res["stdout"] == b""
 
 
+@pytest.mark.parametrize("sig", SIGNALS, ids=lambda s: s.name)
+def test_signal_works_even_if_parent_blocked_it(sig):
+    """부모가 신호를 막은 채(blocked mask) serve 를 띄워도 종료 신호가 듣는다 (WS-29b R1).
+
+    신호 마스크는 fork/exec 로 상속되고 signal.signal 은 마스크를 풀지 않는다. 검증 1차
+    전체 실행의 SIGINT 4건 실패(\"15s 안에 끝나지 않음\")가 이 상태였다 — 부모(실행 환경)가
+    SIGINT 를 막아 두면 base·HEAD 모두 같은 4건이 재현된다(report §6).
+    """
+    def _block() -> None:
+        signal.pthread_sigmask(signal.SIG_BLOCK, set(SIGNALS))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "interface.cli", "serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=_env(), preexec_fn=_block,
+    )
+    head = _wait_stderr(proc, b"agent-browser serve:")
+    time.sleep(0.3)
+    proc.send_signal(sig)
+    res = _finish(proc, head, timeout=15)
+    assert res["rc"] == 128 + int(sig), res
+    assert "정리 완료" in res["stderr"], res["stderr"]
+
+
 # ---------------------------------------------------------------- 정리 상한 뒤 마지막 수단(단위)
 
 

@@ -217,7 +217,7 @@ def test_run_path_uses_default_nav_settle_on(monkeypatch):
         async def close(self):
             return None
 
-    async def fake_open(pw, args, record):
+    async def fake_open(pw, args, record, **_):
         return Br(), Ctx(), Page(), None
 
     async def body(page):
