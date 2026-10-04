@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1307개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1600개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -235,6 +235,27 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 무인 모드(기본)에서는 결제·주문·삭제·동의 같은 이름의 클릭, 폼 제출(`type_text(press_enter)`, 폼 안 입력칸에서 `press_key("Enter")`, 한 줄 입력칸에 줄바꿈 입력), 업로드·다운로드를 `E_HITL_UNATTENDED_BLOCKED`로 막습니다. 운영자가 서버를 띄울 때 `--pre-approve <액션>:<요소 이름>`(반복 가능, 예: `--pre-approve "click:결제 진행"`) 또는 `<액션>:*`로 미리 허용합니다. 차단 결과의 `data.pre_approve_hint`는 그 액션을 여는 값이고, 메시지 끝에 운영자용 안내가 붙습니다. `--mode interactive`는 차단 대신 승인 요청(`data.dialog`)을 돌려줍니다.
 `click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다. 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
 `press_key`의 Enter·Space는 키가 실제로 가는 요소(최상위 문서부터 포커스를 따라 iframe·shadow 안까지)로 판정합니다. Chromium 실측으로 Enter가 폼을 제출하는 포커스 대상 — 폼 안 한 줄 입력칸(text·search·email·number·password·tel·url·date·time·datetime-local·month·week), checkbox·radio·range, `<select>`, 제출 버튼(`<button>`·`input[type=submit|image]`, Space 포함) — 은 모두 폼 제출로 막습니다. 다른 출처 iframe 안 포커스는 포커스를 가진 프레임 사슬이 하나로 확정될 때 그 프레임 안에서 읽고, 포커스를 읽을 수 없거나 사슬을 확정할 수 없거나 폼 안의 알 수 없는 요소(사용자 정의 요소)면 판정 불가로 막습니다.
+
+**판정 근거 — 이름 + 문맥 신호.** 이름에 위험 단어가 없어도 아래 원천 중 하나에 있으면 고위험입니다. `element_id`·`selector`·좌표 클릭과 포커스 후 Enter/Space(요소를 누르는 경우)가 같은 판정 함수를 씁니다.
+
+| 원천(`source`) | 무엇을 보나 | 매칭 |
+| :--- | :--- | :--- |
+| `name` | 접근성 이름(관찰과 같은 규칙) | 부분 문자열 |
+| `text`·`aria` | 보이는 글자와 aria-label **둘 다**(aria '확인' + 보이는 '결제' 불일치 차단) | 부분 문자열 |
+| `title`·`child_title`·`alt`·`svg_title`·`child_aria`·`value` | title(대상 자신의 title 은 이름에 글자가 없을 때만 — 아이콘 버튼 `title=결제`는 차단, '저장' 버튼의 설명 문장은 무시), 자손 title·img alt·svg `<title>`·aria-label(신호를 가진 자손만 골라 400개까지 — 빈 요소를 앞에 끼워 피할 수 없음), 버튼 value | 부분 문자열 |
+| `pseudo` | CSS `::before`/`::after`의 `content` 글자(대상·앞 자손 20개 + 스타일시트에 글자 든 `content` 규칙이 걸린 자손) | 부분 문자열 |
+| `href` | 링크 목적지의 **마지막 경로 조각**과 값 전체가 키워드인 쿼리 값(`/account/delete`, `?action=delete`) — 조회 링크(`/order/123`, `?sort=order_date`)와 권한 명사(`/admin`, `grant`)는 막지 않음 | 단어 토큰 |
+| `form_action`·`formaction` | 제출 버튼의 `formaction`, 소속 폼(`form=` 포함)의 `action` 경로 전체 — GET 제출은 쿼리를 보지 않음(`/search?type=order` 통과, `/checkout` 차단) | 단어 토큰(`/payroll-info`는 pay 아님) |
+| `id`·`class`·`name_attr`·`testid` | id·class·name·data-testid 를 camelCase·kebab·snake 로 나눈 토큰(`btn-pay`, `deleteAccount`), 아이콘 클래스 사전(`fa-trash`, `bi-credit-card` … — 장바구니 아이콘은 '보기'가 흔해 제외) | 단어 토큰. `submit`·`confirm` 같은 폼 일반어는 제외(로그인 `btn-submit` 과차단 방지) |
+
+같은 출처로 이동하는 링크(`a[href]`, download·`#`·`javascript:` 아님)는 이동일 뿐 부작용이 아니므로 `id`·`class`·`name_attr`·`testid`·`title` 원천을 적용하지 않습니다(`fa-trash` '휴지통 보기' 링크 통과). 이름·보이는 글자·aria·alt·href 는 그대로 봅니다(`/account/delete` 링크는 차단).
+
+모든 텍스트는 NFKC 정규화, 보이지 않는 서식 문자(유니코드 범주 Cf 전체 — zero-width·방향 표시·soft hyphen 등)와 U+034F 제거, 공백 정리 뒤 매칭합니다(`결\u200b제`·`결\u200f제` → 결제). 차단 결과의 `data.gate_basis`(`{name, matched_keyword, source}`)와 메시지의 `출처 <source>`로 왜 막혔는지 알 수 있습니다. 판정할 수 없으면 `source: "unresolved"`입니다.
+
+**좌표 클릭(`click(x, y)`).** 게이트 전에 최상위 화면에서 그 좌표의 요소를 찾고(같은 출처 iframe·open shadow 안까지 따라 내려감), 클릭을 실제로 받는 상호작용 조상(button, 링크, 입력칸, `role=button|link|…`, label, summary, `[onclick]`, `[tabindex]`)의 이름·문맥으로 판정합니다. 사전 승인 값은 해석된 이름(`click:<이름>`, `data.pre_approve_hint`)입니다. 좌표에 요소가 없거나, 다른 출처 iframe 위이거나, closed shadow 위(안을 읽을 수 없음)이거나, 해석 중 오류가 나거나, 폼 안의 비상호작용 요소 위면 판정 불가로 막습니다. 캔버스처럼 상호작용 조상이 없고 폼 밖이며 위험 신호도 없는 곳은 통과시키고 결과 `data.gate_basis.coordinate_target: "non_interactive"`로 알립니다(Tier-2 SoM의 본래 용도).
+
+**남은 한계.** ① `select_option`·`check_box`가 `onchange`로 폼을 자동 제출하는 페이지는 미리 알 수 없어 이름 판정만 합니다. ② 캔버스에 그린 결제 버튼은 DOM 신호가 없어 좌표 클릭이 통과합니다. ③ 서버 쪽에서만 아는 위험(무해한 이름·경로의 API 가 실제로 결제)은 알 수 없습니다. ④ 키워드 사전 기반이라 '결제 내역'·'주문 목록'·'Remove filter' 같은 조회·UI 조작도 막힙니다 — 필요한 것은 `--pre-approve`로 엽니다. ⑤ 게이트 판정과 실제 클릭 사이의 DOM·JS 변경(호버 시 글자 교체, 클릭을 아래로 전달하는 덮개)은 막지 못합니다. 캔버스 화면에서도 엄격하게 하려면 무인 모드에서 좌표 클릭을 쓰지 않거나 `--mode interactive`로 사람이 확인하게 하세요.
+
 `download_file`의 `save_dir`는 절대 경로여야 합니다. 상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없으므로 `E_DOWNLOAD_FAILED`로 거부하고, 절대 경로의 `..`·심볼릭 링크는 정규화한 경로에 저장합니다(`downloaded_path`).
 
 MCP SDK는 1.x와 2.x를 모두 지원합니다. 두 메이저는 서버 등록 방식과 스키마 필드명이 달라, 런타임에 실제 API를 조회해 맞춥니다.
@@ -318,7 +339,19 @@ src/
 
 **예산 강제 차단** — 태스크당 $0.75 / 100,000토큰 / 30스텝 중 하나라도 넘으면 호출 자체를 막습니다. 경고가 아니라 차단이며, 응답을 받고 확인하면 이미 과금된 뒤라 호출 **전에** 검사합니다.
 
-**Egress 차단** — allowlist 밖 도메인으로의 요청을 막습니다. 클라우드 메타데이터 엔드포인트(`169.254.169.254`)는 상시 차단합니다.
+**Egress 차단** — allowlist 밖 도메인으로의 요청을 막습니다(`--allow-domain` 미지정이면 공개 주소는 모두 허용). `serve`·`run` 모두 같은 정책이며, 브라우저는 127.0.0.1 무작위 포트의 **검증 프록시**로만 나갑니다. 프록시가 요청마다(리다이렉트 매 홉, 서비스워커, WebSocket 포함) 호스트를 판정하고, 도메인은 해석된 IP **전부**를 검사한 뒤 검사한 그 IP 로만 접속합니다(DNS 재바인딩 방지). HTTPS 는 `CONNECT` 터널만 하고 TLS 를 열어 보지 않습니다.
+
+| 대역 | 기본 | 여는 옵션 |
+| :--- | :--- | :--- |
+| 루프백 `127/8`·`::1`·`localhost`·`*.localhost` | 허용(로컬 Mock·개발 서버) | `--block-loopback` 으로 차단 |
+| 사설 `10/8`·`172.16/12`·`192.168/16`, 링크로컬 `169.254/16`·`fe80::/10`, CGNAT `100.64/10`, IPv6 ULA `fc00::/7`, 그 밖의 비공개 대역 | 차단 | `--allow-private-network`(로컬 NAS·사내망) |
+| 클라우드 메타데이터(`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`), `0.0.0.0`·`::`, 멀티캐스트·예약 대역 | 항상 차단 | 없음 |
+
+IPv4-mapped IPv6(`[::ffff:192.168.1.1]`)·정수(`3232235777`)·16진(`0xc0.0xa8.1.1`)·8진·축약(`192.168.257`) 표기는 브라우저와 같은 규칙으로 정규화해 판정하고, 숫자로 끝나는데 해석할 수 없는 호스트는 막습니다. 도메인 해석 결과는 최대 30초 캐시하며, 해석이 실패하면 막지 않고 기록만 합니다(브라우저도 같은 이름을 찾지 못합니다). Chromium 은 `--disable-quic`(HTTP/3 끔)과 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`(프록시 밖 WebRTC UDP 끔)로 띄웁니다 — 영상 통화 같은 P2P WebRTC 는 동작하지 않습니다. 프록시가 죽으면 브라우저는 직접 접속으로 빠지지 않고 실패합니다.
+
+차단된 문서 이동은 MCP 결과 `data.egress` 에 `{"code": "egress_blocked", "host", "category", "reason", "open_with"}` 로 알립니다(`navigate` 는 `success: false`, `E_INVALID_URL`). `open_with` 는 운영자 옵션 이름이며, 메타데이터처럼 열 수 없는 대역은 `null` 입니다. 허용된 목적지라도 프록시가 닿지 못하면(이름 해석 실패·접속 실패) 프록시 없이와 같이 이동 실패로 알립니다(`navigate` 는 `success: false`, `E_NAVIGATE_TIMEOUT`, `data.egress={"code": "resolve_failed"|"connect_failed", "host"}`). 사이트가 실제로 돌려준 502 는 그대로 이동 성공입니다(`data.last_http_status`). 차단 기록·로그의 URL 은 스킴·호스트·포트·경로까지만 남깁니다(쿼리·조각·사용자정보 제외).
+
+**남은 한계.** ① `user-chrome` 은 Chrome 명령줄로 프록시 자격증명을 줄 수 없어 토큰 없는 프록시를 씁니다 — 같은 컴퓨터의 다른 프로세스도 그 포트를 쓸 수 있으나 가드가 허용한 목적지로만 중계됩니다. 설치된 Chrome 은 WebRTC 플래그를 무시해(Chrome 154 실측) 전용 프로필의 `webrtc.ip_handling_policy` 설정으로도 겁니다. 우리가 띄우지 않은(이미 떠 있는) Chrome 에 붙는 경로는 Egress 정책 밖입니다(`serve`·`run` 에는 그런 경로가 없습니다). ② 프록시는 해석한 IP 로 접속하므로 같은 IP 안의 가상 호스트는 구분하지 않습니다(HTTPS SNI·Host 는 브라우저가 보낸 그대로). ③ 하위 요청(이미지·비콘 등) 차단은 `data.egress` 에 싣지 않습니다(문서 이동만). ④ `session login`(사람이 직접 로그인하는 창)에는 Egress 정책을 걸지 않습니다. ⑤ 루프백은 포트와 무관하게 허용됩니다 — SSH 등 같은 컴퓨터의 로컬 서비스로도 터널이 열릴 수 있습니다. 막으려면 `--block-loopback` 을 쓰십시오.
 
 **프롬프트 주입 격리** — 웹에서 온 텍스트는 신뢰 경계 밖에 둡니다. 차단율 1.0, 오탐률 0.0으로 측정됩니다.
 

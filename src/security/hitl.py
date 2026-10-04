@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import unquote_plus, urlsplit
 
 from contracts import ActionType, ConfirmDialog, DangerLevel, ErrorCode, ExecutionMode
 
@@ -53,6 +55,250 @@ MEDIUM_RISK_KEYWORDS = (
     "저장", "수정", "변경", "업로드", "save", "update", "edit", "upload", "apply",
 )
 
+# ---------------------------------------------------------------------------
+# WS-31: 이름 밖 문맥 신호 (보이는 텍스트·aria·alt·목적지·클래스 토큰·의사요소 글자)
+# ---------------------------------------------------------------------------
+
+#: 정규화에서 지우는 보이지 않는 문자: 유니코드 범주 Cf(서식 문자) **전체** + U+034F(CGJ, 범주 Mn
+#: 이지만 글자 모양이 없음). WS-31 은 zero-width 5종+soft hyphen 만 지워 `결\u200f제`(RLM)·U+2064·
+#: U+061C·U+034F 를 끼우면 통과했다(WS-31 R1 NB-2). Cf 에는 ZWJ(U+200D)도 있어 이모지 ZWJ 시퀀스는
+#: 구성 이모지로 풀린다 — 이모지는 키워드가 아니므로 매칭에 영향이 없다(테스트로 고정).
+#: 한글 완성형(Lo)·자모(Lo)·변형 선택자(Mn)는 지우지 않는다.
+_EXTRA_INVISIBLE = frozenset({"\u034f"})
+_SPACE_RE = re.compile(r"\s+")
+
+
+def strip_invisible(text: str) -> str:
+    """서식 문자(범주 Cf)와 CGJ 를 지운다 (대소문자·정규화는 그대로)."""
+    return "".join(
+        ch for ch in text
+        if ch not in _EXTRA_INVISIBLE and unicodedata.category(ch) != "Cf"
+    )
+
+
+def normalize_gate_text(text: str) -> str:
+    """게이트 매칭용 정규화: NFKC → 보이지 않는 문자 제거 → 공백 정리 → 소문자.
+
+    한글 자모 분리(NFD) 같은 과한 정규화는 하지 않는다 — NFKC 는 완성형 한글을 유지한다.
+    """
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    text = strip_invisible(text)
+    return _SPACE_RE.sub(" ", text).strip().lower()
+
+
+#: 문자열 원천 — 키워드를 **부분 문자열**로 찾는다(이름과 같은 규칙).
+TEXT_SOURCES = frozenset(
+    {"name", "text", "aria", "title", "child_title", "alt", "svg_title", "child_aria", "value",
+     "pseudo", "selector", "detail"}
+)
+#: 목적지 원천(URL) — 경로·쿼리를 **단어 경계 토큰**으로 매칭한다(`/payroll-info` ≠ pay).
+PATH_SOURCES = frozenset({"href", "formaction", "form_action"})
+#: 마크업 식별자 원천 — camelCase·kebab·snake 를 토큰으로 나눠 매칭한다.
+TOKEN_SOURCES = frozenset({"class", "id", "name_attr", "testid"})
+#: 판정 보조 사실(키워드 매칭 안 함): `nav_link` 같은 출처로 이동하는 a[href] 자신, `form_method`
+#: 제출 버튼의 실제 제출 메서드(get/post…). WS-31 R1 NB-6.
+META_SOURCES = frozenset({"nav_link", "form_method"})
+#: 같은 출처 이동 링크에서 적용하지 않는 원천 — 마크업 식별자(class·아이콘 사전·id·testid·name)와
+#: title(보조 설명). 링크는 이동이지 부작용이 아니다(WS-31 과차단: `fa-trash` '휴지통 보기',
+#: `data-testid=nav-order-history`). 이름·보이는 글자·aria·alt·svg title·pseudo·href 는 그대로 본다.
+_NAV_LINK_SKIPPED = TOKEN_SOURCES | {"title", "child_title"}
+
+#: 링크 목적지(href)에서 빼는 **권한 명사** — 링크로 그 페이지에 가는 것은 보기다(`/admin` 대시보드,
+#: `/scholarships/grant-2025`). 동사(revoke·delete·pay·transfer …)는 그대로 막는다. 버튼 이름·폼
+#: action·formaction 에는 적용하지 않는다(WS-31 R1 — 코디네이터 결정 A).
+_HREF_NOUNS = frozenset({"admin", "permission", "grant", "관리자", "권한"})
+
+#: 목적지·식별자 토큰에서 빼는 키워드 — 폼 **메커니즘**을 뜻하는 일반어라 의도를 말하지 않는다.
+#: 실측 근거: 로그인 버튼 `class="btn-submit"`·`id="submit"`, 로그인 폼 `action="/login/submit"`
+#: 이 흔하다(이 토큰으로 막으면 정상 로그인이 차단된다 — WS-31 과차단 측정). 이 단어들은
+#: 이름·보이는 글자(문자열 원천)에서는 그대로 고위험이다.
+_MARKUP_GENERIC = frozenset({"submit", "confirm", "approve", "agree"})
+
+#: 목적지·식별자 토큰과 비교할 영문 키워드 (HIGH_RISK_KEYWORDS 와 공유, 한 단어만).
+_TOKEN_KEYWORDS = tuple(
+    kw for kw in HIGH_RISK_KEYWORDS
+    if kw.isascii() and " " not in kw and kw not in _MARKUP_GENERIC
+)
+#: 경로에서 부분 문자열로 찾는 한글 키워드 (한글 경로는 토큰 경계가 없다).
+_HANGUL_KEYWORDS = tuple(kw for kw in HIGH_RISK_KEYWORDS if not kw.isascii())
+
+#: 아이콘 클래스 사전 — 아이콘만 있는 버튼의 의미(삭제·결제). 접두사(fa-, bi-, icon- …)를 뗀
+#: 이름이 이 표의 키와 같거나 `키-` 로 시작하면(`trash-can`, `credit-card-fill`) 해당한다.
+#: 근거: Font Awesome(fa-trash, fa-credit-card, fa-cart-shopping), Bootstrap Icons(bi-trash,
+#: bi-credit-card, bi-cart), Material Symbols(delete, shopping_cart, payment) 의 실제 이름.
+#: 검색·홈·설정 같은 일반 아이콘은 넣지 않는다(과차단). 값은 판정 근거로 보고할 키워드.
+#: WS-31 R1: 장바구니(cart·shopping-cart·cart-shopping)는 뺐다 — 헤더의 '장바구니 보기'가 가장 흔한
+#: 쓰임이고, '장바구니 담기'도 결제가 아니라 되돌릴 수 있는 담기다(이름 '장바구니 담기'도 고위험
+#: 키워드가 아니다). 결제는 그다음 checkout 단계(이름·경로 신호)에서 막는다.
+ICON_CLASS_RISK = {
+    "trash": "delete",
+    "trash-can": "delete",
+    "trash-alt": "delete",
+    "delete": "delete",
+    "delete-forever": "delete",
+    "remove": "remove",
+    "credit-card": "pay",
+    "creditcard": "pay",
+    "payment": "pay",
+    "payments": "pay",
+    "wallet": "pay",
+    "shopping-bag": "purchase",
+    "bag-check": "purchase",
+    "money-bill": "pay",
+    "cash": "pay",
+}
+_ICON_PREFIXES = ("fa-", "fas-", "far-", "bi-", "icon-", "ico-", "glyphicon-", "mdi-", "ti-",
+                  "ri-", "la-", "las-", "material-icons-", "ms-", "i-")
+
+#: Bootstrap 정렬 유틸리티(`order-1`, `order-md-2`, `order-first`) — 'order' 토큰 과매칭 방지.
+_BOOTSTRAP_ORDER_RE = re.compile(r"^order-(\d|first|last|sm|md|lg|xl|xxl)")
+
+_TOKEN_SPLIT_RE = re.compile(r"[^0-9a-zA-Z]+")
+_CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def _split_camel(word: str) -> List[str]:
+    return [m.group(0).lower() for m in _CAMEL_RE.finditer(word)]
+
+
+def class_tokens(text: str) -> List[str]:
+    """식별자 문자열을 토큰으로: camelCase·kebab-case·snake_case 분해, 소문자."""
+    out: List[str] = []
+    # 대소문자는 camelCase 분해에 필요하므로 정규화는 NFKC·보이지 않는 문자 제거까지만.
+    cleaned = strip_invisible(unicodedata.normalize("NFKC", str(text or "")))
+    for part in _TOKEN_SPLIT_RE.split(cleaned):
+        if part:
+            out.extend(_split_camel(part))
+    return out
+
+
+def path_tokens(url: str) -> List[str]:
+    """URL 경로·쿼리를 토큰으로 (퍼센트 디코딩 뒤 class_tokens 와 같은 분해)."""
+    raw = str(url or "")
+    try:
+        parts = urlsplit(raw)
+        raw = f"{parts.path} {parts.query}"
+    except ValueError:
+        pass
+    return class_tokens(unquote_plus(raw))
+
+
+def _match_text(text: str) -> Optional[str]:
+    return _contains_keyword(normalize_gate_text(text), HIGH_RISK_KEYWORDS)
+
+
+def _match_tokens(tokens: Sequence[str]) -> Optional[str]:
+    present = set(tokens)
+    for kw in _TOKEN_KEYWORDS:
+        if kw in present:
+            return kw
+    return None
+
+
+def _match_path(url: str, path_only: bool = False) -> Optional[str]:
+    """폼 제출 목적지: 경로 전체(+쿼리) 토큰. `path_only` 면 쿼리를 보지 않는다 — GET 제출은
+    브라우저가 action 의 쿼리를 폼 값으로 **바꿔 버려** 보내지도 않는다(`/search?type=order`)."""
+    if path_only:
+        try:
+            parts = urlsplit(str(url or ""))
+            url = parts.path
+        except ValueError:
+            url = str(url or "").split("?", 1)[0]
+    hit = _match_tokens(path_tokens(url))
+    if hit:
+        return hit
+    try:
+        decoded = normalize_gate_text(unquote_plus(url))
+    except Exception:  # noqa: BLE001
+        return None
+    return _contains_keyword(decoded, _HANGUL_KEYWORDS)
+
+
+def _match_href(url: str) -> Optional[str]:
+    """링크(GET 이동) 목적지: **마지막 경로 조각**과 **값 전체가 키워드인 쿼리 값**만 본다.
+
+    링크는 대개 조회다 — `/order/123`(주문 상세), `?sort=order_date`(정렬) 를 경로 전체 토큰으로
+    보면 막힌다(WS-31 과차단 측정: 정상 표본 2건). 동작을 나타내는 링크는 대개 마지막 조각이
+    동사다(`/account/delete`, `/cart/checkout`, `/order/123/pay`) 또는 `?action=delete`.
+    폼 제출 목적지(form_action·formaction)는 실제 제출이므로 `_match_path`(경로 전체)를 쓴다.
+    """
+    raw = str(url or "")
+    try:
+        parts = urlsplit(raw)
+        path, query = parts.path, parts.query
+    except ValueError:
+        path, query = raw, ""
+    segments = [seg for seg in unquote_plus(path).split("/") if seg]
+    last = segments[-1] if segments else ""
+    present = set(class_tokens(last))
+    for kw in _TOKEN_KEYWORDS:
+        if kw in present and kw not in _HREF_NOUNS:
+            return kw
+    normalized_last = normalize_gate_text(last)
+    for kw in _HANGUL_KEYWORDS:
+        if kw in normalized_last and kw not in _HREF_NOUNS:
+            return kw
+    for pair in query.split("&"):
+        value = unquote_plus(pair.partition("=")[2])
+        norm = normalize_gate_text(value)
+        if norm in _HREF_NOUNS:
+            continue
+        if norm in _TOKEN_KEYWORDS or norm in _HANGUL_KEYWORDS:
+            return norm
+    return None
+
+
+def _match_icon_class(cls: str) -> Optional[str]:
+    lowered = cls.strip().lower()
+    for prefix in _ICON_PREFIXES:
+        if lowered.startswith(prefix):
+            stem = lowered[len(prefix):].replace("_", "-")
+            for key in ICON_CLASS_RISK:
+                if stem == key or stem.startswith(key + "-"):
+                    return cls.strip()
+    # Material Symbols 는 클래스가 아니라 글자(ligature)로 쓴다 — 그건 text 원천이 맡는다.
+    return None
+
+
+def _match_markup(source: str, text: str) -> Optional[str]:
+    if source == "class":
+        for cls in str(text or "").split():
+            icon = _match_icon_class(cls)
+            if icon:
+                return icon
+            if _BOOTSTRAP_ORDER_RE.match(cls.lower()):
+                continue
+            hit = _match_tokens(class_tokens(cls))
+            if hit:
+                return hit
+        return None
+    return _match_tokens(class_tokens(text))
+
+
+def match_signal(source: str, text: str, path_only: bool = False) -> Optional[str]:
+    """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None.
+
+    `path_only`: 폼 목적지(form_action·formaction)의 쿼리를 보지 않는다(GET 제출).
+    """
+    if not text or source in META_SOURCES:
+        return None
+    if source == "href":
+        return _match_href(text)
+    if source in PATH_SOURCES:
+        return _match_path(text, path_only=path_only)
+    if source in TOKEN_SOURCES:
+        return _match_markup(source, text)
+    return _match_text(text)
+
+
+@dataclass
+class RiskAssessment:
+    """위험 판정 + 근거(운영자가 왜 막혔는지 알 수 있게)."""
+
+    risk: RiskLevel
+    reason: str
+    basis: Dict[str, Any]
+
 
 @dataclass
 class ActionContext:
@@ -72,6 +318,12 @@ class ActionContext:
     #: 대상을 특정·판정할 수 없었던 사유 (WS-30). 비어 있지 않으면 고위험으로 본다
     #: (fail-closed) — 예: selector 가 0개/여러 개에 맞음, 포커스 요소를 읽을 수 없음.
     unresolved_target: str = ""
+    #: 이름 밖 문맥 신호 (WS-31) — (원천, 텍스트) 쌍. 원천: text·aria·title·alt·svg_title·
+    #: child_aria·value·pseudo(문자열), href·formaction·form_action(경로 토큰),
+    #: class·id·name_attr·testid(식별자 토큰). 페이지에서 읽은 그대로 넘기면 여기서 정규화한다.
+    signals: Tuple[Tuple[str, str], ...] = ()
+    #: 판정 근거에 덧붙일 사실(좌표 해석 결과 등) — 판정에는 쓰지 않는다.
+    basis_extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -84,6 +336,8 @@ class HITLDecision:
     reason: str
     error_code: Optional[ErrorCode] = None
     dialog: Optional[ConfirmDialog] = None
+    #: 판정 근거 {name, matched_keyword, source, …} (WS-31) — 결과 data.gate_basis 로 나간다.
+    basis: Dict[str, Any] = field(default_factory=dict)
 
 
 def _contains_keyword(text: str, keywords: Sequence[str]) -> Optional[str]:
@@ -94,28 +348,106 @@ def _contains_keyword(text: str, keywords: Sequence[str]) -> Optional[str]:
     return None
 
 
-def classify_risk(ctx: ActionContext) -> tuple[RiskLevel, str]:
-    """액션의 위험 등급을 판정한다."""
-    haystack = f"{ctx.element_name} {ctx.selector} {ctx.detail}"
+def _basis(ctx: ActionContext, keyword: Optional[str], source: Optional[str]) -> Dict[str, Any]:
+    basis: Dict[str, Any] = {
+        "name": ctx.element_name,
+        "matched_keyword": keyword,
+        "source": source,
+    }
+    for key, value in ctx.basis_extra.items():
+        basis.setdefault(key, value)
+    return basis
 
+
+def _first_hit(
+    sources: Sequence[Tuple[str, str]], path_only: bool = False
+) -> Optional[Tuple[str, str]]:
+    for source, text in sources:
+        hit = match_signal(source, text, path_only=path_only)
+        if hit:
+            return hit, source
+    return None
+
+
+def _has_letters(text: str) -> bool:
+    """글자(문자·숫자)가 있는가 — 이모지·기호만 있는 이름은 '빈 이름'으로 본다(아이콘 버튼)."""
+    return any(unicodedata.category(ch)[0] in "LN" for ch in normalize_gate_text(text))
+
+
+def _effective_signals(ctx: ActionContext) -> List[Tuple[str, str]]:
+    """원천별 적용 규칙(WS-31 R1 NB-6)을 거친 문맥 신호.
+
+    * 같은 출처 이동 링크(`nav_link`)면 마크업 식별자·title 원천을 뺀다.
+    * 대상 자신의 title 은 보조 설명이라 이름에 글자가 없을 때만 쓴다(아이콘 버튼 title='결제'
+      는 차단, '저장' 버튼의 title 문장이 '결제'를 언급하는 것은 통과). 자손 title 은 그대로.
+    """
+    raw = [(str(src), str(text or "")) for src, text in ctx.signals]
+    nav_link = any(src == "nav_link" for src, _ in raw)
+    named = _has_letters(ctx.element_name)
+    out: List[Tuple[str, str]] = []
+    for src, text in raw:
+        if src in META_SOURCES:
+            continue
+        if nav_link and src in _NAV_LINK_SKIPPED:
+            continue
+        if src == "title" and named:
+            continue
+        out.append((src, text))
+    return out
+
+
+def assess_risk(ctx: ActionContext) -> RiskAssessment:
+    """위험 등급 + 판정 근거. 고위험 키워드는 이름·셀렉터·부가정보 다음 문맥 신호 순서로 찾는다."""
     if ctx.unresolved_target:
-        return RiskLevel.HIGH, f"대상 판정 불가({ctx.unresolved_target}) — 안전하게 차단"
+        return RiskAssessment(
+            RiskLevel.HIGH,
+            f"대상 판정 불가({ctx.unresolved_target}) — 안전하게 차단",
+            _basis(ctx, None, "unresolved"),
+        )
 
-    hit = _contains_keyword(haystack, HIGH_RISK_KEYWORDS)
-    if hit:
-        return RiskLevel.HIGH, f"고위험 키워드 '{hit}' 탐지"
-
-    if ctx.submits_form:
-        return RiskLevel.HIGH, "폼 제출 액션"
+    # 순서: 이름·셀렉터·부가정보 → 폼 제출 → 문맥 신호. 폼 제출 판정(WS-30)이 문맥 신호보다
+    # 먼저여야 기존 사유('폼 제출 액션')가 유지된다 — 어느 쪽이든 고위험이다.
+    own: List[Tuple[str, str]] = [
+        ("name", ctx.element_name), ("selector", ctx.selector), ("detail", ctx.detail),
+    ]
+    found = _first_hit(own)
+    if found is None and ctx.submits_form:
+        return RiskAssessment(RiskLevel.HIGH, "폼 제출 액션", _basis(ctx, None, "form_submit"))
+    if found is None:
+        get_submit = any(
+            str(src) == "form_method" and str(text or "").strip().lower() == "get"
+            for src, text in ctx.signals
+        )
+        found = _first_hit(_effective_signals(ctx), path_only=get_submit)
+    if found is not None:
+        hit, source = found
+        return RiskAssessment(
+            RiskLevel.HIGH,
+            f"고위험 키워드 '{hit}' 탐지(출처 {source})",
+            _basis(ctx, hit, source),
+        )
 
     if ctx.action in _INHERENTLY_RISKY:
-        return RiskLevel.HIGH, f"부작용이 큰 액션: {ctx.action.value}"
+        return RiskAssessment(
+            RiskLevel.HIGH,
+            f"부작용이 큰 액션: {ctx.action.value}",
+            _basis(ctx, None, "action"),
+        )
 
+    haystack = normalize_gate_text(f"{ctx.element_name} {ctx.selector} {ctx.detail}")
     hit = _contains_keyword(haystack, MEDIUM_RISK_KEYWORDS)
     if hit:
-        return RiskLevel.MEDIUM, f"중위험 키워드 '{hit}' 탐지"
+        return RiskAssessment(
+            RiskLevel.MEDIUM, f"중위험 키워드 '{hit}' 탐지", _basis(ctx, hit, "name")
+        )
 
-    return RiskLevel.LOW, "고위험 신호 없음"
+    return RiskAssessment(RiskLevel.LOW, "고위험 신호 없음", _basis(ctx, None, None))
+
+
+def classify_risk(ctx: ActionContext) -> tuple[RiskLevel, str]:
+    """액션의 위험 등급을 판정한다."""
+    assessed = assess_risk(ctx)
+    return assessed.risk, assessed.reason
 
 
 def _build_dialog(ctx: ActionContext, reason: str) -> ConfirmDialog:
@@ -153,7 +485,8 @@ class HITLGate:
 
     def evaluate(self, ctx: ActionContext) -> HITLDecision:
         """액션 실행 가부를 판정한다."""
-        risk, reason = classify_risk(ctx)
+        assessed = assess_risk(ctx)
+        risk, reason, basis = assessed.risk, assessed.reason, assessed.basis
 
         # 저·중위험은 그대로 통과 (관측만)
         if risk is not RiskLevel.HIGH:
@@ -162,6 +495,7 @@ class HITLGate:
                 risk=risk,
                 requires_confirmation=False,
                 reason=reason,
+                basis=basis,
             )
 
         # --- 고위험 ---
@@ -172,6 +506,7 @@ class HITLGate:
                     risk=risk,
                     requires_confirmation=False,
                     reason=f"사전 승인 목록에 존재 ({reason})",
+                    basis=basis,
                 )
             # 기본값은 차단이다.
             return HITLDecision(
@@ -180,6 +515,7 @@ class HITLGate:
                 requires_confirmation=False,
                 reason=f"무인 모드에서 사전 승인되지 않은 고위험 액션 ({reason})",
                 error_code=ErrorCode.HITL_UNATTENDED_BLOCKED,
+                basis=basis,
             )
 
         # 대화형: 승인 모달을 띄우고 사용자 응답을 기다린다.
@@ -189,4 +525,5 @@ class HITLGate:
             requires_confirmation=True,
             reason=f"사용자 승인 필요 ({reason})",
             dialog=_build_dialog(ctx, reason),
+            basis=basis,
         )

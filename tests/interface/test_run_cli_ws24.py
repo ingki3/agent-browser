@@ -265,7 +265,7 @@ def test_last_http_status_key_present_on_error_path(monkeypatch):
         async def close(self):
             return None
 
-    async def fake_open(pw, args, record):
+    async def fake_open(pw, args, record, **_):
         return Br(), Ctx(), Page(), None
 
     async def body(page):
