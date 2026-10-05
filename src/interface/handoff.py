@@ -79,7 +79,9 @@ _FINISHED = frozenset({"used", "denied", "expired", "revoked"})
 _CMD_RE = re.compile(r"^cmd-([A-Za-z0-9_-]{4,64})\.json$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _CODE_RE = re.compile(r"^\d{%d}$" % CODE_DIGITS)
-_OPS = frozenset({"take", "release", "approve", "deny", "show_code"})
+_OPS = frozenset({"take", "release", "approve", "deny", "show_code", "describe"})
+#: describe 요청의 challenge(사람 CLI 가 요청마다 새로 만든 16바이트 hex).
+_CHALLENGE_RE = re.compile(r"^[0-9a-f]{32,128}$")
 
 HOLDER_AGENT = "agent"
 HOLDER_HUMAN = "human"
@@ -530,17 +532,7 @@ class HandoffHub:
         if not self._opened or ap.approval_id not in self.approvals:
             return
         try:
-            _write_private(self.dir / "approvals" / f"{ap.approval_id}.json", {
-                "approval_id": ap.approval_id,
-                "server_id": self.server_id,
-                "action_digest": ap.digest,
-                "status": ap.status,
-                "outcome": ap.outcome,
-                "created_at": _now_iso(ap.created),
-                "expires_at": _now_iso(ap.expires),
-                "summary": ap.summary,
-                "components": ap.components,
-            })
+            _write_private(self.dir / "approvals" / f"{ap.approval_id}.json", self.approval_view(ap))
         except OSError:
             pass
 
@@ -660,8 +652,18 @@ class HandoffHub:
         return live
 
     def take_code_job(self) -> Optional[CodeJob]:
-        """서버가 창에 띄울 코드 한 건을 꺼낸다(꺼낸 뒤 hub 는 평문을 갖지 않는다)."""
-        return self._code_jobs.pop(0) if self._code_jobs else None
+        """서버가 창에 띄울 코드 한 건을 꺼낸다(꺼낸 뒤 hub 는 평문을 갖지 않는다).
+
+        대기하는 동안 코드가 죽었으면(만료·증표 종료·다른 증표가 거둬들임) 띄우지 않고 실패 ack."""
+        while self._code_jobs:
+            job = self._code_jobs.pop(0)
+            ap = self.approvals.get(job.approval_id)
+            if ap is not None:
+                self._expire(ap)
+            if ap is not None and self._code_live(ap):
+                return job
+            self.code_shown(job.nonce, False)
+        return None
 
     def code_shown(self, nonce: str, ok: bool) -> None:
         """서버가 코드 표시 결과를 알린다. 실패면 코드를 거둬들인다(창에 없는 코드는 무효)."""
@@ -678,12 +680,37 @@ class HandoffHub:
             self._ack(nonce, False, "브라우저 창에 확인 코드를 띄울 수 없습니다 — 승인할 수 없습니다"
                                     "(창이 닫혔거나 오버레이를 지원하지 않는 브라우저).")
 
-    def _ack(self, nonce: str, ok: bool, message: str) -> None:
+    def _ack(self, nonce: str, ok: bool, message: str, **extra: Any) -> None:
         try:
             _write_private(self.dir / f"ack-{nonce}.json",
-                           {"ok": ok, "message": message, "control": self.status()})
+                           {"ok": ok, "message": message, "control": self.status(), **extra})
         except OSError:
             pass
+
+    def approval_view(self, ap: Approval) -> Dict[str, Any]:
+        """사람이 볼 승인 내용 — **서버 메모리 기준**(R2). 확인 코드(평문·HMAC)는 넣지 않는다.
+        디스크의 approvals/<id>.json 과 같은 모양이다(CLI 가 둘을 대조한다)."""
+        return {
+            "approval_id": ap.approval_id,
+            "server_id": self.server_id,
+            "action_digest": ap.digest,
+            "status": ap.status,
+            "outcome": ap.outcome,
+            "created_at": _now_iso(ap.created),
+            "expires_at": _now_iso(ap.expires),
+            "summary": ap.summary,
+            "components": ap.components,
+        }
+
+    def _describe(self, ap: Approval, data: Dict[str, Any], nonce: str
+                  ) -> Tuple[Optional[bool], str, Optional[str]]:
+        """사람 CLI 의 승인 화면용 내용 요청. 응답을 요청마다 새 challenge 로 HMAC 해 묶는다."""
+        challenge = str(data.get("challenge") or "")
+        if not _CHALLENGE_RE.match(challenge):
+            return False, "challenge 형식 오류", None
+        view = self.approval_view(ap)
+        self._ack(nonce, True, "", view=view, view_mac=view_mac(challenge, view))
+        return None, "", None
 
     def _show_code(self, ap: Approval, nonce: str) -> Tuple[Optional[bool], str, Optional[str]]:
         if ap.code_shows >= MAX_CODE_SHOWS:
@@ -799,6 +826,8 @@ class HandoffHub:
         if ap is None:
             return False, "알 수 없는 승인 id", None
         self._expire(ap)
+        if op == "describe":  # 상태와 무관하게 서버 기록을 보여 준다(사람 CLI 가 상태도 확인)
+            return self._describe(ap, data, nonce)
         if ap.status != "pending":
             return False, f"승인 대기 상태가 아님({ap.status})", None
         if not secrets.compare_digest(str(data.get("action_digest") or ""), ap.digest):
@@ -819,6 +848,19 @@ class HandoffHub:
 
 
 # ---------------------------------------------------------------------------- 사람 쪽(CLI)
+
+
+def view_mac(challenge: str, view: Dict[str, Any]) -> str:
+    """서버가 승인 화면 내용(view)을 요청의 challenge 로 HMAC-SHA256 한 값(hex).
+
+    challenge 는 사람 CLI 가 요청마다 새로 만든다 — 응답이 이 요청에 대한 것이고 전송 중 바뀌지
+    않았음을 CLI 가 확인한다. 같은 uid 는 명령 파일의 challenge 를 읽을 수 있으므로 같은 uid 에 대한
+    인증은 아니다(README 한계 ①) — 사람이 대조할 독립 채널은 창 오버레이(액션·대상)다."""
+    import hmac
+
+    body = json.dumps(view, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hmac.new(challenge.encode("ascii"), body.encode("ascii"), hashlib.sha256).hexdigest()
+
 
 
 def list_servers(root: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -978,6 +1020,31 @@ def _send(root: Path, sid: str, op: str, timeout_s: float = 5.0, **fields: Any
     return wait_ack(root, sid, nonce, timeout_s=timeout_s)
 
 
+#: 상태 파일과 서버 기록을 대조하는 칸(어느 하나라도 다르면 승인 절차를 시작하지 않는다).
+_VIEW_KEYS = ("approval_id", "server_id", "action_digest", "summary", "components")
+
+
+def _server_view(root: Path, sid: str, approval_id: str
+                 ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """서버 메모리의 승인 내용을 받아 온다(요청마다 새 challenge, 응답 HMAC 확인). 실패하면 (None, 사유)
+    — 파일 내용으로 대신 보여 주지 않는다(fail-closed)."""
+    import hmac
+
+    challenge = secrets.token_hex(16)
+    ack = _send(root, sid, "describe", approval_id=approval_id, challenge=challenge)
+    if ack is None:
+        return None, "서버 응답 없음(5초) — 서버 기록을 받을 수 없어 승인하지 않습니다."
+    if not ack.get("ok"):
+        return None, str(ack.get("message") or "서버가 승인 내용을 주지 않았습니다.")
+    view = ack.get("view")
+    if not isinstance(view, dict) or not hmac.compare_digest(
+            str(ack.get("view_mac") or ""), view_mac(challenge, view)):
+        return None, "서버 응답 검증 실패(내용과 서명이 맞지 않음) — 승인하지 않습니다."
+    if view.get("approval_id") != approval_id or view.get("server_id") != sid:
+        return None, "서버 응답이 요청한 승인 id·서버와 다릅니다 — 승인하지 않습니다."
+    return view, ""
+
+
 def cli_approve(approval_id: str, server_id: Optional[str], yes: bool, deny: bool = False,
                 code: Optional[str] = None) -> int:
     """사람의 승인. 승인에는 **브라우저 창 오버레이에만 뜨는 확인 코드**가 필요하다(WS-29 R1).
@@ -1002,7 +1069,21 @@ def cli_approve(approval_id: str, server_id: Optional[str], yes: bool, deny: boo
         print(f"agent-browser approve: 승인 요청 {display_safe(approval_id)} 를 찾을 수 없습니다.",
               file=sys.stderr)
         return 2
-    print(_show_approval(data))
+    # R2: 사람이 보는 내용은 디스크 파일이 아니라 서버 메모리 기준(파일은 같은 uid 가 고칠 수 있다).
+    view, problem = _server_view(root, sid, approval_id)
+    if view is None:
+        print(f"agent-browser approve: {display_safe(problem, 1000)}", file=sys.stderr)
+        return 2
+    print("(서버 기록 기준 — 실행 중인 서버의 메모리에서 받은 내용입니다. 창의 확인 코드 옆 "
+          "액션·대상과 대조하세요)")
+    print(_show_approval(view))
+    diff = [k for k in _VIEW_KEYS if data.get(k) != view.get(k)]
+    if diff:
+        print(f"agent-browser approve: 상태 파일과 서버 기록이 불일치합니다({', '.join(diff)}) — "
+              "파일이 바뀌었을 수 있어 승인 절차를 시작하지 않습니다. 위 서버 기록을 확인하세요.",
+              file=sys.stderr)
+        return 2
+    data = view
     if data.get("status") != "pending":
         print(f"승인 대기 상태가 아닙니다: {display_safe(data.get('status'))}")
         return 1

@@ -380,6 +380,10 @@ def envelope_json(result: ActionResult) -> str:
 
 from interface.handoff import DEFAULT_APPROVAL_TTL_S, WAIT_DEFAULT_S, WAIT_MAX_S  # noqa: E402
 
+#: WS-29 R2: 확인 코드를 띄우기 전, 이미 진행 중인 화면 캡처가 끝나길 기다리는 상한(초). 넘으면
+#: 표시를 취소한다(코드 무효 — fail-closed). 무거운 페이지 SoM 캡처 실측 수백 ms 의 10배 이상.
+CAPTURE_DRAIN_TIMEOUT_S = 5.0
+
 #: 승인 증표로 실행했는데 결과가 이 코드면 실행 여부가 불확실하다(outcome_unknown, 재시도 금지).
 _UNCERTAIN_CODES = frozenset({
     ErrorCode.TIMEOUT, ErrorCode.PAGE_CRASHED, ErrorCode.NAVIGATE_TIMEOUT,
@@ -602,6 +606,9 @@ class BrowserMCPServer:
         #: 창 오버레이에 확인 코드가 떠 있다(또는 내렸는지 확인하지 못했다) — 그동안 화면 캡처 거부.
         #: 코드 평문은 여기에도 두지 않는다(표시 직후 버린다).
         self._code_on_overlay = False
+        #: WS-29 R2: 확인 코드 오버레이를 켤 때마다 1 씩(세대 번호) · 진행 중인 화면 캡처 수.
+        self._pixel_gen = 0
+        self._captures_inflight = 0
         #: 사람이 에이전트 활성 탭을 닫았음(조작권 반납 때 확인, NB-3) — control_wait/status 로 알린다.
         self._tab_notice: Optional[Dict[str, Any]] = None
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
@@ -758,11 +765,18 @@ class BrowserMCPServer:
 
                 ap = self.hub.approvals.get(job.approval_id)
                 target = display_safe((ap.summary or {}).get("target", "") if ap else "", 40)
-                # 표시 시도 전에 켠다 — 표시 성공 여부를 모르는 동안에도 화면 캡처를 거부(fail-closed).
+                kind = display_safe((ap.components or {}).get("action", "") if ap else "", 20)
+                # (a) 표시 예정: 표시 시도 전에 켠다 — 새 화면 캡처는 이때부터 거부(fail-closed).
                 self._code_on_overlay = True
-                shown = bool(await self._set_banner(
-                    f"agent-browser 승인 확인 코드 {job.code}  (대상: {target}, "
-                    f"{int(CODE_TTL_S)}초) — 터미널의 approve 에 입력"))
+                # (b) 이미 진행 중인 캡처가 끝나야 띄운다. 상한을 넘으면 표시 취소(코드 무효).
+                if await self._wait_captures_idle():
+                    # (c) 오버레이를 켜기 직전 세대를 올린다 — 그 사이 끝나지 않은 캡처는 (d) 에서 버린다.
+                    self._pixel_gen += 1
+                    shown = bool(await self._set_banner(
+                        f"agent-browser 승인 확인 코드 {job.code}  (액션: {kind}, 대상: {target}, "
+                        f"{int(CODE_TTL_S)}초) — 터미널의 approve 화면과 대조해 입력"))
+                else:
+                    logger.warning("진행 중 화면 캡처가 끝나지 않아 확인 코드 표시를 취소함")
             self.hub.code_shown(job.nonce, shown)
             del job  # 평문을 붙잡지 않는다
         if self._code_on_overlay and not self.hub.code_displayed():
@@ -772,6 +786,26 @@ class BrowserMCPServer:
     def _pixels_blocked(self) -> bool:
         """확인 코드가 창에 떠 있을 수 있는 동안 화면 픽셀을 에이전트에게 주지 않는다."""
         return self._code_on_overlay or self.hub.code_displayed()
+
+    async def _wait_captures_idle(self) -> bool:
+        """진행 중인 화면 캡처가 모두 끝날 때까지 기다린다(상한 CAPTURE_DRAIN_TIMEOUT_S). 끝나면 True."""
+        deadline = time.monotonic() + CAPTURE_DRAIN_TIMEOUT_S
+        while self._captures_inflight > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
+
+    def _pixels_refused(self, action: ActionType) -> ActionResult:
+        from interface.handoff import CODE_TTL_S
+
+        return self._error_result(
+            action,
+            ErrorCode.SCREENSHOT_FAILED,
+            "사람이 승인 확인 중이라(창에 확인 코드 표시) 잠시 화면 캡처를 할 수 없습니다. "
+            "observe_page·extract 는 쓸 수 있습니다. 잠시 뒤 다시 시도하세요.",
+            data={"blocked_by": "approval_code_displayed", "retry_after_s": int(CODE_TTL_S)},
+        )
 
     async def _show_control_banner(self, text: Optional[str]) -> None:
         self._control_banner = text
@@ -1034,6 +1068,23 @@ class BrowserMCPServer:
     # -- 툴 호출 ------------------------------------------------------------
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
+        """MCP 툴 호출을 디스패처로 라우팅한다(_call_tool). 화면 캡처는 확인 코드 표시와 직렬화한다.
+
+        WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
+        캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
+        """
+        capture: Dict[str, Any] = {}
+        try:
+            result = await self._call_tool(name, arguments, capture)
+            if capture and capture["gen"] != self._pixel_gen:
+                return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            return result
+        finally:
+            if capture:
+                self._captures_inflight -= 1
+
+    async def _call_tool(self, name: str, arguments: Dict[str, Any],
+                         capture: Dict[str, Any]) -> ActionResult:
         """MCP 툴 호출을 디스패처로 라우팅한다.
 
         실패는 예외가 아니라 `ActionResult`로 반환해 클라이언트가
@@ -1066,18 +1117,15 @@ class BrowserMCPServer:
                 "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
                 data={"control": control},
             )
-        if action is ActionType.TAKE_SCREENSHOT and self._pixels_blocked():
-            # WS-29 R1: 사람용 확인 코드가 창 오버레이에 떠 있다. headed 창에서는 오버레이가
-            # 스크린샷에 찍히므로(실측) 그동안 화면 픽셀(일반·전체·SoM)을 주지 않는다.
-            from interface.handoff import CODE_TTL_S
-
-            return self._error_result(
-                action,
-                ErrorCode.SCREENSHOT_FAILED,
-                "사람이 승인 확인 중이라(창에 확인 코드 표시) 잠시 화면 캡처를 할 수 없습니다. "
-                "observe_page·extract 는 쓸 수 있습니다. 잠시 뒤 다시 시도하세요.",
-                data={"blocked_by": "approval_code_displayed", "retry_after_s": int(CODE_TTL_S)},
-            )
+        if action is ActionType.TAKE_SCREENSHOT:
+            if self._pixels_blocked():
+                # WS-29 R1: 사람용 확인 코드가 창 오버레이에 떠 있다(또는 띄울 예정). headed 창에서는
+                # 오버레이가 스크린샷에 찍히므로(실측) 그동안 화면 픽셀(일반·전체·SoM)을 주지 않는다.
+                return self._pixels_refused(action)
+            # WS-29 R2: 이 캡처를 등록한다(검사와 등록 사이에 await 없음). 코드 표시는 등록된 캡처가
+            # 끝나길 기다리고, call_tool 은 반환 직전 세대 번호로 캡처 도중 오버레이가 켜졌는지 본다.
+            self._captures_inflight += 1
+            capture["gen"] = self._pixel_gen
 
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
