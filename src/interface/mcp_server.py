@@ -757,9 +757,17 @@ class BrowserMCPServer:
         코드는 **창 오버레이에만** 간다 — MCP 응답·stderr·로그·상태 파일에는 쓰지 않는다. 표시가
         실패하면 hub 에 알려 코드를 무효로 한다(창에 없는 코드로는 승인할 수 없다).
         """
+        if self._banner is not None and self._banner_gone():
+            # R3 NB-2: 오버레이를 띄운 탭이 닫혔다 — 오버레이는 탭과 함께 사라졌다. 오버레이는 이
+            # 세션 하나에만 띄우므로(_set_banner) 다른 탭에 코드가 남았을 수 없다. 창에 없는 코드는
+            # 무효로 한다(사람은 approve 를 다시 실행해 지금 탭에 새 코드를 띄운다).
+            self._banner = None
+            if self._code_on_overlay:
+                self.hub.withdraw_codes()
         job = self.hub.take_code_job()
         if job is not None:
             shown = False
+            busy = False
             if self._human_can_see():
                 from interface.handoff import CODE_TTL_S, display_safe
 
@@ -776,11 +784,15 @@ class BrowserMCPServer:
                         f"agent-browser 승인 확인 코드 {job.code}  (액션: {kind}, 대상: {target}, "
                         f"{int(CODE_TTL_S)}초) — 터미널의 approve 화면과 대조해 입력"))
                 else:
+                    busy = True
                     logger.warning("진행 중 화면 캡처가 끝나지 않아 확인 코드 표시를 취소함")
-            self.hub.code_shown(job.nonce, shown)
+            self.hub.code_shown(job.nonce, shown, reason="capture_busy" if busy else None)
             del job  # 평문을 붙잡지 않는다
         if self._code_on_overlay and not self.hub.code_displayed():
-            if await self._set_banner(self._control_banner):
+            # 조작권 안내로 되돌린다. 그게 안 되면(예: 띄울 활성 탭이 없음) 코드만이라도 지운다 —
+            # 지운 것이 확인돼야(또는 오버레이 탭이 사라져야) 화면 캡처 거부를 푼다(fail-closed).
+            if await self._set_banner(self._control_banner) or (
+                    self._control_banner and await self._set_banner(None)):
                 self._code_on_overlay = False
 
     def _pixels_blocked(self) -> bool:
@@ -853,6 +865,17 @@ class BrowserMCPServer:
         """사람이 볼 브라우저 창이 있는가(headless 면 없다)."""
         return self.browser_mode != "headless" or not self.headless
 
+    def _banner_gone(self) -> bool:
+        """오버레이를 띄운 탭이 닫혔음이 **확인**되는가(R3 NB-2). 페이지를 모르거나 확인이 안 되면
+        False — 오버레이가 남았을 수 있다고 본다(fail-closed)."""
+        page = self._banner[2] if self._banner is not None and len(self._banner) > 2 else None
+        if page is None:
+            return False
+        try:
+            return bool(page.is_closed())
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _set_banner(self, text: Optional[str]) -> bool:
         """창 위 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나
         누를 수 없다). 성공하면 True. 창이 없거나 실패하면 False(안내는 stderr 에도 나간다).
@@ -861,31 +884,46 @@ class BrowserMCPServer:
         DOM.enable 이 필요하다(Chromium: 'DOM should be enabled first').
         주의: headed 창에서는 이 오버레이가 Page 스크린샷에 찍힌다(R1 실측) — 확인 코드가 떠 있는
         동안 화면 캡처를 거부하는 이유(_pixels_blocked).
+
+        R3 NB-2: 띄운 탭이 닫혔으면(전송 실패 뒤 페이지 닫힘 확인) 오버레이는 탭과 함께 사라졌다 —
+        지우기는 성공, 띄우기는 현재 활성 탭의 새 세션으로 (한 번 더) 시도한다. 탭이 살아 있는데 전송이
+        실패하면 여전히 False(오버레이가 남았을 수 있다).
         """
         if not self._human_can_see() or self._core is None:
             return False
-        try:
-            if not text:
-                if self._banner is not None:
-                    cdp = self._banner[1]
-                    await cdp.send("Overlay.setPausedInDebuggerMessage", {})
-                    await cdp.send("Overlay.disable")
+        for _attempt in range(2):
+            try:
+                if not text:
+                    if self._banner is not None:
+                        cdp = self._banner[1]
+                        await cdp.send("Overlay.setPausedInDebuggerMessage", {})
+                        await cdp.send("Overlay.disable")
+                    return True
+                tab_id = self._core.active_tab_id
+                if self._banner is not None and self._banner[0] != tab_id:
+                    old = self._banner[1]
+                    await old.send("Overlay.setPausedInDebuggerMessage", {})
+                    self._banner = None
+                if self._banner is None:
+                    get_tab = getattr(self._core, "get_tab", None)
+                    tab = get_tab(tab_id) if callable(get_tab) else None
+                    self._banner = (tab_id, await self._core.new_cdp_session(tab_id),
+                                    getattr(tab, "page", None))
+                cdp = self._banner[1]
+                await cdp.send("DOM.enable")
+                await cdp.send("Overlay.enable")
+                await cdp.send("Overlay.setPausedInDebuggerMessage", {"message": text})
                 return True
-            tab_id = self._core.active_tab_id
-            if self._banner is not None and self._banner[0] != tab_id:
-                old = self._banner[1]
-                await old.send("Overlay.setPausedInDebuggerMessage", {})
-                self._banner = None
-            if self._banner is None:
-                self._banner = (tab_id, await self._core.new_cdp_session(tab_id))
-            cdp = self._banner[1]
-            await cdp.send("DOM.enable")
-            await cdp.send("Overlay.enable")
-            await cdp.send("Overlay.setPausedInDebuggerMessage", {"message": text})
-            return True
-        except Exception:  # noqa: BLE001
-            logger.debug("안내 띠 표시 실패", exc_info=True)
-            return False
+            except Exception:  # noqa: BLE001
+                logger.debug("안내 띠 표시 실패", exc_info=True)
+                if self._banner is not None and self._banner_gone():
+                    # 보내는 도중 탭이 닫혔다 — 오버레이도 함께 사라졌다.
+                    self._banner = None
+                    if not text:
+                        return True
+                    continue  # 띄우기: 현재 활성 탭으로 한 번 더
+                return False
+        return False
 
     def _current_origin(self) -> str:
         from urllib.parse import urlsplit
@@ -1629,7 +1667,8 @@ class BrowserMCPServer:
             action=action,
             current_url=self._page.url if self._page else "",
             snapshot_epoch=self._engine.epoch if self._engine else 0,
-            tab_id=self._core.active_tab_id if self._core else "",
+            # 유일한 탭이 닫히면 활성 탭이 None 이다(R3 NB-2) — 계약은 str.
+            tab_id=(self._core.active_tab_id if self._core else "") or "",
             healed=False,
             reobserve_required=False,
             retry_safe=True,

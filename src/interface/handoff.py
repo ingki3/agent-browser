@@ -165,7 +165,9 @@ def _write_private(path: Path, data: Dict[str, Any]) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
+            # ensure_ascii: 외부 유래 문자열의 외톨이 서로게이트(\ud800)도 손실 없이 \uXXXX 로 쓴다
+            # (ensure_ascii=False 면 UTF-8 인코딩에서 UnicodeEncodeError — R3 NB-1).
+            json.dump(data, fh, ensure_ascii=True)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
@@ -311,7 +313,9 @@ def action_digest(components: Dict[str, Any]) -> str:
     """액션 종류 + 정규화 파라미터 + 대상 근거 + 탭 + origin + epoch 의 SHA-256(hex)."""
     body = json.dumps({"v": 1, **normalize_components(components)},
                       ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    # surrogatepass: 외톨이 서로게이트(요소 이름은 페이지가 정한다)도 예외 없이, 서로 다른 문자열은
+    # 서로 다른 바이트로(단사) — 정상 문자열의 바이트는 strict UTF-8 과 같다(R3 NB-1).
+    return hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # ---------------------------------------------------------------------------- 상태
@@ -665,8 +669,11 @@ class HandoffHub:
             self.code_shown(job.nonce, False)
         return None
 
-    def code_shown(self, nonce: str, ok: bool) -> None:
-        """서버가 코드 표시 결과를 알린다. 실패면 코드를 거둬들인다(창에 없는 코드는 무효)."""
+    def code_shown(self, nonce: str, ok: bool, reason: Optional[str] = None) -> None:
+        """서버가 코드 표시 결과를 알린다. 실패면 코드를 거둬들인다(창에 없는 코드는 무효).
+
+        reason(실패 사유): "capture_busy" = 진행 중 화면 캡처가 상한 안에 끝나지 않아 표시를 취소함
+        (창은 있다 — 잠시 뒤 다시). 그 밖(None) = 창이 없거나 오버레이를 띄우지 못함(R3 NB-4)."""
         approval_id = self._code_pending_ack.pop(nonce, None)
         ap = self.approvals.get(approval_id or "")
         if not ok and ap is not None:
@@ -676,9 +683,19 @@ class HandoffHub:
                        f"({int(CODE_TTL_S)}초 유효). 창에서 보고 "
                        f"`agent-browser approve {approval_id} --code <코드>` 로 입력하세요.")
             self._ack(nonce, True, message)
+        elif reason == "capture_busy":
+            self._ack(nonce, False, "진행 중인 화면 캡처가 끝나지 않아 확인 코드 표시를 취소했습니다"
+                                    "(창은 그대로입니다). 잠시 뒤 `agent-browser approve "
+                                    f"{approval_id or ''}` 를 다시 실행하세요.")
         else:
             self._ack(nonce, False, "브라우저 창에 확인 코드를 띄울 수 없습니다 — 승인할 수 없습니다"
                                     "(창이 닫혔거나 오버레이를 지원하지 않는 브라우저).")
+
+    def withdraw_codes(self) -> None:
+        """창에 떠 있던 확인 코드를 모두 거둬들인다 — 코드를 띄운 탭이 닫혀 창에 코드가 없을 때
+        (R3 NB-2). 창에 없는 코드로는 승인할 수 없다(code_shown 실패와 같은 원칙)."""
+        for ap in self.approvals.values():
+            ap.code_mac = None
 
     def _ack(self, nonce: str, ok: bool, message: str, **extra: Any) -> None:
         try:
