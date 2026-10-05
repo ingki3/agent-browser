@@ -35,12 +35,14 @@ async def _run_session() -> Dict[str, Any]:
     from mcp.client.session import ClientSession
     from mcp.shared.memory import create_client_server_memory_streams
 
-    from interface.mcp_server import create_server
+    from interface.mcp_server import action_from_tool, create_server
 
     server, backend = create_server()
     findings: Dict[str, Any] = {
         "initialized": False,
         "tools_listed": 0,
+        "server_tools_listed": [],
+        "all_listed": 0,
         "tool_names": [],
         "schemas_valid": 0,
         "call_ok": False,
@@ -71,8 +73,15 @@ async def _run_session() -> Dict[str, Any]:
                     findings["initialized"] = True
 
                     listed = await session.list_tools()
-                    findings["tools_listed"] = len(listed.tools)
                     findings["tool_names"] = [t.name for t in listed.tools]
+                    # 액션 툴(계약 19종)과 계약 밖 서버 도구(WS-29 사람 인계)를 나눠 센다.
+                    findings["tools_listed"] = sum(
+                        1 for t in listed.tools if action_from_tool(t.name) is not None
+                    )
+                    findings["server_tools_listed"] = sorted(
+                        t.name for t in listed.tools if action_from_tool(t.name) is None
+                    )
+                    findings["all_listed"] = len(listed.tools)
 
                     # 스키마가 실제로 전달됐는가 (필드명이 틀리면 비어 온다)
                     for tool in listed.tools:
@@ -80,7 +89,8 @@ async def _run_session() -> Dict[str, Any]:
                             tool, "inputSchema", None
                         )
                         if isinstance(schema, dict) and schema.get("type") == "object":
-                            findings["schemas_valid"] += 1
+                            if action_from_tool(tool.name) is not None:
+                                findings["schemas_valid"] += 1
 
                     # 실제 호출 왕복 — 인자 검증 오류라도 응답이 오면 바인딩은 정상
                     for name in PROBE_TOOLS:
@@ -136,6 +146,12 @@ def main() -> int:
         )
     if not findings["call_ok"]:
         violations.append("tools/call 왕복 실패")
+    from interface.mcp_server import SERVER_TOOLS
+
+    if findings["server_tools_listed"] != sorted(SERVER_TOOLS):
+        violations.append(
+            f"서버 도구 불일치: {findings['server_tools_listed']} != {sorted(SERVER_TOOLS)}"
+        )
 
     passed = not violations
     result = MetricResult(
@@ -147,6 +163,7 @@ def main() -> int:
             "initialized": findings["initialized"],
             "tools_listed": findings["tools_listed"],
             "tools_required": args.tools,
+            "server_tools_listed": len(findings["server_tools_listed"]),
             "schemas_valid": findings["schemas_valid"],
             "call_roundtrip": findings["call_ok"],
             "violations": violations or None,
