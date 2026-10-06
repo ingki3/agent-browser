@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1910개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1927개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -364,9 +364,10 @@ agent-browser serve --profile work
 ```
 
 - **이름**: 영문 소문자·숫자·하이픈 1~32자(`[a-z0-9-]`). 경로 문자(`/`·`..`)는 거부합니다.
-- **보관 위치**: `~/.agent-browser/profiles/serve-NAME/`(폴더 권한 700). 사이트별 프로필 폴더와 같은 루트이며 `serve-` 앞머리로 구분합니다. 루트는 환경변수 `AGENT_BROWSER_PROFILE_ROOT`로 바꿀 수 있습니다(테스트는 임시 폴더를 씁니다). 평소 Chrome 프로필 아래와 user-chrome 전용 폴더(`~/.agent-browser/chrome-profile`) 아래는 거부합니다.
+- **보관 위치**: `~/.agent-browser/profiles/serve-NAME/`(폴더 권한 700). 루트 폴더는 우리가 새로 만들 때만 700 으로 만들고, 이미 있는 루트(예: `AGENT_BROWSER_PROFILE_ROOT=$HOME`)의 권한은 바꾸지 않습니다. 사이트별 프로필 폴더와 같은 루트이며 `serve-` 앞머리로 구분합니다. 루트는 환경변수 `AGENT_BROWSER_PROFILE_ROOT`로 바꿀 수 있습니다(테스트는 임시 폴더를 씁니다). 평소 Chrome 프로필 아래와 user-chrome 전용 폴더(`~/.agent-browser/chrome-profile`) 아래는 거부합니다.
 - **보안 정책은 그대로**: Egress 검증 프록시(사설망 기본 차단·CONNECT 만·fail-closed), QUIC 끔, WebRTC 비프록시 UDP 차단, route 가드, 문서 상태·차단 신호, HITL·승인 증표·조작권·안내 띠가 영속 모드에서도 같은 경로로 설치됩니다.
 - **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다.
+- **잠금 파일을 직접 지우지 마십시오**: 프로필 폴더 안 `.agent-browser-serve.lock` 을 지우면 같은 프로필의 동시 사용을 막지 못할 수 있습니다(잠금은 파일 단위라, 지운 뒤 새로 만든 파일은 다른 서버의 잠금과 별개가 됩니다). 서버가 죽으면 잠금은 OS 가 풀어 주므로 지울 필요가 없습니다. 폴더를 없애려면 `agent-browser profile remove` 를 쓰십시오.
 - **`--browser user-chrome`과 함께 쓸 수 없습니다** — user-chrome 은 이미 전용 영속 프로필(`--chrome-profile`)을 씁니다.
 - **에이전트에게 보이는 것**: `browser_control_status`의 `data.profile = {name, persistent: true}`(경로는 싣지 않음). headless + `--profile` 서버에서 로그인이 필요해 `browser_control_request`를 부르면 "창 없음" 안내에 `--browser human --profile NAME`으로 한 번 로그인하라는 문구가 붙습니다.
 - **목록·지우기**:

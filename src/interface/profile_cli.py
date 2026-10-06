@@ -40,7 +40,11 @@ def _human_size(n: int) -> str:
 def _cmd_list(as_json: bool) -> int:
     from browser import serve_profile as sp
 
-    rows = sp.list_profiles()
+    try:
+        rows = sp.list_profiles()
+    except sp.ProfileError as exc:
+        print(f"agent-browser profile: 오류: {exc}", file=sys.stderr)
+        return 2
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0

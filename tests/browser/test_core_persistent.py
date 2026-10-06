@@ -186,3 +186,37 @@ async def test_real_persistent_cookie_survives_reopen(tmp_path):
         assert "keep" in names
     finally:
         await core.close()
+
+
+# ------------------------------------------------------------------ R1: NB-3 로그·오류에 경로 없음
+
+
+async def test_nb3_close_failure_warning_has_no_path(fake_pw, tmp_path, caplog):
+    import logging
+
+    prof = tmp_path / "serve-secret"
+    core = await BrowserCore(persistent_profile=prof).start()
+
+    async def boom() -> None:
+        raise RuntimeError(f"Target closed: {prof}/Default/Cookies")
+
+    core._persistent.close = boom
+    with caplog.at_level(logging.DEBUG, logger="browser.core"):
+        await core.close()
+    text = caplog.text
+    assert "영속 컨텍스트 종료 실패" in text and "RuntimeError" in text
+    assert str(tmp_path) not in text and "serve-secret" not in text
+
+
+async def test_nb3_launch_failure_message_has_no_path(fake_pw, tmp_path):
+    prof = tmp_path / "serve-secret"
+
+    async def fail(user_data_dir: str, **kw: Any) -> Any:
+        raise RuntimeError(f"Browser closed. cmd: chromium --user-data-dir={user_data_dir}\nlog...")
+
+    fake_pw.chromium.launch_persistent_context = fail
+    with pytest.raises(BrowserCoreError) as ei:
+        await BrowserCore(persistent_profile=prof).start()
+    assert str(tmp_path) not in str(ei.value) and "serve-secret" not in str(ei.value)
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+    assert fake_pw.stopped

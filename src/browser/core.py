@@ -195,9 +195,19 @@ class BrowserCore:
             self.headless = bool(headless)
         kw = self._launch_kwargs()
         kw.update(self._context_options())
-        self._persistent = await self._playwright.chromium.launch_persistent_context(
-            str(self.persistent_profile), **kw
-        )
+        try:
+            self._persistent = await self._playwright.chromium.launch_persistent_context(
+                str(self.persistent_profile), **kw
+            )
+        except Exception as exc:  # noqa: BLE001
+            from browser.serve_profile import safe_reason
+
+            # R1 NB-3: Playwright 오류에는 실행 명령(--user-data-dir=<프로필 경로>)이 담긴다 —
+            # 예외 종류·첫 줄만, 경로는 지운다(원 예외 연쇄도 끊는다: traceback 로 새지 않게).
+            raise BrowserCoreError(
+                ErrorCode.PAGE_CRASHED,
+                f"영속 프로필 브라우저를 열지 못했습니다: {safe_reason(exc)}",
+            ) from None
         return self._persistent
 
     async def close_persistent(self) -> None:
@@ -255,7 +265,10 @@ class BrowserCore:
             try:
                 await self.close_persistent()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("영속 컨텍스트 종료 실패: %s", exc)
+                from browser.serve_profile import safe_reason
+
+                # R1 NB-3: 예외 문자열에 프로필 경로가 들어 있을 수 있다 — 종류·짧은 이유만.
+                logger.warning("영속 컨텍스트 종료 실패: %s", safe_reason(exc))
         for managed in list(self._contexts.values()):
             if self.is_user_chrome:
                 # 채택한 기본 컨텍스트를 닫으면 Chrome 창이 통째로 사라진다 — 닫지 않는다.

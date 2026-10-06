@@ -104,6 +104,33 @@ def profile_dir(name: Any, *, root: Optional[Path] = None) -> Path:
     return path
 
 
+_ABS_PATH_RE = re.compile(r"(?<![\w.~-])(?:~|/)[^\s'\"()\[\],;]*")
+
+
+def safe_reason(exc: BaseException, limit: int = 160) -> str:
+    """로그·오류 문구용 짧은 이유: 예외 종류 + 첫 줄, 경로(절대·~ 경로)는 지운다.
+
+    Playwright·OS 예외 문자열에는 프로필 폴더 경로(--user-data-dir=...)가 들어 있을 수 있다.
+    """
+    first = (str(exc).strip().splitlines() or [""])[0]
+    first = _ABS_PATH_RE.sub("<경로>", first).strip()
+    if len(first) > limit:
+        first = first[:limit] + "…"
+    name = type(exc).__name__
+    return f"{name}: {first}" if first else name
+
+
+def _os_reason(exc: OSError) -> str:
+    """OSError → 사람이 읽을 짧은 이유(경로 없음 — filename 은 쓰지 않는다)."""
+    if exc.errno == errno.ELOOP:
+        return "심볼릭 링크가 끼어 있습니다"
+    if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+        return f"권한이 없습니다({errno.errorcode.get(exc.errno, exc.errno)})"
+    code = errno.errorcode.get(exc.errno or 0, "")
+    text = exc.strerror or type(exc).__name__
+    return f"{text}({code})" if code else text
+
+
 def _refuse_symlink(path: Path) -> None:
     try:
         st = os.lstat(path)
@@ -114,11 +141,20 @@ def _refuse_symlink(path: Path) -> None:
 
 
 def prepare(path: Path) -> Path:
-    """프로필 폴더(와 루트)를 0700 으로 만든다. 있으면 0700 으로 조인다. 심볼릭 링크는 거부."""
+    """프로필 폴더를 0700 으로 만든다(있으면 0700 으로 조인다). 심볼릭 링크는 거부.
+
+    루트(부모)는 우리가 새로 만들 때만 0700 — 이미 있는 루트(예: $HOME 을 루트로 준 경우)의
+    권한은 바꾸지 않는다(R1 NB-8). 보호 단위는 프로필 폴더 자체(0700)다.
+    """
     path = Path(path)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+        created_root = True
+    except FileExistsError:
+        created_root = False
     _refuse_symlink(path.parent)
-    os.chmod(path.parent, 0o700)
+    if created_root:
+        os.chmod(path.parent, 0o700)  # umask 가 mode 를 깎았을 수 있다
     _refuse_symlink(path)
     path.mkdir(mode=0o700, exist_ok=True)
     os.chmod(path, 0o700)
@@ -182,18 +218,42 @@ def _try_flock(path: Path) -> Optional[int]:
     return fd
 
 
+def _lock_held_by_other(path: Path) -> bool:
+    """잠금 파일에 배타 잠금(=serve)이 걸려 있는지 — 공유 잠금으로만 들여다본다.
+
+    R1 NB-1: 예전에는 배타 잠금을 잠깐 쥐었다 → 그 순간 시작한 serve 가 '사용 중' 으로 거짓
+    거부됐다(검증 실측 179/3000). 공유 잠금은 다른 들여다보기(`profile list`)와 겹치지 않고,
+    serve 의 acquire() 는 짧게 재시도해 이 순간을 흡수한다.
+    """
+    try:
+        fd = os.open(path / LOCK_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ProfileError(f"프로필 {path.name[len(DIR_PREFIX):]!r} 의 잠금 파일을 열 수 없습니다: "
+                           f"{_os_reason(exc)}") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return True
+        raise ProfileError(f"프로필 잠금을 확인할 수 없습니다: {_os_reason(exc)}") from None
+    finally:
+        os.close(fd)  # 닫으면 공유 잠금도 풀린다
+    return False
+
+
 def holder(name: str, *, root: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """지금 이 프로필을 쓰는 쪽. 아무도 안 쓰면 None. {server_id?, pid?, chromium_pid?}."""
+    """지금 이 프로필을 쓰는 쪽. 아무도 안 쓰면 None. {server_id?, pid?, chromium_pid?}.
+
+    잠금 파일이 심볼릭 링크 등이라 판정할 수 없으면 ProfileError.
+    """
     path = profile_dir(name, root=root)
     if not path.is_dir() or path.is_symlink():
         return None
-    if (path / LOCK_FILE).exists():
-        fd = _try_flock(path)
-        if fd is None:
-            info = _read_lock_info(path)
-            return {k: info[k] for k in ("server_id", "pid") if k in info} or {"server_id": None}
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    if _lock_held_by_other(path):
+        info = _read_lock_info(path)
+        return {k: info[k] for k in ("server_id", "pid") if k in info} or {"server_id": None}
     pid = _chromium_holder(path)
     return {"chromium_pid": pid} if pid else None
 
@@ -225,10 +285,26 @@ class ProfileLock:
             os.close(fd)
 
 
+#: 배타 잠금 재시도 간격(초) — `profile list` 가 잠깐 들여다보는 순간(공유 잠금)을 흡수한다.
+#: 진짜 사용 중(다른 serve)이면 합계 약 0.15초 뒤 그대로 거부된다.
+_ACQUIRE_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08)
+
+
 def acquire(name: str, *, server_id: str, root: Optional[Path] = None) -> ProfileLock:
-    """프로필 폴더를 만들고(0700) 잠근다. 다른 serve·Chromium 이 쓰는 중이면 ProfileInUseError."""
-    path = prepare(profile_dir(name, root=root))
-    fd = _try_flock(path)
+    """프로필 폴더를 만들고(0700) 잠근다. 다른 serve·Chromium 이 쓰는 중이면 ProfileInUseError.
+
+    폴더·잠금 파일을 준비하지 못하면(심볼릭 링크·권한 등) 경로 없는 한 줄 이유의 ProfileError.
+    """
+    try:
+        path = prepare(profile_dir(name, root=root))
+        fd = _try_flock(path)
+        for delay in _ACQUIRE_RETRY_DELAYS:
+            if fd is not None:
+                break
+            time.sleep(delay)
+            fd = _try_flock(path)
+    except OSError as exc:
+        raise ProfileError(f"프로필 {name!r} 을 준비하지 못했습니다: {_os_reason(exc)}") from None
     if fd is None:
         raise ProfileInUseError(name, holder(name, root=root) or {})
     try:
@@ -284,7 +360,11 @@ def list_profiles(*, root: Optional[Path] = None) -> List[Dict[str, Any]]:
             last = os.stat(lock if lock.exists() else d).st_mtime
         except OSError:
             last = 0.0
-        who = holder(name, root=base)
+        try:
+            who = holder(name, root=base)
+        except ProfileError:
+            # 잠금을 판정할 수 없다(잠금 파일이 심볼릭 링크 등) — '비어 있음' 으로 가정하지 않는다.
+            who = {"server_id": None}
         rows.append({
             "name": name,
             "size_bytes": _size(d),
@@ -309,6 +389,8 @@ def remove(name: str, *, root: Optional[Path] = None) -> None:
     lock = acquire(name, server_id="profile-remove", root=root)
     try:
         shutil.rmtree(path)
+    except OSError as exc:
+        raise ProfileError(f"프로필 {name!r} 을 다 지우지 못했습니다: {_os_reason(exc)}") from None
     finally:
         lock.release() if path.exists() else _close_quietly(lock)
 

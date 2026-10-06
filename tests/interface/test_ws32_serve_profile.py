@@ -274,3 +274,68 @@ def test_profile_remove_bad_name(capsys):
 
 def test_profile_remove_missing(capsys):
     assert cli.main(["profile", "remove", "nope", "--yes"]) == 2
+
+
+# ------------------------------------------------------------------ R1: NB-2 사람이 읽을 한 줄
+
+
+@pytest.fixture
+def no_stdio(monkeypatch):
+    import mcp.server.stdio as stdio_mod
+
+    @contextlib.asynccontextmanager
+    async def _no():
+        pytest.fail("프로필을 준비하지 못했으면 MCP 를 열면 안 됨(fail-closed)")
+        yield (None, None)
+
+    monkeypatch.setattr(stdio_mod, "stdio_server", _no)
+
+
+def _one_line_error(err: str, root: Path) -> None:
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    assert len(lines) == 1 and lines[0].startswith("agent-browser serve: 오류:")
+    assert "Traceback" not in err and str(root) not in err
+
+
+def test_nb2_serve_profile_dir_symlink_exit2(no_stdio, capsys, tmp_path, _isolated_profile_root):
+    _isolated_profile_root.mkdir(parents=True)
+    (tmp_path / "v").mkdir()
+    (_isolated_profile_root / "serve-lnk").symlink_to(tmp_path / "v")
+    assert cli.main(["serve", "--profile", "lnk"]) == 2
+    _one_line_error(capsys.readouterr().err, _isolated_profile_root)
+
+
+def test_nb2_serve_lock_file_symlink_exit2(no_stdio, capsys, tmp_path, _isolated_profile_root):
+    d = sp.prepare(sp.profile_dir("t1"))
+    (tmp_path / "other").write_text("")
+    (d / sp.LOCK_FILE).symlink_to(tmp_path / "other")
+    assert cli.main(["serve", "--profile", "t1"]) == 2
+    _one_line_error(capsys.readouterr().err, _isolated_profile_root)
+
+
+def test_nb2_serve_permission_denied_exit2(no_stdio, capsys, _isolated_profile_root):
+    _isolated_profile_root.mkdir(parents=True)
+    _isolated_profile_root.chmod(0o500)
+    try:
+        assert cli.main(["serve", "--profile", "t1"]) == 2
+    finally:
+        _isolated_profile_root.chmod(0o700)
+    _one_line_error(capsys.readouterr().err, _isolated_profile_root)
+
+
+def test_nb2_profile_remove_lock_symlink_exit2(capsys, tmp_path, _isolated_profile_root):
+    d = sp.prepare(sp.profile_dir("t1"))
+    (tmp_path / "other").write_text("")
+    (d / sp.LOCK_FILE).symlink_to(tmp_path / "other")
+    assert cli.main(["profile", "remove", "t1", "--yes"]) == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and str(_isolated_profile_root) not in err
+    assert d.exists()
+
+
+def test_nb2_profile_list_lock_symlink_ok(capsys, tmp_path, _isolated_profile_root):
+    d = sp.prepare(sp.profile_dir("t1"))
+    (tmp_path / "other").write_text("")
+    (d / sp.LOCK_FILE).symlink_to(tmp_path / "other")
+    assert cli.main(["profile", "list"]) == 0
+    assert "t1" in capsys.readouterr().out

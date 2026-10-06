@@ -310,7 +310,7 @@ def _cmd_tools(as_json: bool) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from browser.serve_profile import ProfileInUseError
+    from browser.serve_profile import ProfileError, ProfileInUseError
     from interface.mcp_server import run_stdio
 
     try:
@@ -341,7 +341,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         )
     except KeyboardInterrupt:
         return 130
-    except ProfileInUseError as exc:
+    except (ProfileInUseError, ProfileError) as exc:
+        # R1 NB-2: 폴더·잠금 준비 실패(심볼릭 링크·권한 등)도 traceback 대신 한 줄 + exit 2.
+        # 잠금을 못 잡았으니 서버는 뜨지 않았다(fail-closed).
         print(f"agent-browser serve: 오류: {exc}", file=sys.stderr)
         return 2
     return 0

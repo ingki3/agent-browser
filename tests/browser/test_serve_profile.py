@@ -200,3 +200,120 @@ def test_remove_symlink_refused(_root, tmp_path):
     with pytest.raises(sp.ProfileError):
         sp.remove("t1")
     assert (target / "f").exists()
+
+
+# ------------------------------------------------------------------ R1 (독립 검증 NB)
+
+
+def _hold_shared(path: Path) -> int:
+    """다른 프로세스의 holder()(=`profile list`) 가 잠금을 잠깐 들여다보는 순간을 흉내낸다."""
+    import fcntl
+
+    fd = os.open(path / sp.LOCK_FILE, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    return fd
+
+
+def test_nb1_holder_never_takes_exclusive_lock(_root, monkeypatch):
+    """holder() 는 배타 잠금을 잡지 않는다 — 잡으면 그 순간 시작한 serve 가 거짓 거부된다."""
+    import fcntl
+
+    sp.acquire("t1", server_id="1-a").release()  # 잠금 파일이 있는 상태
+    flags: list = []
+    real = fcntl.flock
+    monkeypatch.setattr(sp.fcntl, "flock", lambda fd, op: (flags.append(op), real(fd, op))[1])
+    assert sp.holder("t1") is None
+    assert flags and not any(op & fcntl.LOCK_EX for op in flags)
+
+
+def test_nb1_holder_while_other_lister_peeks_is_not_in_use(_root):
+    """두 `profile list` 가 겹쳐도 서로를 '사용 중' 으로 보지 않는다."""
+    sp.acquire("t1", server_id="1-a").release()
+    fd = _hold_shared(_root / "serve-t1")
+    try:
+        assert sp.holder("t1") is None
+    finally:
+        os.close(fd)
+
+
+def test_nb1_acquire_absorbs_momentary_peek(_root):
+    """holder() 가 잠깐 들여다보는 동안 시작한 serve 는 짧게 재시도해 잡는다(거짓 거부 0)."""
+    import threading
+
+    sp.acquire("t1", server_id="1-a").release()
+    fd = _hold_shared(_root / "serve-t1")
+    threading.Timer(0.02, os.close, args=(fd,)).start()
+    lock = sp.acquire("t1", server_id="2-b")
+    lock.release()
+
+
+def test_nb1_real_holder_still_refused_quickly(_root):
+    """진짜 동시 사용은 그대로 거부 — 재시도가 거부를 오래 끌지 않는다."""
+    import time as _t
+
+    lock = sp.acquire("t1", server_id="1-a")
+    try:
+        t0 = _t.monotonic()
+        with pytest.raises(sp.ProfileInUseError, match="1-a"):
+            sp.acquire("t1", server_id="2-b")
+        assert _t.monotonic() - t0 < 1.0
+    finally:
+        lock.release()
+
+
+def test_nb2_lock_file_symlink_is_profile_error(_root, tmp_path):
+    d = sp.prepare(sp.profile_dir("t1"))
+    (tmp_path / "other").write_text("")
+    os.symlink(tmp_path / "other", d / sp.LOCK_FILE)
+    with pytest.raises(sp.ProfileError) as ei:
+        sp.acquire("t1", server_id="1-a")
+    assert str(tmp_path) not in str(ei.value)
+    with pytest.raises(sp.ProfileError):
+        sp.holder("t1")
+    with pytest.raises(sp.ProfileError):
+        sp.remove("t1")
+
+
+def test_nb2_unwritable_root_is_profile_error(_root):
+    _root.mkdir(parents=True)
+    os.chmod(_root, 0o500)
+    try:
+        with pytest.raises(sp.ProfileError, match="권한") as ei:
+            sp.acquire("t1", server_id="1-a")
+        assert str(_root) not in str(ei.value)
+    finally:
+        os.chmod(_root, 0o700)
+
+
+def test_nb2_list_survives_broken_lock_file(_root, tmp_path):
+    d = sp.prepare(sp.profile_dir("t1"))
+    (tmp_path / "other").write_text("")
+    os.symlink(tmp_path / "other", d / sp.LOCK_FILE)
+    rows = sp.list_profiles()
+    assert [r["name"] for r in rows] == ["t1"]
+    assert rows[0]["in_use"] is True  # 판정 못 하면 '비어 있음' 으로 가정하지 않는다
+
+
+def test_nb8_existing_root_mode_untouched(_root):
+    """루트가 이미 있으면(예: $HOME) 그 폴더 권한은 바꾸지 않는다 — 프로필 폴더만 0700."""
+    _root.mkdir(parents=True)
+    os.chmod(_root, 0o755)
+    path = sp.prepare(sp.profile_dir("t1"))
+    assert stat.S_IMODE(os.stat(_root).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o700
+
+
+def test_nb8_new_root_is_0700_even_with_loose_umask(_root):
+    old = os.umask(0o022)
+    try:
+        sp.prepare(sp.profile_dir("t1"))
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(os.stat(_root).st_mode) == 0o700
+
+
+def test_safe_reason_strips_paths():
+    exc = RuntimeError("Target closed: /Users/x/.agent-browser/profiles/serve-t1/Default\nmore /a/b")
+    reason = sp.safe_reason(exc)
+    assert reason.startswith("RuntimeError")
+    assert "/Users" not in reason and "serve-t1" not in reason and "more" not in reason
