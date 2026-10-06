@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1826개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+1909개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -349,6 +349,34 @@ agent-browser approve ap_XXXX --code 123456
 서버는 (사람이 승인함 ∧ 만료 전(기본 30분, `serve --approval-ttl SEC`) ∧ 다시 계산한 digest 가 같음 ∧ 처음 씀)일 때만 통과시킵니다. 증표로 실행하는 호출은 **자가 치유(비슷한 이름의 요소로 대체)를 끄고**, `element_id` 대상이 관찰 때 그 요소 그대로(연결·role·이름)일 때만 누릅니다 — 승인 뒤 같은 이름의 다른 버튼으로 바뀌었으면 `E_TOCTOU_MISMATCH`, `data.approval.reason="target_changed"`로 거부합니다(증표는 승인 상태로 남음). 끝난 증표(사용·거절·만료·폐기)는 10분 뒤 메모리·파일에서 지우고, 증표 수는 200개로 제한합니다. 승인 전·다른 서버의 id·만료·재사용·파라미터/대상/탭/origin/epoch 가 달라진 호출은 거부하고 이유를 `data.approval.rejected`에 싣습니다. **에이전트가 가진 `approval_id`만으로는 실행되지 않습니다** — 승인은 사람이 대역 밖에서만 할 수 있고, 서버는 디스크의 승인 파일이 아니라 자기 메모리의 상태만 믿습니다(명령 파일은 같은 사용자 소유·0600·server_id 일치·digest 일치일 때만 처리). 증표로 실행했는데 결과가 불확실하면(`E_TIMEOUT`·`E_PAGE_CRASHED`·`E_NAVIGATE_TIMEOUT`) `data.approval.outcome="outcome_unknown"`, `retry_safe=false`로 알리고 같은 증표는 다시 쓸 수 없습니다 — 자동으로 다시 시도하지 말고 관찰해 확인하십시오. 운영자 정적 허용 `--pre-approve`는 그대로 동작합니다.
 
 **한계.** ① 확인 코드는 "MCP 만 가진 에이전트는 승인할 수 없다"를 보장합니다. **같은 OS 사용자로 셸을 쓰는 에이전트**는 화면 녹화 권한(macOS 화면 기록 등)까지 얻으면 창의 코드를 볼 수 있고, 같은 사용자 권한으로 상태 디렉터리도 다룰 수 있습니다 — 근본 해법은 **에이전트를 다른 OS 사용자로 돌리는 것**입니다. 코드가 떠 있는 동안 화면 캡처 도구는 거부하지만, OS 화면 녹화 권한을 가진 같은 uid 프로세스는 볼 수 있습니다. ② digest 의 origin 은 최상위 문서 기준입니다 — 프레임 안(결제 iframe 등)의 origin 변화는 잡지 않습니다(후속). ③ 서버 생존 판정은 server.json 의 uid·pid·시작 시각으로 합니다(다른 사용자 프로세스가 pid 를 재사용하면 죽은 서버로 봄). ④ 코드 표시와 화면 캡처는 직렬화합니다: 표시 요청이 오면 새 캡처를 먼저 거부하고, 이미 진행 중인 캡처가 끝난 뒤(5초 넘으면 표시 취소)에만 코드를 띄우며, 캡처 도중 코드 오버레이가 한 번이라도 켜졌으면(세대 번호) 그 캡처 결과를 버립니다. ⑤ approve 화면의 서버 응답은 요청마다 새 challenge 로 HMAC 해 확인하지만, 같은 OS 사용자는 그 응답도 흉내 낼 수 있습니다(①과 같은 경계) — 창 오버레이의 액션·대상과 대조하십시오.
+
+### 로그인 유지 (`serve --profile NAME`)
+
+`serve`는 기본으로 매번 빈 브라우저로 시작합니다 — 서버를 다시 켜면 로그인이 사라집니다. `--profile NAME`을 주면 **이름 붙인 영속 프로필 폴더**로 시작해 쿠키·로컬 저장소·IndexedDB 가 다음 실행에도 남습니다(쿠키만 옮겨 담는 방식은 네이버가 다음 실행에서 거부한 실측이 있어 폴더를 통째로 씁니다). `--profile`이 없으면 동작은 예전과 같습니다.
+
+```text
+# 1) 창 있는 브라우저로 한 번 로그인 — 사람이 창에서 직접(에이전트는 비밀번호를 보지 않음)
+agent-browser serve --browser human --profile work
+#    에이전트: browser_control_request(reason="로그인", secret_wanted=true)
+#    사람:     agent-browser control take → 창에서 로그인('로그인 상태 유지' 체크) → agent-browser control release
+# 2) 이후에는 headless 로 — 같은 이름이면 로그인이 유지됨
+agent-browser serve --profile work
+```
+
+- **이름**: 영문 소문자·숫자·하이픈 1~32자(`[a-z0-9-]`). 경로 문자(`/`·`..`)는 거부합니다.
+- **보관 위치**: `~/.agent-browser/profiles/serve-NAME/`(폴더 권한 700). 사이트별 프로필 폴더와 같은 루트이며 `serve-` 앞머리로 구분합니다. 루트는 환경변수 `AGENT_BROWSER_PROFILE_ROOT`로 바꿀 수 있습니다(테스트는 임시 폴더를 씁니다). 평소 Chrome 프로필 아래와 user-chrome 전용 폴더(`~/.agent-browser/chrome-profile`) 아래는 거부합니다.
+- **보안 정책은 그대로**: Egress 검증 프록시(사설망 기본 차단·CONNECT 만·fail-closed), QUIC 끔, WebRTC 비프록시 UDP 차단, route 가드, 문서 상태·차단 신호, HITL·승인 증표·조작권·안내 띠가 영속 모드에서도 같은 경로로 설치됩니다.
+- **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다.
+- **`--browser user-chrome`과 함께 쓸 수 없습니다** — user-chrome 은 이미 전용 영속 프로필(`--chrome-profile`)을 씁니다.
+- **에이전트에게 보이는 것**: `browser_control_status`의 `data.profile = {name, persistent: true}`(경로는 싣지 않음). headless + `--profile` 서버에서 로그인이 필요해 `browser_control_request`를 부르면 "창 없음" 안내에 `--browser human --profile NAME`으로 한 번 로그인하라는 문구가 붙습니다.
+- **목록·지우기**:
+
+```text
+agent-browser profile list            # 이름·크기·마지막 사용·사용 중(서버 id)
+agent-browser profile remove work     # 확인 프롬프트(사용 중이면 거부). 비대화형은 --yes
+```
+
+**한계.** ① **쿠키는 평문**입니다 — Playwright Chromium 프로필은 OS 키체인 암호화를 쓰지 않아 폴더 권한 700 으로만 보호됩니다. 같은 OS 사용자로 도는 프로그램은 읽을 수 있습니다. ② **사이트가 세션 쿠키(만료 없음)만 주면 유지되지 않습니다** — Chromium 은 재시작 때 세션 쿠키를 버립니다(실측: Mock 사이트의 영속 쿠키는 남고 세션 쿠키는 사라짐). 로그인할 때 '로그인 상태 유지'를 체크하십시오. 쿠키 수명을 늘리거나 바꾸는 조작은 하지 않습니다(사이트가 준 그대로). ③ 서버를 SIGTERM·SIGINT·stdin 종료로 끝내면 브라우저를 닫아 쿠키를 디스크에 씁니다. SIGKILL 같은 강제 종료는 직전 변경이 남지 않을 수 있습니다. ④ 영속 프로필에는 캐시·서비스워커 등록도 남습니다(서비스워커 요청도 검증 프록시를 거칩니다).
 
 ---
 

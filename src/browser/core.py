@@ -77,8 +77,17 @@ class BrowserCore:
         chrome_profile: Optional[Path] = None,
         keep_open: bool = False,
         egress: Any = None,
+        persistent_profile: Optional[Path] = None,
     ) -> None:
         """
+        persistent_profile (WS-32): 영속 프로필 폴더(serve --profile, browser.serve_profile).
+        주면 chromium.launch 대신 launch_persistent_context(그 폴더) 로 연다 — 쿠키·로컬
+        저장소·IndexedDB 가 폴더에 남아 다음 실행에서도 로그인이 유지된다. launch 인자(egress
+        프록시·QUIC 끔·WebRTC 정책)와 context 옵션(viewport/locale)은 기존과 같은 것을 한 번에
+        넘긴다. 컨텍스트는 1개(영속 컨텍스트 채택), 저장 세션 주입은 지원하지 않는다.
+        open_persistent()/close_persistent() 로 같은 프로필을 닫고 다시 열 수 있다(WS-34 기반).
+        user-chrome 과는 함께 쓸 수 없다(그 방식은 이미 전용 Chrome 프로필을 쓴다).
+
         egress (WS-29b): security.egress_runtime.EgressRuntime(시작된 것). 주면 브라우저를
         검증 프록시에 묶어 띄운다(Playwright Chromium: launch(proxy=, args=), user-chrome:
         Chrome 명령줄 인자). None 이면 기존 동작(프록시 없음).
@@ -105,6 +114,12 @@ class BrowserCore:
             )
         if browser_mode == "human":
             headless, human_like = False, True
+        if persistent_profile is not None and browser_mode == "user-chrome":
+            raise ValueError(
+                "영속 프로필(--profile)은 user-chrome 방식과 함께 쓸 수 없습니다 — user-chrome 은 "
+                "이미 전용 Chrome 프로필(--chrome-profile)을 씁니다."
+            )
+        self.persistent_profile = Path(persistent_profile) if persistent_profile else None
         self.browser_mode = browser_mode
         self.chrome_profile = chrome_profile
         self.keep_open = keep_open
@@ -125,10 +140,16 @@ class BrowserCore:
         #: user-chrome: 우리가 띄운 Chrome(UserChrome)과 아직 탭으로 채택하지 않은 첫 페이지
         self._user_chrome: Any = None
         self._adoptable_page: Any = None
+        #: 영속 프로필 모드(WS-32): launch_persistent_context 가 돌려준 컨텍스트
+        self._persistent: Any = None
 
     @property
     def is_user_chrome(self) -> bool:
         return self.browser_mode == "user-chrome"
+
+    @property
+    def is_persistent(self) -> bool:
+        return self.persistent_profile is not None
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -139,11 +160,58 @@ class BrowserCore:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
+        if self.is_persistent:
+            try:
+                await self.open_persistent()
+            except BaseException:
+                await self._playwright.stop()
+                self._playwright = None
+                raise
+            return self
+        self._browser = await self._playwright.chromium.launch(**self._launch_kwargs())
+        return self
+
+    def _launch_kwargs(self) -> Dict[str, Any]:
+        """chromium.launch / launch_persistent_context 공통 실행 인자(headless + egress)."""
         launch_kw: Dict[str, Any] = {"headless": self.headless}
         if self.egress is not None:
             launch_kw.update(self.egress.launch_kwargs())
-        self._browser = await self._playwright.chromium.launch(**launch_kw)
-        return self
+        return launch_kw
+
+    async def open_persistent(self, *, headless: Optional[bool] = None) -> Any:
+        """영속 프로필 폴더로 브라우저+컨텍스트를 연다 — 다시 열 수 있는 단위(WS-32/WS-34).
+
+        headless 를 주면 그 값으로 바꿔 연다(같은 프로필을 headless ↔ 창 있는 브라우저로).
+        launch 인자(egress 프록시·플래그)와 context 옵션을 기존 launch+new_context 경로와 같게
+        넘긴다. 컨텍스트 채택·route·이벤트 연결은 new_context(profile) 가 한다(부르는 쪽 몫).
+        """
+        if not self.is_persistent:
+            raise RuntimeError("영속 프로필 모드가 아닙니다(persistent_profile 없음).")
+        if self._persistent is not None:
+            raise RuntimeError("영속 컨텍스트가 이미 열려 있습니다 — close_persistent() 먼저.")
+        if self._playwright is None:
+            raise RuntimeError("playwright 가 시작되지 않았습니다 — start() 먼저.")
+        if headless is not None:
+            self.headless = bool(headless)
+        kw = self._launch_kwargs()
+        kw.update(self._context_options())
+        self._persistent = await self._playwright.chromium.launch_persistent_context(
+            str(self.persistent_profile), **kw
+        )
+        return self._persistent
+
+    async def close_persistent(self) -> None:
+        """영속 컨텍스트(=브라우저)를 닫는다. 쿠키를 디스크에 남기려면 닫아야 한다.
+
+        탭·컨텍스트 기록을 비운다. playwright 는 그대로 둔다(open_persistent 로 다시 열 수 있게).
+        """
+        ctx, self._persistent = self._persistent, None
+        self._contexts.clear()
+        self._tab_index.clear()
+        self._active_tab_id = None
+        self._adoptable_page = None
+        if ctx is not None:
+            await ctx.close()
 
     async def _start_user_chrome(self) -> "BrowserCore":
         """전용 프로필 Chrome 을 띄우고 CDP(127.0.0.1)로 붙는다.
@@ -183,6 +251,11 @@ class BrowserCore:
         return self
 
     async def close(self) -> None:
+        if self.is_persistent:
+            try:
+                await self.close_persistent()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("영속 컨텍스트 종료 실패: %s", exc)
         for managed in list(self._contexts.values()):
             if self.is_user_chrome:
                 # 채택한 기본 컨텍스트를 닫으면 Chrome 창이 통째로 사라진다 — 닫지 않는다.
@@ -231,7 +304,7 @@ class BrowserCore:
 
         동일 프로파일을 재요청하면 기존 컨텍스트를 반환한다(중복 생성 방지).
         """
-        if self._browser is None:
+        if self._browser is None and self._persistent is None:
             raise BrowserCoreError(
                 ErrorCode.PAGE_CRASHED, "브라우저가 시작되지 않았습니다. start()를 먼저 호출하십시오."
             )
@@ -242,6 +315,8 @@ class BrowserCore:
 
         if self.is_user_chrome:
             return self._adopt_default_context(profile_name)
+        if self.is_persistent:
+            return self._adopt_default_context(profile_name, self._persistent)
 
         if len(self._contexts) >= self.max_contexts:
             raise BrowserCoreError(
@@ -261,6 +336,12 @@ class BrowserCore:
         self, profile_name: str, passphrase: str
     ) -> Any:
         """저장된 암호화 storageState를 주입해 컨텍스트를 생성한다."""
+        if self.is_persistent:
+            raise BrowserCoreError(
+                ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                "영속 프로필 방식은 저장 세션 주입을 지원하지 않습니다 — 프로필 폴더 자체가 "
+                "세션 저장소입니다(한 번 로그인하면 유지됩니다).",
+            )
         if self._browser is None:
             raise BrowserCoreError(ErrorCode.PAGE_CRASHED, "브라우저가 시작되지 않았습니다.")
         if self.is_user_chrome:
@@ -285,7 +366,7 @@ class BrowserCore:
         self._watch_context_pages(profile_name, context)
         return context
 
-    def _adopt_default_context(self, profile_name: str) -> Any:
+    def _adopt_default_context(self, profile_name: str, context: Any = None) -> Any:
         """user-chrome: 연결된 Chrome 의 기본 컨텍스트를 profile_name 으로 채택한다.
 
         새 incognito 컨텍스트를 만들면 전용 프로필의 쿠키·로그인을 못 쓴다 — 그래서
@@ -293,19 +374,21 @@ class BrowserCore:
         1개만 허용한다(두 번째 프로필 요청은 오류). 이미 열린 about:blank 페이지는
         첫 new_tab 이 새 탭 대신 채택한다(빈 탭이 창에 남지 않게).
         """
+        kind = "영속 프로필" if context is not None else "user-chrome"
         if self._contexts:
             held = next(iter(self._contexts))
             raise BrowserCoreError(
                 ErrorCode.TAB_LIMIT_EXCEEDED,
-                f"user-chrome 방식은 컨텍스트를 1개만 씁니다(사용 중: {held!r}, "
+                f"{kind} 방식은 컨텍스트를 1개만 씁니다(사용 중: {held!r}, "
                 f"요청: {profile_name!r}).",
             )
-        contexts = list(getattr(self._browser, "contexts", None) or [])
-        if not contexts:
-            raise BrowserCoreError(
-                ErrorCode.PAGE_CRASHED, "연결된 Chrome 에 기본 컨텍스트가 없습니다."
-            )
-        context = contexts[0]
+        if context is None:
+            contexts = list(getattr(self._browser, "contexts", None) or [])
+            if not contexts:
+                raise BrowserCoreError(
+                    ErrorCode.PAGE_CRASHED, "연결된 Chrome 에 기본 컨텍스트가 없습니다."
+                )
+            context = contexts[0]
         self._contexts[profile_name] = ManagedContext(
             profile_name=profile_name, context=context
         )
@@ -434,7 +517,8 @@ class BrowserCore:
             )
 
         async with managed.lock:
-            page = self._take_adoptable_page() if self.is_user_chrome else None
+            adopt = self.is_user_chrome or self.is_persistent
+            page = self._take_adoptable_page() if adopt else None
             if page is None:
                 page = await managed.context.new_page()
 

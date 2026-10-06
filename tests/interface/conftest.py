@@ -17,3 +17,13 @@ def _isolated_handoff_root(tmp_path_factory, monkeypatch):
     root = tmp_path_factory.mktemp("ab-servers") / "servers"
     monkeypatch.setenv(STATE_ROOT_ENV, str(root))
     yield root
+
+
+@pytest.fixture(autouse=True)
+def _isolated_profile_root(tmp_path_factory, monkeypatch):
+    """WS-32: serve --profile 폴더도 임시 디렉터리로(실제 ~/.agent-browser/profiles 무접촉)."""
+    from browser.serve_profile import PROFILE_ROOT_ENV
+
+    root = tmp_path_factory.mktemp("ab-profiles") / "profiles"
+    monkeypatch.setenv(PROFILE_ROOT_ENV, str(root))
+    yield root
