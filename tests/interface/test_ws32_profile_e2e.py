@@ -208,11 +208,19 @@ async def _stdio(profile: str, body, *, kill: int = 0) -> Any:
 
     kill 이 신호 번호면 body 뒤 serve 프로세스에 그 신호를 보내고 끝날 때까지 기다린다(비정상 종료).
     """
+    import tempfile
+
+    # serve stderr 는 실제 파일로 받는다 — sys.stderr 에 fileno 가 없는 환경(백그라운드 실행 등)에서도 돈다.
+    with tempfile.TemporaryFile(mode="w+") as errlog:
+        return await _stdio_inner(profile, body, kill, errlog)
+
+
+async def _stdio_inner(profile: str, body, kill: int, errlog: Any) -> Any:
     from mcp.client.session import ClientSession
     from mcp.client.stdio import stdio_client
 
     out: Dict[str, Any] = {}
-    async with stdio_client(_serve_params(profile)) as (read, write):
+    async with stdio_client(_serve_params(profile), errlog=errlog) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
