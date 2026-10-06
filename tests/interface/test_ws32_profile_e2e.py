@@ -157,17 +157,21 @@ async def test_c_same_profile_concurrent_use_refused(login_site):
 
 
 @requires_chromium
-async def test_d_persistent_mode_keeps_egress_and_approval_gate(login_site, monkeypatch):
+@pytest.mark.parametrize("profile", [None, "t1"], ids=["ephemeral", "persistent"])
+async def test_d_persistent_mode_keeps_egress_and_approval_gate(login_site, monkeypatch, profile):
+    """기존(빈 컨텍스트)과 영속 모드가 같은 보안 경로를 갖는다 — 진입점 대조."""
     monkeypatch.setattr(handoff, "_stdin_is_tty", lambda: False)
-    async with BrowserMCPServer(profile="t1") as s:
+    async with BrowserMCPServer(profile=profile) as s:
         call = _inproc(s)
         before = s._egress_runtime.proxy.handled
         assert (await call("browser_navigate", {"url": login_site + "/"}))["success"]
-        assert s._egress_runtime.proxy.handled > before  # 영속 브라우저도 검증 프록시를 거친다
-        # 사설망 차단(WS-29b 기본)
+        assert s._egress_runtime.proxy.handled > before  # 브라우저가 검증 프록시를 거친다
+        # 사설망 차단(WS-29b 기본). route 가드가 조기 차단하므로 요청이 프록시에 닿지 않는다.
+        at_proxy = s._egress_runtime.proxy.handled
         blocked = await call("browser_navigate", {"url": "http://10.0.0.1/"})
         assert not blocked["success"]
         assert blocked["data"]["egress"]["category"] == "private", blocked
+        assert s._egress_runtime.proxy.handled == at_proxy, "route 가드가 설치되지 않음"
         # 승인 게이트(창이 있다고 두고 오버레이 문구 = 사람의 눈)
         s._human_can_see = lambda: True
         s.banners = []
