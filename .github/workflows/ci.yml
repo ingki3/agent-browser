@@ -78,6 +78,14 @@ jobs:
       - name: Chromium 설치
         run: uv run playwright install --with-deps chromium
 
+      # 창(headed) 테스트(WS-34 on-demand 창 전환·확인 코드 창 등)가 화면 없음으로
+      # skip 되지 않게 가상 화면을 띄운다. 이후 모든 단계가 DISPLAY 를 물려받는다.
+      - name: 가상 화면(Xvfb) 시작
+        run: |
+          sudo apt-get install -y -q xvfb
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
       - name: pytest 실행
         run: |
           set +e
@@ -113,6 +121,14 @@ jobs:
 
       - name: Chromium 설치
         run: uv run playwright install --with-deps chromium
+
+      # 창(headed) 테스트를 실제로 돌리고, check_readme 의 통과 수가 화면 있는
+      # 로컬 게이트와 같게 한다(v1.11.0: Xvfb 없이 13개 skip → 2007 vs 2020 불일치).
+      - name: 가상 화면(Xvfb) 시작
+        run: |
+          sudo apt-get install -y -q xvfb
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
       # Stage 진행에 따라 아래 게이트를 순차적으로 활성화한다.
       # (src/AGENTS.md §5의 Gate 0 ~ Gate 3-B 명령어와 1:1 대응)
