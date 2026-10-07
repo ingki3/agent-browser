@@ -524,7 +524,12 @@ def test_agent_cannot_lower_secret_wanted_by_rerequesting(hub: HandoffHub):
     hub.request("비밀번호 입력", secret_wanted=True)
     hub.request("다시", secret_wanted=False)
     assert hub.status()["secret_wanted"] is True
-    assert hub.control_blocks(ActionType.OBSERVE_PAGE, {}) is not None
+    blocked = hub.control_blocks(ActionType.OBSERVE_PAGE, {})
+    assert blocked is not None
+    # 차단 내용: 비밀 입력 대기라 관찰까지 막고, 그 사유가 낮아지지 않았음을 싣는다.
+    assert blocked["secret_wanted"] is True
+    assert blocked["how_to_wait"] == "browser_control_wait"
+    assert blocked["request_id"] == hub.status()["request_id"]
     write_command(hub.root, hub.server_id, "release")
     hub.poll()
     assert hub.control_blocks(ActionType.OBSERVE_PAGE, {}) is None

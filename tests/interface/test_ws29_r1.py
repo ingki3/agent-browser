@@ -556,10 +556,21 @@ def test_approvals_are_capped(hub: HandoffHub):
 # ======================================================================= 8. pid 재사용 (NB-6)
 
 
-def test_server_json_records_uid_and_start(hub: HandoffHub):
-    info = json.loads((hub.dir / "server.json").read_text())
+def test_server_json_records_uid_and_start(tmp_path: Path):
+    import time
+
+    t0 = time.time()
+    h = HandoffHub(tmp_path / "servers", browser_mode="human")
+    h.open()
+    try:
+        t1 = time.time()
+        info = json.loads((h.dir / "server.json").read_text())
+    finally:
+        h.close()
     assert info["uid"] == os.geteuid()
     assert isinstance(info["started"], (int, float))
+    # pid 재사용 판정(NB-6)의 기준 시각이므로 0·과거값이 아니라 open 시각이어야 한다.
+    assert t0 - 1.0 <= info["started"] <= t1 + 1.0, (t0, info["started"], t1)
 
 
 def test_pid_reused_by_other_user_counts_as_dead(root: Path, monkeypatch):
@@ -730,6 +741,43 @@ async def test_real_human_closes_agent_tab_then_release(site):
         obs = await s.call_tool("browser_observe_page", {})
         assert obs.success, obs
         assert obs.error_code is None and "/esc" in obs.current_url
+
+
+@requires_chromium
+@pytest.mark.xfail(
+    strict=True,
+    reason=("제품 경쟁 조건(WS-35 R2 보고서 §플레이키): 감시 태스크(_watch_handoff)가 반납을 먼저 "
+            "처리하면 control_wait 가 닫힌 탭 복구(_recover_closed_tab)가 끝나기 전에 'released' 를 "
+            "돌려줘 tab_closed_by_human 알림이 빠진다. 위 테스트의 ~10% 실패 원인. 제품 수정은 범위 밖."),
+)
+async def test_release_notice_survives_watcher_winning_the_poll(site, monkeypatch):
+    """결정적 재현: 감시 태스크가 반납을 먼저 집어가고 복구가 느린(CDP 세션 생성 지연) 순서를 고정."""
+    async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
+        _visible(s)
+        await s.call_tool("browser_navigate", {"url": site + "/"})
+        first = s._core.active_tab_id
+        await s.call_server_tool("browser_control_request", {"reason": "확인"})
+        assert await _human("control", "take") == 0
+        ctx = s._core.context_for("mcp-session")
+        other = await ctx.new_page()
+        await other.goto(site + "/esc")
+        await s._page.close()
+        real_cdp = s._core.new_cdp_session
+
+        async def slow_cdp(*a: Any, **k: Any) -> Any:
+            await asyncio.sleep(0.5)  # 복구가 느린 순간(실측 실패 때의 순서를 늘려 고정)
+            return await real_cdp(*a, **k)
+
+        monkeypatch.setattr(s._core, "new_cdp_session", slow_cdp)
+        waiter = asyncio.ensure_future(s.call_server_tool("browser_control_wait", {"timeout_s": 20}))
+        await asyncio.sleep(0.2)  # waiter 가 대기 루프(0.05초 잠) 안에 있다
+        write_command(s.hub.root, s.hub.server_id, "release")
+        watcher_poll = asyncio.ensure_future(s._poll_handoff())  # _watch_handoff 한 바퀴와 같다
+        got = await waiter
+        await watcher_poll
+        assert got["data"]["changed"] == "released"
+        notice = got["data"].get("tab_closed_by_human")
+        assert notice is not None and notice["closed_tab_id"] == first, got["data"]
 
 
 # ======================================================================= 뮤테이션 보강 (R1)

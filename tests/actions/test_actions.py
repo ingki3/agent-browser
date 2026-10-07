@@ -25,6 +25,7 @@ from actions import (
     is_retry_safe,
     ladder_for,
     verify_post_condition,
+    verify_staleness,
 )
 
 
@@ -983,3 +984,69 @@ def test_combo_keys_normalize_each_part():
 def test_empty_key_stays_empty():
     assert _normalize_key("") == ""
     assert _normalize_key("   ") == ""
+
+
+# ---------------------------------------------------------------------------
+# 5. staleness 판정 겹별 단독 고정 (WS-35 R2 — 뮤테이션 V1·V2·V3)
+# ---------------------------------------------------------------------------
+
+
+class _ProbePage:
+    """STALENESS_CHECK_SCRIPT 의 재조회 결과를 정해 주는 페이지 대역. 호출 여부도 센다."""
+
+    def __init__(self, probe: dict) -> None:
+        self.probe, self.calls = probe, 0
+
+    async def evaluate(self, script: str, arg: object = None) -> dict:
+        self.calls += 1
+        return self.probe
+
+
+async def test_staleness_epoch_mismatch_alone():
+    """V1: 에포크가 다르면 노드가 멀쩡해도(같은 role/name) 재조회 없이 EPOCH_MISMATCH.
+
+    엔진 bump_epoch 의 핸들 비우기·get_handle 에포크 검사와 겹치는 방어라 다른 테스트로는
+    이 겹 하나만 빠진 것을 못 잡는다(감사 EQUIVALENT) — 여기서 단독으로 고정한다.
+    """
+    page = _ProbePage({"connected": True, "role": "button", "name": "로그인"})
+    result = await verify_staleness(page, make_handle(epoch=0), current_epoch=1)
+    assert result.fresh is False
+    assert result.reason is StalenessReason.EPOCH_MISMATCH
+    assert result.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert "0" in result.detail and "1" in result.detail
+    assert page.calls == 0, "에포크가 다르면 페이지를 다시 볼 필요도 없다"
+    same = await verify_staleness(page, make_handle(epoch=1), current_epoch=1)
+    assert same.fresh and same.reason is StalenessReason.FRESH  # 대조
+
+
+@pytest.mark.parametrize(
+    "probe,reason,observed",
+    [
+        ({"connected": True, "role": "button", "name": "회원 탈퇴"},
+         StalenessReason.NAME_CHANGED, ("button", "회원 탈퇴")),
+        ({"connected": True, "role": "checkbox", "name": "로그인"},
+         StalenessReason.ROLE_CHANGED, ("checkbox", "로그인")),
+        # 둘 다 바뀌면 role 이 먼저 보고된다(판정 순서 고정)
+        ({"connected": True, "role": "link", "name": "광고"},
+         StalenessReason.ROLE_CHANGED, ("link", "광고")),
+    ],
+    ids=["name", "role", "both"],
+)
+async def test_staleness_role_name_change_is_toctou(probe, reason, observed):
+    """V2·V3: 같은 css_path 에 연결된 노드라도 role/name 이 다르면 TOCTOU (광고 로테이션 방어)."""
+    result = await verify_staleness(_ProbePage(probe), make_handle(), current_epoch=0)
+    assert result.fresh is False
+    assert result.reason is reason
+    assert result.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert (result.observed_role, result.observed_name) == observed
+
+
+async def test_staleness_expected_overrides_handle():
+    """호출자의 expected_role/expected_name 이 핸들 값보다 우선한다."""
+    page = _ProbePage({"connected": True, "role": "button", "name": "로그인"})
+    r = await verify_staleness(page, make_handle(), 0, expected_name="로그아웃")
+    assert r.reason is StalenessReason.NAME_CHANGED
+    r = await verify_staleness(page, make_handle(), 0, expected_role="link")
+    assert r.reason is StalenessReason.ROLE_CHANGED
+    r = await verify_staleness(page, make_handle(), 0)
+    assert r.fresh and r.reason is StalenessReason.FRESH  # 대조
