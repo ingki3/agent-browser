@@ -112,6 +112,10 @@ def site():
                     self._send(403, CAPTCHA.format(js=js))
             elif self.path.startswith("/pay"):
                 self._send(200, PAY)
+            elif self.path.startswith("/late"):
+                self._send(200, "<!doctype html><meta charset=utf-8><title>late</title><p>wait</p>"
+                                "<script>setTimeout(()=>document.body.insertAdjacentHTML("
+                                "'beforeend','<p id=late>늦게</p>'),800)</script>")
             elif self.path.startswith("/form"):
                 self._send(200, "<!doctype html><meta charset=utf-8><title>폼</title>"
                                 "<input id=q aria-label='메모'>")
@@ -516,6 +520,53 @@ async def test_e_route_reinstall_failure_closes_browser(site, monkeypatch):
         assert out["ok"] is False and s._window.state == "failed"
         assert await _wait_no_procs(s._core.persistent_profile) == []
         await _egress_ok(s, call, site)  # 다음 호출이 복구하고, 가드도 다시 선다
+
+
+@requires_chromium
+async def test_e_switch_waits_for_inflight_call(site):
+    """전환은 진행 중인 도구 호출이 끝난 뒤에 브라우저를 닫는다(창 없이 headless→headless 로 고정)."""
+    async with BrowserMCPServer(browser_mode="on-demand") as s:
+        call = _inproc(s)
+        await call("browser_navigate", {"url": site.url + "/late"})
+        waiter = asyncio.ensure_future(call("browser_wait_for", {
+            "condition": "selector", "selector": "#late", "timeout_ms": 5000}))
+        await asyncio.sleep(0.1)
+        assert s._inflight == 1
+        out = await s._switch_window(False, "test", force=True)
+        r = await waiter
+        assert r["success"], r  # 브라우저가 호출 도중 닫히지 않았다
+        assert out["ok"] is True
+
+
+@requires_chromium
+async def test_e_cancelled_switch_is_fail_closed_then_recovers(site):
+    """전환 도중 취소(SIGTERM·클라이언트 취소) — 반쯤 열린 브라우저를 남기지 않고 failed 로, 다음 호출이 복구."""
+    async with BrowserMCPServer(browser_mode="on-demand") as s:
+        call = _inproc(s)
+        await call("browser_navigate", {"url": site.url + "/pay"})
+        path = s._core.persistent_profile
+        core = s._core
+        real = core.open_persistent
+        opening = asyncio.Event()
+
+        async def slow_open(*, headless=None):
+            opening.set()
+            return await real(headless=headless)
+
+        core.open_persistent = slow_open
+        task = asyncio.ensure_future(s._switch_window(False, "test", force=True))
+        await opening.wait()
+        await asyncio.sleep(0.05)  # 브라우저를 다시 여는 도중
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert s._window.state == "failed"
+        assert await _wait_no_procs(path) == []  # 고아 Chromium 0
+        core.open_persistent = real
+        nav = await call("browser_navigate", {"url": site.url + "/pay"})
+        assert nav["success"], nav
+        assert nav["data"]["window"]["recovered"] is True
+        await _egress_ok(s, call, site)
 
 
 @requires_chromium
