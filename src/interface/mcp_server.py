@@ -1302,7 +1302,8 @@ class BrowserMCPServer:
             mode=self.mode, pre_approved_actions=self.pre_approved_actions
         )
 
-    async def _wire_session(self, restore: Optional[List[Dict[str, Any]]] = None) -> tuple:
+    async def _wire_session(self, restore: Optional[List[Dict[str, Any]]] = None,
+                            cookies: Optional[List[Dict[str, Any]]] = None) -> tuple:
         """열린 브라우저에 서버 연결을 단다 — 처음 시작과 창 전환 뒤(WS-34)가 **같은 경로**.
 
         컨텍스트 채택 → 문서 상태 추적(PageDocumentStatus) → 첫 탭(about:blank)·CDP·디스패처 → Egress
@@ -1343,6 +1344,11 @@ class BrowserMCPServer:
         await self._egress.install(context)
         if self._window is not None:
             self._watch_context_close(context)
+        if cookies:
+            try:
+                await context.add_cookies(cookies)
+            except Exception:  # noqa: BLE001 - 세션 쿠키를 못 넣어도 전환은 계속(영속 쿠키는 남음)
+                logger.warning("세션 쿠키 복원 실패", exc_info=True)
         if restore is None:
             return [], 0
         return await self._restore_tabs(tab, restore)
@@ -1532,9 +1538,22 @@ class BrowserMCPServer:
             self._code_on_overlay = False
             self._code_where = None
         self._ctx_closed = False
+        # 세션 쿠키(만료 없음)는 Chromium 이 브라우저를 다시 열 때 버린다(WS-32 실측) — 이 서버가 이미
+        # 가진 세션 쿠키만 그대로 다시 넣는다(사이트가 준 값 그대로, 수명·값을 바꾸지 않음).
+        session_cookies = await self._session_cookies()
         await core.close_persistent()
         await core.open_persistent(headless=headless)
-        return await self._wire_session(restore=snapshot)
+        return await self._wire_session(restore=snapshot, cookies=session_cookies)
+
+    async def _session_cookies(self) -> List[Dict[str, Any]]:
+        ctx = self._core.context_for("mcp-session") if self._core is not None else None
+        if ctx is None or self._ctx_closed:
+            return []
+        try:
+            cookies = await ctx.cookies()
+        except Exception:  # noqa: BLE001 - 창이 이미 닫힘 등 — 영속 쿠키는 폴더에 남는다
+            return []
+        return [c for c in cookies if float(c.get("expires", -1) or -1) < 0]
 
     async def _fail_closed(self, reason: str, snapshot: List[Dict[str, Any]]) -> None:
         """전환 실패: 보호가 덜 걸렸을 수 있는 브라우저를 남기지 않는다(닫음). state=failed."""

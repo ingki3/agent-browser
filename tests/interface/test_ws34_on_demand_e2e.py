@@ -81,8 +81,9 @@ def site():
             n = int(self.headers.get("Content-Length") or 0)
             self.rfile.read(n)
             if self.path.startswith("/login"):
-                self._send(303, "", {"Location": "/shop",
-                                     "Set-Cookie": "auth=ok; Max-Age=86400; Path=/"})
+                # 영속 로그인 쿠키 + 세션 쿠키(만료 없음 — Chromium 은 재시작 때 버린다)
+                self._send(303, "", {"Location": "/shop", "Set-Cookie": [
+                    "auth=ok; Max-Age=86400; Path=/", "sess=ok; Path=/"]})
             elif self.path.startswith("/solve_strict"):
                 # 이 브라우저(UA) 에서 통과한 결과만 인정하는 사이트(HeadlessChrome 이면 다시 요구).
                 tag = _ua_tag(self.headers.get("User-Agent") or "")
@@ -261,6 +262,7 @@ async def test_b_handoff_opens_window_then_returns_headless(site):
         assert s._page.url.endswith("/shop")
         cookies = {c["name"]: c["value"] for c in await s._page.context.cookies()}
         assert cookies.get("auth") == "ok"  # 로그인 쿠키가 창으로 넘어왔다
+        assert cookies.get("sess") == "ok"  # 세션 쿠키도(다시 열 때 서버가 다시 넣음)
         await _egress_ok(s, call, site)  # (f) 창 쪽 브라우저도 같은 가드
         await call("browser_navigate", {"url": site.url + "/shop"})
 
@@ -282,6 +284,8 @@ async def test_b_handoff_opens_window_then_returns_headless(site):
         assert "3000원" in json.dumps(price["data"], ensure_ascii=False), price
         who = await call("browser_extract", {"selector": "#who"})
         assert "로그인됨" in json.dumps(who["data"], ensure_ascii=False)
+        cookies = {c["name"]: c["value"] for c in await s._page.context.cookies()}
+        assert cookies.get("sess") == "ok" and cookies.get("pass") == "1"
         st = await call("browser_control_status", {})
         assert st["data"]["window"]["state"] == "headless"
         await _egress_ok(s, call, site)  # (f) 복귀 뒤에도
