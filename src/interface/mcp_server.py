@@ -24,6 +24,7 @@ import os
 import signal
 import time
 import unicodedata
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from contracts import (
@@ -587,8 +588,22 @@ class BrowserMCPServer:
         block_loopback: bool = False,
         approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
         handoff_root: Any = None,
+        profile: Optional[str] = None,
     ) -> None:
         from interface.handoff import HandoffHub, state_root
+
+        #: 이름 붙인 영속 프로필(WS-32, serve --profile). None 이면 기존 동작(빈 컨텍스트).
+        if profile is not None:
+            from browser import serve_profile
+
+            serve_profile.validate_name(profile)
+            if browser_mode == "user-chrome":
+                raise ValueError(
+                    "--profile 과 --browser user-chrome 은 함께 쓸 수 없습니다 — user-chrome 은 "
+                    "이미 전용 영속 프로필(--chrome-profile)을 씁니다."
+                )
+        self.profile = profile
+        self._profile_lock: Any = None
 
         #: 사람 인계 통로(조작권·승인 증표, WS-29). 디스크 상태는 open_handoff() 에서 만든다.
         self.hub = HandoffHub(
@@ -662,6 +677,8 @@ class BrowserMCPServer:
         from browser import BrowserCore
         from security.egress_runtime import EgressRuntime
 
+        # WS-32: 영속 프로필이면 먼저 잠근다 — 다른 serve 가 쓰는 중이면 아무것도 띄우지 않고 거부.
+        persistent = self.acquire_profile()
         # WS-29b: 브라우저보다 검증 프록시를 먼저 띄운다 — 브라우저는 프록시로만 나간다.
         runtime = EgressRuntime(
             allowed_domains=self.allowed_domains,
@@ -669,19 +686,28 @@ class BrowserMCPServer:
             block_loopback=self.block_loopback,
             tokenless=self.browser_mode == "user-chrome",
         )
-        await runtime.start()
+        try:
+            await runtime.start()
+        except BaseException:
+            self.release_profile()
+            raise
         self._egress_runtime = runtime
         try:
+            core_kw: Dict[str, Any] = {}
+            if persistent is not None:
+                core_kw["persistent_profile"] = persistent
             core = BrowserCore(
                 headless=self.headless,
                 browser_mode=self.browser_mode,
                 chrome_profile=self.chrome_profile,
                 keep_open=self.keep_open,
                 egress=runtime,
+                **core_kw,
             )
             self._core = await core.start()
         except BaseException:
             await self._close_egress()
+            self.release_profile()
             raise
         try:
             await self._init_session()
@@ -695,12 +721,41 @@ class BrowserMCPServer:
                 logger.warning("시작 실패 뒤 브라우저 정리 실패", exc_info=True)
             self._core = None
             await self._close_egress()
+            self.release_profile()
             raise
         self._started = True
         self.open_handoff()
         logger.info(
             "MCP 브라우저 세션 시작 (mode=%s, browser=%s)", self.mode.value, self.browser_mode
         )
+
+    # -- 영속 프로필 (WS-32) ---------------------------------------------------
+
+    def acquire_profile(self) -> Optional[Path]:
+        """--profile 이면 프로필 폴더를 만들고(0700) 이 서버 id 로 잠근다. 폴더 경로를 돌려준다.
+
+        이미 잡았으면 그대로. 다른 serve(또는 Chromium)가 쓰는 중이면 ProfileInUseError —
+        사람이 읽을 이유(어느 서버 id)가 담긴다. --profile 이 없으면 None(기존 동작).
+        """
+        if self.profile is None:
+            return None
+        if self._profile_lock is not None and self._profile_lock.held:
+            return self._profile_lock.path
+        from browser import serve_profile
+
+        self._profile_lock = serve_profile.acquire(self.profile, server_id=self.hub.server_id)
+        return self._profile_lock.path
+
+    def release_profile(self) -> None:
+        lock, self._profile_lock = self._profile_lock, None
+        if lock is not None:
+            lock.release()
+
+    def _profile_info(self) -> Optional[Dict[str, Any]]:
+        """에이전트에게 보이는 프로필 상태 — 이름만(경로는 넣지 않는다)."""
+        if self.profile is None:
+            return None
+        return {"name": self.profile, "persistent": True}
 
     # -- 사람 인계 통로 (WS-29) -------------------------------------------------
 
@@ -951,6 +1006,8 @@ class BrowserMCPServer:
         short = name[len(TOOL_PREFIX):]
         if short == "control_status":
             data: Dict[str, Any] = {"control": self.hub.status()}
+            if self.profile is not None:
+                data["profile"] = self._profile_info()
             if self._tab_notice is not None:
                 data["tab_closed_by_human"] = self._tab_notice
             return {"success": True, "data": data}
@@ -968,14 +1025,24 @@ class BrowserMCPServer:
                     "error_message": "reason 이 필요합니다."}
         if not self._human_can_see():
             # 사람이 볼 창이 없다 — 운영자가 창 보이는 방식으로 띄워야 한다(우회 아님).
+            message = (
+                "headless 서버라 사람이 볼 창이 없습니다. 운영자에게 `agent-browser serve "
+                "--browser human` 또는 `--browser user-chrome` 으로 다시 띄우도록 요청하세요."
+            )
+            data: Dict[str, Any] = {"control": self.hub.status(), "browser_mode": self.browser_mode}
+            if self.profile is not None:
+                # WS-32: 영속 프로필이면 창 있는 서버로 한 번 로그인해 두면 headless 에서도 유지된다.
+                message += (
+                    f" 이 서버는 영속 프로필 {self.profile!r} 을 씁니다 — 운영자가 이 서버를 끝내고 "
+                    f"`agent-browser serve --browser human --profile {self.profile}` 으로 한 번 "
+                    "로그인하면 이후 headless 에서도 로그인이 유지됩니다."
+                )
+                data["profile"] = self._profile_info()
             return {
                 "success": False,
                 "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
-                "error_message": (
-                    "headless 서버라 사람이 볼 창이 없습니다. 운영자에게 `agent-browser serve "
-                    "--browser human` 또는 `--browser user-chrome` 으로 다시 띄우도록 요청하세요."
-                ),
-                "data": {"control": self.hub.status(), "browser_mode": self.browser_mode},
+                "error_message": message,
+                "data": data,
             }
         if not self._started:
             await self.start()
@@ -1081,6 +1148,8 @@ class BrowserMCPServer:
                 await self._core.close()
             await self._close_egress()
         finally:
+            # 브라우저(영속 컨텍스트)를 닫은 뒤에 잠금을 푼다 — 닫히기 전에 다른 serve 가 잡지 않게.
+            self.release_profile()
             self.hub.close()  # 상태 디렉터리 정리(사람 CLI 가 죽은 서버를 고르지 않게)
             self._started = False
 
@@ -1702,6 +1771,7 @@ def create_server(
     allow_private_network: bool = False,
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
+    profile: Optional[str] = None,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -1725,6 +1795,7 @@ def create_server(
         allow_private_network=allow_private_network,
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
+        profile=profile,
     )
 
     def _build_tools() -> List[Tool]:
@@ -1807,10 +1878,13 @@ async def run_stdio(
     allow_private_network: bool = False,
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
+    profile: Optional[str] = None,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
     stdout 은 MCP 프로토콜 전용이다 — 시작 로그는 stderr 로 한 줄만 쓴다.
+    profile(WS-32): 영속 프로필 이름. MCP 를 열기 전에 잠근다 — 다른 serve 가 쓰는 중이면
+    serve_profile.ProfileInUseError 를 올린다(CLI 가 stderr 한 줄 + exit 2).
     """
     import sys
 
@@ -1837,12 +1911,23 @@ async def run_stdio(
         allow_private_network=allow_private_network,
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
+        **({"profile": profile} if profile is not None else {}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None
+    if profile is not None:
+        # WS-32: 브라우저는 첫 툴 호출 때 뜨지만 잠금은 지금 잡는다 — 동시 사용이면 바로 실패.
+        try:
+            backend.acquire_profile()
+        except BaseException:
+            if hasattr(backend, "hub"):
+                backend.hub.close()
+            raise
     extra = ""
     if browser_mode == "user-chrome":
         extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
+    if profile is not None:
+        extra += f" profile={profile}(영속)"
     extra += (
         f" egress(loopback={'blocked' if block_loopback else 'allowed'},"
         f" private={'allowed' if allow_private_network else 'blocked'})"

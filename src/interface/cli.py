@@ -3,13 +3,14 @@
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
-                          [--allow-private-network] [--block-loopback]
+                          [--allow-private-network] [--block-loopback] [--profile NAME]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
     agent-browser run --url <주소> --goal <목표> [--human|--user-chrome] [--handoff]  # 목표 1개 실행
     agent-browser control take|release|status [--server ID]   # 사람: serve 의 조작권 (WS-29)
     agent-browser approve <approval_id> [--server ID] [--code N|--deny]  # 사람: 고위험 행동 승인(창의 확인 코드)
+    agent-browser profile list|remove NAME [--yes]     # serve --profile 영속 프로필 관리 (WS-32)
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -135,6 +136,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SEC",
         help="고위험 행동 승인 증표 수명(초, 기본 1800). 사람이 `agent-browser approve` 로 승인.",
     )
+    serve.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME",
+        help=(
+            "이름 붙인 영속 프로필로 시작(로그인 유지, WS-32). 폴더 ~/.agent-browser/profiles/"
+            "serve-NAME(권한 700). NAME 은 영문 소문자·숫자·하이픈 1~32자. 미지정 시 매번 빈 브라우저. "
+            "--browser human 으로 한 번 로그인하면 이후 headless 에서도 유지."
+        ),
+    )
 
     # --- control / approve (WS-29: 사람 쪽 신호 통로) ---
     control = sub.add_parser("control", help="사람: 실행 중인 serve 의 조작권을 가져오거나 돌려줍니다.")
@@ -150,6 +161,11 @@ def _build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--yes", action="store_true",
                          help="(호환용) 코드를 대신하지 못함 — 승인에는 --code 가 필요")
     approve.add_argument("--deny", action="store_true", help="승인하지 않고 거절로 기록")
+
+    # --- profile (WS-32) ---
+    from interface import profile_cli
+
+    profile_cli.add_parser(sub)
 
     # --- tui ---
     tui = sub.add_parser("tui", help="Textual 대시보드를 실행합니다.")
@@ -294,6 +310,7 @@ def _cmd_tools(as_json: bool) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
+    from browser.serve_profile import ProfileError, ProfileInUseError
     from interface.mcp_server import run_stdio
 
     try:
@@ -319,10 +336,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 allow_private_network=bool(args.allow_private_network),
                 block_loopback=bool(args.block_loopback),
                 **({"approval_ttl_s": args.approval_ttl} if args.approval_ttl else {}),
+                profile=args.profile,
             )
         )
     except KeyboardInterrupt:
         return 130
+    except (ProfileInUseError, ProfileError) as exc:
+        # R1 NB-2: 폴더·잠금 준비 실패(심볼릭 링크·권한 등)도 traceback 대신 한 줄 + exit 2.
+        # 잠금을 못 잡았으니 서버는 뜨지 않았다(fail-closed).
+        print(f"agent-browser serve: 오류: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -395,9 +418,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                if args.chrome_profile else DEFAULT_PROFILE_DIR)
             except ValueError as exc:
                 parser.exit(2, f"agent-browser serve: 오류: {exc}\n")
+        if args.profile is not None:
+            if args.browser == "user-chrome":
+                parser.exit(2, "agent-browser serve: 오류: --profile 과 --browser user-chrome 은 "
+                               "함께 쓸 수 없습니다 — user-chrome 은 이미 전용 영속 프로필"
+                               "(--chrome-profile)을 씁니다. 둘 중 하나만 쓰세요.\n")
+            from browser.serve_profile import ProfileError, profile_dir
+
+            try:
+                profile_dir(args.profile)  # 이름·위치 검사(경로 탈출·평소 Chrome 프로필 거부)
+            except ProfileError as exc:
+                parser.exit(2, f"agent-browser serve: 오류: {exc}\n")
         return _cmd_serve(args)
     if args.command == "tui":
         return _cmd_tui(args)
+    if args.command == "profile":
+        from interface import profile_cli
+
+        return profile_cli.run(args)
     if args.command == "control":
         from interface import handoff
 
