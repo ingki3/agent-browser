@@ -1,7 +1,7 @@
 """CLI 진입점 (PRD §3.3 실행 모드).
 
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
-                          [--browser {headless,human,user-chrome}] [--chrome-profile] [--keep-open]
+                          [--browser {headless,human,user-chrome,on-demand}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
                           [--allow-private-network] [--block-loopback] [--profile NAME]
     agent-browser tui     [--mode]                     # Textual 대시보드
@@ -76,11 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--browser",
-        choices=["headless", "human", "user-chrome"],
+        choices=["headless", "human", "user-chrome", "on-demand"],
         default="headless",
         help=(
-            "브라우저 방식 (기본 headless). human: 창 보이는 Chromium(위장 없음). "
-            "user-chrome: 설치된 Chrome 을 전용 프로필로 띄워 붙음(차단 사이트용)."
+            "브라우저 방식 (기본 headless). human: 창 보이는 Chromium(위장 없음, 디버그용 상시 창). "
+            "user-chrome: 설치된 Chrome 을 전용 프로필로 띄워 붙음(차단 사이트용). "
+            "on-demand: 평소 headless, 사람 인계(control_request)·승인 코드 때만 창(WS-34)."
         ),
     )
     serve.add_argument(
