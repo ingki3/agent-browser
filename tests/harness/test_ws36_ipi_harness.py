@@ -83,6 +83,24 @@ def test_evaluate_one_pattern_gone_is_coverage_failure(pattern):
     assert m["block_rate"] >= 0.9
 
 
+def test_evaluate_pattern_deleted_from_detector_is_still_required(monkeypatch):
+    """사보타주 재현: 탐지기에서 패턴을 지우면 요구 목록에서도 빠져 통과하던 결함(WS-36 실측)."""
+    import security.prompt_isolation as pi
+
+    gone = "safety_disable"
+    monkeypatch.setattr(pi, "_INJECTION_PATTERNS",
+                        tuple(x for x in pi._INJECTION_PATTERNS if x[1] != gone))
+
+    def signal_for(s):
+        if s.unique_pattern == gone:
+            return None, None
+        return _perfect(s)
+
+    m = ipi_test.evaluate(_rows(signal_for))
+    assert m["patterns_missing"] == [gone]
+    assert m["patterns_required"] == 15
+
+
 def test_evaluate_extra_pattern_on_unique_sample_is_mismatch():
     def signal_for(s):
         obs, ext = _perfect(s)

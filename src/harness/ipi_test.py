@@ -310,7 +310,9 @@ def evaluate(measured: Dict[str, Any]) -> Dict[str, Any]:
 
     from security.prompt_isolation import _INJECTION_PATTERNS
 
-    required = [name for _, name in _INJECTION_PATTERNS]
+    # 요구 패턴 = 하네스 고유 표본의 패턴(고정) ∪ 탐지기의 현재 패턴. 탐지기 목록만 쓰면 패턴을
+    # 지웠을 때 요구 목록에서도 빠져 커버리지가 통과한다(사보타주로 실측 — WS-36).
+    required = sorted({p for _, p in UNIQUE_ATTACK_CASES} | {name for _, name in _INJECTION_PATTERNS})
     return {
         "block_rate": round(len(detected) / attack_n, 4) if attack_n else 0.0,
         "fpr": round(len(false_positives) / benign_n, 4) if benign_n else 0.0,
