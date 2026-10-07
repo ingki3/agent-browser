@@ -395,7 +395,7 @@ Chromium 은 같은 브라우저를 headless ↔ 창 있음으로 바꿀 수 없
 2. **창 닫기** — 사람이 `control release` 하면 마지막으로 보던 탭 URL 로 headless 를 다시 열고 `browser_control_wait`(또는 그다음 도구 결과)의 `data.window = {state: "headless", reopened: true, …, hint: "… 다시 관찰하세요"}`로 알립니다. 사람이 take 하지 않은 채 요청이 10분 지나면 요청을 거두고 창도 닫습니다. 사람이 창을 직접 닫으면(X) 조작권을 에이전트에게 돌리고 headless 로 다시 열어 `data.window.notice = {reason: "window_closed"}`로 알립니다.
 3. **sticky** — headless 로 돌아온 뒤, 창에서 해결했던 사이트(등록 가능 도메인 — `shop.example.com` 과 `www.example.com` 은 같은 사이트)에서 차단/캡차(`data.challenge`)가 다시 보이면 그 결과에 `data.window.sticky_pending = {domain, kind, detected_at}`와 "사람을 다시 부르라"는 안내가 붙습니다. 다음 `browser_control_request` 때 창을 열고 **그 서버 수명 동안 창을 유지**합니다(`window.sticky: true, sticky_reason`). 서버를 다시 시작하면 초기화됩니다. 사람은 `agent-browser control status`에서 `window=… sticky=…`로 봅니다.
 4. **승인 코드 창** — headless 상태에서 `agent-browser approve`로 코드가 필요하면, 페이지는 headless 그대로 두고 **별도의 작은 창**(별도 Chromium 프로세스 — 에이전트 탭 목록·영속 프로필에 없음, 스크립트 끔, 네트워크 전부 차단, 로컬 내용만)에 승인 내용(액션·대상·문서 출처·승인 만료)과 6자리 코드를 띄웁니다. 페이지를 다시 열지 않으므로 승인 뒤 같은 인자 + `approval_id` 재호출이 **문서 해시 일치로 그대로 실행**됩니다. 코드를 입력·거절·만료하면 창을 닫습니다. 창을 띄우지 못하면 코드를 무효로 하고 승인할 수 없다고 알립니다(fail-closed). 이미 창이 열린 상태(인계 중·sticky)면 기존처럼 그 창 오버레이에 띄웁니다. 코드가 떠 있는 동안 화면 캡처 거부는 그대로입니다(방어 겹침).
-5. **실패하면 닫는다** — 다시 열기·route 재설치가 실패하거나 전환 중 서버가 신호로 끝나면, 보호가 덜 걸렸을 수 있는 브라우저를 남기지 않고 닫습니다(`data.window.state: "failed"`). 다음 도구 호출이 headless 로 다시 열고 결과에 `data.window.recovered: true`를 붙입니다. 탭 하나의 복원 실패는 그 탭만 `restored: false`(이유)로 알립니다.
+5. **실패하면 닫는다** — 검증 프록시가 실행 중이 아니거나, 다시 열기·route 재설치가 실패하거나 전환 중 서버가 신호로 끝나면, 보호가 덜 걸렸을 수 있는 브라우저를 남기지 않고 닫습니다(`data.window.state: "failed"`). 다음 도구 호출이 headless 로 다시 열고 결과에 `data.window.recovered: true`를 붙입니다. 탭 하나의 복원 실패는 그 탭만 `restored: false`(이유)로 알립니다.
 
 **무엇이 유지되고 사라지나**(로컬 Mock 실측, `.hermes/state/ws34/probe_perf.py`):
 
@@ -408,7 +408,7 @@ Chromium 은 같은 브라우저를 headless ↔ 창 있음으로 바꿀 수 없
 | `element_id`·`tab_id` | 무효(`snapshot_epoch` 증가, 새 tab_id 는 `window.tabs[].tab_id`) |
 | 전환 시간 p50 | headless→창 약 0.6초, 창→headless 약 0.3초(탭 3개 복원) |
 
-**한계.** ① headless 는 UA 에 `HeadlessChrome`을 싣고 우리는 UA 를 바꾸지 않습니다(위장 금지) — 사이트가 창에서 통과한 결과를 headless 에서 인정하지 않고 캡차를 다시 요구할 수 있습니다(그래서 sticky). ② 전환은 **페이지를 다시 여는 것**입니다 — POST 결과 화면·입력 중인 폼·SPA 메모리 상태는 사라지고 GET 으로 다시 불러옵니다. 창을 열기 전에 입력을 끝내거나 사람에게 맡기십시오. ③ 등록 가능 도메인은 흔한 2단계 접미사(`co.kr`·`co.uk` 등)만 아는 근사입니다. ④ 같은 OS 사용자로 셸을 쓰는 에이전트에 대한 한계(승인 절 ①)는 별도 창에서도 같습니다.
+**한계.** ① headless 는 UA 에 `HeadlessChrome`을 싣고 우리는 UA 를 바꾸지 않습니다(위장 금지) — 사이트가 창에서 통과한 결과를 headless 에서 인정하지 않고 캡차를 다시 요구할 수 있습니다(그래서 sticky). ② 전환은 **페이지를 다시 여는 것**입니다 — POST 결과 화면·입력 중인 폼·SPA 메모리 상태는 사라지고 GET 으로 다시 불러옵니다. 창을 열기 전에 입력을 끝내거나 사람에게 맡기십시오. ③ 등록 가능 도메인은 흔한 2단계 접미사(`co.kr`·`co.uk` 등)만 아는 근사입니다. ④ 같은 OS 사용자로 셸을 쓰는 에이전트에 대한 한계(승인 절 ①)는 별도 창에서도 같습니다. ⑤ 창 있는 Chromium 은 시작 직후 브라우저 자체의 Google 배경 요청(계정 조정기 ListAccounts·GCM checkin·네트워크 시각·검색 사전 연결·AI 모드 자격 조회)을 보냅니다(영속 프로필 창: on-demand 전환·`human --profile`). 비영속 `human`(프로필 없음)은 계정·GCM 요청은 없고 `www.google.com`(검색 사전 연결·AI 모드 자격) 1건을 보내며, 이 경로는 아직 끄지 않습니다(정책 안에서 프록시가 판정). 영속 프로필로 띄우는 모든 경로(on-demand headless·창, `--profile`)의 실행 인자에서 끕니다(기능 끔, 계정·GCM 엔드포인트는 닿지 않는 루프백) — 차단 프록시 실측 외부 호스트 0건. 위장 인자는 없습니다. ⑥ 사람이 승인 코드 창을 닫으면 그 코드는 무효입니다 — `agent-browser approve` 를 다시 실행하면 새 창·새 코드가 뜹니다. 코드 창·오버레이의 대상 칸은 "(사이트가 붙인 이름)" 표기 뒤에 보이며 그 안의 6자리 이상 숫자열은 `••••••` 로 가립니다.
 
 ---
 

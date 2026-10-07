@@ -380,6 +380,16 @@ def envelope_json(result: ActionResult) -> str:
 
 
 from interface.handoff import DEFAULT_APPROVAL_TTL_S, WAIT_DEFAULT_S, WAIT_MAX_S  # noqa: E402
+from interface.handoff import SITE_NAME_LABEL  # noqa: E402
+
+
+def code_overlay_text(code: str, kind: str, target: str, ttl_s: int) -> str:
+    """창 오버레이에 띄우는 확인 코드 문구. target 은 사이트가 붙인 이름(살균된 것) — 6자리 이상 숫자열은
+    여기서도 가린다(R1 NB-4)."""
+    from interface.handoff import mask_code_like
+
+    return (f"agent-browser 승인 확인 코드 {code}  (액션: {kind}, 대상: {SITE_NAME_LABEL} "
+            f"{mask_code_like(target)}, {int(ttl_s)}초) — 터미널의 approve 화면과 대조해 입력")
 
 #: WS-29 R2: 확인 코드를 띄우기 전, 이미 진행 중인 화면 캡처가 끝나길 기다리는 상한(초). 넘으면
 #: 표시를 취소한다(코드 무효 — fail-closed). 무거운 페이지 SoM 캡처 실측 수백 ms 의 10배 이상.
@@ -633,6 +643,8 @@ class BrowserMCPServer:
         self._ctx_closed = False
         #: 승인 확인 코드 별도 창(D1)과 코드가 떠 있는 곳("window"|"overlay").
         self._code_window: Any = None
+        #: R1 NB-5: 진행 중인 wait_for 호출(창 전환이 취소해 E_TIMEOUT 으로 끝낸다).
+        self._wait_calls: "set[asyncio.Task]" = set()
         self._code_where: Optional[str] = None
 
         #: 사람 인계 통로(조작권·승인 증표, WS-29). 디스크 상태는 open_handoff() 에서 만든다.
@@ -786,6 +798,8 @@ class BrowserMCPServer:
             return self._profile_lock.path
         from browser import serve_profile
 
+        # R1 NB-6: --profile 서버도 비정상 종료로 남은 임시 프로필(잠금 풀린 것만)을 지운다.
+        serve_profile.cleanup_ephemeral()
         self._profile_lock = serve_profile.acquire(self.profile, server_id=self.hub.server_id)
         return self._profile_lock.path
 
@@ -885,10 +899,11 @@ class BrowserMCPServer:
             shown = False
             busy = False
             if self._human_can_see():
-                from interface.handoff import CODE_TTL_S, display_safe
+                from interface.handoff import CODE_TTL_S, display_safe, mask_code_like
 
                 ap = self.hub.approvals.get(job.approval_id)
-                target = display_safe((ap.summary or {}).get("target", "") if ap else "", 40)
+                raw_target = (ap.summary or {}).get("target", "") if ap else ""
+                target = display_safe(mask_code_like(str(raw_target or "")), 40)
                 kind = display_safe((ap.components or {}).get("action", "") if ap else "", 20)
                 # (a) 표시 예정: 표시 시도 전에 켠다 — 새 화면 캡처는 이때부터 거부(fail-closed).
                 self._code_on_overlay = True
@@ -903,13 +918,17 @@ class BrowserMCPServer:
                     else:
                         self._code_where = "overlay"
                         shown = bool(await self._set_banner(
-                            f"agent-browser 승인 확인 코드 {job.code}  (액션: {kind}, 대상: {target}, "
-                            f"{int(CODE_TTL_S)}초) — 터미널의 approve 화면과 대조해 입력"))
+                            code_overlay_text(job.code, kind, target, int(CODE_TTL_S))))
                 else:
                     busy = True
                     logger.warning("진행 중 화면 캡처가 끝나지 않아 확인 코드 표시를 취소함")
             self.hub.code_shown(job.nonce, shown, reason="capture_busy" if busy else None)
             del job  # 평문을 붙잡지 않는다
+        if (self._code_on_overlay and self._code_where == "window" and self._code_window is not None
+                and self._code_window.closed_externally):
+            # R1 NB-3: 사람이 별도 코드 창을 닫았다 — 창에 없는 코드는 무효(오버레이 탭이 닫힐 때와 같은
+            # 원칙). 아래에서 캡처 거부를 푼다. 사람은 approve 를 다시 실행해 새 창·새 코드를 받는다.
+            self.hub.withdraw_codes()
         if self._code_on_overlay and not self.hub.code_displayed():
             if self._code_where == "window":
                 # 별도 창을 닫았음이 확인돼야 화면 캡처 거부를 푼다(fail-closed).
@@ -1427,9 +1446,16 @@ class BrowserMCPServer:
 
         limit = on_demand.DRAIN_TIMEOUT_S if timeout is None else timeout
         deadline = time.monotonic() + limit
+        # R1 NB-5: wait_for 는 timeout_ms 상한이 없다 — 잠깐(WAIT_CANCEL_AFTER_S, 상한의 절반 이하) 기다려도
+        # 남아 있으면 멈춘다(E_TIMEOUT 결과로 돌아감). 다른 호출은 지금처럼 끝나길 기다린다.
+        cancel_at = time.monotonic() + min(on_demand.WAIT_CANCEL_AFTER_S, limit / 2)
         while self._inflight > 0:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 return False
+            if now >= cancel_at:
+                for task in list(self._wait_calls):
+                    task.cancel()
             await asyncio.sleep(0.01)
         return True
 
@@ -1531,6 +1557,9 @@ class BrowserMCPServer:
 
     async def _reopen_browser(self, headless: bool, snapshot: List[Dict[str, Any]]) -> tuple:
         core = self._core
+        # R1 NB-2: 다시 열 실행 인자를 먼저 만든다 — 검증 프록시가 실제로 듣고 있지 않으면 여기서
+        # 예외(전환하지 않음 → _switch_window 가 fail-closed: 브라우저 닫고 state=failed + 이유).
+        core._launch_kwargs()
         # 창을 닫으면 그 창의 오버레이(확인 코드·안내 띠)도 함께 사라진다 — 창에 없는 코드는 무효.
         self._banner = None
         if self._code_where == "overlay":
@@ -1604,6 +1633,9 @@ class BrowserMCPServer:
 
         w = self._window
         if w is None or w.state != "headed" or self._switch_lock.locked() or self._core is None:
+            return
+        if self._gate_holds > 0:
+            # R1 NB-5: 이미 시작한 전환(태스크가 아직 첫 틱 전)이 있다 — 다시 판정·spawn 하지 않는다.
             return
         tabs = self._core.tabs()
         if tabs and not self._ctx_closed:
@@ -1726,7 +1758,10 @@ class BrowserMCPServer:
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
         try:
-            result = await self._call_tool(name, arguments, capture)
+            if self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
+                result = await self._call_wait_tool(name, arguments, capture)
+            else:
+                result = await self._call_tool(name, arguments, capture)
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
@@ -1736,6 +1771,34 @@ class BrowserMCPServer:
             self._inflight -= 1
             if capture:
                 self._captures_inflight -= 1
+
+    async def _call_wait_tool(self, name: str, arguments: Dict[str, Any],
+                              capture: Dict[str, Any]) -> ActionResult:
+        """on-demand 의 wait_for — 창 전환이 시작되면 대기를 끝내고 E_TIMEOUT 으로 돌려준다(R1 NB-5).
+
+        wait_for 의 timeout_ms 는 상한이 없어 전환이 진행 중 호출을 기다리는 상한(DRAIN_TIMEOUT_S)보다 길 수
+        있다 — 긴 대기 때문에 사람 호출(control_request)이 실패하지 않게, 전환(_drain_calls)이 이 대기를
+        취소한다. 바깥 취소(클라이언트 취소·종료)는 그대로 올린다.
+        """
+        task = asyncio.get_running_loop().create_task(self._call_tool(name, arguments, capture))
+        self._wait_calls.add(task)
+        try:
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            if task.cancelled():
+                w = self._window
+                return self._error_result(
+                    ActionType.WAIT_FOR, ErrorCode.TIMEOUT,
+                    "브라우저 창 전환(사람 호출 등) 때문에 대기를 멈췄습니다 — 전환 뒤 다시 관찰하고 "
+                    "필요하면 다시 기다리세요.",
+                    data={"window": w.info() if w is not None else {}},
+                )
+            return task.result()
+        finally:
+            self._wait_calls.discard(task)
 
     async def _call_tool(self, name: str, arguments: Dict[str, Any],
                          capture: Dict[str, Any]) -> ActionResult:

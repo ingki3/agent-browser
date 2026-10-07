@@ -59,6 +59,46 @@ class ManagedContext:
 #: 브라우저 방식 (WS-27). serve --browser 와 같은 이름.
 BROWSER_MODES = ("headless", "human", "user-chrome")
 
+#: Playwright(1.62) 가 기본으로 주는 --disable-features 목록. Chromium 은 --disable-features 가 여러 번
+#: 오면 **마지막 것만** 쓴다(실측: chrome://version 변형 명령줄) — 우리 값을 따로 주면 이 목록이 되살아나므로
+#: 합쳐서 한 번만 준다. Playwright 를 올리면 tests/browser/test_ws34_r1_background_network.py 가 차이를 잡는다.
+_PLAYWRIGHT_DISABLED_FEATURES = (
+    "AvoidUnnecessaryBeforeUnloadCheckSync", "BoundaryEventDispatchTracksNodeRemoval",
+    "DestroyProfileOnBrowserClose", "DialMediaRouteProvider", "GlobalMediaControls", "HttpsUpgrades",
+    "LensOverlay", "MediaRouter", "PaintHolding", "ThirdPartyStoragePartitioning",
+    "BlockOriginHeaderModificationOnRedirect", "Translate", "AutoDeElevate", "OptimizationHints",
+    "msForceBrowserSignIn", "msEdgeUpdateLaunchServicesPreferredVersion",
+)
+#: WS-34 R1 NB-1: 창 있는 Chromium 이 시작 직후 보내는 배경 요청을 끄는 기능(트래픽 주석으로 확정).
+_BACKGROUND_OFF_FEATURES = (
+    "NetworkTimeServiceQuerying",  # network_time_component: clients2.google.com/time
+    "PreconnectToSearch", "PreconnectToSearchDesktop",  # www.google.com 사전 연결
+    # aim_eligibility_fetch: www.google.com/async/folae (AI 모드 자격 조회)
+    "AimEligibilityService", "AimEnabled", "AimServerEligibility",
+    "AimEligibilityServiceStartWithProfile",
+)
+#: 끌 기능 스위치가 없는 브라우저 내부 Google 엔드포인트는 닿지 않는 루프백 포트로 둔다(discard 9).
+_DEAD_ENDPOINT = "127.0.0.1:9"
+
+
+def background_network_off_args() -> List[str]:
+    """브라우저 자체의 Google 배경 접속을 끄는 Chromium 실행 인자(WS-34 R1 NB-1).
+
+    * 계정 일관성(Dice) 조정기 ListAccounts → --gaia-url 을 닿지 않는 루프백으로(브라우저 로그인 연동만
+      꺼짐 — 웹 페이지의 Google 로그인은 일반 쿠키로 그대로 동작).
+    * GCM checkin·MCS(android.clients.google.com·mtalk.google.com:5228) → GCM 엔드포인트를 루프백으로.
+    * 네트워크 시각·검색 사전 연결·AI 모드 자격 조회 → 기능 끔.
+    위장·자동화 숨김 성격의 인자는 없다(배경 네트워크만).
+    """
+    feats = ",".join(_PLAYWRIGHT_DISABLED_FEATURES + _BACKGROUND_OFF_FEATURES)
+    return [
+        f"--disable-features={feats}",
+        f"--gaia-url=http://{_DEAD_ENDPOINT}",
+        f"--gcm-checkin-url=http://{_DEAD_ENDPOINT}/checkin",
+        f"--gcm-registration-url=http://{_DEAD_ENDPOINT}/register",
+        f"--gcm-mcs-endpoint=https://{_DEAD_ENDPOINT}",
+    ]
+
 
 class BrowserCore:
     """Playwright 기반 브라우저 수명주기 관리자."""
@@ -172,10 +212,14 @@ class BrowserCore:
         return self
 
     def _launch_kwargs(self) -> Dict[str, Any]:
-        """chromium.launch / launch_persistent_context 공통 실행 인자(headless + egress)."""
+        """chromium.launch / launch_persistent_context 공통 실행 인자(headless + egress, 영속이면 배경 접속 끔)."""
         launch_kw: Dict[str, Any] = {"headless": self.headless}
         if self.egress is not None:
             launch_kw.update(self.egress.launch_kwargs())
+        if self.is_persistent:
+            # R1 NB-1: 영속 프로필(일반 프로필로 열림 — 계정 조정기·GCM 이 돎)로 띄우는 모든 경로
+            # (on-demand headless·창, human --profile, headless --profile)에 공통.
+            launch_kw["args"] = list(launch_kw.get("args") or []) + background_network_off_args()
         return launch_kw
 
     async def open_persistent(self, *, headless: Optional[bool] = None) -> Any:

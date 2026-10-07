@@ -42,8 +42,15 @@ def _launch_args() -> list:
 
 def render_html(*, action: str, target: str, origin: str, expires_at: str, code: str,
                 ttl_s: int) -> str:
-    """창 내용(정적 HTML). 인자는 이미 display_safe 를 거친 문자열이어야 한다."""
+    """창 내용(정적 HTML). 인자는 이미 display_safe 를 거친 문자열이어야 한다.
+
+    R1 NB-4: 대상(사이트가 붙인 이름)은 "(사이트가 붙인 이름)" 표기 뒤에, 6자리 이상 숫자열은 가려서 —
+    진짜 코드는 #code 칸에만 큰 글씨로.
+    """
+    from interface.handoff import SITE_NAME_LABEL, mask_code_like
+
     e = html.escape
+    target = f"{SITE_NAME_LABEL} {mask_code_like(target)}"
     spaced = " ".join(code)
     return (
         "<!doctype html><html lang=ko><head><meta charset=utf-8>"
@@ -71,6 +78,8 @@ class ApprovalCodeWindow:
         self._browser: Any = None
         self._context: Any = None
         self.page: Any = None
+        #: 띄우기를 마친 창이 있다(show 성공 뒤 close 전) — 띄우는 중에는 False.
+        self._shown = False
 
     @property
     def is_open(self) -> bool:
@@ -80,6 +89,14 @@ class ApprovalCodeWindow:
             return bool(self._browser.is_connected()) and not self.page.is_closed()
         except Exception:  # noqa: BLE001
             return False
+
+    @property
+    def closed_externally(self) -> bool:
+        """띄워 둔 창이 우리 close() 없이 사라졌다(사람이 창을 닫음·브라우저 종료) — R1 NB-3.
+
+        띄우는 중(show 진행 중)은 False — 아직 열리지 않은 창을 닫힌 것으로 보지 않는다.
+        """
+        return self._shown and not self.is_open
 
     async def _launch(self, playwright: Any) -> Any:
         return await playwright.chromium.launch(headless=False, args=_launch_args())
@@ -110,6 +127,7 @@ class ApprovalCodeWindow:
                 await self.page.bring_to_front()
             except Exception:  # noqa: BLE001
                 pass
+            self._shown = True
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("승인 코드 창을 띄우지 못함: %s", type(exc).__name__)
@@ -119,6 +137,7 @@ class ApprovalCodeWindow:
     async def close(self) -> bool:
         """창을 닫는다. 닫았거나 원래 없으면 True."""
         browser, self._browser = self._browser, None
+        self._shown = False
         self._context = None
         self.page = None
         if browser is None:

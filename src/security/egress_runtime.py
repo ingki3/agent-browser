@@ -60,15 +60,24 @@ class EgressRuntime:
 
     # -- 브라우저 인자 ---------------------------------------------------------
 
+    def _live_proxy(self) -> Any:
+        """실제로 듣고 있는 프록시 — 아니면 RuntimeError(WS-34 R1 NB-2: 죽은 프록시로 브라우저를 띄우지 않는다).
+
+        assert 가 아니라 예외: -O 로 꺼지지 않는다. 부르는 쪽(창 전환)은 이 예외로 fail-closed 한다.
+        """
+        proxy = self.proxy
+        if proxy is None or not proxy.running:
+            raise RuntimeError("검증 프록시가 실행 중이 아닙니다 — 브라우저를 열지 않습니다")
+        return proxy
+
     def launch_kwargs(self) -> Dict[str, Any]:
         """chromium.launch(**) 에 더할 인자(Playwright 번들 Chromium)."""
-        assert self.proxy is not None, "start() 먼저"
-        return {"proxy": self.proxy.playwright_proxy(), "args": chromium_proxy_args()}
+        proxy = self._live_proxy()
+        return {"proxy": proxy.playwright_proxy(), "args": chromium_proxy_args()}
 
     def chrome_args(self) -> List[str]:
         """우리가 Popen 으로 띄우는 Chrome(user-chrome) 명령줄 인자."""
-        assert self.proxy is not None, "start() 먼저"
-        return self.proxy.chrome_args()
+        return self._live_proxy().chrome_args()
 
     async def install(self, context: Any) -> None:
         await self.guard.install(context)

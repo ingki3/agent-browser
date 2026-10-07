@@ -28,6 +28,9 @@ ON_DEMAND = "on-demand"
 SWITCH_WAIT_S = 30.0
 #: 전환이 진행 중인 도구 호출이 끝나길 기다리는 상한(초). 넘으면 전환하지 않는다(브라우저 그대로).
 DRAIN_TIMEOUT_S = 30.0
+#: 전환이 진행 중인 wait_for 를 이만큼(초, DRAIN_TIMEOUT_S 의 절반 이하) 기다린 뒤에도 남아 있으면 멈춘다
+#: (R1 NB-5: wait_for 의 timeout_ms 는 상한이 없어 사람 호출이 오래 막히지 않게 — E_TIMEOUT 으로 돌려줌).
+WAIT_CANCEL_AFTER_S = 5.0
 #: 탭 복원 이동 상한(밀리초).
 RESTORE_NAV_TIMEOUT_MS = 15_000
 #: 조작권 요청으로 연 창을 사람이 take 하지 않으면 닫는 시간(초).
