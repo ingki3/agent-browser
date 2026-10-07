@@ -395,6 +395,88 @@ def remove(name: str, *, root: Optional[Path] = None) -> None:
         lock.release() if path.exists() else _close_quietly(lock)
 
 
+# ---------------------------------------------------------------------------- 서버 전용 임시 프로필 (WS-34)
+
+#: `serve --browser on-demand` 를 --profile 없이 띄울 때의 서버 전용 임시 프로필 폴더 앞머리.
+#: headless ↔ 창 전환은 같은 폴더를 닫고 다시 여는 방식이라(BrowserCore.open_persistent) 이름 붙은
+#: 프로필이 없어도 폴더가 필요하다. 서버 종료 때 지우고, 비정상 종료로 남은 것은 다음 기동 때
+#: 잠금이 풀린 것만 지운다. `serve-` 가 아니므로 `profile list` 에는 보이지 않는다.
+EPHEMERAL_PREFIX = "ondemand-"
+_EPHEMERAL_ID_RE = re.compile(r"[0-9]{1,10}-[0-9a-f]{1,32}")
+
+
+def acquire_ephemeral(*, server_id: str, root: Optional[Path] = None) -> ProfileLock:
+    """서버 전용 임시 프로필(<root>/ondemand-<server_id>, 0700)을 만들고 잠근다."""
+    if not isinstance(server_id, str) or not _EPHEMERAL_ID_RE.fullmatch(server_id):
+        raise ProfileError(f"임시 프로필 서버 id 형식 오류: {server_id!r}")
+    base = Path(root or profile_root()).expanduser()
+    path = base / f"{EPHEMERAL_PREFIX}{server_id}"
+    from browser import user_chrome
+
+    if user_chrome._is_user_default_profile(path):
+        raise ProfileError("사용자 평소 Chrome 프로필 아래는 쓸 수 없습니다(쿠키·비밀번호 보호).")
+    try:
+        prepare(path)
+        fd = _try_flock(path)
+    except OSError as exc:
+        raise ProfileError(f"임시 프로필을 준비하지 못했습니다: {_os_reason(exc)}") from None
+    if fd is None:
+        raise ProfileInUseError(path.name, {})
+    return ProfileLock(name=path.name, path=path, fd=fd)
+
+
+def remove_ephemeral(lock: ProfileLock) -> None:
+    """임시 프로필 폴더를 지우고 잠금을 푼다(브라우저를 닫은 뒤에 부른다). 실패는 조용히 —
+    남은 폴더는 다음 기동의 cleanup_ephemeral 이 지운다."""
+    try:
+        if lock.held:
+            shutil.rmtree(lock.path, ignore_errors=True)
+    finally:
+        _close_quietly(lock)
+
+
+def cleanup_ephemeral(*, root: Optional[Path] = None) -> List[str]:
+    """비정상 종료로 남은 임시 프로필(잠금이 풀린 것)을 지운다. 지운 폴더 이름 목록.
+
+    심볼릭 링크·일반 폴더가 아닌 것·다른 서버가 잠근 것·Chromium 이 쓰는 것은 건드리지 않는다.
+    """
+    base = Path(root or profile_root()).expanduser()
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return []
+    removed: List[str] = []
+    for d in entries:
+        if not d.name.startswith(EPHEMERAL_PREFIX):
+            continue
+        if not _EPHEMERAL_ID_RE.fullmatch(d.name[len(EPHEMERAL_PREFIX):]):
+            continue
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            fd = _try_flock(d)
+        except OSError:
+            continue
+        if fd is None:
+            continue  # 살아 있는 서버가 쓰는 중
+        try:
+            if _chromium_holder(d) is not None:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            if not d.exists():
+                removed.append(d.name)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return removed
+
+
 def _close_quietly(lock: ProfileLock) -> None:
     fd, lock.fd = lock.fd, None
     if fd is not None:

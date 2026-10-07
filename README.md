@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-1927개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
+2020개가 통과해야 합니다(7개 건너뜀). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -187,12 +187,13 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 
 ### 브라우저 방식 (`serve --browser`)
 
-MCP 서버가 여는 브라우저를 시작 옵션으로 고릅니다. Egress 가드·HITL·차단 신호(`data.challenge`)는 세 방식 모두 같습니다.
+MCP 서버가 여는 브라우저를 시작 옵션으로 고릅니다. Egress 가드·HITL·차단 신호(`data.challenge`)는 네 방식 모두 같습니다.
 
 | 방식 | 무엇 | 언제 |
 | :--- | :--- | :--- |
 | `headless` (기본) | 화면 없는 Playwright Chromium, 고정 뷰포트 1280×720 | 일반 사이트, CI, 가장 가볍고 빠름 |
-| `human` | 창이 보이는 Chromium, 창 크기 그대로(`no_viewport`), `locale=ko-KR` | 사람이 지켜보거나 중간에 손을 대야 할 때 |
+| `on-demand` | 평소 headless, **사람 인계·승인 코드 때만 창**(아래 '필요할 때만 창' 절) | 에이전트가 혼자 돌다가 캡차·로그인·고위험 승인 때만 사람을 부를 때 |
+| `human` | 창이 보이는 Chromium, 창 크기 그대로(`no_viewport`), `locale=ko-KR` — 서버 수명 내내 창(디버그용 상시 창) | 사람이 계속 지켜보거나 디버그할 때 |
 | `user-chrome` | 설치된 Google Chrome 을 자동화 플래그 없이 **전용 프로필**로 띄워 CDP(127.0.0.1)로 붙음 | headless·human 이 막히는 사이트(실측: G마켓은 이 방식만 검색까지 통과) |
 
 ```bash
@@ -317,7 +318,7 @@ agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않�
 
 액션 툴 19종 외에 계약 밖 **서버 도구 4개**(`browser_control_request`·`browser_control_status`·`browser_control_wait`·`browser_approval_wait`)가 tools/list 에 함께 실립니다. 사람은 같은 컴퓨터의 터미널에서 `agent-browser control …`·`agent-browser approve …`로 답합니다. `serve`는 시작할 때 stderr 에 `server_id=<id>`를 한 줄 씁니다. 서버별 상태는 `~/.agent-browser/servers/<server_id>/`(0700, 파일 0600)에 있고 서버가 끝나면 지웁니다(프로세스가 없는 옛 디렉터리는 다음 서버가 시작할 때 청소). 서버가 하나만 떠 있으면 `--server`를 생략할 수 있고, 둘 이상이면 목록을 보여 주고 거부합니다.
 
-**캡차 예시(조작권).** 창이 보이는 서버(`serve --browser human` 또는 `--browser user-chrome`)에서만 됩니다 — headless 서버의 `browser_control_request`는 사람이 볼 창이 없어 거부하고 이 옵션을 안내합니다.
+**캡차 예시(조작권).** 창이 보이는 서버(`serve --browser human` 또는 `--browser user-chrome`)와 필요할 때 창을 여는 `--browser on-demand` 서버에서 됩니다 — headless 서버의 `browser_control_request`는 사람이 볼 창이 없어 거부하고 이 옵션들을 안내합니다.
 
 1. 에이전트: `browser_navigate` 결과에 `data.challenge`가 있음 → `browser_control_request(reason="캡차 확인")`. 창이 앞으로 오고 창 위에 안내 띠(DevTools 오버레이 — 페이지 DOM 을 바꾸지 않고 페이지 스크립트가 읽거나 누를 수 없음)가 뜨며, 서버 stderr 에도 안내가 나갑니다.
 2. 에이전트: `browser_control_wait(timeout_s=120)` — 사람이 가져가거나 돌려줄 때까지 기다립니다(상한 120초, 다시 부르면 이어서 기다림).
@@ -332,7 +333,7 @@ agent-browser control release
 
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 
-**결제 버튼 예시(승인 증표).** 창이 보이는 서버(`--browser human`·`user-chrome`)에서 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, expires_at, how_to_approve}`가 붙습니다. 서버는 이 증표를 행동 내용의 해시(액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거 `gate_basis` + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256)에 묶어 두고, 해시는 사람 CLI 만 상태 파일에서 읽습니다(에이전트 응답에는 싣지 않음). **headless 서버는 승인 증표를 발급하지 않습니다** — 사람이 볼 창이 없어 확인 코드를 띄울 곳이 없기 때문입니다. 그때는 기존처럼 `--pre-approve`·`--mode interactive` 안내만 나가며, 대화형 모드의 확인도 같은 이유로 창(확인 코드)이 있어야 완료할 수 있습니다.
+**결제 버튼 예시(승인 증표).** 창이 보이는 서버(`--browser human`·`user-chrome`)와 `--browser on-demand` 서버(코드는 별도 작은 창 — 아래 '필요할 때만 창' 절)에서 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, expires_at, how_to_approve}`가 붙습니다. 서버는 이 증표를 행동 내용의 해시(액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거 `gate_basis` + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256)에 묶어 두고, 해시는 사람 CLI 만 상태 파일에서 읽습니다(에이전트 응답에는 싣지 않음). **headless 서버는 승인 증표를 발급하지 않습니다** — 사람이 볼 창이 없어 확인 코드를 띄울 곳이 없기 때문입니다. 그때는 기존처럼 `--pre-approve`·`--mode interactive` 안내만 나가며, 대화형 모드의 확인도 같은 이유로 창(확인 코드)이 있어야 완료할 수 있습니다.
 
 1. 에이전트: `browser_click(element_id="@e5", epoch=3)` → 차단, `approval_id=ap_…`. 메시지는 "사람에게 `agent-browser approve ap_…` 실행을 요청"하라고 안내합니다.
 2. 사람: 터미널에서 `agent-browser approve ap_…`를 치면 내용(액션·대상·근거·origin·탭·epoch·파라미터·만료)이 **실행 중인 서버의 메모리 기준**으로 나오고(상태 파일과 다르면 경고하고 승인 절차를 시작하지 않음), **브라우저 창 위(오버레이)에 6자리 확인 코드**가 액션 종류·대상 이름과 함께 뜹니다(120초 유효 — 터미널 내용과 대조). 그 코드를 프롬프트에 입력하거나 `--code`로 다시 실행합니다. `--deny`는 거절, 빈 입력은 취소입니다. 페이지·에이전트가 정한 문자열(요소 이름·사유·URL)은 제어문자·개행·양방향 제어를 `\x1b`·`\u202e` 같은 보이는 표기로 바꿔 보여 줍니다(화면 위조 방지).
@@ -378,6 +379,36 @@ agent-browser profile remove work     # 확인 프롬프트(사용 중이면 거
 ```
 
 **한계.** ① **쿠키는 평문**입니다 — Playwright Chromium 프로필은 OS 키체인 암호화를 쓰지 않아 폴더 권한 700 으로만 보호됩니다. 같은 OS 사용자로 도는 프로그램은 읽을 수 있습니다. ② **사이트가 세션 쿠키(만료 없음)만 주면 유지되지 않습니다** — Chromium 은 재시작 때 세션 쿠키를 버립니다(실측: Mock 사이트의 영속 쿠키는 남고 세션 쿠키는 사라짐). 로그인할 때 '로그인 상태 유지'를 체크하십시오. 쿠키 수명을 늘리거나 바꾸는 조작은 하지 않습니다(사이트가 준 그대로). ③ 서버를 SIGTERM·SIGINT·stdin 종료로 끝내면 브라우저를 닫아 쿠키를 디스크에 씁니다. SIGKILL 같은 강제 종료는 직전 변경이 남지 않을 수 있습니다. ④ 영속 프로필에는 캐시·서비스워커 등록도 남습니다(서비스워커 요청도 검증 프록시를 거칩니다).
+
+### 필요할 때만 창 (`serve --browser on-demand`)
+
+에이전트는 평소 화면 없이(headless) 혼자 브라우징하고, **사람이 필요할 때만** 창을 띄웁니다 — 캡차·로그인 인계(`browser_control_request`)와 고위험 행동 승인 코드. `--browser human`은 서버 수명 내내 창이 떠 있는 **디버그용 상시 창**으로 남습니다.
+
+```text
+agent-browser serve --browser on-demand                 # 서버 전용 임시 프로필(종료 때 삭제)
+agent-browser serve --browser on-demand --profile work  # 이름 붙인 영속 프로필(로그인 유지)
+```
+
+Chromium 은 같은 브라우저를 headless ↔ 창 있음으로 바꿀 수 없습니다. 그래서 **같은 프로필 폴더를 닫고 창 있음/없음으로 다시 엽니다**(`--profile`이 없으면 서버 전용 임시 프로필 `~/.agent-browser/profiles/ondemand-<server_id>/`, 0700, 서버 종료 때 삭제 — 비정상 종료로 남은 것은 다음 on-demand 서버가 시작할 때 잠금이 풀린 것만 지움, `profile list`에는 안 보임). 다시 연 브라우저에는 처음 시작과 **같은 경로**로 검증 프록시(실행 인자)·route 가드·문서 상태 추적·탭·CDP·디스패처를 다시 달고, 열려 있던 탭 URL 을 복원합니다(활성 탭 먼저, `about:blank`·`chrome://` 등 http(s) 가 아닌 탭은 건너뜀). 전환 동안 프로필 잠금은 그대로 쥡니다.
+
+1. **창 열기** — `browser_control_request` 가 오면(또는 사람이 요청 없이 `control take`) 진행 중인 도구 호출이 끝나길 기다렸다가 창을 엽니다. 전환 중 들어온 도구 호출은 끝날 때까지(최대 30초) 기다리고, 넘으면 `E_TIMEOUT` + `data.window`로 알립니다. 결과 `data.window = {mode: "on-demand", state: "headed", reopened: true, tabs: [{tab_id, was, url, active, restored, http_status?, error?}], skipped, switch_ms, snapshot_epoch, hint}`.
+2. **창 닫기** — 사람이 `control release` 하면 마지막으로 보던 탭 URL 로 headless 를 다시 열고 `browser_control_wait`(또는 그다음 도구 결과)의 `data.window = {state: "headless", reopened: true, …, hint: "… 다시 관찰하세요"}`로 알립니다. 사람이 take 하지 않은 채 요청이 10분 지나면 요청을 거두고 창도 닫습니다. 사람이 창을 직접 닫으면(X) 조작권을 에이전트에게 돌리고 headless 로 다시 열어 `data.window.notice = {reason: "window_closed"}`로 알립니다.
+3. **sticky** — headless 로 돌아온 뒤, 창에서 해결했던 사이트(등록 가능 도메인 — `shop.example.com` 과 `www.example.com` 은 같은 사이트)에서 차단/캡차(`data.challenge`)가 다시 보이면 그 결과에 `data.window.sticky_pending = {domain, kind, detected_at}`와 "사람을 다시 부르라"는 안내가 붙습니다. 다음 `browser_control_request` 때 창을 열고 **그 서버 수명 동안 창을 유지**합니다(`window.sticky: true, sticky_reason`). 서버를 다시 시작하면 초기화됩니다. 사람은 `agent-browser control status`에서 `window=… sticky=…`로 봅니다.
+4. **승인 코드 창** — headless 상태에서 `agent-browser approve`로 코드가 필요하면, 페이지는 headless 그대로 두고 **별도의 작은 창**(별도 Chromium 프로세스 — 에이전트 탭 목록·영속 프로필에 없음, 스크립트 끔, 네트워크 전부 차단, 로컬 내용만)에 승인 내용(액션·대상·문서 출처·승인 만료)과 6자리 코드를 띄웁니다. 페이지를 다시 열지 않으므로 승인 뒤 같은 인자 + `approval_id` 재호출이 **문서 해시 일치로 그대로 실행**됩니다. 코드를 입력·거절·만료하면 창을 닫습니다. 창을 띄우지 못하면 코드를 무효로 하고 승인할 수 없다고 알립니다(fail-closed). 이미 창이 열린 상태(인계 중·sticky)면 기존처럼 그 창 오버레이에 띄웁니다. 코드가 떠 있는 동안 화면 캡처 거부는 그대로입니다(방어 겹침).
+5. **실패하면 닫는다** — 검증 프록시가 실행 중이 아니거나, 다시 열기·route 재설치가 실패하거나 전환 중 서버가 신호로 끝나면, 보호가 덜 걸렸을 수 있는 브라우저를 남기지 않고 닫습니다(`data.window.state: "failed"`). 다음 도구 호출이 headless 로 다시 열고 결과에 `data.window.recovered: true`를 붙입니다. 탭 하나의 복원 실패는 그 탭만 `restored: false`(이유)로 알립니다.
+
+**무엇이 유지되고 사라지나**(로컬 Mock 실측, `.hermes/state/ws34/probe_perf.py`):
+
+| 항목 | 전환 뒤 |
+| :--- | :--- |
+| 영속 쿠키·localStorage·IndexedDB | 유지(같은 프로필 폴더) |
+| 세션 쿠키(만료 없음) | 유지 — 이 서버가 가진 값 그대로 다시 넣음(수명·값 변경 없음) |
+| 탭 URL·활성 탭 | 복원(http(s) 탭만, 활성 탭 먼저) |
+| 입력 중이던 폼 내용·sessionStorage·스크롤 위치 | **사라짐**(페이지를 다시 엶) |
+| `element_id`·`tab_id` | 무효(`snapshot_epoch` 증가, 새 tab_id 는 `window.tabs[].tab_id`) |
+| 전환 시간 p50 | headless→창 약 0.6초, 창→headless 약 0.3초(탭 3개 복원) |
+
+**한계.** ① headless 는 UA 에 `HeadlessChrome`을 싣고 우리는 UA 를 바꾸지 않습니다(위장 금지) — 사이트가 창에서 통과한 결과를 headless 에서 인정하지 않고 캡차를 다시 요구할 수 있습니다(그래서 sticky). ② 전환은 **페이지를 다시 여는 것**입니다 — POST 결과 화면·입력 중인 폼·SPA 메모리 상태는 사라지고 GET 으로 다시 불러옵니다. 창을 열기 전에 입력을 끝내거나 사람에게 맡기십시오. ③ 등록 가능 도메인은 흔한 2단계 접미사(`co.kr`·`co.uk` 등)만 아는 근사입니다. ④ 같은 OS 사용자로 셸을 쓰는 에이전트에 대한 한계(승인 절 ①)는 별도 창에서도 같습니다. ⑤ 창 있는 Chromium 은 시작 직후 브라우저 자체의 Google 배경 요청(계정 조정기 ListAccounts·GCM checkin·네트워크 시각·검색 사전 연결·AI 모드 자격 조회)을 보냅니다(영속 프로필 창: on-demand 전환·`human --profile`). 비영속 `human`(프로필 없음)도 같은 요청을 보내며(실측) 이 경로는 아직 끄지 않습니다 — 요청은 검증 프록시 정책 안에서 판정됩니다. 영속 프로필로 띄우는 모든 경로(on-demand headless·창, `--profile`)의 실행 인자에서 끕니다(기능 끔, 계정·GCM 엔드포인트는 닿지 않는 루프백) — 차단 프록시 실측 외부 호스트 0건. 위장 인자는 없습니다. ⑥ 사람이 승인 코드 창을 닫으면 그 코드는 무효입니다 — `agent-browser approve` 를 다시 실행하면 새 창·새 코드가 뜹니다. 코드 창·오버레이의 대상 칸은 "(사이트가 붙인 이름)" 표기 뒤에 보이며 그 안의 6자리 이상 숫자열은 `••••••` 로 가립니다.
 
 ---
 
