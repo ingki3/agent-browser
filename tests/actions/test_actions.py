@@ -288,10 +288,47 @@ def test_idempotent_and_side_effect_sets_are_disjoint():
     assert IDEMPOTENT_ACTIONS & SIDE_EFFECT_ACTIONS == set()
 
 
+#: (액션 × 실패 단계) 기대 판정 — 소스가 아니라 PRD §4.1 멱등성 열과 §4.3 흐름도에서 옮겼다.
+#: PRE_DISPATCH: 브라우저에 아무 이벤트도 가지 않았으므로 모든 액션이 안전(§4.3 1단계).
+#: POST_DISPATCH: §4.1 멱등성 Yes 만 안전. No(부작용: 키 입력·대화상자 응답·파일 업·다운로드)와
+#: '실패단계 종속'(click·type_text = 발송 뒤엔 이중 제출 위험)은 불가. tab_control 은 'Depends'
+#: 지만 create/close 가 탭을 만들고 닫는 부작용이라 명령을 모르는 판정에서는 보수적으로 불가.
+_POST_DISPATCH_SAFE = {
+    ActionType.OBSERVE_PAGE: True,
+    ActionType.TAKE_SCREENSHOT: True,
+    ActionType.NAVIGATE: True,
+    ActionType.GO_BACK: True,
+    ActionType.RELOAD: True,
+    ActionType.CLICK: False,
+    ActionType.TYPE_TEXT: False,
+    ActionType.SELECT_OPTION: True,
+    ActionType.CHECK_BOX: True,
+    ActionType.SCROLL: True,
+    ActionType.HOVER: True,
+    ActionType.PRESS_KEY: False,
+    ActionType.WAIT_FOR: True,
+    ActionType.EXTRACT: True,
+    ActionType.SWITCH_FRAME: True,
+    ActionType.HANDLE_DIALOG: False,
+    ActionType.UPLOAD_FILE: False,
+    ActionType.DOWNLOAD_FILE: False,
+    ActionType.TAB_CONTROL: False,
+}
+
+
 def test_every_action_type_has_a_retry_verdict():
-    """19종 전부가 판정 가능해야 한다."""
-    for action in ActionType:
-        assert isinstance(is_retry_safe(action, FailurePhase.POST_DISPATCH), bool)
+    """19종 각각이 단계별로 PRD 가 정한 판정을 내야 한다(bool 이기만 하면 통과하던 것을 조임)."""
+    assert set(_POST_DISPATCH_SAFE) == set(ActionType) and len(_POST_DISPATCH_SAFE) == 19
+    wrong = {
+        action.value: (
+            is_retry_safe(action, FailurePhase.PRE_DISPATCH),
+            is_retry_safe(action, FailurePhase.POST_DISPATCH),
+        )
+        for action in ActionType
+        if is_retry_safe(action, FailurePhase.PRE_DISPATCH) is not True
+        or is_retry_safe(action, FailurePhase.POST_DISPATCH) is not _POST_DISPATCH_SAFE[action]
+    }
+    assert wrong == {}, f"(PRE, POST) 판정이 PRD 와 다름: {wrong}"
 
 
 # ---------------------------------------------------------------------------

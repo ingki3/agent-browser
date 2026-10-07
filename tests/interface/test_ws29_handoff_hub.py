@@ -167,9 +167,19 @@ def test_human_holder_blocks_manipulation(hub: HandoffHub, action: ActionType):
 
 @pytest.mark.parametrize("command", ["create", "switch", "close"])
 def test_human_holder_blocks_tab_changes(hub: HandoffHub, command: str):
+    args = {"command": command}
+    # 대조: agent 가 쥐고 있으면 같은 명령은 허용(None) — '항상 막는' 구현을 걸러낸다.
+    assert hub.control_blocks(ActionType.TAB_CONTROL, args) is None
     write_command(hub.root, hub.server_id, "take")
     hub.poll()
-    assert hub.control_blocks(ActionType.TAB_CONTROL, {"command": command}) is not None
+    blocked = hub.control_blocks(ActionType.TAB_CONTROL, args)
+    assert blocked is not None
+    assert blocked["holder"] == "human"
+    assert blocked["how_to_wait"] == "browser_control_wait"
+    assert blocked["secret_wanted"] is False
+    assert blocked["since"]  # 사람이 언제부터 쥐었는지 안내
+    assert set(blocked) == {"holder", "reason", "since", "secret_wanted", "request_id",
+                            "how_to_wait"}
 
 
 @pytest.mark.parametrize("action,args", [(a, {}) for a in OBSERVATION]
