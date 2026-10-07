@@ -156,6 +156,21 @@ def display_safe(value: Any, limit: int = DISPLAY_LIMIT) -> str:
     return "".join(out)
 
 
+#: R1 NB-4: 승인 코드 화면에서 사이트가 붙인 대상 이름 앞에 붙이는 표기.
+SITE_NAME_LABEL = "(사이트가 붙인 이름)"
+#: 코드처럼 보이는 숫자열 — 6자리 이상(공백·하이픈·점 한 칸 사이 허용, 전각 숫자 포함).
+_CODE_LIKE_RE = re.compile(r"\d(?:[\s\-.·_/]?\d){5,}")
+
+
+def mask_code_like(value: str) -> str:
+    """대상 이름의 6자리 이상 숫자열을 `••••••` 로 가린다(R1 NB-4).
+
+    사이트가 요소 이름에 "확인 코드 123456" 을 넣어 진짜 확인 코드와 헷갈리게 하지 못하게 —
+    진짜 코드는 별도 라벨·큰 글씨로만 보인다. 판정용 원문은 건드리지 않는다(표시 전용).
+    """
+    return _CODE_LIKE_RE.sub("••••••", value or "")
+
+
 # ---------------------------------------------------------------------------- 파일 도구
 
 
@@ -383,6 +398,8 @@ class HandoffHub:
         #: 창에 띄울 코드(서버가 take_code_job 으로 꺼낸다) · 표시 결과를 기다리는 ack nonce.
         self._code_jobs: List[CodeJob] = []
         self._code_pending_ack: Dict[str, str] = {}
+        #: 창 상태(WS-34 on-demand). None 이면 상태에 싣지 않는다(다른 방식은 그대로).
+        self.window: Optional[Dict[str, Any]] = None
 
     # -- 수명주기 ------------------------------------------------------------
 
@@ -444,7 +461,7 @@ class HandoffHub:
     # -- 조작권 --------------------------------------------------------------
 
     def status(self) -> Dict[str, Any]:
-        return {
+        out = {
             "holder": self.holder,
             "requested": self.requested,
             "reason": self.reason,
@@ -453,6 +470,35 @@ class HandoffHub:
             "request_id": self.request_id,
             "server_id": self.server_id,
         }
+        window = getattr(self, "window", None)
+        if window is not None:
+            out["window"] = dict(window)
+        return out
+
+    def set_window(self, info: Optional[Dict[str, Any]]) -> None:
+        """창 상태(WS-34 on-demand: headless/headed/sticky)를 사람용 상태 파일에도 싣는다."""
+        self.window = dict(info) if info is not None else None
+        if self._opened:
+            self._write_control()
+
+    def cancel_request(self, event: str = "request_expired") -> bool:
+        """사람이 가져가지 않은 조작권 요청을 서버가 거둔다(WS-34: 창을 연 요청의 만료)."""
+        if not self.requested:
+            return False
+        self.requested = False
+        self.since = self.clock()
+        self._changed(event)
+        return True
+
+    def release_by_server(self) -> None:
+        """서버가 조작권을 에이전트에게 돌린다(WS-34: 사람이 창을 직접 닫음 = 창이 없음).
+
+        사람의 release 와 같은 상태로 만든다(비밀 입력 보호도 해제 — 비밀을 넣을 창이 없다)."""
+        self.holder = HOLDER_AGENT
+        self.requested = False
+        self.secret_wanted = False
+        self.since = self.clock()
+        self._changed("released")
 
     def how_to_respond(self) -> str:
         sid = self.server_id
@@ -1000,6 +1046,17 @@ def cli_control(op: str, server_id: Optional[str], as_json: bool = False) -> int
                   f"secret_wanted={display_safe(st.get('secret_wanted'))} "
                   f"reason={display_safe(st.get('reason'), 500)} "
                   f"since={display_safe(st.get('since'))}")
+            window = st.get("window")
+            if isinstance(window, dict):  # WS-34 on-demand: 창 상태·sticky
+                line = (f"  window={display_safe(window.get('state'))} "
+                        f"sticky={display_safe(window.get('sticky'))}")
+                if window.get("sticky_reason"):
+                    line += f" sticky_reason={display_safe(window.get('sticky_reason'), 300)}"
+                pending = window.get("sticky_pending")
+                if isinstance(pending, dict):
+                    line += (f" sticky_pending={display_safe(pending.get('domain'))}"
+                             " (다음 조작권 요청 때 창을 열고 유지)")
+                print(line)
         return 0
     nonce = write_command(root, sid, op)
     ack = wait_ack(root, sid, nonce)
