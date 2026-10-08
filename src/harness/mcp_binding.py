@@ -46,6 +46,7 @@ async def _run_session() -> Dict[str, Any]:
         "tool_names": [],
         "schemas_valid": 0,
         "call_ok": False,
+        "instructions": None,
         "errors": [],
     }
 
@@ -69,8 +70,10 @@ async def _run_session() -> Dict[str, Any]:
 
             try:
                 async with ClientSession(client_read, client_write) as session:
-                    await session.initialize()
+                    init = await session.initialize()
                     findings["initialized"] = True
+                    # WS-38: 서버 instructions(레시피 쓰는 법)가 initialize 응답으로 실제 도착하는가
+                    findings["instructions"] = getattr(init, "instructions", None)
 
                     listed = await session.list_tools()
                     findings["tool_names"] = [t.name for t in listed.tools]
@@ -146,8 +149,10 @@ def main() -> int:
         )
     if not findings["call_ok"]:
         violations.append("tools/call 왕복 실패")
-    from interface.mcp_server import SERVER_TOOLS
+    from interface.mcp_server import RECIPE_INSTRUCTIONS, SERVER_TOOLS
 
+    if findings["instructions"] != RECIPE_INSTRUCTIONS:
+        violations.append("initialize 의 서버 instructions(WS-38 레시피 안내)가 클라이언트에 도착하지 않음")
     if findings["server_tools_listed"] != sorted(SERVER_TOOLS):
         violations.append(
             f"서버 도구 불일치: {findings['server_tools_listed']} != {sorted(SERVER_TOOLS)}"
@@ -166,6 +171,7 @@ def main() -> int:
             "server_tools_listed": len(findings["server_tools_listed"]),
             "schemas_valid": findings["schemas_valid"],
             "call_roundtrip": findings["call_ok"],
+            "instructions_delivered": findings["instructions"] == RECIPE_INSTRUCTIONS,
             "violations": violations or None,
             "note": "SDK 바인딩을 우회하지 않는 실사용 경로 검증",
         },
