@@ -1299,8 +1299,9 @@ class BrowserMCPServer:
             window = self._take_window_report()
         data: Dict[str, Any] = {"control": self._control_view(), "changed": changed}
         if changed == "released":
-            # WS-37: 감시 태스크의 복구가 아직 진행 중이면 tab_closed_by_human 이 빠진다 — 기다린다.
-            await self._await_release_recovery()
+            # WS-37: 감시 태스크가 복구 중이었다면 위 _poll_handoff 가 그 복구를 기다린 뒤 돌아왔다
+            # (복구 Future) — 창이 없는(복구를 하는) 경로에서는 그 뒤로 await 가 없으므로 아래
+            # tab_closed_by_human 은 빠지지 않는다.
             self._release_unreported = False
             data["hint"] = _RELEASE_HINT
             data["snapshot_epoch"] = self._engine.epoch if self._engine else 0
