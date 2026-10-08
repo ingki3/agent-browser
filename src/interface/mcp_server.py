@@ -394,6 +394,8 @@ def code_overlay_text(code: str, kind: str, target: str, ttl_s: int) -> str:
 #: WS-29 R2: 확인 코드를 띄우기 전, 이미 진행 중인 화면 캡처가 끝나길 기다리는 상한(초). 넘으면
 #: 표시를 취소한다(코드 무효 — fail-closed). 무거운 페이지 SoM 캡처 실측 수백 ms 의 10배 이상.
 CAPTURE_DRAIN_TIMEOUT_S = 5.0
+#: WS-37: 조작권 반납 때 진행 중인 닫힌 탭 복구(CDP 세션 생성 등)를 기다리는 상한(초).
+RELEASE_RECOVERY_WAIT_S = 10.0
 
 #: 승인 증표로 실행했는데 결과가 이 코드면 실행 여부가 불확실하다(outcome_unknown, 재시도 금지).
 _UNCERTAIN_CODES = frozenset({
@@ -668,6 +670,9 @@ class BrowserMCPServer:
         self._captures_inflight = 0
         #: 사람이 에이전트 활성 탭을 닫았음(조작권 반납 때 확인, NB-3) — control_wait/status 로 알린다.
         self._tab_notice: Optional[Dict[str, Any]] = None
+        #: WS-37: 진행 중인 닫힌 탭 복구(반납 처리). 감시 태스크가 반납을 먼저 집어 복구하는 동안
+        #: 다른 호출(control_wait 등)이 복구가 끝나기 전에 '반납됨' 을 알리지 않도록 기다리는 데 쓴다.
+        self._release_recovery: Optional["asyncio.Future[None]"] = None
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
         self.allow_private_network = allow_private_network
         self.block_loopback = block_loopback
@@ -862,7 +867,7 @@ class BrowserMCPServer:
                     # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
                     self._on_demand_released()
                 else:
-                    await self._recover_closed_tab()
+                    await self._recover_closed_tab_serialized()
                 await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
@@ -877,7 +882,43 @@ class BrowserMCPServer:
         if self._window is not None:
             await self._watch_window()
         await self._sync_code_overlay()
+        # WS-37: 다른 태스크(감시 태스크)가 반납을 먼저 집어 복구 중이면 끝날 때까지 기다린다 —
+        # 이 함수가 돌아온 뒤 호출자가 보는 상태(반납·탭 알림)가 어긋나지 않게.
+        await self._await_release_recovery()
         return events
+
+    async def _recover_closed_tab_serialized(self) -> None:
+        """닫힌 탭 복구를 Future 로 감싸 진행 중임을 알린다(WS-37 반납 알림 경쟁 조건).
+
+        Future 는 첫 await 전에 만든다 — hub.poll() 이 'released' 를 돌려준 같은 동기 구간 안이라,
+        hub.version 이 바뀐 것을 본 다른 태스크는 반드시 이 Future 도 본다.
+        """
+        fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self._release_recovery = fut
+        try:
+            await self._recover_closed_tab()
+        finally:
+            if not fut.done():
+                fut.set_result(None)
+            if self._release_recovery is fut:
+                self._release_recovery = None
+
+    async def _await_release_recovery(self) -> None:
+        """진행 중인 닫힌 탭 복구가 있으면 끝날 때까지(상한 RELEASE_RECOVERY_WAIT_S) 기다린다."""
+        deadline = time.monotonic() + RELEASE_RECOVERY_WAIT_S
+        while True:
+            fut = self._release_recovery
+            if fut is None or fut.done():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("닫힌 탭 복구가 %.0f초 안에 끝나지 않음", RELEASE_RECOVERY_WAIT_S)
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), remaining)
+            except asyncio.TimeoutError:
+                logger.warning("닫힌 탭 복구가 %.0f초 안에 끝나지 않음", RELEASE_RECOVERY_WAIT_S)
+                return
 
     # -- 확인 코드 오버레이 (WS-29 R1) ------------------------------------------
 
@@ -1258,6 +1299,9 @@ class BrowserMCPServer:
             window = self._take_window_report()
         data: Dict[str, Any] = {"control": self._control_view(), "changed": changed}
         if changed == "released":
+            # WS-37: 감시 태스크가 복구 중이었다면 위 _poll_handoff 가 그 복구를 기다린 뒤 돌아왔다
+            # (복구 Future) — 창이 없는(복구를 하는) 경로에서는 그 뒤로 await 가 없으므로 아래
+            # tab_closed_by_human 은 빠지지 않는다.
             self._release_unreported = False
             data["hint"] = _RELEASE_HINT
             data["snapshot_epoch"] = self._engine.epoch if self._engine else 0

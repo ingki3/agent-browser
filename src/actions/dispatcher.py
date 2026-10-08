@@ -40,11 +40,13 @@ from actions.healing import (
     HealingCandidate,
     HealingResult,
     heal,
+    identity_change_refused,
     is_retry_safe,
 )
 from actions.verification import (
     PostConditionResult,
     capture_state,
+    safe_page_text,
     verify_post_condition,
     verify_staleness,
 )
@@ -1432,20 +1434,52 @@ class ActionDispatcher:
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
+        if not staleness.fresh and identity_change_refused(staleness.reason, action):
+            # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
+            # 바뀌었다(제자리 교체). 치유 사다리의 어느 단계로 골라도(testid 유지·비슷한
+            # 이름·같은 경로) 다른 요소를 누를 수 있으므로 사다리를 돌리지 않고 재관찰을 요구한다.
+            before_role = params.get("expected_role") or handle.role
+            before_name = (
+                params.get("expected_name")
+                if params.get("expected_name") is not None
+                else handle.name
+            )
+            return self._identity_changed_result(
+                action,
+                staleness.error_code or ErrorCode.TOCTOU_MISMATCH,
+                f"Staleness 검증 실패({staleness.reason.value}) — 치유하지 않음",
+                (before_role, before_name),
+                (staleness.observed_role, staleness.observed_name),
+                {},
+            )
         if not staleness.fresh:
             # 부작용이 없는 시점이므로 치유가 안전하다.
-            healing = await self._attempt_heal(handle)
+            healing = await self._attempt_heal(handle, action)
             if not healing.healed or healing.candidate is None:
+                fail_data: Dict[str, Any] = {"healing_attempts": healing.attempts}
+                swapped = healing.identity_refused
+                if swapped is not None:
+                    # WS-37 R2: 앞단 가드를 지나온 사유(요소가 사라진 NODE_DETACHED)에서 사다리의
+                    # 어느 단계가 role/name 이 다른 요소를 골랐다 — heal() 채택 지점이 부작용
+                    # 액션이라 거부했고 누르지 않았다. (디스패처에서 EPOCH_MISMATCH 는 핸들 조회가
+                    # 먼저 막아 여기 오지 않는다.) 요소를 '못 찾은' 것이 아니라 관찰과 다른 요소를
+                    # 찾은 것이므로 앞단 가드와 같은 E_TOCTOU_MISMATCH 로 보고한다.
+                    return self._identity_changed_result(
+                        action,
+                        ErrorCode.TOCTOU_MISMATCH,
+                        f"Staleness 검증 실패({staleness.reason.value}) 및 자가 치유 거부",
+                        (handle.role, handle.name),
+                        (swapped.role, swapped.name),
+                        fail_data,
+                    )
                 return self._result(
                     success=False,
                     action=action,
                     retry_safe=True,
                     error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
-                    error_message=(
-                        f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패"
-                    ),
+                    error_message=f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패",
                     reobserve_required=True,
-                    data={"healing_attempts": healing.attempts},
+                    data=fail_data,
                 )
             new_handle = self.ctx.engine.get_handle(healing.candidate.element_id)
             if new_handle is None:
@@ -1831,8 +1865,50 @@ class ActionDispatcher:
 
     # -- 치유 ---------------------------------------------------------------
 
-    async def _attempt_heal(self, handle: ElementHandle) -> HealingResult:
-        """재관찰 후 자가 치유 사다리를 가동한다."""
+    def _identity_changed_result(
+        self,
+        action: ActionType,
+        error_code: ErrorCode,
+        lead: str,
+        before: Tuple[Optional[str], Optional[str]],
+        after: Tuple[Optional[str], Optional[str]],
+        data: Dict[str, Any],
+    ) -> ActionResult:
+        """제자리 교체 거부 응답: E_TOCTOU_MISMATCH 계열 + 재관찰 + element_changed/hint.
+
+        이름·role 은 페이지가 정한 문자열이라 `safe_page_text` 로 제어문자를 보이는 표기로
+        바꾸고 80자로 자른다. error_message 는 안내(hint)를 한 번만 싣는다 — staleness.detail
+        에 같은 이름이 또 들어 있으므로 함께 붙이지 않는다(검증 NB-4: 같은 문자열 4중 적재).
+        """
+        b_role, b_name = (safe_page_text(v) for v in before)
+        a_role, a_name = (safe_page_text(v) for v in after)
+        hint = (
+            f"요소가 바뀜(이전 {b_role} '{b_name}' → 현재 {a_role} '{a_name}') — 다시 관찰하라"
+        )
+        out = dict(data)
+        out["element_changed"] = {
+            "before": {"role": b_role, "name": b_name},
+            "after": {"role": a_role, "name": a_name},
+        }
+        out["hint"] = hint
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=error_code,
+            error_message=f"{lead}: {hint}",
+            reobserve_required=True,
+            data=out,
+        )
+
+    async def _attempt_heal(
+        self, handle: ElementHandle, action: Optional[ActionType] = None
+    ) -> HealingResult:
+        """재관찰 후 자가 치유 사다리를 가동한다.
+
+        ``action`` 이 부작용 액션이면 어느 단계든 role/name 이 바뀐 요소를 채택하지
+        않는다(`actions.healing.heal` 채택 지점, `path_heal_allowed`).
+        """
         self._healing_attempts += 1
 
         result = await self.ctx.engine.observe_page(
@@ -1852,7 +1928,7 @@ class ActionDispatcher:
                 )
             )
 
-        healing = heal(handle, candidates)
+        healing = heal(handle, candidates, action=action)
         if healing.healed:
             self._healing_successes += 1
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)

@@ -350,6 +350,14 @@ def test_protocols_are_runtime_checkable():
 
     assert isinstance(_StubDispatcher(), contracts.ActionDispatcherProtocol)
 
+    # 반대 케이스: dispatch 가 없으면(메서드 이름만 다름) 구조 검사에서 걸러진다.
+    class _WrongName:
+        async def run(self, action, params, epoch):  # noqa: ANN001, D102
+            return None
+
+    assert not isinstance(_WrongName(), contracts.ActionDispatcherProtocol)
+    assert not isinstance(object(), contracts.ActionDispatcherProtocol)
+
 
 def test_protocol_rejects_incomplete_implementation():
     class _Missing:
