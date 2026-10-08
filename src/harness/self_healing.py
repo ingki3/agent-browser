@@ -16,8 +16,10 @@
 
 변형 시나리오는 실제 웹에서 흔한 패턴을 재현한다:
 * 클래스명 변경 (CSS-in-JS 해시 재생성) -> 1단계
-* 이름 변경 + testid 유지 (i18n 전환)   -> 2단계 (hover, 또는 요소가 옮겨져 사라진 경우 click)
-* 문구 미세 변경 (A/B 테스트)           -> 3단계 (요소가 옮겨져 사라짐 — NODE_DETACHED)
+* 이름 변경 + testid 유지 (i18n 전환)   -> 2단계 (hover — 이름이 다른 대체는 읽기 액션만)
+* 대소문자만 바뀐 문구 + testid + 이동   -> 2단계 (click — 정규화 이름이 같다)
+* 문구 미세 변경 (A/B 테스트) + 이동     -> 3단계 (hover)
+* 대소문자만 바뀐 문구 + 이동(testid 없음) -> 3단계 (click — 정규화 이름이 같다)
 * role/name 변경, 경로 유지 + 읽기 액션 -> 4단계 (hover)
 
 **제자리 교체 거부 (WS-37 R1, 음성 케이스)**:
@@ -30,6 +32,12 @@
 * 양성 시나리오는 제품 경로에서 실제로 사다리에 닿는 것만 둔다: 읽기 액션이거나 요소가
   사라진(NODE_DETACHED) 경우. 부작용 액션 + 신원 변경 양성은 제품이 거부하므로 그 단계를
   측정하지 못한다 — 측정 중 `identity_change_refused` 가 참이면 단계 불일치로 exit 2(규칙 2).
+* **채택 규칙 (WS-37 R2)**: 부작용 액션은 어떤 단계가 고른 후보든 role 과 정규화한 name
+  (공백 접기·대소문자)이 원래와 같을 때만 채택한다(`actions.heal` 채택 지점). 그래서 부작용
+  액션 양성은 '같은 신원(정규화), 다른 경로/대소문자' 이고, 이름이 다른 대체 치유 양성은
+  읽기 액션(hover)이다. 음성에 요소가 사라진 자리(NODE_DETACHED)에 같은 testid 의 다른 이름
+  (detached_testid)·다른 역할(detached_testid_role)·같은 이름 다른 역할(detached_role_only)·
+  비슷한 이름(detached_similar) 요소를 두고, 사다리를 돈 뒤 채택 지점에서 거부되는지 본다.
 * 음성 케이스(`expect_refusal`)는 **실제 디스패처**(`ActionDispatcher.dispatch`)로 돌린다:
   이름만/역할만/둘 다/testid 유지/비슷한 이름. 눌리거나 치유되면 wrongful heal 로 exit 2,
   앞단 가드가 아닌 다른 사유(사다리를 돈 흔적 `healing_attempts`)로 거부되면 exit 2(규칙 2),
@@ -54,10 +62,22 @@ REQUIRED_STAGES = ("role_name", "testid", "text_similarity", "css_path")
 
 #: 부작용 액션의 제자리 교체 거부가 다섯 종류 모두 측정되어야 한다.
 #: testid·similar 는 앞단 가드가 없으면 2·3단계가 교체된 요소를 고르는 경로다(검증 B1·NB-2).
-REQUIRED_REFUSALS = ("name", "role", "both", "testid", "similar")
+REQUIRED_REFUSALS = (
+    "name",
+    "role",
+    "both",
+    "testid",
+    "similar",
+    "detached_testid",
+    "detached_testid_role",
+    "detached_role_only",
+    "detached_similar",
+)
 
-#: 음성 케이스의 기대 거부 지점(사다리 단계가 아니라 사다리 앞단).
+#: 음성 케이스의 기대 거부 지점: 사다리 앞단(제자리 교체).
 FRONT_GUARD = "front_guard"
+#: 음성 케이스의 기대 거부 지점: 사다리를 돈 뒤 후보 채택 지점(요소가 사라짐, WS-37 R2).
+ADOPT_GUARD = "adopt_guard"
 
 
 @dataclass
@@ -76,6 +96,8 @@ class MutationCase:
     action: ActionType = ActionType.CLICK
     #: 음성 케이스: 치유를 **거부**해야 정답. 값은 바뀐 신원 종류(name/role/both).
     expect_refusal: str = ""
+    #: 관찰 이전에 실행할 사전 스크립트(문구 설정 등). s13 은 testid 도 심는다.
+    pre: str = ""
 
 
 MUTATION_CASES: Tuple[MutationCase, ...] = (
@@ -113,9 +135,11 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "testid",
         ActionType.HOVER,
     ),
+    # 부작용 액션(click) 양성: 같은 신원(정규화 이름 동일 — 대소문자만 바뀐 카피 수정)이
+    # 옮겨져 원래 자리에서 사라졌다. 1단계(정확 일치)는 놓치고 2단계 testid 가 잡는다.
     MutationCase(
         "s13_spa",
-        "설정으로 이동",
+        "Go to settings",
         """
         const el = document.getElementById('go-settings');
         el.textContent = 'Go to Settings';
@@ -124,8 +148,9 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         el.parentNode.insertBefore(wrap, el);
         wrap.appendChild(el);
         """,
-        "testid 유지 이름 변경 + 이동 (i18n 재렌더, click)",
+        "testid 유지 대소문자 변경 + 이동 (카피 수정 재렌더, click)",
         "testid",
+        pre="document.getElementById('go-settings').textContent = 'Go to settings';",
     ),
     # --- 3단계: 문구만 미세하게 변경 (A/B 테스트 모사) ---
     #     CSS 경로도 함께 바꿔야 4단계로 새지 않고 3단계에서 해결된다.
@@ -141,8 +166,9 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         el.parentNode.insertBefore(wrap, el);
         wrap.appendChild(el);
         """,
-        "문구 미세 변경 (A/B 테스트)",
+        "문구 미세 변경 (A/B 테스트, hover)",
         "text_similarity",
+        ActionType.HOVER,
     ),
     MutationCase(
         "s01_login",
@@ -155,8 +181,25 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         el.parentNode.insertBefore(wrap, el);
         wrap.appendChild(el);
         """,
-        "버튼 문구 변경 (짧은 라벨 접미 확장)",
+        "버튼 문구 변경 (짧은 라벨 접미 확장, hover)",
         "text_similarity",
+        ActionType.HOVER,
+    ),
+    # 부작용 액션(click) 양성: testid 없는 버튼의 대소문자만 바뀐 카피 + 이동 → 3단계.
+    MutationCase(
+        "s09_ad_rotation",
+        "Add to cart",
+        """
+        const el = document.getElementById('cart');
+        el.textContent = 'Add to Cart';
+        el.removeAttribute('id');
+        const wrap = document.createElement('section');
+        el.parentNode.insertBefore(wrap, el);
+        wrap.appendChild(el);
+        """,
+        "대소문자 변경 + 이동 (testid 없음, click)",
+        "text_similarity",
+        pre="document.getElementById('cart').textContent = 'Add to cart';",
     ),
     # --- 4단계: role과 name이 바뀌고 CSS 경로만 남음 — 읽기 액션 ---
     #     (검증 NB-5: extract 는 디스패처가 element_id 를 받지 않아 제품 경로에서 치유에 닿지
@@ -233,6 +276,80 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         ActionType.CLICK,
         expect_refusal="similar",
     ),
+    # --- 음성: 부작용 액션 + 요소가 사라짐(NODE_DETACHED) + 다른 신원 → 채택 지점 거부 (R2) ---
+    # 재검증 N1: 원 노드 제거 + 다른 자리에 같은 testid 의 '회원 탈퇴' → 2단계가 골랐다.
+    MutationCase(
+        "s13_spa",
+        "설정으로 이동",
+        "",  # _detached_script 로 채운다
+        "사라진 자리 같은 testid '회원 탈퇴' (click, 거부)",
+        ADOPT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="detached_testid",
+    ),
+    # 재검증 N1b: 같은 testid 인데 role 도 다름(button → link).
+    MutationCase(
+        "s13_spa",
+        "설정으로 이동",
+        "",
+        "사라진 자리 같은 testid link '회원 탈퇴' (click, 거부)",
+        ADOPT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="detached_testid_role",
+    ),
+    # 이름은 같고 role 만 다름(button → link) — name 만 비교하는 구현을 잡는다.
+    MutationCase(
+        "s13_spa",
+        "설정으로 이동",
+        "",
+        "사라진 자리 같은 testid·같은 이름 link (click, 거부)",
+        ADOPT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="detached_role_only",
+    ),
+    # 재검증 N2: testid 없음, 의미가 반전된 비슷한 이름 '인증 확인 취소' → 3단계가 골랐다.
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        "",
+        "사라진 자리 비슷한 이름 '인증 확인 취소' (click, 거부)",
+        ADOPT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="detached_similar",
+    ),
+)
+
+
+def _detached_script(el_id: str, tag: str, name: str, testid: str = "") -> str:
+    """원 노드를 지우고 body 앞 section 에 새 요소를 붙인다(NODE_DETACHED).
+
+    새 요소는 눌리면 body[data-result] 를 'wrongful' 로 바꾼다 — wrongful 판정용 흔적.
+    """
+    tid = f"n.setAttribute('data-testid', '{testid}');" if testid else ""
+    href = "n.setAttribute('href', '#');" if tag == "a" else ""
+    return (
+        f"document.getElementById('{el_id}').remove();"
+        f"const n = document.createElement('{tag}'); {href} {tid} n.textContent = '{name}';"
+        "n.addEventListener('click', (e) => { e.preventDefault();"
+        " document.body.setAttribute('data-result', 'wrongful'); });"
+        "const s = document.createElement('section'); s.appendChild(n); document.body.prepend(s);"
+    )
+
+
+_DETACHED_SCRIPTS: Dict[str, str] = {
+    "detached_testid": _detached_script("go-settings", "button", "회원 탈퇴", "settings-nav"),
+    "detached_testid_role": _detached_script("go-settings", "a", "회원 탈퇴", "settings-nav"),
+    "detached_role_only": _detached_script("go-settings", "a", "설정으로 이동", "settings-nav"),
+    "detached_similar": _detached_script("verify", "button", "인증 확인 취소"),
+}
+MUTATION_CASES = tuple(
+    MutationCase(
+        c.site_id, c.target_name, _DETACHED_SCRIPTS[c.expect_refusal], c.label,
+        c.expected_stage, c.action, c.expect_refusal, c.pre,
+    )
+    if c.expect_refusal in _DETACHED_SCRIPTS
+    else c
+    for c in MUTATION_CASES
 )
 
 
@@ -241,7 +358,9 @@ _TESTID_PRE = (
     "document.getElementById('go-settings').setAttribute('data-testid', 'settings-nav');"
 )
 _PRE_SCRIPTS: Dict[str, str] = {
-    c.label: _TESTID_PRE for c in MUTATION_CASES if c.site_id == "s13_spa"
+    c.label: (_TESTID_PRE if c.site_id == "s13_spa" else "") + c.pre
+    for c in MUTATION_CASES
+    if c.site_id == "s13_spa" or c.pre
 }
 
 #: 디스패처 음성 케이스에서 '눌렸는가'를 보는 페이지 상태(클릭 핸들러가 남기는 흔적).
@@ -328,6 +447,8 @@ async def _run(tasks: int) -> Dict[str, Any]:
                     dispatcher = ActionDispatcher(DispatchContext(page=page, engine=engine))
                     r = await dispatcher.dispatch(case.action, {"element_id": target_id})
                     mark_after = await page.evaluate(_PAGE_MARK_JS)
+                    adopt = case.expected_stage == ADOPT_GUARD
+                    attempts = r.data.get("healing_attempts") or []
                     if r.success or r.healed or mark_after != mark_before:
                         wrongful_heals.append(
                             f"{case.label}: {case.action.value} 인데 치유·실행됨 "
@@ -338,12 +459,18 @@ async def _run(tasks: int) -> Dict[str, Any]:
                         r.error_code is ErrorCode.TOCTOU_MISMATCH
                         and r.reobserve_required
                         and "element_changed" in r.data
-                        and "healing_attempts" not in r.data
+                        and (
+                            # 채택 지점 거부: 사다리를 돌았고 어느 단계가 고른 후보를 거부했다.
+                            any("identity_changed" in a for a in attempts)
+                            if adopt
+                            # 앞단 가드 거부: 사다리를 아예 돌지 않았다.
+                            else "healing_attempts" not in r.data
+                        )
                     ):
                         refusals[case.expect_refusal] = refusals.get(case.expect_refusal, 0) + 1
                     else:
                         note = (
-                            f"{case.label}: 앞단 가드 거부 기대, 다른 사유로 실패 "
+                            f"{case.label}: {case.expected_stage} 거부 기대, 다른 사유로 실패 "
                             f"({r.error_code.value if r.error_code else None}, "
                             f"attempts={r.data.get('healing_attempts')})"
                         )

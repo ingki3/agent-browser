@@ -85,7 +85,8 @@ def test_stage2_testid_when_name_changed():
     """이름이 바뀌어도 testid가 같으면 2단계에서 치유되어야 한다."""
     target = make_handle(name="로그인", testid="login-btn")
     candidate = make_candidate(name="Sign In", testid="login-btn", css_path="다름")
-    result = heal(target, [candidate])
+    # 이름이 다른 대체는 읽기 액션만 채택한다(WS-37 R2, 부작용 액션은 test_ws37_r2_adopt_guard).
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TESTID
 
@@ -94,7 +95,7 @@ def test_stage3_text_similarity_for_minor_change():
     """문구가 조금 바뀐 경우 3단계 유사도로 치유한다."""
     target = make_handle(name="장바구니 담기")
     candidate = make_candidate(name="장바구니에 담기", css_path="다름")
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
 
@@ -117,7 +118,7 @@ def test_stage3_handles_short_label_suffix_extension(before, after):
     """
     target = make_handle(name=before)
     candidate = make_candidate(name=after, css_path="다름")
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True, f"{before!r} -> {after!r} 치유 실패"
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
 
@@ -161,7 +162,7 @@ def test_stage3_proceeds_when_one_candidate_is_clearly_better():
         make_candidate(element_id="@e1", name="로그인하기", css_path="a"),
         make_candidate(element_id="@e2", name="회원가입", css_path="b"),
     ]
-    result = heal(target, candidates)
+    result = heal(target, candidates, action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
     assert result.candidate is not None
@@ -332,14 +333,31 @@ def test_harness_cases_reach_product_heal_path():
 
     extract 는 디스패처가 element_id 를 받지 않아 제품 경로에서 치유에 닿지 않는다(검증 NB-5).
     """
-    from harness.self_healing import FRONT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
+    from harness.self_healing import ADOPT_GUARD, FRONT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
 
     assert {"testid", "similar"} <= set(REQUIRED_REFUSALS)
     positive = [c for c in MUTATION_CASES if not c.expect_refusal]
     negative = [c for c in MUTATION_CASES if c.expect_refusal]
     assert all(c.action is not ActionType.EXTRACT for c in positive)
-    assert all(c.expected_stage == FRONT_GUARD for c in negative)
-    assert FRONT_GUARD not in {c.expected_stage for c in positive}
+    assert all(c.expected_stage in (FRONT_GUARD, ADOPT_GUARD) for c in negative)
+    assert not {FRONT_GUARD, ADOPT_GUARD} & {c.expected_stage for c in positive}
+
+
+def test_harness_r2_adopt_guard_cases():
+    """WS-37 R2: 2·3단계는 부작용(click, 같은 정규화 신원) 양성과 읽기(hover, 다른 이름) 양성을
+    모두 갖고, 요소가 사라진 자리의 다른 신원(N1·N1b·N2 형 + 역할만 다름)은 채택 지점 거부 음성."""
+    from harness.self_healing import ADOPT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
+
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    for stage in ("testid", "text_similarity"):
+        actions = {c.action in READ_ONLY_ACTIONS for c in positive if c.expected_stage == stage}
+        assert actions == {True, False}, (stage, actions)
+    detached = {"detached_testid", "detached_testid_role", "detached_role_only", "detached_similar"}
+    assert detached <= set(REQUIRED_REFUSALS)
+    adopt = [c for c in MUTATION_CASES if c.expect_refusal in detached]
+    assert {c.expect_refusal for c in adopt} == detached
+    assert all(c.expected_stage == ADOPT_GUARD and c.script and "remove()" in c.script
+               for c in adopt)
 
 
 def test_harness_required_stages_match_ladder():

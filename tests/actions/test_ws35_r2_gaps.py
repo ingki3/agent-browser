@@ -246,8 +246,11 @@ async def test_heal_disabled_never_substitutes_similar_element():
     assert r.success is False and r.healed is False and r.data.get("heal_disabled") is True
     assert r.error_code is ErrorCode.ELEMENT_NOT_FOUND  # 제거(NODE_DETACHED) 사유의 코드
     assert out1 == "대기"
-    assert r2.healed is True, "대조: heal_disabled 가 아니면 치유 사다리가 돈다"
-    assert out2 == "near"
+    # 대조: heal_disabled 가 아니면 치유 사다리가 돈다(healing_attempts). WS-37 R2 부터 부작용
+    # 액션은 이름이 다른 후보('결제 하기')를 채택하지 않으므로 3단계에서 거부되고 누르지 않는다.
+    assert "text_similarity(identity_changed)" in r2.data.get("healing_attempts", []), r2.data
+    assert r2.healed is False and r2.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert out2 == "대기"
 
 
 # ------------------------------------------------------------------ D1: 호출자 epoch 불일치

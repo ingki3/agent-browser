@@ -3,7 +3,8 @@
 사용자 결정 A(2026-10-08): 부작용 액션(`READ_ONLY_ACTIONS` 밖 전부, 모르는 액션 포함)에서
 `verify_staleness` 가 NAME_CHANGED 또는 ROLE_CHANGED(같은 자리 요소의 신원이 바뀜)면 치유
 사다리를 아예 돌리지 않는다 → E_TOCTOU_MISMATCH + reobserve_required + element_changed/hint.
-요소가 사라진 경우(NODE_DETACHED)·에포크 불일치는 현행 치유 그대로, 읽기 액션도 현행 그대로.
+요소가 사라진 경우(NODE_DETACHED)는 사다리를 돌되 R2 부터 채택 지점이 같은 신원만 받는다
+(test_ws37_r2_adopt_guard), 읽기 액션은 현행 그대로.
 
 검증 B1: 2단계(testid)가 같은 자리 교체를 그대로 눌렀다(1a·1b·1b2·1b3).
 검증 NB-2: 3단계(유사도)가 '결제하기(광고)'·'결제하기 취소'·'결제 취소' 를 눌렀다(1c~1e).
@@ -231,8 +232,10 @@ async def test_counter_label_change_is_refused_as_intended_cost():
 
 
 @requires_chromium
-async def test_deleted_element_still_heals_to_similar_sibling():
-    """요소가 사라진 경우(NODE_DETACHED)는 현행 치유 그대로 — 유사 요소로 3단계 치유."""
+async def test_deleted_element_similar_sibling_is_not_clicked():
+    """요소가 사라진 경우(NODE_DETACHED)도 사다리는 돌지만, 부작용 액션은 이름이 다른 후보
+    ('결제 하기' ≠ '결제하기' — 공백은 접을 뿐 지우지 않는다)를 채택하지 않는다(WS-37 R2).
+    R1 에서는 3단계로 'near' 를 눌렀다."""
     html = PLAIN_HTML.replace(
         "<p id=out>", "<a id=near href=\"#\" onclick=\"document.getElementById('out')"
         ".textContent='near';return false\">결제 하기</a><p id=out>")
@@ -240,8 +243,10 @@ async def test_deleted_element_still_heals_to_similar_sibling():
                                           "document.getElementById('slot').remove()",
                                           ActionType.CLICK)
     assert st.reason.value == "node_detached"
-    assert r.success is True and r.healed is True, (r.error_code, r.error_message, r.data)
-    assert out == "near"
+    assert out == "대기" and r.success is False and r.healed is False
+    assert r.error_code is ErrorCode.TOCTOU_MISMATCH and r.reobserve_required is True
+    assert r.data["element_changed"]["after"]["name"] == "결제 하기"
+    assert "text_similarity(identity_changed)" in r.data["healing_attempts"]
 
 
 @requires_chromium

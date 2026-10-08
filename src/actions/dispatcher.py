@@ -1459,11 +1459,14 @@ class ActionDispatcher:
                 fail_data: Dict[str, Any] = {"healing_attempts": healing.attempts}
                 swapped = healing.identity_refused
                 if swapped is not None:
-                    # 이중 방어: 앞단 가드를 지나온 사유(에포크 불일치 등)에서도 경로 단계가
-                    # 같은 자리의 role/name 이 다른 요소를 골랐다 — 누르지 않았다.
+                    # WS-37 R2: 앞단 가드를 지나온 사유(요소가 사라진 NODE_DETACHED)에서 사다리의
+                    # 어느 단계가 role/name 이 다른 요소를 골랐다 — heal() 채택 지점이 부작용
+                    # 액션이라 거부했고 누르지 않았다. (디스패처에서 EPOCH_MISMATCH 는 핸들 조회가
+                    # 먼저 막아 여기 오지 않는다.) 요소를 '못 찾은' 것이 아니라 관찰과 다른 요소를
+                    # 찾은 것이므로 앞단 가드와 같은 E_TOCTOU_MISMATCH 로 보고한다.
                     return self._identity_changed_result(
                         action,
-                        staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
+                        ErrorCode.TOCTOU_MISMATCH,
                         f"Staleness 검증 실패({staleness.reason.value}) 및 자가 치유 거부",
                         (handle.role, handle.name),
                         (swapped.role, swapped.name),
@@ -1903,8 +1906,8 @@ class ActionDispatcher:
     ) -> HealingResult:
         """재관찰 후 자가 치유 사다리를 가동한다.
 
-        ``action`` 이 부작용 액션이면 경로 단계는 role/name 이 바뀐 요소를 고르지
-        않는다(`actions.healing.path_heal_allowed`).
+        ``action`` 이 부작용 액션이면 어느 단계든 role/name 이 바뀐 요소를 채택하지
+        않는다(`actions.healing.heal` 채택 지점, `path_heal_allowed`).
         """
         self._healing_attempts += 1
 
