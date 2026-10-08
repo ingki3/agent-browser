@@ -416,6 +416,9 @@ python -m harness.ipi_test
 
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
+
+# 10. 동작 캐시(레시피) 재생 — 시나리오 8종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38)
+python -m harness.recipe_replay
 ```
 
 > **명령어 주석**:
