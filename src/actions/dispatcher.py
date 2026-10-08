@@ -40,11 +40,13 @@ from actions.healing import (
     HealingCandidate,
     HealingResult,
     heal,
+    identity_change_refused,
     is_retry_safe,
 )
 from actions.verification import (
     PostConditionResult,
     capture_state,
+    safe_page_text,
     verify_post_condition,
     verify_staleness,
 )
@@ -1432,32 +1434,47 @@ class ActionDispatcher:
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
+        if not staleness.fresh and identity_change_refused(staleness.reason, action):
+            # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
+            # 바뀌었다(제자리 교체). 치유 사다리의 어느 단계로 골라도(testid 유지·비슷한
+            # 이름·같은 경로) 다른 요소를 누를 수 있으므로 사다리를 돌리지 않고 재관찰을 요구한다.
+            before_role = params.get("expected_role") or handle.role
+            before_name = (
+                params.get("expected_name")
+                if params.get("expected_name") is not None
+                else handle.name
+            )
+            return self._identity_changed_result(
+                action,
+                staleness.error_code or ErrorCode.TOCTOU_MISMATCH,
+                f"Staleness 검증 실패({staleness.reason.value}) — 치유하지 않음",
+                (before_role, before_name),
+                (staleness.observed_role, staleness.observed_name),
+                {},
+            )
         if not staleness.fresh:
             # 부작용이 없는 시점이므로 치유가 안전하다.
             healing = await self._attempt_heal(handle, action)
             if not healing.healed or healing.candidate is None:
                 fail_data: Dict[str, Any] = {"healing_attempts": healing.attempts}
-                message = f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패"
                 swapped = healing.identity_refused
                 if swapped is not None:
-                    # 제자리 교체: 같은 자리에 role/name 이 다른 요소가 있다.
-                    # 부작용 액션이라 그 요소를 누르지 않았다 — 재관찰을 안내한다.
-                    hint = (
-                        f"요소가 바뀜(이전 {handle.role} '{handle.name}' → 현재 "
-                        f"{swapped.role} '{swapped.name}') — 다시 관찰하라"
+                    # 이중 방어: 앞단 가드를 지나온 사유(에포크 불일치 등)에서도 경로 단계가
+                    # 같은 자리의 role/name 이 다른 요소를 골랐다 — 누르지 않았다.
+                    return self._identity_changed_result(
+                        action,
+                        staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
+                        f"Staleness 검증 실패({staleness.reason.value}) 및 자가 치유 거부",
+                        (handle.role, handle.name),
+                        (swapped.role, swapped.name),
+                        fail_data,
                     )
-                    fail_data["element_changed"] = {
-                        "before": {"role": handle.role, "name": handle.name},
-                        "after": {"role": swapped.role, "name": swapped.name},
-                    }
-                    fail_data["hint"] = hint
-                    message = f"{message}: {hint}"
                 return self._result(
                     success=False,
                     action=action,
                     retry_safe=True,
                     error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
-                    error_message=message,
+                    error_message=f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패",
                     reobserve_required=True,
                     data=fail_data,
                 )
@@ -1844,6 +1861,42 @@ class ActionDispatcher:
         )
 
     # -- 치유 ---------------------------------------------------------------
+
+    def _identity_changed_result(
+        self,
+        action: ActionType,
+        error_code: ErrorCode,
+        lead: str,
+        before: Tuple[Optional[str], Optional[str]],
+        after: Tuple[Optional[str], Optional[str]],
+        data: Dict[str, Any],
+    ) -> ActionResult:
+        """제자리 교체 거부 응답: E_TOCTOU_MISMATCH 계열 + 재관찰 + element_changed/hint.
+
+        이름·role 은 페이지가 정한 문자열이라 `safe_page_text` 로 제어문자를 보이는 표기로
+        바꾸고 80자로 자른다. error_message 는 안내(hint)를 한 번만 싣는다 — staleness.detail
+        에 같은 이름이 또 들어 있으므로 함께 붙이지 않는다(검증 NB-4: 같은 문자열 4중 적재).
+        """
+        b_role, b_name = (safe_page_text(v) for v in before)
+        a_role, a_name = (safe_page_text(v) for v in after)
+        hint = (
+            f"요소가 바뀜(이전 {b_role} '{b_name}' → 현재 {a_role} '{a_name}') — 다시 관찰하라"
+        )
+        out = dict(data)
+        out["element_changed"] = {
+            "before": {"role": b_role, "name": b_name},
+            "after": {"role": a_role, "name": a_name},
+        }
+        out["hint"] = hint
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=error_code,
+            error_message=f"{lead}: {hint}",
+            reobserve_required=True,
+            data=out,
+        )
 
     async def _attempt_heal(
         self, handle: ElementHandle, action: Optional[ActionType] = None

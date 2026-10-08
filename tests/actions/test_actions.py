@@ -327,6 +327,21 @@ def test_harness_stage4_positive_uses_read_action_and_refusals_are_side_effect()
     assert all(c.action not in READ_ONLY_ACTIONS for c in negative)
 
 
+def test_harness_cases_reach_product_heal_path():
+    """WS-37 R1: 음성은 testid·비슷한 이름 경로까지(검증 B1·NB-2), 양성은 제품에서 사다리에 닿는 액션.
+
+    extract 는 디스패처가 element_id 를 받지 않아 제품 경로에서 치유에 닿지 않는다(검증 NB-5).
+    """
+    from harness.self_healing import FRONT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
+
+    assert {"testid", "similar"} <= set(REQUIRED_REFUSALS)
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    negative = [c for c in MUTATION_CASES if c.expect_refusal]
+    assert all(c.action is not ActionType.EXTRACT for c in positive)
+    assert all(c.expected_stage == FRONT_GUARD for c in negative)
+    assert FRONT_GUARD not in {c.expected_stage for c in positive}
+
+
 def test_harness_required_stages_match_ladder():
     """REQUIRED_STAGES가 실제 사다리 정의와 어긋나면 안 된다."""
     from harness.self_healing import REQUIRED_STAGES

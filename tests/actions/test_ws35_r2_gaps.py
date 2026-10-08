@@ -42,7 +42,15 @@ SWAPS = [
      "(() => { const a = document.getElementById('slot'); const n = a.cloneNode(false);"
      " n.textContent = '광고: 대출 상담'; n.onclick = a.onclick; a.replaceWith(n); })()",
      "name_changed"),
+    # role 과 이름이 함께 바뀜(verify_staleness 는 role 을 먼저 본다)
+    ("role+name",
+     "(() => { const a = document.getElementById('slot'); a.textContent = '회원 탈퇴';"
+     " a.setAttribute('role', 'checkbox'); })()",
+     "role_changed"),
 ]
+
+#: WS-37 R1(검증 B1): 슬롯에 data-testid 가 있으면 2단계(testid)가 같은 자리 교체를 눌렀다.
+AD_HTML_TESTID = AD_HTML.replace("<a id=slot ", '<a id=slot data-testid="pay" ')
 
 
 async def _setup(pw, html: str):
@@ -126,18 +134,20 @@ async def test_in_place_swap_blocks_approved_click(label, swap_js, reason):
 
 
 @requires_chromium
+@pytest.mark.parametrize("html", [AD_HTML, AD_HTML_TESTID], ids=["plain", "testid"])
 @pytest.mark.parametrize("label,swap_js,reason", SWAPS, ids=[s[0] for s in SWAPS])
-async def test_in_place_swap_default_dispatch_does_not_click(label, swap_js, reason):
+async def test_in_place_swap_default_dispatch_does_not_click(label, swap_js, reason, html):
     """WS-37 결함1: 기본 디스패치(치유 켜짐)도 제자리 교체된 요소를 누르지 않는다.
 
     전에는 치유 4단계(css_path)가 같은 자리의 교체된 요소('회원 탈퇴', '광고: 대출 상담')로
-    '치유'해 healed=True 로 눌렀다. 부작용 액션은 경로 단계에서 role/name 이 바뀐 요소를
-    고르지 않는다 — TOCTOU_MISMATCH 와 '요소가 바뀜(이전 → 현재) — 다시 관찰하라' 안내.
+    '치유'해 healed=True 로 눌렀다. R1(검증 B1): testid 가 있으면 2단계가 같은 일을 했다 —
+    부작용 액션 + NAME/ROLE_CHANGED 면 치유 사다리를 아예 돌리지 않는다(앞단 가드).
+    TOCTOU_MISMATCH 와 '요소가 바뀜(이전 → 현재) — 다시 관찰하라' 안내.
     """
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        browser, page, engine, d = await _setup(pw, AD_HTML)
+        browser, page, engine, d = await _setup(pw, html)
         try:
             obs, el = await _observe_slot(engine, page)
             await page.evaluate(swap_js)
@@ -152,14 +162,17 @@ async def test_in_place_swap_default_dispatch_does_not_click(label, swap_js, rea
     changed = r.data.get("element_changed")
     assert changed is not None, r.data
     assert changed["before"] == {"role": "link", "name": "결제하기"}
-    if reason == "role_changed":
+    if label == "role":
         assert changed["after"] == {"role": "checkbox", "name": "결제하기"}
+    elif label == "role+name":
+        assert changed["after"] == {"role": "checkbox", "name": "회원 탈퇴"}
     else:
         assert changed["after"]["role"] == "link"
         assert changed["after"]["name"] in ("회원 탈퇴", "광고: 대출 상담")
     assert "다시 관찰" in r.data["hint"] and "결제하기" in r.data["hint"]
     assert "다시 관찰" in (r.error_message or "")
-    assert any("identity_changed" in a for a in r.data["healing_attempts"])
+    # 앞단 가드: 치유 사다리를 돌리지 않는다(어느 단계도 후보를 고르지 않음).
+    assert "healing_attempts" not in r.data, r.data
 
 
 @requires_chromium

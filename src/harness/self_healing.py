@@ -16,18 +16,24 @@
 
 변형 시나리오는 실제 웹에서 흔한 패턴을 재현한다:
 * 클래스명 변경 (CSS-in-JS 해시 재생성) -> 1단계
-* 이름 변경 + testid 유지 (i18n 전환)   -> 2단계
-* 문구 미세 변경 (A/B 테스트)           -> 3단계
-* role/name 변경, 경로 유지 + 읽기 액션 -> 4단계
+* 이름 변경 + testid 유지 (i18n 전환)   -> 2단계 (hover, 또는 요소가 옮겨져 사라진 경우 click)
+* 문구 미세 변경 (A/B 테스트)           -> 3단계 (요소가 옮겨져 사라짐 — NODE_DETACHED)
+* role/name 변경, 경로 유지 + 읽기 액션 -> 4단계 (hover)
 
-**제자리 교체 거부 (WS-37, 음성 케이스)**:
-4단계(css_path)는 role·name 이 바뀐 '같은 자리의 다른 요소'만 고른다(둘 다 같으면
-1단계가 먼저 잡는다). 광고 로테이션으로 '결제하기' 자리에 '회원 탈퇴'가 들어온 경우가
-그렇다. 그래서 부작용 액션(click 등, `actions.READ_ONLY_ACTIONS` 밖)은 4단계 치유를
-거부해야 한다. 4단계 양성 시나리오는 읽기 액션(hover/extract)으로 유발하고, 부작용
-액션 + 이름만/역할만/둘 다 변경은 **거부가 정답**인 음성 케이스(`expect_refusal`)로
-둔다. 음성 케이스를 치유해 버리면(wrongful heal) exit 2, 거부 사유가 4단계 신원 검사가
-아니거나(규칙 2) 세 종류 중 하나라도 측정하지 못하면(규칙 1) exit 2.
+**제자리 교체 거부 (WS-37 R1, 음성 케이스)**:
+부작용 액션(click 등, `actions.READ_ONLY_ACTIONS` 밖)에서 관찰한 그 자리 요소의 role/name 이
+바뀌면(staleness NAME_CHANGED/ROLE_CHANGED) 디스패처는 치유 사다리를 **아예 돌리지 않고**
+재관찰을 요구한다(`actions.identity_change_refused`, 사용자 결정 A). 사다리의 어느 단계로
+골라도 — testid 유지(2단계), '인증 확인 취소' 같은 비슷한 이름(3단계), 같은 경로(4단계) —
+교체된 요소를 누르게 되기 때문이다. 그래서
+
+* 양성 시나리오는 제품 경로에서 실제로 사다리에 닿는 것만 둔다: 읽기 액션이거나 요소가
+  사라진(NODE_DETACHED) 경우. 부작용 액션 + 신원 변경 양성은 제품이 거부하므로 그 단계를
+  측정하지 못한다 — 측정 중 `identity_change_refused` 가 참이면 단계 불일치로 exit 2(규칙 2).
+* 음성 케이스(`expect_refusal`)는 **실제 디스패처**(`ActionDispatcher.dispatch`)로 돌린다:
+  이름만/역할만/둘 다/testid 유지/비슷한 이름. 눌리거나 치유되면 wrongful heal 로 exit 2,
+  앞단 가드가 아닌 다른 사유(사다리를 돈 흔적 `healing_attempts`)로 거부되면 exit 2(규칙 2),
+  다섯 종류 중 하나라도 측정하지 못하면 exit 2(규칙 1).
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-from contracts import ActionType, thresholds
+from contracts import ActionType, ErrorCode, thresholds
 
 from harness.mock_sites import MockServer
 from harness.result import MetricResult, emit, emit_error
@@ -46,8 +52,12 @@ from harness.result import MetricResult, emit, emit_error
 #: 사다리 4단계가 모두 검증되어야 지표를 신뢰할 수 있다.
 REQUIRED_STAGES = ("role_name", "testid", "text_similarity", "css_path")
 
-#: 부작용 액션의 제자리 교체 거부가 세 종류 모두 측정되어야 한다.
-REQUIRED_REFUSALS = ("name", "role", "both")
+#: 부작용 액션의 제자리 교체 거부가 다섯 종류 모두 측정되어야 한다.
+#: testid·similar 는 앞단 가드가 없으면 2·3단계가 교체된 요소를 고르는 경로다(검증 B1·NB-2).
+REQUIRED_REFUSALS = ("name", "role", "both", "testid", "similar")
+
+#: 음성 케이스의 기대 거부 지점(사다리 단계가 아니라 사다리 앞단).
+FRONT_GUARD = "front_guard"
 
 
 @dataclass
@@ -93,18 +103,33 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "role_name",
     ),
     # --- 2단계: 이름이 바뀌고 testid만 남음 (i18n 언어 전환 모사) ---
+    #     부작용 액션 + 제자리 이름 변경은 앞단 가드가 거부하므로(음성 'testid' 참고)
+    #     양성은 읽기 액션(hover)이거나, 요소가 옮겨져 원래 자리에서 사라진 경우(click).
+    MutationCase(
+        "s13_spa",
+        "설정으로 이동",
+        "document.getElementById('go-settings').textContent = 'Go to Settings';",
+        "testid 유지 이름 변경 (i18n, hover)",
+        "testid",
+        ActionType.HOVER,
+    ),
     MutationCase(
         "s13_spa",
         "설정으로 이동",
         """
         const el = document.getElementById('go-settings');
-        el.setAttribute('data-testid', 'settings-nav');
+        el.textContent = 'Go to Settings';
+        el.removeAttribute('id');
+        const wrap = document.createElement('section');
+        el.parentNode.insertBefore(wrap, el);
+        wrap.appendChild(el);
         """,
-        "testid 부여 후 이름 변경 (i18n)",
+        "testid 유지 이름 변경 + 이동 (i18n 재렌더, click)",
         "testid",
     ),
     # --- 3단계: 문구만 미세하게 변경 (A/B 테스트 모사) ---
     #     CSS 경로도 함께 바꿔야 4단계로 새지 않고 3단계에서 해결된다.
+    #     원래 경로의 요소가 사라지므로(NODE_DETACHED) 부작용 액션도 사다리를 돈다.
     MutationCase(
         "s09_ad_rotation",
         "장바구니 담기",
@@ -134,6 +159,8 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "text_similarity",
     ),
     # --- 4단계: role과 name이 바뀌고 CSS 경로만 남음 — 읽기 액션 ---
+    #     (검증 NB-5: extract 는 디스패처가 element_id 를 받지 않아 제품 경로에서 치유에 닿지
+    #     않는다 — 제품에서 경로 치유에 닿는 읽기 액션인 hover 로 둘 다 유발한다.)
     MutationCase(
         "s02_twofactor",
         "인증 확인",
@@ -150,17 +177,17 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "s02_twofactor",
         "인증 확인",
         "document.getElementById('verify').textContent = '전혀 다른 문구입니다';",
-        "name 만 변경 (경로 유지, extract)",
+        "name 만 변경 (경로 유지, hover)",
         "css_path",
-        ActionType.EXTRACT,
+        ActionType.HOVER,
     ),
-    # --- 음성: 부작용 액션 + 제자리 교체 → 치유 거부가 정답 (WS-37) ---
+    # --- 음성: 부작용 액션 + 제자리 교체 → 앞단 가드 거부가 정답 (WS-37 R1) ---
     MutationCase(
         "s02_twofactor",
         "인증 확인",
         "document.getElementById('verify').textContent = '회원 탈퇴';",
         "제자리 교체 name 만 (click, 거부)",
-        "css_path",
+        FRONT_GUARD,
         ActionType.CLICK,
         expect_refusal="name",
     ),
@@ -169,7 +196,7 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "인증 확인",
         "document.getElementById('verify').setAttribute('role', 'checkbox');",
         "제자리 교체 role 만 (click, 거부)",
-        "css_path",
+        FRONT_GUARD,
         ActionType.CLICK,
         expect_refusal="role",
     ),
@@ -182,33 +209,56 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         el.setAttribute('role', 'link');
         """,
         "제자리 교체 role/name 동시 (click, 거부)",
-        "css_path",
+        FRONT_GUARD,
         ActionType.CLICK,
         expect_refusal="both",
+    ),
+    # 검증 B1: testid 가 남은 채 같은 자리 요소가 바뀌면 2단계가 그 요소를 골랐다.
+    MutationCase(
+        "s13_spa",
+        "설정으로 이동",
+        "document.getElementById('go-settings').textContent = '회원 탈퇴';",
+        "제자리 교체 testid 유지 (click, 거부)",
+        FRONT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="testid",
+    ),
+    # 검증 NB-2: 의미가 반전된 비슷한 이름(규칙 3)은 3단계가 그 요소를 골랐다.
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        "document.getElementById('verify').textContent = '인증 확인 취소';",
+        "제자리 교체 비슷한 이름 '인증 확인 취소' (click, 거부)",
+        FRONT_GUARD,
+        ActionType.CLICK,
+        expect_refusal="similar",
     ),
 )
 
 
-#: 2단계 유발을 위해 관찰 시점에 testid를 심는 사전 스크립트
+#: 2단계 유발을 위해 관찰 시점에 testid를 심는 사전 스크립트 (s13 의 모든 케이스)
+_TESTID_PRE = (
+    "document.getElementById('go-settings').setAttribute('data-testid', 'settings-nav');"
+)
 _PRE_SCRIPTS: Dict[str, str] = {
-    "testid 부여 후 이름 변경 (i18n)": (
-        "document.getElementById('go-settings')"
-        ".setAttribute('data-testid', 'settings-nav');"
-    ),
+    c.label: _TESTID_PRE for c in MUTATION_CASES if c.site_id == "s13_spa"
 }
 
-#: 2단계 시나리오는 변형 시 이름을 바꿔 role_name 매칭을 끊는다.
-_POST_RENAME: Dict[str, str] = {
-    "testid 부여 후 이름 변경 (i18n)": (
-        "document.getElementById('go-settings').textContent = 'Go to Settings';"
-    ),
-}
+#: 디스패처 음성 케이스에서 '눌렸는가'를 보는 페이지 상태(클릭 핸들러가 남기는 흔적).
+_PAGE_MARK_JS = "() => [location.href, document.body.getAttribute('data-result')]"
 
 
 async def _run(tasks: int) -> Dict[str, Any]:
     from playwright.async_api import async_playwright
 
-    from actions import HealingCandidate, heal
+    from actions import (
+        ActionDispatcher,
+        DispatchContext,
+        HealingCandidate,
+        heal,
+        identity_change_refused,
+        verify_staleness,
+    )
     from perception import PerceptionEngine
 
     healed = 0
@@ -248,22 +298,69 @@ async def _run(tasks: int) -> Dict[str, Any]:
                 # 1) 최초 관찰 -> 타깃 핸들 확보
                 observation = await engine.observe_page(page=page, prune_top_n=50)
                 target_handle = None
+                target_id = ""
                 for element in observation.elements:
                     if case.target_name in element.name:
                         target_handle = engine.get_handle(element.element_id)
+                        target_id = element.element_id
                         break
 
                 if target_handle is None:
-                    total += 1
-                    failures.append(f"{case.label}: 타깃 요소를 찾지 못함")
+                    if case.expect_refusal:
+                        guard_total += 1
+                        note = f"{case.label}: 타깃 요소를 찾지 못해 거부를 측정하지 못함"
+                        if note not in stage_mismatch:
+                            stage_mismatch.append(note)
+                    else:
+                        total += 1
+                        failures.append(f"{case.label}: 타깃 요소를 찾지 못함")
                     continue
 
                 # 2) DOM 변형 -> element_id가 stale이 된다
                 await page.evaluate(f"() => {{ {case.script} }}")
-                rename = _POST_RENAME.get(case.label)
-                if rename:
-                    await page.evaluate(f"() => {{ {rename} }}")
                 await page.wait_for_timeout(100)
+
+                if case.expect_refusal:
+                    # 음성 케이스: 성공률 표본이 아니다. 실제 디스패처(제품 경로)로 돌려
+                    # 앞단 가드가 사다리 전에 거부하는지 본다.
+                    guard_total += 1
+                    mark_before = await page.evaluate(_PAGE_MARK_JS)
+                    dispatcher = ActionDispatcher(DispatchContext(page=page, engine=engine))
+                    r = await dispatcher.dispatch(case.action, {"element_id": target_id})
+                    mark_after = await page.evaluate(_PAGE_MARK_JS)
+                    if r.success or r.healed or mark_after != mark_before:
+                        wrongful_heals.append(
+                            f"{case.label}: {case.action.value} 인데 치유·실행됨 "
+                            f"(success={r.success}, healed={r.healed}, "
+                            f"page {mark_before} -> {mark_after})"
+                        )
+                    elif (
+                        r.error_code is ErrorCode.TOCTOU_MISMATCH
+                        and r.reobserve_required
+                        and "element_changed" in r.data
+                        and "healing_attempts" not in r.data
+                    ):
+                        refusals[case.expect_refusal] = refusals.get(case.expect_refusal, 0) + 1
+                    else:
+                        note = (
+                            f"{case.label}: 앞단 가드 거부 기대, 다른 사유로 실패 "
+                            f"({r.error_code.value if r.error_code else None}, "
+                            f"attempts={r.data.get('healing_attempts')})"
+                        )
+                        if note not in stage_mismatch:
+                            stage_mismatch.append(note)
+                    continue
+
+                # 양성: 제품 경로에서 이 시나리오가 사다리에 닿는가(규칙 2). 부작용 액션 +
+                # 신원 변경이면 디스패처가 앞단에서 거부하므로 그 단계를 측정하지 못한다.
+                staleness = await verify_staleness(page, target_handle, engine.epoch)
+                if identity_change_refused(staleness.reason, case.action):
+                    note = (
+                        f"{case.label}: {case.action.value} + {staleness.reason.value} 는 "
+                        f"제품 경로에서 앞단 가드가 거부 — {case.expected_stage} 미측정"
+                    )
+                    if note not in stage_mismatch:
+                        stage_mismatch.append(note)
 
                 # 3) 재관찰 후 치유 사다리 가동
                 fresh = await engine.observe_page(page=page, prune_top_n=50)
@@ -282,29 +379,6 @@ async def _run(tasks: int) -> Dict[str, Any]:
                     )
 
                 result = heal(target_handle, candidates, action=case.action)
-                if case.expect_refusal:
-                    # 음성 케이스: 성공률 표본이 아니다. 거부만이 정답이다.
-                    guard_total += 1
-                    if result.healed:
-                        wrongful_heals.append(
-                            f"{case.label}: {case.action.value} 인데 "
-                            f"{result.strategy.value if result.strategy else '?'} 로 "
-                            f"'{result.candidate.name if result.candidate else '?'}' 치유"
-                        )
-                    elif (
-                        result.identity_refused is not None
-                        and result.attempts
-                        and result.attempts[-1] == f"{case.expected_stage}(identity_changed)"
-                    ):
-                        refusals[case.expect_refusal] = refusals.get(case.expect_refusal, 0) + 1
-                    else:
-                        note = (
-                            f"{case.label}: {case.expected_stage} 신원 검사로 거부 기대, "
-                            f"다른 사유로 실패 ({result.reason})"
-                        )
-                        if note not in stage_mismatch:
-                            stage_mismatch.append(note)
-                    continue
                 total += 1
                 if result.healed and result.strategy:
                     healed += 1

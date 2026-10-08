@@ -292,6 +292,8 @@ click         ->  element_id="@e3", epoch=0
 
 페이지가 바뀌면 `epoch`이 올라가고 이전 `element_id`는 무효가 됩니다. 오래된 ID로 액션을 보내면 `E_TOCTOU_MISMATCH`로 거부됩니다 — 다른 요소를 잘못 누르는 것보다 낫다는 판단입니다.
 
+같은 `epoch` 안에서도 관찰한 자리의 요소가 바뀌었으면(이름이나 role이 달라짐 — 광고 로테이션으로 '결제하기' 자리에 '회원 탈퇴'가 들어온 경우) 부작용 액션(`click`·`type_text`·`select_option`·`check_box` 등, 읽기 액션 `observe_page`·`take_screenshot`·`scroll`·`hover`·`wait_for`·`extract` 밖 전부)은 자가 치유를 시도하지 않고 `E_TOCTOU_MISMATCH`, `reobserve_required=true`, `data.element_changed={before, after}`·`data.hint`로 거부합니다. testid가 남았거나 이름이 비슷해도('결제하기 취소') 마찬가지입니다. 대가로 '장바구니(1)'→'장바구니(2)'처럼 같은 버튼의 이름만 바뀐 경우도 다시 관찰해야 합니다. 요소가 사라진 경우는 지금처럼 자가 치유합니다. 안내에 실리는 이름·role은 제어문자를 보이는 표기로 바꾸고 80자로 자릅니다.
+
 `click`(좌표 포함)·`press_key`·`select_option`·`check_box`·`type_text(press_enter)` 뒤 200ms 안에 메인 프레임 문서 요청이 시작되면, 새 문서가 커밋되고 `domcontentloaded`가 될 때까지(상한 8초) 기다린 뒤 결과를 돌려줍니다. 결과 `data`에 `nav_wait_ms`·`nav_committed`(상한 초과면 `nav_timed_out`, 204·다운로드·요청 실패면 `nav_aborted`)가 남고, 새 문서가 떴으면 `reobserve_required=true`입니다. 떠나는 중인 페이지를 관찰해 판단하지 않게 하려는 것입니다(G마켓 실측: Enter 뒤 결과 문서가 0.7~0.9초 늦게 와 홈 화면에서 scroll을 골랐다). 대신 이동이 없는 이 액션들은 감지 창만큼(약 200ms) 느려집니다. 링크·리다이렉트 클릭은 Playwright `click()`이 커밋까지 기다린 뒤 반환하므로 `nav_wait_ms`가 0에 가깝게 찍힙니다 — 기다리지 않았다는 뜻이 아니라 `click()` 안에서 기다린 것입니다.
 
 요소 액션의 성공 판정(사후조건)은 대상 문서의 변화 외에 다음도 효과로 봅니다: 새 메인 문서 커밋(`signals`에 `navigated: …`, 예: `type_text(press_enter)`로 폼이 결과 페이지로 감), `switch_frame`으로 들어간 프레임 안 액션이 바꾼 최상위 문서(`top:…`)나 연 새 탭, 네이티브 다이얼로그(`dialog_opened:<type>`, `data.dialogs`에 종류·문구·`accepted`/`dismissed`). 아무 변화도 없는 클릭은 여전히 `E_TIMEOUT`입니다. `handle_dialog`를 먼저 부르지 않은 다이얼로그는 거절됩니다(beforeunload 는 수락). 다이얼로그는 원인을 가리지 않습니다 — 액션 중(대기 창 포함) 뜬 다이얼로그는 무관한 타이머가 띄운 것이어도 효과로 기록됩니다(`data.dialogs`의 문구로 확인하십시오).
@@ -329,7 +331,7 @@ agent-browser control take
 agent-browser control release
 ```
 
-4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다. 사람이 에이전트가 쓰던 탭을 닫았으면 반납 때 남은 탭으로 바꾸고 `data.tab_closed_by_human={closed_tab_id, active_tab_id, hint}`로 알립니다(`browser_tab_control(command="list")`로 확인).
+4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다. 사람이 에이전트가 쓰던 탭을 닫았으면 반납 때 남은 탭으로 바꾸고 `data.tab_closed_by_human={closed_tab_id, active_tab_id, hint}`로 알립니다(`browser_tab_control(command="list")`로 확인). 탭 복구가 10초 안에 끝나지 않으면 반납 응답에는 이 알림이 빠지고 다음 `browser_control_status` 응답에 실립니다(서버 로그에 경고 — 의도된 저하).
 
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 

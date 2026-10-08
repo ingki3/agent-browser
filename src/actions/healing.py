@@ -27,6 +27,8 @@ from contracts import ActionType
 from perception import label_similarity
 from perception.engine import ElementHandle
 
+from actions.verification import StalenessReason
+
 logger = logging.getLogger(__name__)
 
 #: 텍스트 유사도 치유의 최소 임계값. 이보다 낮으면 다른 요소로 간주한다.
@@ -119,6 +121,27 @@ def path_heal_allowed(action: Optional[ActionType]) -> bool:
     return action is not None and action in READ_ONLY_ACTIONS
 
 
+#: 같은 자리 요소의 신원(role/name)이 바뀌었다는 staleness 사유.
+IDENTITY_CHANGE_REASONS = frozenset(
+    {StalenessReason.NAME_CHANGED, StalenessReason.ROLE_CHANGED}
+)
+
+
+def identity_change_refused(
+    reason: Optional[StalenessReason], action: Optional[ActionType]
+) -> bool:
+    """치유 사다리를 **돌리기 전에** 거부해야 하는가 (WS-37 R1, 사용자 결정 A).
+
+    부작용 액션(`path_heal_allowed` 가 거짓 — 읽기 액션 밖 전부, 모르는 액션 포함)에서
+    staleness 가 NAME_CHANGED/ROLE_CHANGED 면 관찰했던 그 자리의 요소가 다른 요소로
+    바뀐 것이다. 사다리의 어느 단계로 고르든(testid 유지·유사한 이름·같은 경로)
+    '결제하기' 자리의 '회원 탈퇴'·'결제하기 취소'를 누를 수 있으므로 단계별 검사가
+    아니라 앞단에서 한 번에 막는다. 요소가 사라진 경우(NODE_DETACHED)·에포크 불일치·
+    읽기 액션은 현행 치유 그대로다.
+    """
+    return reason in IDENTITY_CHANGE_REASONS and not path_heal_allowed(action)
+
+
 def ladder_for(handle: ElementHandle) -> Sequence[HealingStrategy]:
     """요소 특성에 맞는 사다리를 선택한다."""
     return SHADOW_LADDER if handle.is_shadow else DEFAULT_LADDER
@@ -139,6 +162,11 @@ def heal(
     ``action`` 이 읽기 액션(`READ_ONLY_ACTIONS`)이 아니면 경로 단계는 role 과
     name 이 원래 값과 모두 같은 후보만 받는다(사실상 경로 단계 치유 안 함 —
     `path_heal_allowed`). 거부한 후보는 ``identity_refused`` 에 담는다.
+
+    WS-37 R1: 부작용 액션 + NAME/ROLE_CHANGED 는 디스패처가 사다리 **앞단**에서
+    거부한다(`identity_change_refused`). 이 경로 단계 검사는 앞단 가드가 보지 않는
+    사유(에포크 불일치 — 탐색 뒤 같은 경로에 다른 요소)와 heal 을 직접 부르는 호출자를
+    위한 이중 방어로 남긴다.
     """
     attempts: List[str] = []
     refused: Optional[HealingCandidate] = None

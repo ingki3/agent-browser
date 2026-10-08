@@ -22,7 +22,9 @@ from actions.healing import (
     HealingCandidate,
     HealingResult,
     HealingStrategy,
+    IDENTITY_CHANGE_REASONS,
     heal,
+    identity_change_refused,
     is_retry_safe,
     ladder_for,
     path_heal_allowed,
@@ -55,6 +57,8 @@ __all__ = [
     "IDEMPOTENT_ACTIONS",
     "READ_ONLY_ACTIONS",
     "path_heal_allowed",
+    "IDENTITY_CHANGE_REASONS",
+    "identity_change_refused",
     "SIDE_EFFECT_ACTIONS",
     "TEXT_SIMILARITY_THRESHOLD",
     # 검증
