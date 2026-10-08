@@ -126,12 +126,19 @@ _INJECTION_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
     ),
     # 영어 override — 'ignore (the|your|my|any|all (of the)) previous instructions',
     # 'disregard … instructions/rules/prompt', 'forget everything above' (WS-36 R1, NB6).
+    # R2(재검증 NB-R1): disregard 는 창 30자 + 대상 앞 한정어 요구('rules' 뒤 관계절·전치사구는 제외 —
+    # 'disregard any rules that no longer apply'), forget 은 대상 명사(instructions·rules·said …) 또는
+    # 지시 연결('… above and click', '… before this line. New task')을 요구('forget all previous attempts' 제외).
     (
         re.compile(
             r"ignore\s+(?:all\s+(?:of\s+)?)?(?:(?:the|your|my|any)\s+)?(?:previous|prior|above|earlier)"
             r"\s+instructions?"
-            r"|disregard\s+[^\n]{0,40}?(?:instructions?|rules|prompt)"
-            r"|forget\s+(?:everything|all)\s+(?:above|before|previous(?:ly)?|prior)",
+            r"|disregard\s+[^\n]{0,30}?(?:all|your|the|previous|prior|above|any|earlier|my|system)\s+"
+            r"(?:instructions?|prompt|rules(?!\s+(?:that|which|in|of)\b))"
+            r"|forget\s+(?:everything|all)\s+(?:the\s+)?(?:above|before|previous(?:ly)?|prior|earlier)\s+"
+            r"(?:instructions?|rules|prompts?|guidance|commands?|said|told)"
+            r"|forget\s+everything\s+(?:above|before)(?:\s+this\s+(?:line|message|point))?"
+            r"[ \t]*[,.;:!]?[ \t]*(?:and|then|now|new\s+task)\b",
         ),
         "prior_instruction_override_en",
     ),
@@ -165,12 +172,13 @@ _INJECTION_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
     ),
     # '[SYSTEM]' 태그 — 한 줄에 홀로 있거나 같은 줄에 지시 단서가 있을 때만
     # ('[SYSTEM] 홍길동님이 입장하셨습니다' 같은 게임·채팅 로그는 제외). R1: 태그 바로 뒤의 영어 명령형
-    # 동사('[SYSTEM] Delete …')도 단서로 본다.
+    # 동사('[SYSTEM] Delete …')도 단서로 본다. R2(재검증 NB-R2): 사이에 please/now/immediately/kindly 허용.
     (
         re.compile(
             r"\[[ \t]*system[ \t]*\](?:[ \t]*(?:\n|$)"
             r"|[^\n]{0,60}?(지시|명령|권한|무시|instruction|override|ignore|you\s+must)"
-            r"|[ \t]*:?[ \t]*(delete|send|transfer|approve|disable|grant|execute|reveal|obey|forward"
+            r"|[ \t]*:?[ \t]*(?:(?:please|now|immediately|kindly)[ \t]+)?"
+            r"(delete|send|transfer|approve|disable|grant|execute|reveal|obey|forward"
             r"|upload|export|erase|wipe|purchase|buy)\b)",
         ),
         "bracket_system_tag",
