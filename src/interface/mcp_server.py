@@ -1808,6 +1808,17 @@ class BrowserMCPServer:
                 result = await self._call_tool(name, arguments, capture)
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
+            # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
+            # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
+            # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
+            from security.injection_signal import attach_injection_signal
+
+            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
+            # 부분은 늘 검사 범위 안이다.
+            attach_injection_signal(result, max_scan_chars=10 * self.max_result_chars)
+            # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
+            cap_result_size(result, self.max_result_chars)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
                 self._attach_window_report(result)
             return result
@@ -1952,8 +1963,7 @@ class BrowserMCPServer:
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS:
             await self._attach_challenge(result)
-        # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-        cap_result_size(result, self.max_result_chars)
+        # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
     def _attach_egress_block(
