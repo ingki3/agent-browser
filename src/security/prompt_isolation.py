@@ -111,28 +111,39 @@ def detect_injection_markers(web_text: str) -> List[str]:
 #: **대소문자**: 패턴은 소문자로 쓰고 IGNORECASE 없이 `text.lower()` 에 맞춘다(`matching_patterns`).
 #: IGNORECASE 는 sre 의 접두 문자 빠른 탐색을 꺼서 큰 페이지에서 두 배 느렸다(실측 3.4ms → 1.6ms).
 _INJECTION_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
-    # 이전 지시 무효화 + 새 지시 ('모든 규칙을 무시하는 행위는 금지' 같은 서술은 제외)
+    # 이전 지시 무효화 + 새 지시. 어미 **화이트리스트가 아니라 서술형만 제외**한다(WS-36 R1):
+    # 명령형은 '무시해/무시하시고/무시해 주시고/무시할 것/무시.' 처럼 활용이 많아 목록으로는 놓친다
+    # (독립 검증 B1 — 7종 미탐). 제외: '무시하는(행위)'·'무시되/됩/된'·'무시할 수'·'무시하지 마/않'·
+    # '무시했', '무효화하는/된'·'무효화되', '잊지 마'·'잊혀'·'잊었'·'잊으셨'.
     (
         re.compile(
             r"(이전|앞선|위의?|모든)\s*(지시|명령|규칙|지침|instructions?)[^\n]{0,20}?"
-            r"(무시(하고|하세요|하십시오|하라|해라)|무효(입니다|이다|로\s*한다|화)"
-            r"|잊(어|고|으세요|으십시오|어라))",
+            r"(무시(?!하는|되|됩|된|할\s*수|하지\s*(마|않)|했)"
+            r"|무효(?!화\s*(하는|된|되|됩))"
+            r"|잊(?!지\s*마|혀|었|으셨))",
         ),
         "prior_instruction_override",
     ),
+    # 영어 override — 'ignore (the|your|my|any|all (of the)) previous instructions',
+    # 'disregard … instructions/rules/prompt', 'forget everything above' (WS-36 R1, NB6).
     (
         re.compile(
-            r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions?"
+            r"ignore\s+(?:all\s+(?:of\s+)?)?(?:(?:the|your|my|any)\s+)?(?:previous|prior|above|earlier)"
+            r"\s+instructions?"
+            r"|disregard\s+[^\n]{0,40}?(?:instructions?|rules|prompt)"
+            r"|forget\s+(?:everything|all)\s+(?:above|before|previous(?:ly)?|prior)",
         ),
         "prior_instruction_override_en",
     ),
     # 시스템/어시스턴트 역할 사칭 — 줄 머리의 'System:' 만으로는 판정하지 않는다
-    # ('System: macOS 13 이상', 'Assistant: 김민수'). 같은 줄에 지시 단서가 있어야 한다.
+    # ('System: macOS 13 이상', 'Assistant: 김민수'). 같은 줄(또는 콜론 바로 다음 줄)에 지시 단서가
+    # 있어야 한다. R1: 'I will now'·'승인하라' 류 명령형과 'System:\n<지시>' 를 더했다.
     (
         re.compile(
-            r"^[ \t]*(system|assistant)[ \t]*[:\uff1a][^\n]{0,200}?"
+            r"^[ \t]*(system|assistant)[ \t]*[:\uff1a][ \t]*(?:\n[ \t]*)?[^\n]{0,200}?"
             r"(지시|명령|따르라|따르십시오|알겠습니다|임무|지금부터"
-            r"|you\s+(must|are\s+now|will\s+now|should\s+now)|ignore|new\s+instructions?"
+            r"|(승인|삭제|전송|실행|유출|결제)(하라|하십시오|해라)"
+            r"|you\s+(must|are\s+now|will\s+now|should\s+now)|i\s+will\s+now|ignore|new\s+instructions?"
             r"|from\s+now\s+on)",
             re.MULTILINE,
         ),
@@ -146,17 +157,21 @@ _INJECTION_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
     (
         re.compile(
             r"(?:-(?<![-=]-)-{2,}|=(?<![-=]=)={2,})\s*"
-            r"(end\s+of\s+(web\s+|page\s+|untrusted\s+)?(content|page|context|document|input|data)"
+            r"(end\s+of\s+(web\s+|page\s+|untrusted\s+|system\s+)?"
+            r"(content|page|context|document|input|data|instructions?|prompt)"
             r"|실제\s*지시|real\s+instructions?|new\s+instructions?)",
         ),
         "separator_forgery",
     ),
     # '[SYSTEM]' 태그 — 한 줄에 홀로 있거나 같은 줄에 지시 단서가 있을 때만
-    # ('[SYSTEM] 홍길동님이 입장하셨습니다' 같은 게임·채팅 로그는 제외).
+    # ('[SYSTEM] 홍길동님이 입장하셨습니다' 같은 게임·채팅 로그는 제외). R1: 태그 바로 뒤의 영어 명령형
+    # 동사('[SYSTEM] Delete …')도 단서로 본다.
     (
         re.compile(
             r"\[[ \t]*system[ \t]*\](?:[ \t]*(?:\n|$)"
-            r"|[^\n]{0,60}?(지시|명령|권한|무시|instruction|override|ignore|you\s+must))",
+            r"|[^\n]{0,60}?(지시|명령|권한|무시|instruction|override|ignore|you\s+must)"
+            r"|[ \t]*:?[ \t]*(delete|send|transfer|approve|disable|grant|execute|reveal|obey|forward"
+            r"|upload|export|erase|wipe|purchase|buy)\b)",
         ),
         "bracket_system_tag",
     ),
@@ -237,12 +252,16 @@ _INJECTION_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
         ),
         "safety_disable",
     ),
-    # 자동 승인 압박 (HITL 우회 시도) — 명령형만('친구 요청을 자동 승인합니다'·'즉시 승인 대출' 제외)
+    # 자동 승인 압박 (HITL 우회 시도) — 명령형만('친구 요청을 자동 승인합니다'·'즉시 승인 대출' 제외).
+    # R1: 'auto-approve all purchases / this transaction' — 한정사 + 결제·요청류 목적어일 때만
+    # ('Auto-approve new members'·'Auto-approve purchases under $10' 같은 설정 라벨은 제외).
     (
         re.compile(
             r"(자동|즉시|바로)\s*승인\s*(하세요|하십시오|해\s*주세요|하라|해라|처리하세요)"
             r"|approve\s+(it|this|all|everything)\s+without\s+(asking|confirmation|confirming|review"
-            r"|checking)",
+            r"|checking)"
+            r"|auto[- ]?approve\s+(all|every|any|this|these|the|pending)\s+([a-z]+\s+)?"
+            r"(purchases?|transactions?|payments?|orders?|requests?|charges?|transfers?)",
         ),
         "hitl_bypass_pressure",
     ),

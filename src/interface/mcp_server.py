@@ -1770,7 +1770,9 @@ class BrowserMCPServer:
             # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
             from security.injection_signal import attach_injection_signal
 
-            attach_injection_signal(result)
+            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
+            # 부분은 늘 검사 범위 안이다.
+            attach_injection_signal(result, max_scan_chars=10 * self.max_result_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
             cap_result_size(result, self.max_result_chars)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
