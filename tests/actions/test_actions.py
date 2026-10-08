@@ -14,6 +14,7 @@ from perception.engine import ElementHandle
 from actions import (
     DEFAULT_LADDER,
     IDEMPOTENT_ACTIONS,
+    READ_ONLY_ACTIONS,
     SHADOW_LADDER,
     SIDE_EFFECT_ACTIONS,
     FailurePhase,
@@ -24,6 +25,7 @@ from actions import (
     heal,
     is_retry_safe,
     ladder_for,
+    path_heal_allowed,
     verify_post_condition,
     verify_staleness,
 )
@@ -173,14 +175,84 @@ def test_label_similarity_is_symmetric():
 
 
 def test_stage4_css_path_last_resort():
-    """role/name/testid가 모두 달라도 CSS 경로가 같으면 4단계로 치유한다."""
+    """읽기 액션이면 role/name/testid가 모두 달라도 CSS 경로가 같으면 4단계로 치유한다."""
     target = make_handle(role="button", name="확인", css_path="form > button#go")
     candidate = make_candidate(
-        role="button", name="전혀 다른 이름", css_path="form > button#go"
+        role="menuitem", name="전혀 다른 이름", css_path="form > button#go"
     )
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.CSS_PATH
+    assert result.identity_refused is None
+
+
+#: WS-37: 같은 자리(css_path)에 role/name 이 바뀐 요소 — 이름만 / 역할만 / 둘 다
+_SWAPPED = [
+    ("name", "button", "회원 탈퇴"),
+    ("role", "checkbox", "확인"),
+    ("both", "menuitem", "광고: 대출 상담"),
+]
+
+
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+@pytest.mark.parametrize(
+    "action", sorted(set(ActionType) - set(READ_ONLY_ACTIONS), key=lambda a: a.value)
+)
+def test_stage4_refuses_swapped_element_for_side_effect_actions(action, kind, role, name):
+    """WS-37 결함1: 부작용 액션은 경로 단계로 제자리 교체된 요소를 고르지 않는다."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    swapped = make_candidate(role=role, name=name, css_path="form > button#go")
+    result = heal(target, [swapped], action=action)
+    assert result.healed is False and result.candidate is None
+    assert result.identity_refused is swapped
+    assert result.attempts[-1] == "css_path(identity_changed)"
+    assert "확인" in result.reason and name in result.reason and role in result.reason
+
+
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+def test_stage4_unknown_action_is_fail_closed(kind, role, name):
+    """action 을 모르면(None) 부작용으로 본다."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    result = heal(target, [make_candidate(role=role, name=name, css_path="form > button#go")])
+    assert result.healed is False and result.identity_refused is not None
+
+
+def test_shadow_piercing_stage_has_same_guard():
+    target = make_handle(name="확인", css_path="x-app >>> button", is_shadow=True)
+    swapped = make_candidate(name="회원 탈퇴", css_path="x-app >>> button", is_shadow=True)
+    refused = heal(target, [swapped], action=ActionType.CLICK)
+    assert refused.healed is False and refused.attempts[-1] == "css_piercing(identity_changed)"
+    ok = heal(target, [swapped], action=ActionType.EXTRACT)
+    assert ok.healed is True and ok.strategy is HealingStrategy.CSS_PIERCING
+
+
+@pytest.mark.parametrize("action", sorted(READ_ONLY_ACTIONS, key=lambda a: a.value))
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+def test_stage4_read_actions_keep_path_healing(action, kind, role, name):
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    result = heal(target, [make_candidate(role=role, name=name, css_path="form > button#go")],
+                  action=action)
+    assert result.healed is True and result.strategy is HealingStrategy.CSS_PATH
+
+
+def test_read_only_actions_exclude_every_state_changing_action():
+    """읽기 집합에 부작용 액션(재시도 불가 집합 + 선택·체크)이 섞이면 가드가 뚫린다."""
+    assert not (set(READ_ONLY_ACTIONS) & set(SIDE_EFFECT_ACTIONS))
+    for action in (*SIDE_EFFECT_ACTIONS, ActionType.SELECT_OPTION, ActionType.CHECK_BOX):
+        assert path_heal_allowed(action) is False, action
+    assert path_heal_allowed(None) is False
+    assert set(READ_ONLY_ACTIONS) == {
+        ActionType.OBSERVE_PAGE, ActionType.TAKE_SCREENSHOT, ActionType.SCROLL,
+        ActionType.HOVER, ActionType.WAIT_FOR, ActionType.EXTRACT,
+    }
+
+
+def test_side_effect_action_still_heals_same_identity_at_other_path():
+    """가드는 경로 단계만 막는다: 같은 role+name 이 옮겨지면 클릭도 1단계로 치유."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    moved = make_candidate(role="button", name="확인", css_path="section > button")
+    result = heal(target, [moved], action=ActionType.CLICK)
+    assert result.healed is True and result.strategy is HealingStrategy.ROLE_NAME
 
 
 def test_ladder_order_prefers_earlier_stage():
@@ -240,6 +312,19 @@ def test_harness_requires_all_ladder_stages():
     declared = {case.expected_stage for case in MUTATION_CASES}
     missing = [s for s in REQUIRED_STAGES if s not in declared]
     assert not missing, f"하네스가 유발하지 않는 치유 단계: {missing}"
+
+
+def test_harness_stage4_positive_uses_read_action_and_refusals_are_side_effect():
+    """WS-37: 4단계 양성은 읽기 액션으로, 부작용 액션 제자리 교체는 거부(음성) 케이스로."""
+    from harness.self_healing import MUTATION_CASES, REQUIRED_REFUSALS, REQUIRED_STAGES
+
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    negative = [c for c in MUTATION_CASES if c.expect_refusal]
+    assert {c.expected_stage for c in positive} == set(REQUIRED_STAGES)
+    stage4 = [c for c in positive if c.expected_stage == "css_path"]
+    assert stage4 and all(c.action in READ_ONLY_ACTIONS for c in stage4)
+    assert {c.expect_refusal for c in negative} == set(REQUIRED_REFUSALS)
+    assert all(c.action not in READ_ONLY_ACTIONS for c in negative)
 
 
 def test_harness_required_stages_match_ladder():

@@ -126,14 +126,14 @@ async def test_in_place_swap_blocks_approved_click(label, swap_js, reason):
 
 
 @requires_chromium
-@pytest.mark.xfail(
-    strict=True,
-    reason=("실제 결함(WS-35 R2 보고서 §결함1): 기본 경로에서 NAME/ROLE_CHANGED 를 잡아도 자가 치유 "
-            "4단계(CSS_PATH)가 같은 css_path 의 교체된 요소로 '치유'해 그대로 누른다 — 광고 로테이션 "
-            "방어가 디스패치에서 무력화. 제품 수정은 범위 밖."),
-)
 @pytest.mark.parametrize("label,swap_js,reason", SWAPS, ids=[s[0] for s in SWAPS])
 async def test_in_place_swap_default_dispatch_does_not_click(label, swap_js, reason):
+    """WS-37 결함1: 기본 디스패치(치유 켜짐)도 제자리 교체된 요소를 누르지 않는다.
+
+    전에는 치유 4단계(css_path)가 같은 자리의 교체된 요소('회원 탈퇴', '광고: 대출 상담')로
+    '치유'해 healed=True 로 눌렀다. 부작용 액션은 경로 단계에서 role/name 이 바뀐 요소를
+    고르지 않는다 — TOCTOU_MISMATCH 와 '요소가 바뀜(이전 → 현재) — 다시 관찰하라' 안내.
+    """
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
@@ -148,6 +148,61 @@ async def test_in_place_swap_default_dispatch_does_not_click(label, swap_js, rea
             await browser.close()
     assert out == "대기", f"교체된 요소가 눌렸다: {out!r} (healed={r.healed})"
     assert r.success is False and r.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert r.healed is False and r.reobserve_required is True
+    changed = r.data.get("element_changed")
+    assert changed is not None, r.data
+    assert changed["before"] == {"role": "link", "name": "결제하기"}
+    if reason == "role_changed":
+        assert changed["after"] == {"role": "checkbox", "name": "결제하기"}
+    else:
+        assert changed["after"]["role"] == "link"
+        assert changed["after"]["name"] in ("회원 탈퇴", "광고: 대출 상담")
+    assert "다시 관찰" in r.data["hint"] and "결제하기" in r.data["hint"]
+    assert "다시 관찰" in (r.error_message or "")
+    assert any("identity_changed" in a for a in r.data["healing_attempts"])
+
+
+@requires_chromium
+@pytest.mark.parametrize("label,swap_js,reason", SWAPS, ids=[s[0] for s in SWAPS])
+async def test_in_place_swap_read_action_still_heals_by_path(label, swap_js, reason):
+    """대조(WS-37): 읽기 액션(hover)은 현행대로 경로 단계로 같은 자리 요소에 닿는다."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser, page, engine, d = await _setup(pw, AD_HTML)
+        try:
+            obs, el = await _observe_slot(engine, page)
+            await page.evaluate(swap_js)
+            r = await d.dispatch(ActionType.HOVER,
+                                 {"element_id": el.element_id, "epoch": obs.snapshot_epoch})
+            out = await page.text_content("#out")
+        finally:
+            await browser.close()
+    assert r.healed is True, (r.error_code, r.error_message, r.data)
+    assert "element_changed" not in r.data
+    assert out == "대기", "hover 는 클릭하지 않는다"
+
+
+@requires_chromium
+async def test_moved_same_identity_element_still_heals_for_click():
+    """대조(WS-37): 같은 이름·역할 요소가 다른 경로로 옮겨지면 클릭도 1단계로 치유한다."""
+    from playwright.async_api import async_playwright
+
+    move_js = ("(() => { const a = document.getElementById('slot'); const s = "
+               "document.createElement('section'); document.body.prepend(s); "
+               "a.removeAttribute('id'); s.appendChild(a); })()")
+    async with async_playwright() as pw:
+        browser, page, engine, d = await _setup(pw, AD_HTML)
+        try:
+            obs, el = await _observe_slot(engine, page)
+            await page.evaluate(move_js)
+            r = await d.dispatch(ActionType.CLICK,
+                                 {"element_id": el.element_id, "epoch": obs.snapshot_epoch})
+            out = await page.text_content("#out")
+        finally:
+            await browser.close()
+    assert r.success is True and r.healed is True, (r.error_code, r.error_message, r.data)
+    assert out == "clicked:결제하기"
 
 
 # ------------------------------------------------------------------ D2: heal_disabled 대체 금지

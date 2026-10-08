@@ -744,14 +744,11 @@ async def test_real_human_closes_agent_tab_then_release(site):
 
 
 @requires_chromium
-@pytest.mark.xfail(
-    strict=True,
-    reason=("제품 경쟁 조건(WS-35 R2 보고서 §플레이키): 감시 태스크(_watch_handoff)가 반납을 먼저 "
-            "처리하면 control_wait 가 닫힌 탭 복구(_recover_closed_tab)가 끝나기 전에 'released' 를 "
-            "돌려줘 tab_closed_by_human 알림이 빠진다. 위 테스트의 ~10% 실패 원인. 제품 수정은 범위 밖."),
-)
 async def test_release_notice_survives_watcher_winning_the_poll(site, monkeypatch):
-    """결정적 재현: 감시 태스크가 반납을 먼저 집어가고 복구가 느린(CDP 세션 생성 지연) 순서를 고정."""
+    """결정적 재현: 감시 태스크가 반납을 먼저 집어가고 복구가 느린(CDP 세션 생성 지연) 순서를 고정.
+
+    WS-37: 복구를 Future 로 직렬화해(_recover_closed_tab_serialized) control_wait 가 진행 중인 복구를
+    기다린 뒤 응답한다 — 전에는 ~10% 로 tab_closed_by_human 이 빠졌다(WS-35 R2 §3)."""
     async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
         _visible(s)
         await s.call_tool("browser_navigate", {"url": site + "/"})
@@ -778,6 +775,39 @@ async def test_release_notice_survives_watcher_winning_the_poll(site, monkeypatc
         assert got["data"]["changed"] == "released"
         notice = got["data"].get("tab_closed_by_human")
         assert notice is not None and notice["closed_tab_id"] == first, got["data"]
+
+
+@requires_chromium
+async def test_tool_call_during_watcher_recovery_waits_for_new_tab(site, monkeypatch):
+    """WS-37 형제 경로: 감시 태스크가 복구 중일 때 들어온 도구 호출(observe·control_status)도 복구를
+    기다린다 — 닫힌 탭을 관찰하지 않고, status 에 알림이 실린다."""
+    async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
+        _visible(s)
+        await s.call_tool("browser_navigate", {"url": site + "/"})
+        first = s._core.active_tab_id
+        await s.call_server_tool("browser_control_request", {"reason": "확인"})
+        assert await _human("control", "take") == 0
+        ctx = s._core.context_for("mcp-session")
+        other = await ctx.new_page()
+        await other.goto(site + "/esc")
+        await s._page.close()
+        real_cdp = s._core.new_cdp_session
+
+        async def slow_cdp(*a: Any, **k: Any) -> Any:
+            await asyncio.sleep(0.5)
+            return await real_cdp(*a, **k)
+
+        monkeypatch.setattr(s._core, "new_cdp_session", slow_cdp)
+        write_command(s.hub.root, s.hub.server_id, "release")
+        watcher_poll = asyncio.ensure_future(s._poll_handoff())  # 감시 태스크가 반납을 먼저 집는다
+        await asyncio.sleep(0.05)  # 복구가 느린 CDP 세션 생성에서 멈춰 있다
+        assert s._release_recovery is not None and not s._release_recovery.done()
+        status = await s.call_server_tool("browser_control_status", {})
+        obs = await s.call_tool("browser_observe_page", {})
+        await watcher_poll
+        notice = status["data"].get("tab_closed_by_human")
+        assert notice is not None and notice["closed_tab_id"] == first, status["data"]
+        assert obs.success and obs.error_code is None and "/esc" in obs.current_url, obs
 
 
 # ======================================================================= 뮤테이션 보강 (R1)

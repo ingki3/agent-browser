@@ -1434,18 +1434,32 @@ class ActionDispatcher:
             )
         if not staleness.fresh:
             # 부작용이 없는 시점이므로 치유가 안전하다.
-            healing = await self._attempt_heal(handle)
+            healing = await self._attempt_heal(handle, action)
             if not healing.healed or healing.candidate is None:
+                fail_data: Dict[str, Any] = {"healing_attempts": healing.attempts}
+                message = f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패"
+                swapped = healing.identity_refused
+                if swapped is not None:
+                    # 제자리 교체: 같은 자리에 role/name 이 다른 요소가 있다.
+                    # 부작용 액션이라 그 요소를 누르지 않았다 — 재관찰을 안내한다.
+                    hint = (
+                        f"요소가 바뀜(이전 {handle.role} '{handle.name}' → 현재 "
+                        f"{swapped.role} '{swapped.name}') — 다시 관찰하라"
+                    )
+                    fail_data["element_changed"] = {
+                        "before": {"role": handle.role, "name": handle.name},
+                        "after": {"role": swapped.role, "name": swapped.name},
+                    }
+                    fail_data["hint"] = hint
+                    message = f"{message}: {hint}"
                 return self._result(
                     success=False,
                     action=action,
                     retry_safe=True,
                     error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
-                    error_message=(
-                        f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패"
-                    ),
+                    error_message=message,
                     reobserve_required=True,
-                    data={"healing_attempts": healing.attempts},
+                    data=fail_data,
                 )
             new_handle = self.ctx.engine.get_handle(healing.candidate.element_id)
             if new_handle is None:
@@ -1831,8 +1845,14 @@ class ActionDispatcher:
 
     # -- 치유 ---------------------------------------------------------------
 
-    async def _attempt_heal(self, handle: ElementHandle) -> HealingResult:
-        """재관찰 후 자가 치유 사다리를 가동한다."""
+    async def _attempt_heal(
+        self, handle: ElementHandle, action: Optional[ActionType] = None
+    ) -> HealingResult:
+        """재관찰 후 자가 치유 사다리를 가동한다.
+
+        ``action`` 이 부작용 액션이면 경로 단계는 role/name 이 바뀐 요소를 고르지
+        않는다(`actions.healing.path_heal_allowed`).
+        """
         self._healing_attempts += 1
 
         result = await self.ctx.engine.observe_page(
@@ -1852,7 +1872,7 @@ class ActionDispatcher:
                 )
             )
 
-        healing = heal(handle, candidates)
+        healing = heal(handle, candidates, action=action)
         if healing.healed:
             self._healing_successes += 1
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)

@@ -18,7 +18,16 @@
 * 클래스명 변경 (CSS-in-JS 해시 재생성) -> 1단계
 * 이름 변경 + testid 유지 (i18n 전환)   -> 2단계
 * 문구 미세 변경 (A/B 테스트)           -> 3단계
-* role/name 동시 변경, 경로 유지        -> 4단계
+* role/name 변경, 경로 유지 + 읽기 액션 -> 4단계
+
+**제자리 교체 거부 (WS-37, 음성 케이스)**:
+4단계(css_path)는 role·name 이 바뀐 '같은 자리의 다른 요소'만 고른다(둘 다 같으면
+1단계가 먼저 잡는다). 광고 로테이션으로 '결제하기' 자리에 '회원 탈퇴'가 들어온 경우가
+그렇다. 그래서 부작용 액션(click 등, `actions.READ_ONLY_ACTIONS` 밖)은 4단계 치유를
+거부해야 한다. 4단계 양성 시나리오는 읽기 액션(hover/extract)으로 유발하고, 부작용
+액션 + 이름만/역할만/둘 다 변경은 **거부가 정답**인 음성 케이스(`expect_refusal`)로
+둔다. 음성 케이스를 치유해 버리면(wrongful heal) exit 2, 거부 사유가 4단계 신원 검사가
+아니거나(규칙 2) 세 종류 중 하나라도 측정하지 못하면(규칙 1) exit 2.
 """
 
 from __future__ import annotations
@@ -29,13 +38,16 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-from contracts import thresholds
+from contracts import ActionType, thresholds
 
 from harness.mock_sites import MockServer
 from harness.result import MetricResult, emit, emit_error
 
 #: 사다리 4단계가 모두 검증되어야 지표를 신뢰할 수 있다.
 REQUIRED_STAGES = ("role_name", "testid", "text_similarity", "css_path")
+
+#: 부작용 액션의 제자리 교체 거부가 세 종류 모두 측정되어야 한다.
+REQUIRED_REFUSALS = ("name", "role", "both")
 
 
 @dataclass
@@ -47,8 +59,13 @@ class MutationCase:
     #: 관찰 후 실행할 변형 스크립트
     script: str
     label: str
-    #: 이 변형이 유발해야 하는 치유 단계 (커버리지 검증용)
+    #: 이 변형이 유발해야 하는 치유 단계 (커버리지 검증용). 음성 케이스는
+    #: 거부가 일어나야 하는 단계.
     expected_stage: str
+    #: 치유를 요청하는 액션. 4단계 허용 여부가 여기에 달렸다.
+    action: ActionType = ActionType.CLICK
+    #: 음성 케이스: 치유를 **거부**해야 정답. 값은 바뀐 신원 종류(name/role/both).
+    expect_refusal: str = ""
 
 
 MUTATION_CASES: Tuple[MutationCase, ...] = (
@@ -116,7 +133,7 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         "버튼 문구 변경 (짧은 라벨 접미 확장)",
         "text_similarity",
     ),
-    # --- 4단계: role과 name이 모두 바뀌고 CSS 경로만 남음 ---
+    # --- 4단계: role과 name이 바뀌고 CSS 경로만 남음 — 읽기 액션 ---
     MutationCase(
         "s02_twofactor",
         "인증 확인",
@@ -125,8 +142,49 @@ MUTATION_CASES: Tuple[MutationCase, ...] = (
         el.textContent = '전혀 다른 문구입니다';
         el.setAttribute('role', 'menuitem');
         """,
-        "role/name 동시 변경 (경로 유지)",
+        "role/name 동시 변경 (경로 유지, hover)",
         "css_path",
+        ActionType.HOVER,
+    ),
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        "document.getElementById('verify').textContent = '전혀 다른 문구입니다';",
+        "name 만 변경 (경로 유지, extract)",
+        "css_path",
+        ActionType.EXTRACT,
+    ),
+    # --- 음성: 부작용 액션 + 제자리 교체 → 치유 거부가 정답 (WS-37) ---
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        "document.getElementById('verify').textContent = '회원 탈퇴';",
+        "제자리 교체 name 만 (click, 거부)",
+        "css_path",
+        ActionType.CLICK,
+        expect_refusal="name",
+    ),
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        "document.getElementById('verify').setAttribute('role', 'checkbox');",
+        "제자리 교체 role 만 (click, 거부)",
+        "css_path",
+        ActionType.CLICK,
+        expect_refusal="role",
+    ),
+    MutationCase(
+        "s02_twofactor",
+        "인증 확인",
+        """
+        const el = document.getElementById('verify');
+        el.textContent = '광고: 대출 상담';
+        el.setAttribute('role', 'link');
+        """,
+        "제자리 교체 role/name 동시 (click, 거부)",
+        "css_path",
+        ActionType.CLICK,
+        expect_refusal="both",
     ),
 )
 
@@ -158,6 +216,9 @@ async def _run(tasks: int) -> Dict[str, Any]:
     failures: List[str] = []
     strategies: Dict[str, int] = {}
     stage_mismatch: List[str] = []
+    refusals: Dict[str, int] = {}
+    wrongful_heals: List[str] = []
+    guard_total = 0
 
     with MockServer() as server:
         async with async_playwright() as pw:
@@ -220,7 +281,30 @@ async def _run(tasks: int) -> Dict[str, Any]:
                         )
                     )
 
-                result = heal(target_handle, candidates)
+                result = heal(target_handle, candidates, action=case.action)
+                if case.expect_refusal:
+                    # 음성 케이스: 성공률 표본이 아니다. 거부만이 정답이다.
+                    guard_total += 1
+                    if result.healed:
+                        wrongful_heals.append(
+                            f"{case.label}: {case.action.value} 인데 "
+                            f"{result.strategy.value if result.strategy else '?'} 로 "
+                            f"'{result.candidate.name if result.candidate else '?'}' 치유"
+                        )
+                    elif (
+                        result.identity_refused is not None
+                        and result.attempts
+                        and result.attempts[-1] == f"{case.expected_stage}(identity_changed)"
+                    ):
+                        refusals[case.expect_refusal] = refusals.get(case.expect_refusal, 0) + 1
+                    else:
+                        note = (
+                            f"{case.label}: {case.expected_stage} 신원 검사로 거부 기대, "
+                            f"다른 사유로 실패 ({result.reason})"
+                        )
+                        if note not in stage_mismatch:
+                            stage_mismatch.append(note)
+                    continue
                 total += 1
                 if result.healed and result.strategy:
                     healed += 1
@@ -242,6 +326,9 @@ async def _run(tasks: int) -> Dict[str, Any]:
         "failures": failures,
         "strategies": strategies,
         "stage_mismatch": stage_mismatch,
+        "refusals": refusals,
+        "wrongful_heals": wrongful_heals,
+        "guard_total": guard_total,
     }
 
 
@@ -300,6 +387,31 @@ def main() -> None:
             )
         )
 
+    # --- 제자리 교체 거부 검증 (WS-37) -----------------------------------
+    # 부작용 액션으로 같은 자리의 다른 요소를 '치유'하면 그 요소를 누르게 된다.
+    for note in metrics["wrongful_heals"]:
+        print(f"[-] 잘못된 치유: {note}", file=sys.stderr)
+    if metrics["wrongful_heals"]:
+        sys.exit(
+            int(
+                emit_error(
+                    "self_healing_rate",
+                    f"부작용 액션의 제자리 교체 {len(metrics['wrongful_heals'])}건을 "
+                    "치유했습니다(거부가 정답). 교체된 요소를 누르게 됩니다.",
+                )
+            )
+        )
+    unrefused = [k for k in REQUIRED_REFUSALS if k not in metrics["refusals"]]
+    if unrefused and not args.allow_partial_stages:
+        sys.exit(
+            int(
+                emit_error(
+                    "self_healing_rate",
+                    f"제자리 교체 거부 {', '.join(unrefused)} 종류가 측정되지 않았습니다.",
+                )
+            )
+        )
+
     # --- 단계 정합성 검증 -------------------------------------------------
     # 시나리오가 의도한 단계가 아닌 다른 단계로 해결되면, 그 단계는
     # '측정된 것처럼 보이지만' 실제로는 검증되지 않은 상태다.
@@ -327,6 +439,10 @@ def main() -> None:
             "stages_covered": sorted(used),
             "stages_required": list(REQUIRED_STAGES),
             "stage_mismatch": metrics["stage_mismatch"] or None,
+            "guard_cases": metrics["guard_total"],
+            "guard_refusals": metrics["refusals"],
+            "refusals_required": list(REQUIRED_REFUSALS),
+            "wrongful_heals": len(metrics["wrongful_heals"]),
             "failures": metrics["failures"][:10] or None,
         },
     )
