@@ -874,6 +874,9 @@ async def test_dispatcher_heal_disabled_never_substitutes(site):
             s._dispatcher.heal_disabled = False
         assert not r.success and r.healed is False and r.data.get("heal_disabled") is True
         assert await s._page.text_content("#out") == "대기"
-        # 대조: 끄지 않으면 치유가 일어난다(검증자 probe_heal 의 원래 동작)
+        # 대조: 끄지 않으면 치유 사다리가 돈다(검증자 probe_heal 의 원래 동작). WS-37 R2 부터
+        # 부작용 액션은 이름이 다른 후보('결제 하기')를 채택하지 않아 3단계에서 거부·재관찰.
         r2 = await s._dispatcher.dispatch(ActionType.CLICK, {"element_id": eid, "epoch": ep})
-        assert r2.healed is True
+        assert "text_similarity(identity_changed)" in r2.data.get("healing_attempts", []), r2.data
+        assert r2.healed is False and r2.reobserve_required is True
+        assert await s._page.text_content("#out") == "대기"

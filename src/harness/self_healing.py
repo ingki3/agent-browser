@@ -74,6 +74,10 @@ REQUIRED_REFUSALS = (
     "detached_similar",
 )
 
+#: 부작용 액션(click)이 같은 신원(정규화 이름)으로 치유돼야 하는 단계 — 과차단 탐지(규칙 3).
+#: 채택 규칙이 정규화 없이 정확 비교로 굳으면 이 단계들의 click 양성이 전부 실패한다.
+REQUIRED_SIDE_EFFECT_STAGES = ("testid", "text_similarity")
+
 #: 음성 케이스의 기대 거부 지점: 사다리 앞단(제자리 교체).
 FRONT_GUARD = "front_guard"
 #: 음성 케이스의 기대 거부 지점: 사다리를 돈 뒤 후보 채택 지점(요소가 사라짐, WS-37 R2).
@@ -373,6 +377,7 @@ async def _run(tasks: int) -> Dict[str, Any]:
     from actions import (
         ActionDispatcher,
         DispatchContext,
+        READ_ONLY_ACTIONS,
         HealingCandidate,
         heal,
         identity_change_refused,
@@ -388,6 +393,7 @@ async def _run(tasks: int) -> Dict[str, Any]:
     refusals: Dict[str, int] = {}
     wrongful_heals: List[str] = []
     guard_total = 0
+    side_effect_stages: Dict[str, int] = {}
 
     with MockServer() as server:
         async with async_playwright() as pw:
@@ -511,6 +517,8 @@ async def _run(tasks: int) -> Dict[str, Any]:
                     healed += 1
                     key = result.strategy.value
                     strategies[key] = strategies.get(key, 0) + 1
+                    if case.action not in READ_ONLY_ACTIONS and key == case.expected_stage:
+                        side_effect_stages[key] = side_effect_stages.get(key, 0) + 1
                     if key != case.expected_stage:
                         note = f"{case.label}: {case.expected_stage} 기대, {key} 사용"
                         if note not in stage_mismatch:
@@ -530,6 +538,7 @@ async def _run(tasks: int) -> Dict[str, Any]:
         "refusals": refusals,
         "wrongful_heals": wrongful_heals,
         "guard_total": guard_total,
+        "side_effect_stages": side_effect_stages,
     }
 
 
@@ -597,8 +606,9 @@ def main() -> None:
             int(
                 emit_error(
                     "self_healing_rate",
-                    f"부작용 액션의 제자리 교체 {len(metrics['wrongful_heals'])}건을 "
-                    "치유했습니다(거부가 정답). 교체된 요소를 누르게 됩니다.",
+                    f"부작용 액션의 신원 변경(제자리 교체·사라진 자리의 다른 요소) "
+                    f"{len(metrics['wrongful_heals'])}건을 치유했습니다(거부가 정답). "
+                    "다른 요소를 누르게 됩니다.",
                 )
             )
         )
@@ -609,6 +619,23 @@ def main() -> None:
                 emit_error(
                     "self_healing_rate",
                     f"제자리 교체 거부 {', '.join(unrefused)} 종류가 측정되지 않았습니다.",
+                )
+            )
+        )
+
+    # --- 과차단 검증 (WS-37 R2) -------------------------------------------
+    # 부작용 액션도 같은 신원(정규화 이름)이면 2·3단계로 치유돼야 한다. 채택 규칙이 그것까지
+    # 막으면 성공률은 임계값 근처로만 떨어져 통과할 수 있으므로 별도로 실패시킨다.
+    overblocked = [
+        s for s in REQUIRED_SIDE_EFFECT_STAGES if s not in metrics["side_effect_stages"]
+    ]
+    if overblocked and not args.allow_partial_stages:
+        sys.exit(
+            int(
+                emit_error(
+                    "self_healing_rate",
+                    f"부작용 액션의 같은 신원 치유가 {', '.join(overblocked)} 단계에서 "
+                    "한 번도 되지 않았습니다(과차단).",
                 )
             )
         )
@@ -644,6 +671,7 @@ def main() -> None:
             "guard_refusals": metrics["refusals"],
             "refusals_required": list(REQUIRED_REFUSALS),
             "wrongful_heals": len(metrics["wrongful_heals"]),
+            "side_effect_heals": metrics["side_effect_stages"],
             "failures": metrics["failures"][:10] or None,
         },
     )
