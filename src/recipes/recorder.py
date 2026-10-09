@@ -39,10 +39,13 @@ def signal_kinds(signals: Any) -> List[str]:
 
 
 def nav_kind(before: str, after: str) -> str:
+    """none | same | cross | error(이동 뒤 주소가 chrome-error:// 등 http(s) 출처가 아님 — R1 NB-3)."""
     b, a = (before or "").split("#", 1)[0], (after or "").split("#", 1)[0]
     if not a or a == b:
         return "none"
     ob, oa = keys.origin_of(b), keys.origin_of(a)
+    if not oa:
+        return "error"
     return "same" if ob and ob == oa else "cross"
 
 

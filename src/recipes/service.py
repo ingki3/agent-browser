@@ -176,6 +176,9 @@ class RecipeService:
             return
         secret = data.get("secret_resolved") is not None
         entry = make_entry(a, params, pre, str(result.current_url or ""), data, secret)
+        if entry["expect"]["nav"] == "error":
+            self.reset("nav_error")  # R1 NB-3: 오류 페이지(차단·실패)로 간 단계는 기록하지 않는다
+            return
         self.trajectory.add(entry)
         self._maybe_hint(entry, result)
 
@@ -272,7 +275,8 @@ class RecipeService:
         pins = args.get("pins") or {}
         if not isinstance(params, dict) or not isinstance(pins, dict):
             raise RecipeError("params·pins 는 객체여야 합니다.")
-        rec = compile_recipe(args.get("name"), entries, params=params, pins=pins)
+        dropped: List[str] = []
+        rec = compile_recipe(args.get("name"), entries, params=params, pins=pins, dropped=dropped)
         saved = self.store.save(rec)
         data: Dict[str, Any] = {
             "recipe": {"id": saved["id"], "name": saved["name"], "steps": saved["steps"],
@@ -281,6 +285,14 @@ class RecipeService:
                                    for s in rec["steps"]]},
             "persisted": saved["persisted"],
         }
+        if dropped:
+            # R1 NB-2: 치환 안 된 쿼리 값은 저장하지 않는다(키만) — 재생 때 값이 필요하면 params 로.
+            keys_ = sorted(set(dropped))[:10]
+            data["dropped_query_values"] = {
+                "keys": keys_,
+                "hint": "이동 URL 의 이 쿼리 값은 저장하지 않았습니다(빈 값으로 재생). 값이 필요하면 "
+                        "params 로 지정해 다시 save 하세요(토큰·세션·이메일 등 민감 값은 params 도 거부).",
+            }
         if self.store.warnings:
             data["warnings"] = [clean_text(w, 200) for w in self.store.warnings[-3:]]
         return {"success": True, "data": data}

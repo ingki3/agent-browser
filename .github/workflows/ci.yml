@@ -170,6 +170,7 @@ jobs:
             uv run python -m harness.webarena --tasks 20
             uv run python -m harness.ipi_test
             uv run python -m harness.session_probe --runs 50
+            uv run python -m harness.recipe_replay
           else
             echo "::notice::src/interface 미존재 — Stage 3-B 착수 전이므로 건너뜁니다."
           fi

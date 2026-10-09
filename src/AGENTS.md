@@ -417,7 +417,7 @@ python -m harness.ipi_test
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
 
-# 10. 동작 캐시(레시피) 재생 — 시나리오 8종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38)
+# 10. 동작 캐시(레시피) 재생 — 시나리오 9종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38)
 python -m harness.recipe_replay
 ```
 
@@ -1074,8 +1074,15 @@ Gate 3-B #8 "IPI 차단율 1.0"은 `detect_injection`을 **직접** 불러 잰 �
 | 텍스트 유사도·좌표 재생 금지 | M-1 오일치 사례(해외여행→해외여행자보험, 같은 자리 다른 광고) — 이름은 정확히 같음, 위치는 ui 450px 가드에만 |
 | 기본 경로 비용 | 레시피 없는 출처의 관찰은 dict 조회 하나(골격 계산 없음). 기록은 액션당 evaluate 1회 |
 
-측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 8종, 오클릭 하나라도 exit 2, 커버리지 8/8. 사보타주
-(틀 확인 제거·순번 무시·골격 확인 제거)에서 exit 2 확인. 뮤테이션 표·성능은 `.hermes/state/ws38/report.md`.
+측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 9종, 오클릭 하나라도 exit 2, 커버리지 9/9. 사보타주
+(틀 확인 제거·순번 무시·골격 확인 제거·URL 패턴 확인 제거)에서 exit 2 확인. 뮤테이션 표·성능은 `.hermes/state/ws38/report.md`,
+R1(독립 검증 NB 수정)은 `.hermes/state/ws38-r1/report.md`.
+
+R1 보강: navigate 의 params 치환은 경로 조각·쿼리 값에만(scheme·host·port 금지, 자리표시자는 늘 퍼센트 인코딩)
++ 재생 때 렌더된 URL 출처 ≠ 저장된 틀 출처면 `page_changed`. 치환 안 된 쿼리 값은 버리고(키만, save 응답
+`data.dropped_query_values`), 민감 키(token·session·sid·auth·key·code·email·password·secret 류) 값은 params 로도 거부.
+이동 뒤 `chrome-error://`·빈 출처는 이동 성공이 아니다(재생 `expect_mismatch`, 기록 안 함). 목록 항목 ≥3 개의 대상
+href 가 완전히 같으면 자리표시자로 보고 준비 대기와 같은 상한(2초)까지 기다린 뒤 `not_ready`.
 
 > **교훈**: 하네스의 '오클릭' 판정은 재생 엔진의 자기 보고가 아니라 Mock 서버 요청 기록(무엇이 열렸나)으로 한다 —
 > 엔진이 성공이라 해도 다른 기사를 열었으면 오클릭이다.

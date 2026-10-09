@@ -62,11 +62,15 @@ def expect_ok(step: Dict[str, Any], before_url: str, result: Any) -> Optional[st
     after = str(getattr(result, "current_url", "") or "")
     data = getattr(result, "data", None) or {}
     if step.get("action") == "navigate":
+        if not keys.origin_of(after):
+            return "이동 뒤 주소가 오류 페이지·빈 출처(차단·실패)"
         want = exp.get("url_pat")
         if want and keys.url_pattern(after) != want:
             return "이동한 URL 패턴이 기록과 다름"
         return None
     now = nav_kind(before_url, after)
+    if now == "error":  # R1 NB-3: chrome-error:// 등 — 다른 출처 이동 성공이 아니다
+        return "이동 뒤 주소가 오류 페이지·빈 출처(차단·실패)"
     if data.get("nav_committed") and now == "none":
         now = "same"
     want_nav = str(exp.get("nav") or "none")
@@ -132,6 +136,12 @@ async def run_recipe(host: ReplayHost, store: RecipeStore, rid: str, params: Dic
             page = host.page()
             before_url = str(getattr(page, "url", "") or "") if page is not None else ""
             chosen: Optional[Dict[str, Any]] = None
+            if action == "navigate":
+                # R1 NB-1: 렌더된 URL 의 출처가 저장된 틀의 출처와 같아야 한다(params 로 출처를 못 바꾼다).
+                # 기록 때 다른 출처로 가는 이동이었다면 틀의 출처가 곧 그 출처라 그대로 허용된다.
+                recorded = keys.origin_of(str((step.get("args") or {}).get("url") or ""))
+                if not recorded or keys.origin_of(str(args.get("url") or "")) != recorded:
+                    raise _Stop("page_changed", "이동할 주소의 출처가 기록과 다름(params 로 출처를 바꿀 수 없음)")
             if action != "navigate":
                 if page is None:
                     raise _Stop("page_changed", "활성 페이지 없음(프레임 안이거나 탭이 닫힘)")
@@ -143,7 +153,9 @@ async def run_recipe(host: ReplayHost, store: RecipeStore, rid: str, params: Dic
                 need = math.ceil(READY_RATIO * min((int(v.get("ready") or 0) for v in variants), default=0))
                 probe = await _probe(page, variants, step)
                 deadline = time.monotonic() + READY_WAIT_S
-                while probe["ready"] < need and time.monotonic() < deadline:
+                # R1 NB-5: 같은 href 자리표시자(locate 의 not_ready)도 덜 로드로 보고 같은 상한까지 기다린다.
+                while ((probe["ready"] < need or probe.get("reason") == "not_ready")
+                       and time.monotonic() < deadline):
                     await asyncio.sleep(READY_POLL_S)
                     probe = await _probe(page, variants, step)
                 if probe["ready"] < need:

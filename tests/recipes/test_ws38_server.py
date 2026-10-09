@@ -328,6 +328,86 @@ async def test_recipe_hint_once_per_origin(site):
         assert "browser_recipe save" in got[0]["text"] and got[0]["last_n"] >= 3
 
 
+@pytest.mark.asyncio
+async def test_healed_result_breaks_trajectory_on_server_path(site, monkeypatch):
+    """R1 NB-7: 서버 경로에서 치유된(healed) 결과는 궤적을 끊는다."""
+    async with BrowserMCPServer(headless=True) as srv:
+        await call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+        obs = await observe(srv)
+        disp = srv._dispatcher
+        real = disp.dispatch
+
+        async def healed(action, params):
+            res = await real(action, params)
+            if action is ActionType.CLICK:
+                res.healed = True
+            return res
+
+        monkeypatch.setattr(disp, "dispatch", healed)
+        res = await click(srv, obs, ROWS[0][1])
+        assert res.success and res.healed
+        out = await recipe(srv, op="save", name="x", last_n=1)
+        assert not out["success"], out  # 치유된 단계에서 끊김 — navigate 도 함께 사라짐
+        assert srv._recipes.trajectory.last_break == "healed"
+
+
+@pytest.mark.asyncio
+async def test_approval_token_use_breaks_trajectory_on_server_path(site, monkeypatch):
+    """R1 NB-7: 승인 증표로 실행한 단계(_used_approval)는 궤적을 끊는다(승인을 레시피로 재사용 금지)."""
+    async with BrowserMCPServer(headless=True) as srv:
+        await call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+        obs = await observe(srv)
+        real = srv._check_hitl
+
+        async def approved(action, params, approval_id=None):
+            blocked = await real(action, params, approval_id=approval_id)
+            if blocked is None and action is ActionType.CLICK:
+                srv._used_approval = "ap_test"  # _use_approval 이 통과시킨 상태와 같다
+            return blocked
+
+        monkeypatch.setattr(srv, "_check_hitl", approved)
+        res = await click(srv, obs, ROWS[0][1])
+        assert res.success, res.error_message
+        assert res.data.get("approval", {}).get("status") == "used"
+        out = await recipe(srv, op="save", name="x", last_n=1)
+        assert not out["success"], out
+        assert srv._recipes.trajectory.last_break == "approval_replay"
+
+
+@pytest.mark.asyncio
+async def test_save_drops_unsubstituted_query_values_and_says_so(site, _isolated_profile_root):
+    """R1 NB-2: navigate URL 의 토큰·이메일 쿼리 값은 파일에 남지 않고, save 응답이 params 로 지정하라고 안내."""
+    async with BrowserMCPServer(headless=True, profile="nb2") as srv:
+        await call(srv, ActionType.NAVIGATE,
+                    url=site.url("/list?token=SESSIONTOKEN123&user=alice%40example.com&new=1"))
+        saved = await recipe(srv, op="save", name="토큰 URL", last_n=1)
+        assert saved["success"], saved
+        hint = saved["data"]["dropped_query_values"]
+        assert hint["keys"] == ["new", "token", "user"] and "params" in hint["hint"]
+        bad = await recipe(srv, op="save", name="토큰 params", last_n=1, params={"t": "SESSIONTOKEN123"})
+        assert not bad["success"] and "민감" in bad["error_message"]
+        assert "SESSIONTOKEN123" not in json.dumps(bad, ensure_ascii=False)
+    from browser.serve_profile import profile_dir
+
+    raw = (profile_dir("nb2") / "recipes.json").read_text(encoding="utf-8")
+    assert "SESSIONTOKEN123" not in raw and "alice" not in raw
+
+
+@pytest.mark.asyncio
+async def test_click_blocked_by_egress_reports_egress_and_is_not_recorded(site):
+    """R1 NB-3 형제 경로: 클릭으로 나간 이동이 egress 에 막히면 click 결과에도 data.egress 를 싣고
+    (navigate 와 같은 모양), 오류 페이지로 간 단계는 궤적에 넣지 않는다."""
+    site.feed(ROWS, ad_first=True)
+    async with BrowserMCPServer(headless=True, allowed_domains=("127.0.0.1",)) as srv:
+        await call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+        obs = await observe(srv)
+        res = await click(srv, obs, "오늘만 특가")
+        egress = res.data.get("egress")
+        assert egress and egress["host"] == "ads.invalid", res.data
+        out = await recipe(srv, op="save", name="x", last_n=1)
+        assert not out["success"], out  # navigate 도 끊긴 뒤라 저장할 단계가 없다
+
+
 # ---------------------------------------------------------------------------
 # 목록·삭제·살균·IPI
 # ---------------------------------------------------------------------------
@@ -355,6 +435,15 @@ async def test_list_delete_and_name_sanitized_with_ipi_signal(site):
 # ---------------------------------------------------------------------------
 # 끄기·프로필 저장·도구 목록
 # ---------------------------------------------------------------------------
+
+
+def test_recipe_schema_properties_are_described():
+    """R1 NB-6: id·params·pins·last_n 의 모양을 스키마 설명으로 알려 준다(도구 설명은 80토큰 그대로)."""
+    props = SERVER_TOOLS[RECIPE_TOOL]["inputSchema"]["properties"]
+    for key in ("id", "name", "last_n", "params", "pins"):
+        assert props[key].get("description"), key
+    assert "run" in props["id"]["description"] and "delete" in props["id"]["description"]
+    assert "{" in props["params"]["description"] and "identity" in props["pins"]["description"]
 
 
 @pytest.mark.asyncio

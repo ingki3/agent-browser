@@ -58,7 +58,7 @@ def url_pattern(url: str) -> str:
         parts = urlsplit(url or "")
     except ValueError:
         return ""
-    host = (parts.netloc or "").lower()
+    host = (parts.netloc or "").rsplit("@", 1)[-1].lower()
     return host + path_pattern(parts.path, parts.query)
 
 
@@ -69,7 +69,10 @@ def origin_of(url: str) -> str:
         return ""
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return ""
-    return f"{parts.scheme}://{parts.netloc}".lower()
+    netloc = parts.netloc.rsplit("@", 1)[-1]  # 사용자 정보(user:pass@)는 출처가 아니다
+    if not netloc:
+        return ""
+    return f"{parts.scheme}://{netloc}".lower()
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +386,33 @@ KEYS_JS = r"""
     if (sig(t) !== s.tsig) return {ok: false, reason: 'target_not_found', detail: '틀 불일치(모양)'};
     if (inferRole(t) !== s.role) return {ok: false, reason: 'target_not_found', detail: '틀 불일치(역할)'};
     if (hrefPat(t) !== s.href_pat) return {ok: false, reason: 'target_not_found', detail: '틀 불일치(href 패턴)'};
+    // R1 NB-5: 항목 ≥3 개의 대상 href 가 완전히 같으면 덜 로드된 자리표시자로 본다(같은 틀·같은 패턴이라
+    // 틀 확인으로는 못 거른다). '#'·javascript:·현재 문서로 가는 링크는 버튼 역할이라 제외.
+    const same = placeholderCount(items, s.rel, t);
+    if (same >= MIN_ITEMS)
+      return {ok: false, reason: 'not_ready', detail: '목록 항목 ' + same + '개의 대상 주소가 모두 같음(자리표시자)'};
     return found(t, {items: items.length});
+  }
+  function realHref(el) {
+    const h = el.getAttribute('href');
+    if (h === null || h === '' || h.charAt(0) === '#') return null;
+    let u;
+    try { u = new URL(h, location.href); } catch (e) { return null; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    u.hash = '';
+    const here = location.href.split('#')[0];
+    return u.href === here ? null : u.href;
+  }
+  function placeholderCount(items, rel, t) {
+    const mine = realHref(t);
+    if (mine === null) return 0;
+    let n = 0;
+    for (const it of items) {
+      let ts;
+      try { ts = rel ? it.querySelectorAll(':scope > ' + rel) : [it]; } catch (e) { ts = []; }
+      if (ts.length === 1 && realHref(ts[0]) === mine) n++;
+    }
+    return n;
   }
   function locateUi(u) {
     const cands = [];

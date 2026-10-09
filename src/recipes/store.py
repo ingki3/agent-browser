@@ -35,7 +35,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote_plus, urlsplit, urlunsplit
 
 from recipes import keys
 
@@ -99,19 +99,79 @@ def _sub_text(text: str, params: Dict[str, str], used: set) -> str:
     return out
 
 
-def _sub_url(url: str, params: Dict[str, str], used: set) -> str:
-    out = url
+#: 값이 params 로 지정되면 save 를 거부하는 쿼리 키(R1 NB-2). 긴 낱말은 키 어디에 있어도, 짧은 낱말은
+#: 키 조각(영숫자 경계·camelCase)으로 같거나 끝에 붙을 때만 — keyword·author·side 같은 흔한 키는 통과.
+_SENSITIVE_SUB = re.compile(r"token|session|passw|secret|e-?mail|csrf|xsrf", re.I)
+_SENSITIVE_PART = frozenset({"sid", "key", "code", "auth", "authorization", "pw", "pwd", "otp"})
+_SENSITIVE_SUFFIX = ("sid", "key")
+
+
+def _sensitive_key(key: str) -> bool:
+    if _SENSITIVE_SUB.search(key):
+        return True
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key)
+    parts = [p.lower() for p in re.split(r"[^A-Za-z0-9]+|\s+", spaced) if p]
+    if any(p in _SENSITIVE_PART for p in parts):
+        return True
+    low = key.lower()
+    return any(low.endswith(s) for s in _SENSITIVE_SUFFIX)
+
+
+def _sub_piece(piece: str, params: Dict[str, str], used: set) -> str:
+    """URL 조각(경로 조각 하나·쿼리 값 하나) 안에서만 params 치환. 자리표시자는 늘 `:url`(재생 때
+    퍼센트 인코딩 — 값의 `/ ? # @` 가 조각 밖으로 새지 못한다). 이미 만든 자리표시자 안은 다시 안 본다."""
+    out = piece
     for name, value in sorted(params.items(), key=lambda kv: -len(kv[1])):
         if not value:
             continue
-        for form in {quote(value, safe=""), quote_plus(value)}:
-            if form and form != value and form in out:
-                out = out.replace(form, "{" + name + ":url}")
-                used.add(name)
-        if value in out:
-            out = out.replace(value, "{" + name + "}")
-            used.add(name)
+        for form in sorted({quote(value, safe=""), quote_plus(value), value}, key=len, reverse=True):
+            if not form:
+                continue
+            chunks = re.split(r"(\{[A-Za-z_][A-Za-z0-9_]{0,31}(?::url)?\})", out)
+            for k in range(0, len(chunks), 2):  # 짝수 칸 = 자리표시자 밖
+                if form in chunks[k]:
+                    chunks[k] = chunks[k].replace(form, "{" + name + ":url}")
+                    used.add(name)
+            out = "".join(chunks)
     return out
+
+
+def _sub_url(url: str, params: Dict[str, str], used: set,
+             dropped: Optional[List[str]] = None) -> str:
+    """navigate URL 의 params 치환(R1 NB-1·NB-2).
+
+    * scheme·host·port 는 그대로(치환 금지 — 재생이 다른 출처로 새지 않게). 사용자 정보(user:pass@)·
+      `#` 이하는 버린다.
+    * 경로: 조각(`/` 사이)마다 치환.
+    * 쿼리: 값마다 치환. 자리표시자만 남지 않은 값(치환 안 된 원문)은 버리고 키만 남긴다 — 토큰·이메일
+      같은 원문이 파일에 남지 않게. 버린 키는 dropped 에.
+    * 민감 키(token·session·sid·auth·key·code·email·password·secret 류)의 값을 params 로 지정하면 거부.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise RecipeError("이동 URL 을 해석할 수 없어 저장하지 않습니다.") from None
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    path = "/".join(_sub_piece(seg, params, used) for seg in parts.path.split("/"))
+    pairs = []
+    for raw in parts.query.split("&") if parts.query else []:
+        key, sep, value = raw.partition("=")
+        if value:
+            mine: set = set()
+            sub = _sub_piece(value, params, mine)
+            if _PLACEHOLDER.sub("", sub):  # 원문이 남음 → 값 버림(이 값에서 쓴 params 도 안 씀)
+                value = ""
+                if dropped is not None:
+                    dropped.append(clean_text(unquote_plus(key), 40))
+            else:
+                if _sensitive_key(unquote_plus(key)):
+                    raise RecipeError(
+                        f"쿼리 키 {clean_text(unquote_plus(key), 40)!r} 는 민감 값(토큰·세션·인증·이메일 등)이라 "
+                        "params 로도 저장하지 않습니다.")
+                used.update(mine)
+                value = sub
+        pairs.append(key + sep + value if sep or value else key)
+    return urlunsplit((parts.scheme, netloc, path, "&".join(pairs), ""))
 
 
 def compile_recipe(
@@ -120,8 +180,12 @@ def compile_recipe(
     *,
     params: Optional[Dict[str, Any]] = None,
     pins: Optional[Dict[Any, Any]] = None,
+    dropped: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """기록된 궤적 항목들(기록 당시 스냅숏) → 저장할 레시피(dict, id 없음)."""
+    """기록된 궤적 항목들(기록 당시 스냅숏) → 저장할 레시피(dict, id 없음).
+
+    dropped 를 주면 navigate URL 에서 값을 버린 쿼리 키 이름을 담는다(save 응답 안내용).
+    """
     clean_name = clean_text(name)
     if not clean_name:
         raise RecipeError("레시피 이름이 비었습니다.")
@@ -159,7 +223,7 @@ def compile_recipe(
                 raise RecipeError(f"{i}단계는 비밀번호 칸 입력이라 저장하지 않습니다(params 여도 거부).")
             args["text"] = _sub_text(str(args.get("text") or ""), params, used)
         if action == "navigate":
-            args["url"] = _sub_url(str(args.get("url") or ""), params, used)
+            args["url"] = _sub_url(str(args.get("url") or ""), params, used, dropped)
         target: Optional[Dict[str, Any]] = None
         if action in ELEMENT_ACTIONS:
             try:

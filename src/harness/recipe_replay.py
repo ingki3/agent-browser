@@ -3,7 +3,7 @@
     python -m harness.recipe_replay
 
 제품 경로(MCP 서버 `BrowserMCPServer.call_tool` + 서버 도구 `browser_recipe`)로 Mock 사이트에서
-"기록 → save → 페이지 변형 → run" 을 시나리오 8종으로 잰다. 외부 접속 없음(로컬 HTTP).
+"기록 → save → 페이지 변형 → run" 을 시나리오 9종으로 잰다. 외부 접속 없음(로컬 HTTP).
 
 양성(재생 성공 + 맞는 대상을 눌렀는가)
   ① content_swap   기사 교체 → 같은 자리(1번째)의 새 기사
@@ -15,10 +15,11 @@
   ⑤ ambiguous_lists     같은 틀 목록 2개 → target_ambiguous
   ⑥ ad_forgery          같은 자리·같은 모양 광고(href 패턴 다름) → target_not_found
   ⑦ payment_approval    결제 단계(HITL 고위험) → approval_required (승인 증표 저장 안 함)
+  ⑨ pattern_changed     같은 틀·같은 골격, 다른 URL 패턴(/list?new=1) → page_changed (R1 NB-4)
 
 판정
 * 오클릭(음성에서 무엇이든 누름, 양성에서 다른 대상을 누름)이 하나라도 있으면 **exit 2**.
-* 커버리지(scenarios_covered) 8/8 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
+* 커버리지(scenarios_covered) 9/9 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
   실패(규칙 2) — 값에 반영돼 exit 1.
 * 오클릭 판정은 하네스 쪽 독립 증거(Mock 서버 요청 기록 + 재생 응답의 실행 단계)로 한다.
 """
@@ -45,6 +46,7 @@ SCENARIOS: Dict[str, Tuple[str, Optional[str]]] = {
     "ambiguous_lists": ("negative", "target_ambiguous"),
     "ad_forgery": ("negative", "target_not_found"),
     "payment_approval": ("negative", "approval_required"),
+    "pattern_changed": ("negative", "page_changed"),
 }
 
 
@@ -166,6 +168,13 @@ async def _scenario(name: str, site: Any) -> Dict[str, Any]:
         elif name == "ad_forgery":
             rid = await _record_article(srv, site, m.ROWS[0][1])
             site.feed(m.ROWS, ad_first=True)
+        elif name == "pattern_changed":
+            # 같은 틀·같은 골격의 목록이지만 URL 패턴(list?new)이 기록(list)과 다르다 — URL 패턴 확인만
+            # 이 시나리오를 고유하게 막는다(규칙 2: 다른 확인으로 새지 않게 골격·틀은 그대로).
+            rid = await _record_article(srv, site, m.ROWS[0][1])
+            out = await _run(srv, site, rid, "/list?new=1")
+            opened = site.opened("/item")
+            return _judge(name, out, misclick=bool(opened) or _dispatched(out) > 0)
         else:
             raise RuntimeError(f"알 수 없는 시나리오: {name}")
         out = await _run(srv, site, rid)

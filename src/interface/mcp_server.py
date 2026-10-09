@@ -175,11 +175,12 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
             "type": "object",
             "properties": {
                 "op": {"enum": ["save", "run", "list", "delete"]},
-                "id": {"type": "string"},
-                "name": {"type": "string"},
-                "last_n": {"type": "integer", "minimum": 1, "maximum": 20},
-                "params": {"type": "object"},
-                "pins": {"type": "object"},
+                "id": {"type": "string", "description": "run·delete 대상 레시피 id"},
+                "name": {"type": "string", "description": "save 할 이름"},
+                "last_n": {"type": "integer", "minimum": 1, "maximum": 20,
+                           "description": "save: 최근 통과 단계 수"},
+                "params": {"type": "object", "description": "{이름: 값} — save 는 입력한 글자, run 은 새 값"},
+                "pins": {"type": "object", "description": "save: {\"단계번호\": \"identity\"} (slot|ui|identity)"},
             },
             "required": ["op"],
         },
@@ -2018,6 +2019,8 @@ class BrowserMCPServer:
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
+        # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
+        target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
         if used is not None:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
@@ -2033,7 +2036,7 @@ class BrowserMCPServer:
                 self._dispatcher.heal_disabled = False
         if used is not None:
             self._attach_approval_outcome(used, result)
-        result = self._attach_egress_block(action, params, result, blocks_before)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
@@ -2048,8 +2051,21 @@ class BrowserMCPServer:
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
+    def _handle_href(self, params: Dict[str, Any]) -> Optional[str]:
+        """element_id 대상 핸들의 href(링크가 아니거나 핸들이 없으면 None)."""
+        eid = params.get("element_id")
+        if not eid or self._engine is None:
+            return None
+        try:
+            handle = self._engine.get_handle(eid)
+        except Exception:  # noqa: BLE001 - 진단용 보조 정보일 뿐
+            return None
+        href = getattr(handle, "href", None) if handle is not None else None
+        return href if isinstance(href, str) and href else None
+
     def _attach_egress_block(
-        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int,
+        *, target_href: Optional[str] = None,
     ) -> ActionResult:
         """이번 호출 중 Egress 가 막은 이동을 에이전트에게 알린다 (WS-29b).
 
@@ -2057,6 +2073,8 @@ class BrowserMCPServer:
         data.egress 에 이유(code=egress_blocked, host, category, reason, open_with)를 싣는다.
         navigate 가 막혔으면 실패(E_INVALID_URL)로 돌려준다 — 막힌 문서를 성공으로 보고하지
         않는다. 하위 요청(이미지·비콘 등) 차단은 싣지 않는다(문서 이동만).
+        클릭한 링크의 호스트(target_href, WS-38 R1 NB-3)도 이동 대상으로 본다 — 막히면 탭이
+        chrome-error:// 로 바뀌어 현재 주소로는 호스트를 알 수 없기 때문이다.
         """
         if self._egress is None:
             return result
@@ -2066,7 +2084,7 @@ class BrowserMCPServer:
         from urllib.parse import urlparse
 
         hosts = set()
-        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url):
+        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url, target_href):
             try:
                 h = urlparse(raw or "").hostname
             except ValueError:
