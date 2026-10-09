@@ -45,6 +45,7 @@ packages = [
     "src/harness",
     "src/agent",
     "src/llm",
+    "src/vision",
 ]
 
 [tool.pytest.ini_options]
