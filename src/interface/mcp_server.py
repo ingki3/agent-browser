@@ -168,8 +168,8 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
     # WS-38 동작 캐시(레시피). serve --no-recipes 면 목록에서 뺀다(build_server_tools).
     f"{TOOL_PREFIX}recipe": {
         "description": (
-            "레시피=검증된 동작 묶음. save: 최근 통과 last_n 단계 저장(입력은 params). "
-            "run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. list·delete"
+            "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 "
+            "이어감. save: 이름·params 바꿀 때만(last_n). list·delete"
         ),
         "inputSchema": {
             "type": "object",
@@ -190,12 +190,12 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
 #: 레시피 서버 도구 이름(WS-38).
 RECIPE_TOOL = f"{TOOL_PREFIX}recipe"
 
-#: MCP initialize 의 서버 instructions(WS-38 — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.
+#: MCP initialize 의 서버 instructions(WS-38·38b — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.
 RECIPE_INSTRUCTIONS = (
-    "agent-browser: 같은 사이트에서 반복할 일은 성공한 뒤 browser_recipe save 로 저장하세요"
-    "(입력 글자는 params).\n"
+    "agent-browser: 통과한 흐름(2단계 이상)은 레시피로 자동 저장됩니다(입력 글자는 params, 결과 "
+    "data.recipe_saved).\n"
     "observe_page 결과 data.recipes 에 후보가 있으면 단계별로 하기 전에 browser_recipe run 을 먼저 "
-    "시도하세요.\n"
+    "시도하세요. save 는 이름·params 를 바꾸고 싶을 때만.\n"
     "run 이 멈추면(data.recipe.reason + 현재 관찰) 그 지점부터 평소대로 진행하세요. 재생도 승인·차단 "
     "관문을 그대로 지납니다."
 )
