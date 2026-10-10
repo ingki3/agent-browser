@@ -53,6 +53,9 @@ DEFAULT_APPROVAL_TTL_S = 30 * 60
 #: browser_control_wait / browser_approval_wait 의 timeout_s 상한·기본(초).
 WAIT_MAX_S = 120.0
 WAIT_DEFAULT_S = 60.0
+#: login 요청의 서버 쪽 만료 여유(초). 살아 있는 CLI 가 자기 timeout 에 먼저 끝내고(exit 1) 반납하게 하고,
+#: 서버 만료는 CLI 가 죽었을 때(kill -9)의 회복용 — 둘이 같은 시각이면 어느 쪽이 먼저인지 경합한다(CI 실측).
+LOGIN_SERVER_GRACE_S = 5.0
 #: 서버의 명령 디렉터리 감시 주기(초).
 POLL_INTERVAL_S = 0.1
 #: 명령 파일 크기 상한(바이트) — 그 이상은 읽지 않는다.
@@ -926,7 +929,7 @@ class HandoffHub:
                 return False, "이미 사람이 조작 중입니다.", None
             if login_id in self._finished_logins:
                 return False, "이미 취소한 로그인 요청입니다.", None
-            self.login = LoginJob(url=url, login_id=login_id, deadline=time.monotonic() + duration,
+            self.login = LoginJob(url=url, login_id=login_id, deadline=time.monotonic() + duration + LOGIN_SERVER_GRACE_S,
                                   nonce=nonce)
             self._write_control()
             return None, "로그인 창 준비 중", "login"

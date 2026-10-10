@@ -183,7 +183,12 @@ def test_hub_login_timeout_bound(duration):
     assert hub._apply({"op": "login", "url": "https://example.test", "login_id": "mock", "timeout": duration})[0] is False
     assert hub.login is None and hub.holder == "agent"
     assert hub._apply({"op": "login", "url": "https://example.test", "login_id": "mock", "timeout": 3600})[2] == "login"
-    assert hub.login.deadline - time.monotonic() <= 3600
+    from interface.handoff import LOGIN_SERVER_GRACE_S
+
+    # 서버 만료는 CLI timeout 보다 늦어야 한다 — 같으면 CLI 의 timeout(exit 1)과 서버 만료(exit 0)가 경합(CI 실측).
+    assert 3600 < hub.login.deadline - time.monotonic() <= 3600 + LOGIN_SERVER_GRACE_S
+    assert LOGIN_SERVER_GRACE_S >= 2
+
 
 
 def test_server_release_clears_login():
