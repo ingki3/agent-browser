@@ -8,6 +8,7 @@
 * /search?q=...    — 검색 결과 목록(같은 틀) — params 치환 확인용
 * /item?id=N       — 기사 페이지("장바구니 담기" → /cart)
 * /cart            — "결제하기" 버튼(HITL 고위험) → /paid 요청이면 결제됨
+* /login           — 아이디·비밀번호 칸 + 로그인 버튼(WS-38b 비밀 단계 자동 저장 제외 확인용)
 """
 
 from __future__ import annotations
@@ -115,6 +116,13 @@ class RecipeSite:
             return 200, (HEAD.format(title="장바구니") + HEADER
                          + "<main><form action='/paid'><button type='submit'>결제하기</button></form>"
                          "</main></body></html>")
+        if parts.path == "/login":  # WS-38b: 비밀번호 칸·자격증명 치환 단계는 자동 저장하지 않는다
+            return 200, (HEAD.format(title="로그인") + HEADER
+                         + "<main><form onsubmit='return false'>"
+                         "<input id='u' type='text' aria-label='아이디'>"
+                         "<input id='p' type='password' aria-label='비밀번호'>"
+                         "<button type='button' onclick=\"document.getElementById('msg').textContent="
+                         "'확인 중'\">로그인</button><p id='msg'></p></form></main></body></html>")
         if parts.path == "/paid":
             return 200, HEAD.format(title="결제 완료") + "<p>paid</p></body></html>"
         return 404, HEAD.format(title="없음") + "<p>404</p></body></html>"

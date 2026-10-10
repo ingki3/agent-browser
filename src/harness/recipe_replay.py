@@ -3,12 +3,15 @@
     python -m harness.recipe_replay
 
 제품 경로(MCP 서버 `BrowserMCPServer.call_tool` + 서버 도구 `browser_recipe`)로 Mock 사이트에서
-"기록 → save → 페이지 변형 → run" 을 시나리오 9종으로 잰다. 외부 접속 없음(로컬 HTTP).
+"기록 → save → 페이지 변형 → run" 을 시나리오 10종으로 잰다. 외부 접속 없음(로컬 HTTP).
 
 양성(재생 성공 + 맞는 대상을 눌렀는가)
   ① content_swap   기사 교체 → 같은 자리(1번째)의 새 기사
   ② reorder        목록 순서 변경 → 순번(3번째)대로(이름 아님)
   ⑧ params         입력 params 치환 → 새 검색어로 검색하고 첫 결과
+  ⑩ autosave       save 없이 자동 저장(WS-38b) → 검색 결과 내용이 바뀐 뒤 새 세션(같은 --profile)에서
+                   관찰 후보(auto)로 run, 자동 params(검색어)로 새 검색어 → 새 첫 결과. 파일에 입력 원문이
+                   있으면(자동 params 치환 파손) 실패
 음성(정해진 사유로 멈추고 **아무것도 누르지 않았는가**)
   ③ ab_unrecorded       A/B 변형(기록 안 된 화면) → page_changed
   ④ partial_load        덜 로드(요소 50% 미만) → not_ready
@@ -19,7 +22,7 @@
 
 판정
 * 오클릭(음성에서 무엇이든 누름, 양성에서 다른 대상을 누름)이 하나라도 있으면 **exit 2**.
-* 커버리지(scenarios_covered) 9/9 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
+* 커버리지(scenarios_covered) 10/10 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
   실패(규칙 2) — 값에 반영돼 exit 1.
 * 오클릭 판정은 하네스 쪽 독립 증거(Mock 서버 요청 기록 + 재생 응답의 실행 단계)로 한다.
 """
@@ -47,6 +50,7 @@ SCENARIOS: Dict[str, Tuple[str, Optional[str]]] = {
     "ad_forgery": ("negative", "target_not_found"),
     "payment_approval": ("negative", "approval_required"),
     "pattern_changed": ("negative", "page_changed"),
+    "autosave": ("positive", None),
 }
 
 
@@ -131,6 +135,9 @@ async def _scenario(name: str, site: Any) -> Dict[str, Any]:
         bad = bool(site.opened("/paid")) or (_dispatched(out) > 0 and bool(out.get("success")))
         return _judge(name, out, misclick=bad)
 
+    if name == "autosave":
+        return await _autosave(site)
+
     async with BrowserMCPServer(headless=True) as srv:
         if name == "params":
             await _call(srv, ActionType.NAVIGATE, url=site.url("/list"))
@@ -183,6 +190,53 @@ async def _scenario(name: str, site: Any) -> Dict[str, Any]:
             return _judge(name, out, misclick=bool(opened) and opened != expected_open,
                           positive_check=opened == expected_open)
         return _judge(name, out, misclick=bool(opened) or _dispatched(out) > 0)
+
+
+async def _autosave(site: Any) -> Dict[str, Any]:
+    """⑩ save 를 한 번도 부르지 않고 기록 → 자동 저장 → 내용 바뀐 뒤 새 세션에서 관찰 후보로 run."""
+    from urllib.parse import quote
+
+    from browser.serve_profile import profile_dir
+    from contracts import ActionType
+    from interface import BrowserMCPServer
+
+    typed = "노트북"
+    async with BrowserMCPServer(headless=True, profile="replay-auto") as srv:
+        await _call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+        obs = await _observe(srv)
+        res = await _call(srv, ActionType.TYPE_TEXT, element_id=_eid(obs, "검색어"), text=typed,
+                          epoch=obs.snapshot_epoch)
+        if not res.success:
+            raise RuntimeError(f"기록 단계 실패: type_text: {res.error_message}")
+        await _click(srv, obs, "검색", "button")
+        await _click(srv, await _observe(srv), f"{typed} 결과 1")
+    raw = (profile_dir("replay-auto") / "recipes.json").read_bytes()
+    leaked = any(form.encode("utf-8") in raw for form in (typed, quote(typed)))
+    # 검색 결과 내용이 바뀐다(같은 틀, 다른 항목) — 자리(첫 결과)로 찾아야 맞는 대상
+    site.search_rows = lambda q: [(400 + i, f"{q} 신상 {i}") for i in range(1, 6)]
+    try:
+        async with BrowserMCPServer(headless=True, profile="replay-auto") as srv:
+            await _call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+            cands = ((await _observe(srv)).data.get("recipes") or {}).get("candidates") or []
+            auto = [c for c in cands if c.get("auto")]
+            if not auto:
+                return _judge("autosave", {"success": False, "error_message": f"자동 저장 후보 없음: {cands}"},
+                              misclick=False, positive_check=False)
+            rid, pnames = auto[0]["id"], auto[0].get("params") or []
+            site.clear_log()
+            query = "무선 이어폰"
+            out = await srv.call_server_tool("browser_recipe", {"op": "run", "id": rid,
+                                                                "params": {p: query for p in pnames}})
+    finally:
+        site.search_rows = lambda q: [(300 + i, f"{q} 결과 {i}") for i in range(1, 6)]
+    ok_search = site.opened("/search") == ["/search?q=" + quote(query)]
+    opened = site.opened("/item")
+    mis = (bool(opened) and opened != ["/item?id=401"]) or (bool(site.opened("/search")) and not ok_search)
+    res = _judge("autosave", out, misclick=mis,
+                 positive_check=ok_search and opened == ["/item?id=401"] and pnames == ["검색어"] and not leaked)
+    if leaked:
+        res["detail"] = "레시피 파일에 입력 원문이 남음(자동 params 치환 파손)"
+    return res
 
 
 def _judge(name: str, out: Dict[str, Any], *, misclick: bool,

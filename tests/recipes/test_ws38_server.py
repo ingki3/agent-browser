@@ -1,4 +1,4 @@
-"""WS-38 단계 3~5: 서버 연결 — 궤적 기록·save/run/list/delete·observe data.recipes·recipe_hint·
+"""WS-38 단계 3~5: 서버 연결 — 궤적 기록·save/run/list/delete·observe data.recipes·recipe_saved(WS-38b)·
 instructions·--no-recipes·프로필 저장 (실제 Chromium + 로컬 Mock 사이트, 외부 접속 없음).
 
 재생도 기존 관문을 그대로 지나는지(HITL 고위험 → approval_required 중단, egress 차단 → 중단,
@@ -81,8 +81,10 @@ async def test_save_observe_candidates_and_run_after_content_change(site):
         obs = await observe(srv)
         cands = obs.data["recipes"]
         assert cands["how"] and "run" in cands["how"]
-        assert [c["id"] for c in cands["candidates"]] == [rid]
-        assert cands["candidates"][0]["name"] == "첫 기사 열기"
+        # 에이전트가 save 한 것(가장 최근) + 같은 흐름의 자동 저장(navigate→click, WS-38b)
+        assert cands["candidates"][0]["id"] == rid
+        assert cands["candidates"][0]["name"] == "첫 기사 열기" and cands["candidates"][0]["auto"] is False
+        assert [c["auto"] for c in cands["candidates"][1:]] == [True]
         site.clear_log()
         out = await recipe(srv, op="run", id=rid)
         assert out["success"], out
@@ -313,19 +315,22 @@ async def test_human_control_breaks_trajectory(site, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recipe_hint_once_per_origin(site):
+async def test_no_recipe_hint_and_recipe_saved_once_per_segment(site):
+    """WS-38b: 저장 권유(recipe_hint)는 없어지고, 구간이 처음 저장된 단계에만 recipe_saved 가 붙는다."""
     async with BrowserMCPServer(headless=True) as srv:
-        hints = []
+        results = []
         for _ in range(2):
-            await call(srv, ActionType.NAVIGATE, url=site.url("/list"))
+            results.append(await call(srv, ActionType.NAVIGATE, url=site.url("/list")))
             obs = await observe(srv)
-            r1 = await click(srv, obs, ROWS[0][1])
+            results.append(await click(srv, obs, ROWS[0][1]))
             obs = await observe(srv)
-            r2 = await click(srv, obs, "home")
-            hints += [r.data.get("recipe_hint") for r in (r1, r2)]
-        got = [h for h in hints if h]
-        assert len(got) == 1, hints
-        assert "browser_recipe save" in got[0]["text"] and got[0]["last_n"] >= 3
+            results.append(await click(srv, obs, "home"))
+        assert all("recipe_hint" not in r.data for r in results)
+        saved = [i for i, r in enumerate(results) if r.data.get("recipe_saved")]
+        # 구간(navigate 로 시작)마다 한 번: 처음은 둘째 단계, 반복 구간은 기존 레시피의 앞부분이라 미뤘다가
+        # 같은 구조가 된 셋째 단계(합쳐짐)에서
+        assert saved == [1, 5], saved
+        assert len((await recipe(srv, op="list"))["data"]["recipes"]) == 1
 
 
 @pytest.mark.asyncio
@@ -423,12 +428,12 @@ async def test_list_delete_and_name_sanitized_with_ipi_signal(site):
         saved = await recipe(srv, op="save", name=name, last_n=1)
         assert saved["success"], saved
         listed = await recipe(srv, op="list")
-        entry = listed["data"]["recipes"][0]
+        entry = next(r for r in listed["data"]["recipes"] if not r["auto"])
         assert "\x1b" not in entry["name"] and len(entry["name"]) <= 80
         assert SIGNAL_KEY in listed["data"]
         rid = entry["id"]
         assert (await recipe(srv, op="delete", id=rid))["success"]
-        assert (await recipe(srv, op="list"))["data"]["recipes"] == []
+        assert rid not in [r["id"] for r in (await recipe(srv, op="list"))["data"]["recipes"]]
         assert not (await recipe(srv, op="delete", id=rid))["success"]
 
 
@@ -485,7 +490,7 @@ async def test_profile_store_persists_0600(site, _isolated_profile_root):
     assert rid in data["recipes"]
     async with BrowserMCPServer(headless=True, profile="rcp") as srv2:
         listed = await recipe(srv2, op="list")
-        assert [r["id"] for r in listed["data"]["recipes"]] == [rid]
+        assert [r["id"] for r in listed["data"]["recipes"] if not r["auto"]] == [rid]
 
 
 @pytest.mark.asyncio
