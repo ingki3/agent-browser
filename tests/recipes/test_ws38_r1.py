@@ -42,7 +42,11 @@ def test_param_equal_to_host_or_port_or_scheme_is_not_substituted():
 
 
 def test_path_segment_param_is_encoded_and_cannot_leave_origin():
-    rec = st.compile_recipe("x", [_nav("http://mock.test/u/alice/profile", after_pat="mock.test/u/alice/profile")],
+    # WS-38b R1 NB-5: params 값이 이동 뒤 URL 패턴에 원문으로 남으면 save 도 거부한다.
+    with pytest.raises(st.RecipeError):
+        st.compile_recipe("x", [_nav("http://mock.test/u/alice/profile", after_pat="mock.test/u/alice/profile")],
+                          params={"who": "alice"})
+    rec = st.compile_recipe("x", [_nav("http://mock.test/u/alice/profile", after_pat="mock.test/u/{n}/profile")],
                             params={"who": "alice"})
     url = rec["steps"][0]["args"]["url"]
     assert url == "http://mock.test/u/{who:url}/profile"

@@ -36,7 +36,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote, quote_plus, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 
 from recipes import keys
 
@@ -176,6 +176,108 @@ def _sub_url(url: str, params: Dict[str, str], used: set,
     return urlunsplit((parts.scheme, netloc, path, "&".join(pairs), ""))
 
 
+#: 경로 토큰(WS-38b R1 BLOCKING-1): 퍼센트 디코드한 조각이 16자 이상, 이 글자들로만 이뤄졌고 영숫자 밖 글자를
+#: 하나 이상 품으면(JWT·base64url·하이픈 토큰) 자격 증명으로 본다. 영숫자만인 긴 조각은 keys 가 `{id}` 로 접는다.
+_TOKEN_SEG = re.compile(r"^[A-Za-z0-9._~%+=-]{16,}$")
+_TOKEN_MARK = re.compile(r"[._~%+=-]")
+#: 개인 식별자(R1 NB-1): 이메일, 국내 휴대전화(구분자 있거나 10~11자리 숫자), +국가번호 형식.
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_PHONE = re.compile(
+    r"(?<!\d)01[016789][-\s.]?\d{3,4}[-\s.]?\d{4}(?!\d)"
+    r"|(?<![\w+])\+\d{1,3}[-\s.]?\(?\d{1,4}\)?(?:[-\s.]?\d{2,4}){2,3}(?!\d)"
+)
+
+
+def _decode_segment(seg: str) -> Optional[str]:
+    """퍼센트 디코드(UTF-8 strict). 실패하거나 제어 문자가 나오면 None(→ 토큰으로 본다, fail-closed)."""
+    try:
+        out = unquote(seg, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in out):
+        return None
+    return out
+
+
+def _token_segment(seg: str) -> bool:
+    """경로 조각 하나가 토큰·이메일이면 True(BLOCKING-1). 자리표시자·접힌 패턴(`{id}`)은 아님."""
+    if not seg:
+        return False
+    dec = _decode_segment(seg)
+    if dec is None:
+        return True
+    if "@" in dec or "%40" in dec.lower():
+        return True
+    return bool(_TOKEN_SEG.match(dec) and _TOKEN_MARK.search(dec))
+
+
+def _path_of(text: str, *, is_url: bool) -> str:
+    """URL(scheme 포함) 또는 패턴(`host/path?keys`)의 경로 부분."""
+    if is_url:
+        try:
+            return urlsplit(text).path
+        except ValueError:
+            return text
+    body = text.split("?", 1)[0].split("#", 1)[0]
+    return body[body.find("/"):] if "/" in body else ""
+
+
+def _token_in_path(text: Any, *, is_url: bool) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    stripped = _PLACEHOLDER.sub("", text)
+    return any(_token_segment(s) for s in _path_of(stripped, is_url=is_url).split("/"))
+
+
+def _check_paths(rec: Dict[str, Any]) -> None:
+    """이동 URL·모든 url_pat·index_pat 경로에 토큰·이메일 조각이 있으면 거부(BLOCKING-1). 레시피 이름은
+    index_pat 에서 만들므로 함께 막힌다."""
+    found = _token_in_path(rec.get("index_pat"), is_url=False)
+    for s in rec.get("steps") or []:
+        if found:
+            break
+        found = (_token_in_path((s.get("args") or {}).get("url"), is_url=True)
+                 or _token_in_path(s.get("url_pat"), is_url=False)
+                 or _token_in_path((s.get("expect") or {}).get("url_pat"), is_url=False))
+    if found:
+        raise RecipeError("이동 주소·URL 패턴의 경로에 토큰(JWT·base64url 등) 또는 이메일로 보이는 조각이 있어 "
+                          "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
+
+
+def _pii(text: str) -> bool:
+    dec = _decode_segment(text)
+    norm = unicodedata.normalize("NFKC", dec if dec is not None else text)
+    return bool(_EMAIL.search(norm) or _PHONE.search(norm))
+
+
+def _has_pii(obj: Any, key: str = "") -> bool:
+    if key in _HASH_KEYS:
+        return False
+    if isinstance(obj, dict):
+        return any(_has_pii(v, str(k)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_has_pii(v, key) for v in obj)
+    if isinstance(obj, str):
+        return _pii(_PLACEHOLDER.sub("", obj))
+    return False
+
+
+def _check_pii(rec: Dict[str, Any]) -> None:
+    """저장될 문자열(대상 이름·식별값·이름 등)에 이메일·전화번호가 있으면 거부(R1 NB-1)."""
+    if _has_pii({"name": rec.get("name"), "index_pat": rec.get("index_pat"), "steps": rec.get("steps")}):
+        raise RecipeError("저장될 대상 이름·식별값·주소에 이메일 또는 전화번호로 보이는 글자가 있어 저장하지 "
+                          "않습니다(개인 식별자는 레시피에 남기지 않음).")
+
+
+def _check_leaks(rec: Dict[str, Any], values: Any) -> None:
+    """입력값(params 값)이 이동 주소·URL 패턴·대상 이름에 원문으로 남으면 거부(R1 NB-5, 자동 저장도 같은
+    검사). 원문·NFKC·퍼센트 인코딩·대소문자 변형을 본다. 값 자체는 메시지에 넣지 않는다."""
+    forms = [f for v in values if len(str(v).strip()) >= 2 for f in _value_forms(str(v))]
+    if forms and _leaks({"steps": rec["steps"], "index_pat": rec["index_pat"]}, forms):
+        raise RecipeError("이 입력값이 이동 주소/URL 패턴/대상 이름에 남아 저장할 수 없습니다(입력 원문은 "
+                          "저장하지 않음).")
+
+
 def compile_recipe(
     name: Any,
     entries: List[Dict[str, Any]],
@@ -233,6 +335,13 @@ def compile_recipe(
                     used.add(typed[text])
             else:
                 args["text"] = _sub_text(text, params, used)
+        if action == "select_option" and isinstance(args.get("value"), str) and args["value"]:
+            # 선택 값(R1 NB-2): 자동 저장은 칸마다 통째로 params, 에이전트 save 는 params 값과 같을 때만.
+            value = args["value"]
+            pname = (typed or {}).get(value) or next((n for n, v in params.items() if v == value), None)
+            if pname:
+                args["value"] = "{" + pname + "}"
+                used.add(pname)
         if action == "navigate":
             args["url"] = _sub_url(str(args.get("url") or ""), params, used, dropped)
         target: Optional[Dict[str, Any]] = None
@@ -269,13 +378,17 @@ def compile_recipe(
         raise RecipeError("출처(http/https)를 알 수 없어 저장하지 않습니다.")
     first = steps[0]
     index_pat = (first["expect"].get("url_pat") or "") if first["action"] == "navigate" else first["url_pat"]
-    return {
+    rec = {
         "name": clean_name,
         "origin": origin,
         "params": sorted(params),
         "index_pat": index_pat or "",
         "steps": steps,
     }
+    _check_paths(rec)
+    _check_leaks(rec, params.values())
+    _check_pii(rec)
+    return rec
 
 
 def render_args(step: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,7 +405,7 @@ def render_args(step: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
 
         return _PLACEHOLDER.sub(_one, text)
 
-    for key in ("text", "url"):
+    for key in ("text", "url", "value"):
         if isinstance(out.get(key), str):
             out[key] = _fill(out[key])
     return out
@@ -314,6 +427,8 @@ def _same_shape(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 AUTO_NAME_LIMIT = 40
 #: 자동 params 이름 앞머리(라벨이 없거나 겹칠 때 text1, text2…).
 AUTO_PARAM_PREFIX = "text"
+#: 선택 값(select_option) 자동 params 이름 앞머리(라벨이 없거나 겹칠 때 choice1, choice2…, R1 NB-2).
+AUTO_CHOICE_PREFIX = "choice"
 #: 원문 누출 검사에서 보지 않는 키(해시 — 짧은 입력값이 우연히 섞일 수 있음).
 _HASH_KEYS = frozenset({"skel", "chain", "itpl"})
 _ACTION_WORD = {"click": "클릭", "select_option": "선택", "check_box": "체크", "navigate": "이동"}
@@ -333,8 +448,9 @@ def auto_param_name(label: Any, value: str, taken: set) -> str:
     name = re.sub(r"\W+", "_", text).strip("_")[:32].rstrip("_")
     if not name or not _PARAM_NAME.match(name) or name in taken:
         return ""
-    if name.startswith(AUTO_PARAM_PREFIX) and name[len(AUTO_PARAM_PREFIX):].isdigit():
-        return ""  # textN 자리와 겹치지 않게
+    for prefix in (AUTO_PARAM_PREFIX, AUTO_CHOICE_PREFIX):
+        if name.startswith(prefix) and name[len(prefix):].isdigit():
+            return ""  # textN·choiceN 자리와 겹치지 않게
     return name
 
 
@@ -363,9 +479,16 @@ def _auto_name(steps: List[Dict[str, Any]], index_pat: str) -> str:
     return clean_text(f"자동: {path} {summary}", AUTO_NAME_LIMIT)
 
 
+def _fold(text: str) -> str:
+    """누출 비교용 정규화(R1 NB-3): NFKC 뒤 casefold — NFD/NFC·전각/반각·대소문자 변형을 같게 본다."""
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
 def _value_forms(value: str) -> List[str]:
-    forms = {value, quote(value, safe=""), quote_plus(value), quote(value)}
-    return sorted({f.lower() for f in forms if f}, key=len, reverse=True)
+    forms = set()
+    for v in {value, unicodedata.normalize("NFKC", value), unicodedata.normalize("NFC", value)}:
+        forms.update({v, quote(v, safe=""), quote_plus(v), quote(v)})
+    return sorted({_fold(f) for f in forms if f}, key=len, reverse=True)
 
 
 def _leaks(obj: Any, forms: List[str], key: str = "") -> bool:
@@ -376,7 +499,7 @@ def _leaks(obj: Any, forms: List[str], key: str = "") -> bool:
     if isinstance(obj, list):
         return any(_leaks(v, forms, key) for v in obj)
     if isinstance(obj, str):
-        low = _PLACEHOLDER.sub("", obj).lower()
+        low = _fold(_PLACEHOLDER.sub("", obj))
         return any(f in low for f in forms)
     return False
 
@@ -385,13 +508,15 @@ def compile_auto(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """구간(통과 단계들) → 자동 레시피(WS-38b). 저장하면 안 되는 구간이면 RecipeError.
 
     * type_text 글자는 칸마다 통째로 params(이름은 칸 라벨 정규화, 없거나 겹치면 text1, text2…; 같은 글자는
-      같은 이름). 이동 URL 의 경로·쿼리 값에 같은 글자가 있으면 compile 규칙대로 그 param 으로.
-    * 거부(→ 그 구간은 저장 안 함): 비밀 단계, 민감 쿼리 키(token·session·email…)가 있는 이동, 그리고
-      입력 글자(2자 이상)가 저장될 문자열(대상 이름·URL 패턴·이동 URL)에 남는 경우(원문 누출 fail-closed).
+      같은 이름). select_option 값도 같은 식(없으면 choice1…, R1 NB-2). 이동 URL 의 경로·쿼리 값에 같은 글자가
+      있으면 compile 규칙대로 그 param 으로.
+    * 거부(→ 그 구간은 저장 안 함): 비밀 단계, 민감 쿼리 키(token·session·email…)가 있는 이동, 입력 글자(2자
+      이상)가 저장될 문자열(대상 이름·URL 패턴·이동 URL)에 남는 경우(원문 누출 fail-closed, NFKC 비교), 경로의
+      토큰(JWT·base64url)·이메일 조각, 저장될 문자열의 이메일·전화번호(R1).
     """
     typed: Dict[str, str] = {}
     taken: set = set()
-    counter = 0
+    counters: Dict[str, int] = {}
     for i, e in enumerate(entries):
         action = str(e.get("action") or "")
         desc = e.get("desc") or {}
@@ -406,25 +531,26 @@ def compile_auto(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
                 k, _, v = raw.partition("=")
                 if v and _sensitive_key(unquote_plus(k)):
                     raise RecipeError("민감 쿼리 키가 있는 이동이라 자동 저장하지 않습니다.")
-        if action != "type_text":
+        if action == "type_text":
+            text, prefix = str((e.get("args") or {}).get("text") or ""), AUTO_PARAM_PREFIX
+        elif action == "select_option" and isinstance((e.get("args") or {}).get("value"), str):
+            text, prefix = str(e["args"]["value"]), AUTO_CHOICE_PREFIX  # R1 NB-2: 선택 값도 원문 저장 안 함
+        else:
             continue
-        text = str((e.get("args") or {}).get("text") or "")
         if not text or text in typed:
             continue
         name = auto_param_name(desc.get("name") or (desc.get("ui") or {}).get("name"), text, taken)
         if not name:
-            counter += 1
-            name = f"{AUTO_PARAM_PREFIX}{counter}"
+            counters[prefix] = counters.get(prefix, 0) + 1
+            name = f"{prefix}{counters[prefix]}"
             while name in taken:
-                counter += 1
-                name = f"{AUTO_PARAM_PREFIX}{counter}"
+                counters[prefix] += 1
+                name = f"{prefix}{counters[prefix]}"
         typed[text] = name
         taken.add(name)
     params = {name: value for value, name in typed.items()}
+    # 입력값 원문 누출·경로 토큰·이메일·전화번호 검사는 compile_recipe 가 한다(에이전트 save 와 같은 관문).
     rec = compile_recipe("자동", entries, params=params, typed=typed)
-    forms = [f for v in typed for f in _value_forms(v) if len(v.strip()) >= 2]
-    if forms and _leaks({"steps": rec["steps"], "index_pat": rec["index_pat"]}, forms):
-        raise RecipeError("입력 글자가 저장될 문자열(대상 이름·URL 패턴)에 남아 자동 저장하지 않습니다.")
     rec["name"] = _auto_name(rec["steps"], rec["index_pat"])
     rec["auto"] = True
     return rec
@@ -761,8 +887,10 @@ class RecipeStore:
 
     def _evict(self, keep: str) -> None:
         def lru() -> List[str]:
+            # 자동 레시피부터(오래 안 쓴 순), 자동이 다 밀린 뒤에야 에이전트가 save 한 레시피(R1 NB-4).
             return sorted((r for r in self._recipes if r != keep),
-                          key=lambda r: float(self._recipes[r]["stats"].get("last_used_at") or 0))
+                          key=lambda r: (0 if self._recipes[r].get("auto") else 1,
+                                         float(self._recipes[r]["stats"].get("last_used_at") or 0)))
 
         while len(self._recipes) > MAX_RECIPES:
             victims = lru()

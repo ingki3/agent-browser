@@ -1070,7 +1070,7 @@ Gate 3-B #8 "IPI 차단율 1.0"은 `detect_injection`을 **직접** 불러 잰 �
 WS-38b 자동 저장(2026-10-10 사용자 결정): 통과 단계를 **구간**(navigate·출처 변경·끊김·20단계 초과에서 새로 시작)으로
 나눠, 2단계 이상이면 구간 전체를 레시피 하나로 upsert(구간당 1개·같은 구조면 합침·기존 레시피 앞부분이면 구간 끝까지
 미룸). 입력 글자는 전부 자동 params(칸 라벨 → `검색어`, 없으면 `text1`…), 비밀 단계 이후·민감 키 이동·원문 누출 구간은
-조용히 저장 안 함. 알림은 구간 첫 저장 때 `data.recipe_saved` 한 번(`recipe_hint` 폐지). save 는 이름·params 를 바꿀
+조용히 저장 안 함 — R1: 토큰·이메일·전화번호가 보이는 흐름(경로 JWT·base64url·이메일, 대상 이름 PII)도 저장 안 함(save 는 이유와 함께 거부), select_option 값도 자동 params, 누출 비교는 NFKC+casefold, 상한 정리는 자동 레시피부터(`.hermes/state/ws38b-r1/report.md`). 알림은 구간 첫 저장 때 `data.recipe_saved` 한 번(`recipe_hint` 폐지). save 는 이름·params 를 바꿀
 때만(같은 구조 자동 레시피를 덮어씀, `auto: false`). 오염은 재생 쪽 관문(골격·유일성·Expect·신원 가드·3회 실패 끔)이 막는다.
 기록 단계당 추가 지연(200개·~1MB, write-through)은 p50 0.6ms — `.hermes/state/ws38b/report.md`.
 
