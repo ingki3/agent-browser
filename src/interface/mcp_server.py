@@ -1917,7 +1917,7 @@ class BrowserMCPServer:
 
                 ctx = getattr(self._dispatcher, "ctx", None)
                 page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
-                await attach_robots_signal(self._robots, result, page, self._egress)
+                await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를

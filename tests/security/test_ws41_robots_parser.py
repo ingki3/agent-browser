@@ -72,11 +72,34 @@ def test_utf8_percent_encoding_reserved_and_query():
 
 def test_byte_limit_ignores_tail_and_incomplete_line():
     prefix = b"User-agent: *\n"
-    body = prefix + b"#" + b"x" * (MAX_ROBOTS_BYTES - len(prefix) - 1) + b"\nDisallow: /"
+    body = prefix + b"#" + b"x" * (MAX_ROBOTS_BYTES - len(prefix) - 1) + b"\nDisallow: /\n"
     assert not RobotsRules.parse(body).match("/", "*").disallowed
     prefix = b"User-agent: *\nDisallow: /"
     body = prefix + b"a" * (MAX_ROBOTS_BYTES - len(prefix)) + b"b\n"
     assert not RobotsRules.parse(body).match("/", "*").disallowed
+
+
+@pytest.mark.parametrize("token", ["Yahoo! Slurp", "360Spider", "GPTBot/1.0", "Mozilla/5.0 (compatible; Foo)", ""])
+def test_every_agent_header_ends_previous_rules_group(token):
+    body = f"User-agent: *\nDisallow: /private\nUser-agent: {token}\nDisallow: /\n"
+    assert not signal(body).disallowed
+    assert signal(body, "/private").disallowed
+
+
+@pytest.mark.parametrize("token,product", [("GPTBot/1.0", "GPTBot"), ("Yahoo! Slurp", "Yahoo"),
+                                           ("Mozilla/5.0 (compatible; Foo)", "Mozilla")])
+def test_agent_product_prefix(token, product):
+    assert signal(f"User-agent: {token}\nDisallow: /\n", agent=product).disallowed
+
+
+def test_agent_product_prefix_is_ascii_only():
+    # Python IGNORECASE expands [a-z] to four additional Unicode letters.
+    for token in ("İBot", "ıbot", "ſBot", "KBot"):
+        assert RobotsRules.parse(f"User-agent: {token}\nDisallow: /\n".encode()).groups == {}
+
+
+def test_invalid_agent_without_rules_cannot_leak_into_previous_header():
+    assert not signal("User-agent: *\nUser-agent: 360Spider\nDisallow: /\n").disallowed
 
 
 def test_ai_specific_ban_and_bounded_signal():

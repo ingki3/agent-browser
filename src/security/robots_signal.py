@@ -1,9 +1,9 @@
 """WS-41 robots.txt intent signal; never authorizes or blocks navigation.
 
 REP groups are merged by product token, with '*' used only as a fallback.
-Paths and queries use RFC 9309 octet comparison. Retrieval uses the existing
-browser context request client and explicitly checks egress on every hop
-(APIRequestContext does not pass through context.route).
+Paths and queries use RFC 9309 octet comparison. Bounded HTTP streaming uses
+the existing egress proxy and explicitly checks policy on every hop, without
+sharing the Playwright command pipe or browser cookies/authentication.
 """
 
 from __future__ import annotations
@@ -11,16 +11,20 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Optional, TypedDict
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
+import httpx
 from playwright.async_api import BrowserContext, Page
 
 from contracts import ActionResult
 from security.egress import EgressGuard
+from security.egress_proxy import EgressProxy, PROXY_USER
 
 MAX_ROBOTS_BYTES = 500 * 1024
+MAX_DOWNLOAD_BYTES = 512 * 1024
 AI_USER_AGENTS = (
     "GPTBot", "ChatGPT-User", "OAI-SearchBot", "ClaudeBot", "Claude-User",
     "anthropic-ai", "PerplexityBot", "Google-Extended", "CCBot", "Bytespider",
@@ -31,7 +35,7 @@ ROBOTS_INSTRUCTIONS = (
     "계속할지는 사용자 뜻에 따라 판단하세요."
 )
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-_AGENT = re.compile(r"(?:[a-z_-]+|\*)\Z", re.IGNORECASE)
+_AGENT = re.compile(r"[A-Za-z_-]+|\*")
 _ESCAPE = re.compile(r"%([0-9a-f]{2})", re.IGNORECASE)
 
 
@@ -113,11 +117,16 @@ class RobotsRules:
                 continue
             key, value = key.strip().lower(), value.strip()
             if key == "user-agent":
-                if not _AGENT.fullmatch(value):
-                    continue
                 if has_rules:
                     agents, has_rules = [], False
-                token = value.lower()
+                # A malformed header still separates groups; its rules must
+                # never attach to the preceding agents. Consecutive valid
+                # headers continue to describe one group (RFC 9309).
+                product = _AGENT.match(value)
+                if product is None:
+                    agents = []
+                    continue
+                token = product[0].lower()
                 if token not in agents:
                     agents.append(token)
                     groups.setdefault(token, [])
@@ -163,6 +172,7 @@ BACKGROUND_TIMEOUT_S = 10.0
 CACHE_TTL_S = 24 * 60 * 60
 UNKNOWN_TTL_S = 10 * 60
 MAX_REDIRECTS = 5
+MAX_CACHE_ORIGINS = 1000
 
 
 def _origin(url: str) -> Optional[str]:
@@ -197,27 +207,29 @@ class RobotsSignals:
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
-        self._cache: dict[str, CacheEntry] = {}
+        self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._pending: dict[str, asyncio.Task[None]] = {}
 
     @property
     def pending(self) -> bool:
         return bool(self._pending)
 
-    async def signal(self, context: BrowserContext, url: str, guard: EgressGuard) -> Optional[RobotsSignal]:
+    async def signal(self, context: BrowserContext, url: str, guard: EgressGuard,
+                     proxy: Optional[EgressProxy] = None) -> Optional[RobotsSignal]:
         origin = _origin(url)
         if origin is None:
             return None
         robots_url = origin + "/robots.txt"
-        # APIRequestContext skips route handlers. Check policy even on cache
-        # hits, so tightening a live session's policy does not reuse a signal.
+        # Check policy even on cache hits, so tightening a live session's
+        # policy does not reuse a signal.
         if not guard.evaluate(robots_url).allowed:
             return None
         entry = self._cache.get(origin)
         if entry is None or entry.expires <= self._clock():
+            self._cache.pop(origin, None)
             task = self._pending.get(origin)
             if task is None:
-                task = asyncio.create_task(self._populate(context, origin, guard))
+                task = asyncio.create_task(self._populate(context, origin, guard, proxy))
                 self._pending[origin] = task
             # shield keeps the shared request alive after the response budget
             # or a caller's cancellation expires. _populate owns its lifetime.
@@ -226,47 +238,94 @@ class RobotsSignals:
             except asyncio.TimeoutError:
                 return None
             entry = self._cache.get(origin)
+        if entry is not None:
+            self._cache.move_to_end(origin)
         if entry is None or entry.rules is None:
             return None
         parts = urlsplit(url)
         path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         return entry.rules.signal(path, robots_url)
 
-    async def _populate(self, context: BrowserContext, origin: str, guard: EgressGuard) -> None:
+    async def _populate(self, context: BrowserContext, origin: str, guard: EgressGuard,
+                        proxy: Optional[EgressProxy] = None) -> None:
         rules: Optional[RobotsRules] = None
         try:
-            rules = await asyncio.wait_for(self._fetch(context, origin, guard), timeout=BACKGROUND_TIMEOUT_S)
+            rules = await asyncio.wait_for(self._fetch(context, origin, guard, proxy), timeout=BACKGROUND_TIMEOUT_S)
         except Exception:  # noqa: BLE001 - diagnostic failures never change the action result
             pass
         finally:
             self._pending.pop(origin, None)
         ttl = CACHE_TTL_S if rules is not None else UNKNOWN_TTL_S
         self._cache[origin] = CacheEntry(self._clock() + ttl, rules)
+        self._cache.move_to_end(origin)
+        while len(self._cache) > MAX_CACHE_ORIGINS:
+            self._cache.popitem(last=False)
 
-    async def _fetch(self, context: BrowserContext, origin: str, guard: EgressGuard) -> Optional[RobotsRules]:
+    async def _fetch(self, context: BrowserContext, origin: str, guard: EgressGuard,
+                     proxy: Optional[EgressProxy] = None) -> Optional[RobotsRules]:
         url = origin + "/robots.txt"
-        for hop in range(MAX_REDIRECTS + 1):
-            if not (await guard.evaluate_async(url)).allowed:
+        if not (await guard.evaluate_async(url)).allowed:
+            return None
+        # Read the context's actual UA, including a configured UA override.
+        # An empty context needs a temporary blank page; never request a site
+        # merely to discover this browser setting.
+        owned_page = not context.pages
+        ua_page = await context.new_page() if owned_page else context.pages[0]
+        try:
+            user_agent = await ua_page.evaluate("() => navigator.userAgent")
+        finally:
+            if owned_page:
+                await ua_page.close()
+        owned_proxy = proxy is None
+        if owned_proxy:
+            # Standalone callers still use the same guarded/pinned transport.
+            proxy = await EgressProxy(guard).start()
+        try:
+            if proxy is None or not proxy.running:
                 return None
-            # Browser-context client inherits its UA, proxy and TLS options.
-            # Disable automatic redirects: every target must pass the guard.
-            response = await context.request.get(url, max_redirects=0, timeout=BACKGROUND_TIMEOUT_S * 1000)
-            try:
-                status = response.status
-                if 300 <= status < 400:
-                    target = urljoin(url, response.headers.get("location", ""))
-                    # Conservative same-site boundary: exact origin only.
-                    if not response.headers.get("location") or _origin(target) != origin or hop == MAX_REDIRECTS:
+            transport_proxy = httpx.Proxy(proxy.server_url, auth=(PROXY_USER, proxy.token) if proxy.token else None)
+            async with httpx.AsyncClient(proxy=transport_proxy, trust_env=False, follow_redirects=False,
+                                         timeout=BACKGROUND_TIMEOUT_S,
+                                         headers={"User-Agent": user_agent, "Accept-Encoding": "identity"}) as client:
+                for hop in range(MAX_REDIRECTS + 1):
+                    if not (await guard.evaluate_async(url)).allowed:
                         return None
-                    url = target
-                elif 200 <= status < 300:
-                    return RobotsRules.parse(await response.body())
-                elif 400 <= status < 500 and status not in {401, 403}:
-                    return RobotsRules({})
-                else:
-                    return None
-            finally:
-                await response.dispose()
+                    # Never forward even cookies set by a previous robots hop.
+                    client.cookies.clear()
+                    async with client.stream("GET", url) as response:
+                        status = response.status_code
+                        if 300 <= status < 400:
+                            target = urljoin(url, response.headers.get("location", ""))
+                            if not response.headers.get("location") or _origin(target) != origin or hop == MAX_REDIRECTS:
+                                return None
+                            url = target
+                        elif 200 <= status < 300:
+                            length = response.headers.get("content-length")
+                            if length is not None:
+                                try:
+                                    if int(length) < 0 or int(length) > MAX_DOWNLOAD_BYTES:
+                                        return None
+                                except ValueError:
+                                    return None
+                            if response.headers.get("content-encoding", "identity").lower() != "identity":
+                                return None
+                            body = bytearray()
+                            async for chunk in response.aiter_raw(chunk_size=16 * 1024):
+                                body.extend(chunk)
+                                if len(body) >= MAX_DOWNLOAD_BYTES:
+                                    # At the limit, unknown-length streams are
+                                    # unknown. Do not read another byte for EOF.
+                                    if length is None or int(length) != MAX_DOWNLOAD_BYTES:
+                                        return None
+                                    break
+                            return RobotsRules.parse(bytes(body))
+                        elif 400 <= status < 500 and status not in {401, 403}:
+                            return RobotsRules({})
+                        else:
+                            return None
+        finally:
+            if owned_proxy and proxy is not None:
+                await proxy.close()
         return None
 
     async def close(self) -> None:
@@ -279,12 +338,13 @@ class RobotsSignals:
 
 
 async def attach_robots_signal(service: RobotsSignals, result: ActionResult,
-                               page: Optional[Page], guard: Optional[EgressGuard]) -> None:
+                               page: Optional[Page], guard: Optional[EgressGuard],
+                               proxy: Optional[EgressProxy] = None) -> None:
     """Small MCP hook; only successful navigate/observe results carry signals."""
     if not result.success or page is None or guard is None:
         return
     try:
-        signal = await service.signal(page.context, page.url, guard)
+        signal = await service.signal(page.context, page.url, guard, proxy)
         if signal is not None:
             result.data["robots"] = signal
     except Exception:  # noqa: BLE001 - a diagnostic must not fail navigation/observation

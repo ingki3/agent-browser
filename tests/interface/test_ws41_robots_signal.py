@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -28,6 +30,10 @@ class Site:
     page_redirect: str = ""
     requests: Counter = field(default_factory=Counter)
     user_agents: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, dict[str, str]] = field(default_factory=dict)
+    stream_bytes: int = 0
+    chunked: bool = False
+    robots_set_cookie: str = ""
     url: str = ""
 
 
@@ -40,6 +46,7 @@ def site():
             path = self.path.split("?", 1)[0]
             state.requests[path] += 1
             state.user_agents[path] = self.headers.get("User-Agent", "")
+            state.headers[path] = {key.lower(): value for key, value in self.headers.items()}
             robots = path == "/robots.txt" or path.startswith("/rep/")
             if robots:
                 time.sleep(state.delay)
@@ -48,10 +55,28 @@ def site():
             self.send_response(302 if redirect else state.status if robots else 200)
             if redirect:
                 self.send_header("Location", redirect)
-            self.send_header("Content-Length", str(len(data)))
+            if robots and state.robots_set_cookie:
+                self.send_header("Set-Cookie", state.robots_set_cookie)
+            streaming = robots and state.stream_bytes
+            if streaming and state.chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(state.stream_bytes if streaming else len(data)))
             self.end_headers()
             try:
-                self.wfile.write(data)
+                if streaming:
+                    remaining = state.stream_bytes
+                    while remaining:
+                        chunk = (data if remaining == state.stream_bytes else b"#" + b"x" * 65535)[:remaining]
+                        if state.chunked:
+                            self.wfile.write(f"{len(chunk):x}".encode() + b"\r\n" + chunk + b"\r\n")
+                        else:
+                            self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                    if state.chunked:
+                        self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -149,13 +174,14 @@ async def test_cached_signal_is_not_used_after_egress_restriction(site):
 
 
 @requires_chromium
-async def test_single_fetch_for_concurrent_requests_and_failure_ttl(site):
+@pytest.mark.parametrize("status", [500, 401, 403])
+async def test_single_fetch_for_concurrent_requests_and_failure_ttl(site, status):
     from playwright.async_api import async_playwright
 
     now = [0.0]
     service = RobotsSignals(clock=lambda: now[0])
     guard = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
-    site.status, site.delay = 500, 0.1
+    site.status, site.delay = status, 0.1
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         context = await browser.new_context()
@@ -179,6 +205,108 @@ async def test_single_fetch_for_concurrent_requests_and_failure_ttl(site):
         finally:
             await service.close()
             await browser.close()
+
+
+@requires_chromium
+@pytest.mark.parametrize("redirect", [False, True])
+async def test_robots_uses_proxy_and_browser_ua_without_credentials(site, redirect):
+    site.robots_redirect = "/rep/ok" if redirect else ""
+    site.robots_set_cookie = "mock_robots=synthetic; Path=/"
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        await server._page.context.add_cookies([{"name": "mock_session", "value": "synthetic", "url": site.url}])
+        await server._page.context.set_extra_http_headers({"Authorization": "Bearer synthetic", "X-Mock": "context-header"})
+        before = server._egress_proxy.handled
+        result = await navigate(server, site.url + "/read")
+        assert result.success and result.data["robots"]
+        assert server._egress_proxy.handled >= before + 2
+        assert site.user_agents["/robots.txt"] == site.user_agents["/read"]
+        assert "cookie" in site.headers["/read"]
+        for header in ("cookie", "authorization", "proxy-authorization", "x-mock"):
+            assert header not in site.headers["/robots.txt"]
+            if redirect:
+                assert header not in site.headers["/rep/ok"]
+
+
+def rss_mb():
+    return int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True).strip()) / 1024
+
+
+@requires_chromium
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("size_mb", [1, 64])
+async def test_oversize_unknown_and_other_origin_navigation_remains_responsive(site, chunked, size_mb, record_property):
+    site.stream_bytes, site.chunked = size_mb * 1024 * 1024, chunked
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        # A different host is a different origin even on the same local Mock.
+        benign = site.url.replace("127.0.0.1", "localhost")
+        site.stream_bytes = 0
+        await navigate(server, benign + "/warm")
+        site.stream_bytes = size_mb * 1024 * 1024
+        baseline = rss_mb()
+        peaks = [baseline]
+        done = asyncio.Event()
+
+        async def sample():
+            while not done.is_set():
+                peaks.append(rss_mb())
+                await asyncio.sleep(0.03)
+
+        sampler = asyncio.create_task(sample())
+        try:
+            hostile = await navigate(server, site.url + "/hostile")
+            started = time.monotonic()
+            followup = await navigate(server, benign + "/followup")
+            elapsed = time.monotonic() - started
+            assert hostile.success and "robots" not in hostile.data
+            assert followup.success
+            assert elapsed < 0.5, elapsed
+            assert not server._robots.pending
+            peaks.append(rss_mb())
+            record_property("followup_navigation_s", elapsed)
+            record_property("peak_python_rss_increase_mb", max(peaks) - baseline)
+            assert max(peaks) - baseline < 100, peaks
+        finally:
+            done.set()
+            await sampler
+
+
+@requires_chromium
+@pytest.mark.parametrize("target", ["http://10.10.10.10/robots.txt", "http://outside.invalid/robots.txt",
+                                      "http://169.254.169.254/robots.txt"])
+async def test_redirect_to_private_or_outside_allowlist_never_requests_target(site, target):
+    site.robots_redirect = target
+    async with BrowserMCPServer(nav_settle=False, recipes=False, allowed_domains=["127.0.0.1"]) as server:
+        result = await navigate(server, site.url + "/read")
+        assert result.success and "robots" not in result.data
+    assert site.requests == Counter({"/read": 1, "/robots.txt": 1})
+
+
+async def test_origin_cache_is_bounded_lru_and_expired_entries_refetch(monkeypatch):
+    from security.robots_signal import RobotsRules
+
+    now = [0.0]
+    service = RobotsSignals(clock=lambda: now[0])
+    guard = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
+    fetched = Counter()
+
+    async def fetch(context, origin, guard, *args):
+        fetched[origin] += 1
+        return RobotsRules.parse(b"User-agent: *\nDisallow: /\n")
+
+    monkeypatch.setattr(service, "_fetch", fetch)
+    urls = [f"http://127.0.0.1:{10000 + i}" for i in range(1001)]
+    for url in urls[:1000]:
+        assert await service.signal(None, url, guard)
+    assert await service.signal(None, urls[0], guard)  # refresh recency
+    assert await service.signal(None, urls[1000], guard)
+    assert len(service._cache) == 1000
+    assert urls[0] in service._cache and urls[1] not in service._cache
+    assert await service.signal(None, urls[1], guard)
+    assert fetched[urls[1]] == 2 and len(service._cache) == 1000
+    now[0] = 86401
+    assert await service.signal(None, urls[0], guard)
+    assert fetched[urls[0]] == 2
+    await service.close()
 
 
 @requires_chromium
@@ -281,6 +409,12 @@ async def test_non_web_and_malformed_urls_skip_request(url):
 async def test_private_ip_and_dns_resolution_block_before_request():
     class Context:
         request_reads = 0
+        page_reads = 0
+
+        @property
+        def pages(self):
+            self.page_reads += 1
+            raise AssertionError("blocked fetch must not access the browser")
 
         @property
         def request(self):
@@ -296,4 +430,45 @@ async def test_private_ip_and_dns_resolution_block_before_request():
     assert await service.signal(context, "http://10.10.10.10/", guard) is None
     assert await service.signal(context, "http://private.invalid/", guard) is None
     assert context.request_reads == 0
+    assert context.page_reads == 0
     assert not service.pending
+
+
+@requires_chromium
+async def test_configured_context_ua_is_preserved_and_blank_probe_page_is_closed(site):
+    from playwright.async_api import async_playwright
+
+    service = RobotsSignals()
+    guard = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(user_agent="SyntheticMockBrowser/1.0")
+        try:
+            assert await service.signal(context, site.url, guard)
+            assert site.user_agents["/robots.txt"] == "SyntheticMockBrowser/1.0"
+            assert context.pages == []
+        finally:
+            await service.close()
+            await browser.close()
+
+
+@requires_chromium
+async def test_each_same_origin_redirect_checks_guard_before_proxy_request(site, monkeypatch):
+    from security.egress import EgressDecision
+
+    site.robots_redirect = "/rep/ok"
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        await navigate(server, site.url + "/warm")
+        server._robots._cache.clear()
+        evaluate = server._egress.evaluate_async
+
+        async def blocked_hop(url):
+            if url.endswith("/rep/ok"):
+                return EgressDecision(False, url, None, "synthetic hop denied")
+            return await evaluate(url)
+
+        monkeypatch.setattr(server._egress, "evaluate_async", blocked_hop)
+        before = server._egress_proxy.handled
+        assert await server._robots.signal(server._page.context, site.url, server._egress, server._egress_proxy) is None
+        assert server._egress_proxy.handled == before + 1
+        assert site.requests["/rep/ok"] == 1  # warmup only
