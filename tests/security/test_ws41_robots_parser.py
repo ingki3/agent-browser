@@ -98,8 +98,15 @@ def test_agent_product_prefix_is_ascii_only():
         assert RobotsRules.parse(f"User-agent: {token}\nDisallow: /\n".encode()).groups == {}
 
 
-def test_invalid_agent_without_rules_cannot_leak_into_previous_header():
-    assert not signal("User-agent: *\nUser-agent: 360Spider\nDisallow: /\n").disallowed
+@pytest.mark.parametrize("valid", ["*", "GPTBot"])
+@pytest.mark.parametrize("invalid", ["360Spider", "", "*bot", "**"])
+def test_invalid_agent_in_group_header_preserves_valid_members(valid, invalid):
+    assert signal(f"User-agent: {valid}\nUser-agent: {invalid}\nDisallow: /\n", agent=valid).disallowed
+
+
+@pytest.mark.parametrize("token", ["*bot", "**", "*/1.0"])
+def test_star_prefix_is_not_a_global_agent(token):
+    assert RobotsRules.parse(f"User-agent: {token}\nDisallow: /\n".encode()).groups == {}
 
 
 def test_ai_specific_ban_and_bounded_signal():

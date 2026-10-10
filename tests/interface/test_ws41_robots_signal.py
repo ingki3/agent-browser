@@ -34,6 +34,8 @@ class Site:
     stream_bytes: int = 0
     chunked: bool = False
     robots_set_cookie: str = ""
+    page_body: bytes = b"<!doctype html><title>Mock</title><button>Read</button>"
+    content_encoding: str = ""
     url: str = ""
 
 
@@ -51,12 +53,14 @@ def site():
             if robots:
                 time.sleep(state.delay)
             redirect = state.robots_redirect if path == "/robots.txt" else state.page_redirect if path == "/redirect" else ""
-            data = state.body if robots else b"<!doctype html><title>Mock</title><button>Read</button>"
+            data = state.body if robots else state.page_body
             self.send_response(302 if redirect else state.status if robots else 200)
             if redirect:
                 self.send_header("Location", redirect)
             if robots and state.robots_set_cookie:
                 self.send_header("Set-Cookie", state.robots_set_cookie)
+            if robots and state.content_encoding:
+                self.send_header("Content-Encoding", state.content_encoding)
             streaming = robots and state.stream_bytes
             if streaming and state.chunked:
                 self.send_header("Transfer-Encoding", "chunked")
@@ -435,7 +439,7 @@ async def test_private_ip_and_dns_resolution_block_before_request():
 
 
 @requires_chromium
-async def test_configured_context_ua_is_preserved_and_blank_probe_page_is_closed(site):
+async def test_configured_context_ua_is_preserved_without_probe_page(site):
     from playwright.async_api import async_playwright
 
     service = RobotsSignals()
@@ -444,12 +448,138 @@ async def test_configured_context_ua_is_preserved_and_blank_probe_page_is_closed
         browser = await pw.chromium.launch()
         context = await browser.new_context(user_agent="SyntheticMockBrowser/1.0")
         try:
+            page = await context.new_page()
+            await page.goto(site.url + "/configured")
+            await page.close()
             assert await service.signal(context, site.url, guard)
-            assert site.user_agents["/robots.txt"] == "SyntheticMockBrowser/1.0"
+            assert site.user_agents["/robots.txt"] == site.user_agents["/configured"] == "SyntheticMockBrowser/1.0"
             assert context.pages == []
         finally:
             await service.close()
             await browser.close()
+
+
+@requires_chromium
+@pytest.mark.parametrize("getter", ["return 'EvilBot/9.9'", "throw new Error('mock')", "while(true){}"])
+async def test_hostile_tab_zero_cannot_control_other_origin_robots_ua(site, getter, record_property):
+    site.page_body = ("<!doctype html><title>Mock</title><script>"
+                      "Object.defineProperty(navigator,'userAgent',{get(){" + getter + "}})"
+                      "</script><button>Read</button>").encode()
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        assert (await navigate(server, site.url + "/tab0")).success
+        assert (await server.call_tool("browser_tab_control", {"command": "create", "url": "about:blank"})).success
+        # A new origin forces a robots cache miss while tab zero stays hostile.
+        other = site.url.replace("127.0.0.1", "localhost")
+        started = time.monotonic()
+        first = await navigate(server, other + "/other")
+        elapsed = time.monotonic() - started
+        second = await navigate(server, other + "/again")
+        assert elapsed < 0.5, elapsed
+        assert first.success and second.success
+        assert first.data["robots"]["disallowed"] and second.data["robots"]["disallowed"]
+        assert site.user_agents["/robots.txt"] == site.user_agents["/other"]
+        assert "HeadlessChrome" in site.user_agents["/other"]
+        assert site.requests["/robots.txt"] == 2  # one per origin
+        assert not server._robots.pending
+        record_property("other_origin_navigation_s", elapsed)
+
+
+@requires_chromium
+@pytest.mark.parametrize("rejection", ["content-length", "content-encoding"])
+async def test_rejected_headers_do_not_consume_raw_stream(site, monkeypatch, rejection):
+    import httpx
+
+    if rejection == "content-length":
+        site.stream_bytes = 1024 * 1024
+    else:
+        # Deliberately plain text despite the header: deleting the encoding
+        # check must not quietly become a parser-negative compressed fixture.
+        site.content_encoding = "gzip"
+    reads = []
+    original = httpx.Response.aiter_raw
+
+    async def raw(response, *args, **kwargs):
+        reads.append(str(response.url))
+        async for chunk in original(response, *args, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr(httpx.Response, "aiter_raw", raw)
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        result = await navigate(server, site.url + "/read")
+        assert result.success and "robots" not in result.data
+        assert not server._robots.pending
+    assert site.requests["/robots.txt"] == 1
+    assert reads == []
+
+
+@requires_chromium
+async def test_robots_ignores_environment_transport_configuration(site, monkeypatch):
+    # httpx trusts SSL_CERT_FILE at construction even for plain HTTP. The
+    # nonexistent local path exposes trust_env=True without any public egress.
+    monkeypatch.setenv("SSL_CERT_FILE", "nonexistent-ws41-r2-ca.pem")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        result = await navigate(server, site.url + "/read")
+        assert result.success and result.data["robots"]["disallowed"]
+    assert site.requests["/robots.txt"] == 1
+    assert "authorization" not in site.headers["/robots.txt"]
+
+
+@requires_chromium
+async def test_browser_ua_is_discovered_once_per_context_without_pages(site, monkeypatch):
+    from playwright.async_api import async_playwright
+
+    service = RobotsSignals()
+    guard = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context()
+        original = browser.new_browser_cdp_session
+        calls = []
+
+        async def cdp():
+            calls.append(True)
+            return await original()
+
+        async def forbidden_page():
+            raise AssertionError("UA discovery must not create a page")
+
+        monkeypatch.setattr(browser, "new_browser_cdp_session", cdp)
+        monkeypatch.setattr(context, "new_page", forbidden_page)
+        try:
+            results = await asyncio.gather(service.signal(context, site.url, guard),
+                                           service.signal(context, site.url.replace("127.0.0.1", "localhost"), guard))
+            assert all(results)
+            assert calls == [True]
+            assert context.pages == []
+            assert "HeadlessChrome" in site.user_agents["/robots.txt"]
+        finally:
+            await service.close()
+            await browser.close()
+
+
+@requires_chromium
+@pytest.mark.parametrize("failure", ["throw", "stall"])
+async def test_unavailable_browser_ua_is_cached_unknown_without_navigation_delay(site, monkeypatch, failure):
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        calls = []
+
+        async def unavailable():
+            calls.append(True)
+            if failure == "stall":
+                await asyncio.sleep(30)
+            raise RuntimeError("synthetic browser protocol failure")
+
+        monkeypatch.setattr(server._page.context.browser, "new_browser_cdp_session", unavailable)
+        for url in (site.url, site.url.replace("127.0.0.1", "localhost")):
+            started = time.monotonic()
+            result = await navigate(server, url + "/read")
+            assert time.monotonic() - started < 0.5
+            assert result.success and "robots" not in result.data
+        assert calls == [True]
+        assert not server._robots.pending
+    assert site.requests["/robots.txt"] == 0
 
 
 @requires_chromium

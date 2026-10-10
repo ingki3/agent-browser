@@ -15,6 +15,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Optional, TypedDict
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from weakref import WeakKeyDictionary
 
 import httpx
 from playwright.async_api import BrowserContext, Page
@@ -35,7 +36,7 @@ ROBOTS_INSTRUCTIONS = (
     "계속할지는 사용자 뜻에 따라 판단하세요."
 )
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-_AGENT = re.compile(r"[A-Za-z_-]+|\*")
+_AGENT = re.compile(r"[A-Za-z_-]+|\*(?=\s|$)")
 _ESCAPE = re.compile(r"%([0-9a-f]{2})", re.IGNORECASE)
 
 
@@ -124,7 +125,6 @@ class RobotsRules:
                 # headers continue to describe one group (RFC 9309).
                 product = _AGENT.match(value)
                 if product is None:
-                    agents = []
                     continue
                 token = product[0].lower()
                 if token not in agents:
@@ -173,6 +173,7 @@ CACHE_TTL_S = 24 * 60 * 60
 UNKNOWN_TTL_S = 10 * 60
 MAX_REDIRECTS = 5
 MAX_CACHE_ORIGINS = 1000
+UA_TIMEOUT_S = 0.1
 
 
 def _origin(url: str) -> Optional[str]:
@@ -209,6 +210,7 @@ class RobotsSignals:
         self._clock = clock
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._pending: dict[str, asyncio.Task[None]] = {}
+        self._user_agents: WeakKeyDictionary[BrowserContext, asyncio.Task[Optional[str]]] = WeakKeyDictionary()
 
     @property
     def pending(self) -> bool:
@@ -266,16 +268,9 @@ class RobotsSignals:
         url = origin + "/robots.txt"
         if not (await guard.evaluate_async(url)).allowed:
             return None
-        # Read the context's actual UA, including a configured UA override.
-        # An empty context needs a temporary blank page; never request a site
-        # merely to discover this browser setting.
-        owned_page = not context.pages
-        ua_page = await context.new_page() if owned_page else context.pages[0]
-        try:
-            user_agent = await ua_page.evaluate("() => navigator.userAgent")
-        finally:
-            if owned_page:
-                await ua_page.close()
+        user_agent = await self._context_user_agent(context)
+        if user_agent is None:
+            return None
         owned_proxy = proxy is None
         if owned_proxy:
             # Standalone callers still use the same guarded/pinned transport.
@@ -328,6 +323,41 @@ class RobotsSignals:
                 await proxy.close()
         return None
 
+    async def _context_user_agent(self, context: BrowserContext) -> Optional[str]:
+        # Share discovery across origins, including failures. A page must never
+        # supply this header: its navigator getter is controlled by the site.
+        task = self._user_agents.get(context)
+        if task is None:
+            task = asyncio.create_task(self._read_user_agent(context))
+            self._user_agents[context] = task
+        return await asyncio.shield(task)
+
+    async def _read_user_agent(self, context: BrowserContext) -> Optional[str]:
+        session = None
+        try:
+            # Playwright exposes no public context-options getter. Read only
+            # its immutable, host-side userAgent option, never browser headers
+            # or cookies. Missing internals fail closed rather than guess a UA.
+            override = context._impl_obj._options.get("userAgent")
+            if override is not None:
+                return override if isinstance(override, str) else None
+            browser = context.browser
+            if browser is None:
+                return None
+            async with asyncio.timeout(UA_TIMEOUT_S):
+                session = await browser.new_browser_cdp_session()
+                version = await session.send("Browser.getVersion")
+                user_agent = version.get("userAgent")
+                return user_agent if isinstance(user_agent, str) else None
+        except Exception:  # noqa: BLE001 - unavailable UA means unknown, never a page probe
+            return None
+        finally:
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.detach(), timeout=UA_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - browser shutdown must not delay navigation
+                    pass
+
     async def close(self) -> None:
         tasks = list(self._pending.values())
         for task in tasks:
@@ -335,6 +365,13 @@ class RobotsSignals:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._pending.clear()
+        ua_tasks = list(self._user_agents.values())
+        for task in ua_tasks:
+            if not task.done():
+                task.cancel()
+        if ua_tasks:
+            await asyncio.gather(*ua_tasks, return_exceptions=True)
+        self._user_agents.clear()
 
 
 async def attach_robots_signal(service: RobotsSignals, result: ActionResult,
