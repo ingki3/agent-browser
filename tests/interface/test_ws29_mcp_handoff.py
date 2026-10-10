@@ -378,7 +378,8 @@ def test_server_tools_token_cost_small():
     import tiktoken
 
     enc = tiktoken.get_encoding("cl100k_base")
-    extra = len(enc.encode(json.dumps(mcp_server.build_server_tools(), ensure_ascii=False)))
+    # WS-29 사람 인계 도구 4종만 잰다(WS-38 레시피 도구는 tests/recipes 에서 설명 ≤80토큰으로 따로 잰다).
+    extra = len(enc.encode(json.dumps(mcp_server.build_server_tools(recipes=False), ensure_ascii=False)))
     assert extra <= 300, extra  # 실측 293 (WS-29 보고서)
 
 
@@ -620,7 +621,7 @@ async def test_real_serve_prints_server_id_and_serves_control_tools(tmp_path):
                 await session.initialize()
                 listed = await session.list_tools()
                 names = [t.name for t in listed.tools]
-                assert len(names) == 23 and set(SERVER_TOOLS) <= set(names)
+                assert len(names) == 24 and set(SERVER_TOOLS) <= set(names)  # 19 + 서버 도구 5(WS-38)
                 res = await session.call_tool("browser_control_status", {})
                 st = json.loads(res.content[0].text)
                 assert st["data"]["control"]["holder"] == "agent"

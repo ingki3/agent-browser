@@ -46,6 +46,7 @@ packages = [
     "src/agent",
     "src/llm",
     "src/vision",
+    "src/recipes",
 ]
 
 [tool.pytest.ini_options]

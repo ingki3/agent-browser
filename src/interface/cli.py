@@ -3,7 +3,7 @@
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome,on-demand}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
-                          [--allow-private-network] [--block-loopback] [--profile NAME]
+                          [--allow-private-network] [--block-loopback] [--profile NAME] [--no-recipes]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -136,6 +136,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SEC",
         help="고위험 행동 승인 증표 수명(초, 기본 1800). 사람이 `agent-browser approve` 로 승인.",
+    )
+    serve.add_argument(
+        "--no-recipes",
+        dest="recipes",
+        action="store_false",
+        help=(
+            "동작 캐시(레시피, WS-38) 끄기 — 기록·browser_recipe 도구·관찰 data.recipes 없음. 기본 켬: "
+            "--profile 이 있으면 프로필 폴더 recipes.json(0600), 없으면 메모리(종료 시 소멸)."
+        ),
     )
     serve.add_argument(
         "--profile",
@@ -338,6 +347,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 block_loopback=bool(args.block_loopback),
                 **({"approval_ttl_s": args.approval_ttl} if args.approval_ttl else {}),
                 profile=args.profile,
+                **({} if getattr(args, "recipes", True) else {"recipes": False}),
             )
         )
     except KeyboardInterrupt:

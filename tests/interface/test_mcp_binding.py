@@ -59,8 +59,9 @@ def test_create_server_does_not_crash():
     expected = {f"browser_{a.value}" for a in ActionType} | {
         "browser_control_request", "browser_control_status",
         "browser_control_wait", "browser_approval_wait",
+        "browser_recipe",  # WS-38 동작 캐시(기본 켬)
     }
-    assert len(names) == len(set(names)) == 23
+    assert len(names) == len(set(names)) == 24
     assert set(names) == expected
 
 

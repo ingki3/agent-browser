@@ -165,17 +165,54 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
             "required": ["approval_id"],
         },
     },
+    # WS-38 동작 캐시(레시피). serve --no-recipes 면 목록에서 뺀다(build_server_tools).
+    f"{TOOL_PREFIX}recipe": {
+        "description": (
+            "레시피=검증된 동작 묶음. save: 최근 통과 last_n 단계 저장(입력은 params). "
+            "run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. list·delete"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {"enum": ["save", "run", "list", "delete"]},
+                "id": {"type": "string", "description": "run·delete 대상 레시피 id"},
+                "name": {"type": "string", "description": "save 할 이름"},
+                "last_n": {"type": "integer", "minimum": 1, "maximum": 20,
+                           "description": "save: 최근 통과 단계 수"},
+                "params": {"type": "object", "description": "{이름: 값} — save 는 입력한 글자, run 은 새 값"},
+                "pins": {"type": "object", "description": "save: {\"단계번호\": \"identity\"} (slot|ui|identity)"},
+            },
+            "required": ["op"],
+        },
+    },
 }
 
+#: 레시피 서버 도구 이름(WS-38).
+RECIPE_TOOL = f"{TOOL_PREFIX}recipe"
 
-def build_server_tools() -> List[Dict[str, Any]]:
-    """계약 밖 서버 도구 정의(WS-29). 액션 툴 목록(build_all_tools)과 합쳐 tools/list 가 된다."""
-    return [{"name": name, **spec} for name, spec in SERVER_TOOLS.items()]
+#: MCP initialize 의 서버 instructions(WS-38 — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.
+RECIPE_INSTRUCTIONS = (
+    "agent-browser: 같은 사이트에서 반복할 일은 성공한 뒤 browser_recipe save 로 저장하세요"
+    "(입력 글자는 params).\n"
+    "observe_page 결과 data.recipes 에 후보가 있으면 단계별로 하기 전에 browser_recipe run 을 먼저 "
+    "시도하세요.\n"
+    "run 이 멈추면(data.recipe.reason + 현재 관찰) 그 지점부터 평소대로 진행하세요. 재생도 승인·차단 "
+    "관문을 그대로 지납니다."
+)
 
 
-def build_listed_tools() -> List[Dict[str, Any]]:
+def build_server_tools(recipes: bool = True) -> List[Dict[str, Any]]:
+    """계약 밖 서버 도구 정의(WS-29). 액션 툴 목록(build_all_tools)과 합쳐 tools/list 가 된다.
+
+    recipes=False(serve --no-recipes)면 레시피 도구(WS-38)를 뺀다.
+    """
+    return [{"name": name, **spec} for name, spec in SERVER_TOOLS.items()
+            if recipes or name != RECIPE_TOOL]
+
+
+def build_listed_tools(recipes: bool = True) -> List[Dict[str, Any]]:
     """MCP tools/list 전체 = 액션 툴 19종 + 서버 도구."""
-    return build_all_tools() + build_server_tools()
+    return build_all_tools() + build_server_tools(recipes)
 
 
 _DESCRIPTIONS: Dict[ActionType, str] = {
@@ -601,6 +638,7 @@ class BrowserMCPServer:
         approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
         handoff_root: Any = None,
         profile: Optional[str] = None,
+        recipes: bool = True,
     ) -> None:
         from interface.handoff import HandoffHub, state_root
 
@@ -616,6 +654,14 @@ class BrowserMCPServer:
                 )
         self.profile = profile
         self._profile_lock: Any = None
+        #: WS-38 동작 캐시(레시피). 기본 켬(serve --no-recipes 로 끔). --profile 이면 프로필 폴더의
+        #: recipes.json(0600), 없으면 메모리만.
+        self.recipes_enabled = bool(recipes)
+        self._recipes: Any = None
+        if self.recipes_enabled:
+            from recipes.service import RecipeService
+
+            self._recipes = RecipeService(self)
         #: WS-34 on-demand 창 상태(다른 방식이면 None — 기존 동작 그대로).
         from interface.on_demand import ON_DEMAND, WindowState
 
@@ -856,6 +902,8 @@ class BrowserMCPServer:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if events and self._recipes is not None and ("taken" in events or "released" in events):
+            self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
         for event in events:
             if event == "released":
                 self._release_unreported = True
@@ -1157,6 +1205,8 @@ class BrowserMCPServer:
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
+        if name == RECIPE_TOOL:
+            return await self._recipe_tool(args)
         if not self.hub.opened:
             self.open_handoff()
         if not self.hub.opened:
@@ -1180,6 +1230,28 @@ class BrowserMCPServer:
         if short == "control_wait":
             return await self._control_wait(timeout)
         return await self._approval_wait(str(args.get("approval_id") or ""), timeout)
+
+    async def _recipe_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """browser_recipe(WS-38). 응답 data 도 IPI 신호 경로를 거친다(레시피 이름·중단 사유·관찰)."""
+        if self._recipes is None:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "레시피가 꺼져 있습니다(serve --no-recipes)."}
+        payload = await self._recipes.tool(args)
+        data = payload.get("data")
+        if isinstance(data, dict) and "injection_suspected" not in data:
+            from security.injection_signal import injection_signal
+
+            signal = injection_signal(data, None, 10 * self.max_result_chars)
+            if signal is not None:
+                data["injection_suspected"] = signal
+        return payload
+
+    def _recipe_page(self) -> Any:
+        """레시피 기록·재생 대상 페이지. 프레임 안이면 None(지원하지 않음)."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        if ctx is None or getattr(ctx, "root_page", None) is not None:
+            return None
+        return getattr(ctx, "page", None)
 
     async def _control_request(self, args: Dict[str, Any]) -> Dict[str, Any]:
         reason = str(args.get("reason") or "").strip()
@@ -1742,6 +1814,8 @@ class BrowserMCPServer:
         return None
 
     async def close(self) -> None:
+        if self._recipes is not None:
+            self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)
         task, self._hub_task = self._hub_task, None
         if task is not None:
             task.cancel()
@@ -1881,6 +1955,8 @@ class BrowserMCPServer:
             await self._poll_handoff()
         control = self.hub.control_blocks(action, params)
         if control is not None:
+            if self._recipes is not None:
+                self._recipes.reset("human_control")
             what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
             return self._error_result(
                 action,
@@ -1938,9 +2014,13 @@ class BrowserMCPServer:
         if blocked is not None:
             return blocked
 
+        # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
+        recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None else None
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
+        # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
+        target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
         if used is not None:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
@@ -1956,18 +2036,36 @@ class BrowserMCPServer:
                 self._dispatcher.heal_disabled = False
         if used is not None:
             self._attach_approval_outcome(used, result)
-        result = self._attach_egress_block(action, params, result, blocks_before)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS:
             await self._attach_challenge(result)
+        if self._recipes is not None:
+            # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
+            self._recipes.post(action, params, recipe_pre, result, used is not None)
+            if action is ActionType.OBSERVE_PAGE:
+                await self._recipes.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
+    def _handle_href(self, params: Dict[str, Any]) -> Optional[str]:
+        """element_id 대상 핸들의 href(링크가 아니거나 핸들이 없으면 None)."""
+        eid = params.get("element_id")
+        if not eid or self._engine is None:
+            return None
+        try:
+            handle = self._engine.get_handle(eid)
+        except Exception:  # noqa: BLE001 - 진단용 보조 정보일 뿐
+            return None
+        href = getattr(handle, "href", None) if handle is not None else None
+        return href if isinstance(href, str) and href else None
+
     def _attach_egress_block(
-        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int,
+        *, target_href: Optional[str] = None,
     ) -> ActionResult:
         """이번 호출 중 Egress 가 막은 이동을 에이전트에게 알린다 (WS-29b).
 
@@ -1975,6 +2073,8 @@ class BrowserMCPServer:
         data.egress 에 이유(code=egress_blocked, host, category, reason, open_with)를 싣는다.
         navigate 가 막혔으면 실패(E_INVALID_URL)로 돌려준다 — 막힌 문서를 성공으로 보고하지
         않는다. 하위 요청(이미지·비콘 등) 차단은 싣지 않는다(문서 이동만).
+        클릭한 링크의 호스트(target_href, WS-38 R1 NB-3)도 이동 대상으로 본다 — 막히면 탭이
+        chrome-error:// 로 바뀌어 현재 주소로는 호스트를 알 수 없기 때문이다.
         """
         if self._egress is None:
             return result
@@ -1984,7 +2084,7 @@ class BrowserMCPServer:
         from urllib.parse import urlparse
 
         hosts = set()
-        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url):
+        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url, target_href):
             try:
                 h = urlparse(raw or "").hostname
             except ValueError:
@@ -2448,6 +2548,7 @@ def create_server(
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
+    recipes: bool = True,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -2472,7 +2573,10 @@ def create_server(
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
         profile=profile,
+        recipes=recipes,
     )
+    #: WS-38: MCP initialize 의 서버 instructions(레시피 쓰는 법). 꺼져 있으면 보내지 않는다.
+    instructions = RECIPE_INSTRUCTIONS if recipes else None
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
@@ -2487,7 +2591,7 @@ def create_server(
         """
         field = "input_schema" if "input_schema" in Tool.model_fields else "inputSchema"
         out: List[Tool] = []
-        for spec in build_listed_tools():  # 액션 툴 19종 + 서버 도구(WS-29)
+        for spec in build_listed_tools(recipes):  # 액션 툴 19종 + 서버 도구(WS-29·WS-38)
             kwargs = {
                 "name": spec["name"],
                 "description": spec["description"],
@@ -2500,7 +2604,7 @@ def create_server(
         return _build_tools()
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-        if name in SERVER_TOOLS:
+        if name in SERVER_TOOLS and (recipes or name != RECIPE_TOOL):
             import json
 
             payload = await backend.call_server_tool(name, arguments)
@@ -2515,8 +2619,13 @@ def create_server(
     # 실측 — 데코레이터만 쓰면 create_server()가 AttributeError로 즉사해
     # `agent-browser serve` 경로 전체가 막힌다.
     if hasattr(Server("__probe__"), "list_tools"):
-        # mcp 1.x — 데코레이터 등록
-        server = Server("agent-browser")
+        # mcp 1.x — 데코레이터 등록. instructions 인자가 없는 옛 1.x 는 속성으로 넣는다
+        # (create_initialization_options 가 self.instructions 를 읽는다).
+        try:
+            server = Server("agent-browser", instructions=instructions)
+        except TypeError:
+            server = Server("agent-browser")
+            server.instructions = instructions  # type: ignore[attr-defined]
         server.list_tools()(_list_tools_impl)  # type: ignore[attr-defined]
         server.call_tool()(_call_tool_impl)  # type: ignore[attr-defined]
         return server, backend
@@ -2533,6 +2642,7 @@ def create_server(
 
     server = Server(
         "agent-browser",
+        instructions=instructions,
         on_list_tools=_on_list_tools,
         on_call_tool=_on_call_tool,
     )
@@ -2555,6 +2665,7 @@ async def run_stdio(
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
+    recipes: bool = True,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -2588,6 +2699,7 @@ async def run_stdio(
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
         **({"profile": profile} if profile is not None else {}),
+        **({} if recipes else {"recipes": False}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None
@@ -2607,6 +2719,7 @@ async def run_stdio(
     if browser_mode == "on-demand":
         extra += (" [평소 headless — 사람 인계·승인 코드 때만 창"
                   + ("" if profile is not None else ", 서버 전용 임시 프로필(종료 때 삭제)") + "]")
+    extra += " recipes=" + (("on(profile)" if profile is not None else "on(memory)") if recipes else "off")
     extra += (
         f" egress(loopback={'blocked' if block_loopback else 'allowed'},"
         f" private={'allowed' if allow_private_network else 'blocked'})"
