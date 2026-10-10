@@ -759,6 +759,9 @@ class BrowserMCPServer:
         self._http_status: Dict[str, Any] = {"last_http_status": None}
         #: 탭(페이지)별 메인 문서 상태(WS-26b). start() 가 context 에 단다.
         self._page_status: Any = None
+        from security.robots_signal import RobotsSignals
+
+        self._robots = RobotsSignals()  # WS-41: server-memory intent signal cache
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -1814,6 +1817,7 @@ class BrowserMCPServer:
         return None
 
     async def close(self) -> None:
+        await self._robots.close()  # WS-41: join background requests before closing their context
         if self._recipes is not None:
             self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)
         task, self._hub_task = self._hub_task, None
@@ -1882,6 +1886,12 @@ class BrowserMCPServer:
                 result = await self._call_tool(name, arguments, capture)
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            if action_from_tool(name) in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
+                from security.robots_signal import attach_robots_signal
+
+                ctx = getattr(self._dispatcher, "ctx", None)
+                page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+                await attach_robots_signal(self._robots, result, page, self._egress)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -2576,7 +2586,9 @@ def create_server(
         recipes=recipes,
     )
     #: WS-38: MCP initialize 의 서버 instructions(레시피 쓰는 법). 꺼져 있으면 보내지 않는다.
-    instructions = RECIPE_INSTRUCTIONS if recipes else None
+    from security.robots_signal import ROBOTS_INSTRUCTIONS
+
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + ROBOTS_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
