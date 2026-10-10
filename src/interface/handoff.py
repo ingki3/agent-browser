@@ -512,11 +512,22 @@ class HandoffHub:
         """서버가 조작권을 에이전트에게 돌린다(WS-34: 사람이 창을 직접 닫음 = 창이 없음).
 
         사람의 release 와 같은 상태로 만든다(비밀 입력 보호도 해제 — 비밀을 넣을 창이 없다)."""
+        self._clear_login()
         self.holder = HOLDER_AGENT
         self.requested = False
         self.secret_wanted = False
         self.since = self.clock()
         self._changed("released")
+
+    def _clear_login(self) -> None:
+        job, self.login = self.login, None
+        if job is None:
+            return
+        self._finished_logins[job.login_id] = None
+        if len(self._finished_logins) > 2048:
+            self._finished_logins.pop(next(iter(self._finished_logins)))
+        if job.status != "ready":
+            self._ack(job.nonce, False, "로그인 창 요청 취소/시간 만료")
 
     def how_to_respond(self) -> str:
         sid = self.server_id
@@ -897,14 +908,14 @@ class HandoffHub:
             self.site_jobs.append(nonce)
             return None, "쿠키 메타데이터 요청", "cookie_sites"
         if op == "login":
-            from interface.login_cli import validate_url
+            from interface.login_cli import MAX_LOGIN_TIMEOUT_S, validate_url
 
             try:
                 url = validate_url(data.get("url", ""))
                 duration = float(data.get("timeout", 600))
                 import math
 
-                if not math.isfinite(duration) or duration <= 0:
+                if not math.isfinite(duration) or not 0 < duration <= MAX_LOGIN_TIMEOUT_S:
                     raise ValueError
                 login_id = data.get("login_id")
                 if not isinstance(login_id, str) or not _ID_RE.fullmatch(login_id):
@@ -931,9 +942,7 @@ class HandoffHub:
             job = self.login
             if not job or job.login_id != login_id:
                 return True, "이미 반납했습니다.", None
-            self.login = None
-            if job.status != "ready":
-                self._ack(job.nonce, False, "로그인 창 요청 취소/시간 만료")
+            self._clear_login()
             if self.holder == HOLDER_HUMAN:
                 self.release_by_server()
                 return True, "로그인 조작권 반납", "released"
@@ -946,13 +955,7 @@ class HandoffHub:
             self._changed("taken")
             return True, "조작권을 사람이 가져갔습니다. 해결 뒤 release 하세요.", "taken"
         if op == "release":
-            if self.login is not None:
-                self._apply({"op": "login_finish", "login_id": self.login.login_id})
-            self.holder = HOLDER_AGENT
-            self.requested = False
-            self.secret_wanted = False
-            self.since = self.clock()
-            self._changed("released")
+            self.release_by_server()
             return True, "조작권을 에이전트에게 돌려줬습니다.", "released"
         approval_id = str(data.get("approval_id") or "")
         ap = self.approvals.get(approval_id)

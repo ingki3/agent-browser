@@ -7,6 +7,7 @@ import math
 import os
 import secrets
 import select
+import signal
 import sys
 import time
 from typing import Callable, Mapping, Optional
@@ -14,6 +15,8 @@ from urllib.parse import urlsplit
 
 from browser import serve_profile
 from interface import handoff
+
+MAX_LOGIN_TIMEOUT_S = 3600
 
 
 def validate_url(url: str) -> str:
@@ -36,10 +39,11 @@ def display_available() -> bool:
 
 def add_parser(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("login", help="맥 앞에서 serve 프로필에 미리 로그인합니다.")
-    p.add_argument("url", metavar="URL")
-    p.add_argument("--profile", metavar="NAME")
-    p.add_argument("--server", metavar="ID")
-    p.add_argument("--timeout", type=float, default=600, metavar="SEC")
+    p.add_argument("url", metavar="URL", help="창에서 로그인할 http/https 주소")
+    p.add_argument("--profile", metavar="NAME", help="로그인을 유지할 프로필 이름(서버가 하나면 생략 가능)")
+    p.add_argument("--server", metavar="ID", help="로그인 창을 요청할 실행 중인 서버 ID")
+    p.add_argument("--timeout", type=float, default=600, metavar="SEC",
+                   help="로그인 대기 초(기본 600s, 최대 3600s); 만료 시 조작권 반납")
 
 
 def _enter_ready() -> bool:
@@ -116,8 +120,8 @@ async def direct_login(name: str, url: str, timeout: float) -> int:
 def run(args: argparse.Namespace) -> int:
     try:
         validate_url(args.url)
-        if not math.isfinite(args.timeout) or args.timeout <= 0:
-            raise ValueError("--timeout 은 0보다 큰 유한한 초여야 합니다.")
+        if not math.isfinite(args.timeout) or not 0 < args.timeout <= MAX_LOGIN_TIMEOUT_S:
+            raise ValueError("--timeout 은 0보다 크고 3600 이하인 유한한 초여야 합니다.")
         if not display_available():
             raise ValueError("화면(DISPLAY)이 없습니다. 맥 앞에서 같은 명령을 실행하세요.")
         servers = handoff.list_servers()
@@ -145,8 +149,7 @@ def run(args: argparse.Namespace) -> int:
         if info and info.get("browser_mode") == "headless":
             raise ValueError("headless 전용 서버에는 로그인 창을 열 수 없습니다. 맥 앞에서 서버를 끝내고 "
                              "같은 login 명령을 실행한 뒤 serve --browser on-demand --profile 로 띄우세요.")
-        return asyncio.run(server_login(info, args.url, args.timeout) if info
-                           else direct_login(name, args.url, args.timeout))
+        return asyncio.run(_login_with_signals(info, name, args.url, args.timeout))
     except KeyboardInterrupt:
         print("agent-browser login: 취소했습니다; 조작권·프로필 잠금을 반납합니다.", file=sys.stderr)
         return 130
@@ -156,3 +159,33 @@ def run(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"agent-browser login: 창을 열지 못했습니다({type(exc).__name__}). 맥 앞에서 화면/Chromium을 확인하세요.", file=sys.stderr)
         return 2
+
+
+async def _login_with_signals(info: Optional[Mapping[str, object]], name: str,
+                              url: str, timeout: float) -> int:
+    """Cancel on TERM/HUP so both login paths finish their existing cleanup."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    received: Optional[int] = None
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+
+    def stop(sig: int) -> None:
+        nonlocal received
+        if received is None:
+            received = sig
+            task.cancel()
+
+    try:
+        for sig in previous:
+            loop.add_signal_handler(sig, stop, sig)
+        try:
+            return await (server_login(info, url, timeout) if info else direct_login(name, url, timeout))
+        except asyncio.CancelledError:
+            if received is None:
+                raise
+            print("agent-browser login: 종료 신호를 받았습니다; 조작권·프로필 잠금을 반납합니다.", file=sys.stderr)
+            return 128 + received
+    finally:
+        for sig, handler in previous.items():
+            loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)

@@ -5,7 +5,10 @@ import asyncio
 import json
 import os
 import sqlite3
+import shlex
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +25,7 @@ def test_login_parser():
     assert args.profile == "mock"
 
 
-@pytest.mark.parametrize("url", ["javascript:alert(1)", "file:///etc/hosts", "https://", "https://u:p@example.test"])
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "file:///etc/hosts", "file://localhost/etc/hosts", "ftp://h/", "javascript://h/%0aalert(1)", "https://", "https://u:p@example.test"])
 def test_bad_url(url, capsys):
     assert main(["login", url, "--profile", "mock"]) != 0
     assert not serve_profile.profile_dir("mock").exists()
@@ -101,7 +104,8 @@ async def test_login_hint_control_request():
         assert out["data"]["login_hint"]
         s._page = SimpleNamespace(url="http://[::1]:1234/path")
         out = await s.call_server_tool("browser_control_request", {"reason": "로그인 필요"})
-        assert "http://[::1]:1234 --profile mock" in out["data"]["login_hint"]
+        assert out["data"]["login_hint"] == f"맥에서: agent-browser login {shlex.quote('http://[::1]:1234')} --profile mock"
+        assert shlex.split(out["data"]["login_hint"].removeprefix("맥에서: ")) == ["agent-browser", "login", "http://[::1]:1234", "--profile", "mock"]
         s.profile = None
         out = await s.call_server_tool("browser_control_request", {"reason": "로그인 필요"})
         assert "--profile 로 서버를 띄워야" in out["data"]["login_hint"]
@@ -166,11 +170,75 @@ def test_finish_before_login_cannot_leave_orphan_window():
         hub.close()
 
 
-@pytest.mark.parametrize("url", ["file:///etc/hosts", "javascript:alert(1)"])
+@pytest.mark.parametrize("url", ["file:///etc/hosts", "javascript:alert(1)", "file://localhost/etc/hosts", "ftp://h/", "javascript://h/%0aalert(1)"])
 def test_hub_rejects_bad_scheme(url):
     hub = HandoffHub()
     assert hub._apply({"op": "login", "url": url, "login_id": "mock", "timeout": 1})[0] is False
     assert hub.login is None
+
+
+@pytest.mark.parametrize("duration", [3600.01, 1e12])
+def test_hub_login_timeout_bound(duration):
+    hub = HandoffHub()
+    assert hub._apply({"op": "login", "url": "https://example.test", "login_id": "mock", "timeout": duration})[0] is False
+    assert hub.login is None and hub.holder == "agent"
+    assert hub._apply({"op": "login", "url": "https://example.test", "login_id": "mock", "timeout": 3600})[2] == "login"
+    assert hub.login.deadline - time.monotonic() <= 3600
+
+
+def test_server_release_clears_login():
+    hub = HandoffHub()
+    hub.login = LoginJob(url="https://example.test", login_id="mock", status="opening", nonce="mock", deadline=1)
+    hub.holder = "human"
+    hub.secret_wanted = True
+    hub.release_by_server()
+    assert hub.login is None and hub.holder == "agent" and not hub.secret_wanted
+    assert hub._apply({"op": "login", "url": "https://example.test", "login_id": "next", "timeout": 1})[2] == "login"
+
+
+def test_login_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["login", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "600" in out and "3600" in out
+    assert "http/https" in out and "프로필" in out and "서버" in out
+
+
+def test_sqlite_sites_exclusive_lock_is_bounded():
+    path = serve_profile.prepare(serve_profile.profile_dir("mock")) / "Default"
+    path.mkdir()
+    with sqlite3.connect(path / "Cookies") as db:
+        db.execute("CREATE TABLE cookies(host_key TEXT, expires_utc INTEGER)")
+        db.commit()
+        db.execute("BEGIN EXCLUSIVE")
+        start = time.monotonic()
+        out = subprocess.run([sys.executable, "-m", "interface.cli", "profile", "sites", "mock", "--json"],
+                             capture_output=True, text=True, timeout=5)
+        assert time.monotonic() - start < 5
+        assert out.returncode == 2 and "잠금" in out.stderr
+        assert not out.stdout
+
+
+def test_sqlite_sites_output_bound(capsys):
+    path = serve_profile.prepare(serve_profile.profile_dir("mock")) / "Default"
+    path.mkdir()
+    with sqlite3.connect(path / "Cookies") as db:
+        db.execute("CREATE TABLE cookies(host_key TEXT, expires_utc INTEGER)")
+        db.executemany("INSERT INTO cookies VALUES(?, 0)", [(f"site{i}.test",) for i in range(1500)])
+    assert main(["profile", "sites", "mock", "--json"]) == 0
+    out = capsys.readouterr().out
+    assert len(out.encode()) < 16000
+    data = json.loads(out)
+    assert data["sites"] and data["truncated"]
+
+
+def test_login_hint_invalid_profile_is_placeholder():
+    s = BrowserMCPServer(profile="mock")
+    s.profile = "mock;id"
+    s._page = SimpleNamespace(url="https://example.test/")
+    assert "mock;id" not in s._login_hint()
+    assert "<프로필 이름>" in s._login_hint()
 
 
 def test_regular_release_finishes_login():

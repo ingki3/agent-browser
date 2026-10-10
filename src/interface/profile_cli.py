@@ -102,7 +102,7 @@ def _cmd_remove(name: str, yes: bool) -> int:
 
 def run(args: argparse.Namespace) -> int:
     if args.profile_action == "sites":
-        from browser.serve_profile import ProfileError, cookie_sites
+        from browser.serve_profile import ProfileError, bound_cookie_sites, cookie_sites
         from interface.handoff import display_safe
         from interface import handoff
 
@@ -121,7 +121,7 @@ def run(args: argparse.Namespace) -> int:
                 rows = ack["sites"]
                 truncated = bool(ack.get("truncated"))
             else:
-                rows = cookie_sites(args.name)
+                rows, truncated = bound_cookie_sites(cookie_sites(args.name))
         except ProfileError as exc:
             print(f"agent-browser profile sites: {display_safe(str(exc))}", file=sys.stderr)
             return 2

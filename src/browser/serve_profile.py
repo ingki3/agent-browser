@@ -351,15 +351,39 @@ def cookie_sites(name: str) -> List[Dict[str, object]]:
     with tempfile.TemporaryDirectory(prefix="ab-cookie-sites-", dir=scratch) as tmp:
         snapshot = Path(tmp) / "cookies.sqlite"
         snapshot.touch(mode=0o600)
+        deadline = time.monotonic() + 2
+
+        def progress(status: int, remaining: int, total: int) -> None:
+            # SQLite's backup retries BUSY/LOCKED indefinitely even when the
+            # connection timeout is set. Bound retries as well as elapsed time.
+            nonlocal retries
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                retries += 1
+            if retries >= 20 or time.monotonic() >= deadline:
+                raise ProfileError("쿠키 DB 잠금 또는 복사 시간이 초과됐습니다; 잠시 뒤 다시 실행하세요.")
+
+        retries = 0
         try:
-            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0.1) as db:
                 with sqlite3.connect(snapshot) as copy:
-                    db.backup(copy)
+                    db.backup(copy, pages=256, progress=progress, sleep=0.05)
             with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as copy:
                 metadata = copy.execute("SELECT host_key, expires_utc FROM cookies").fetchall()
         except sqlite3.Error:
             raise ProfileError("쿠키 메타데이터를 읽을 수 없습니다(Chromium DB 상태 확인).") from None
     return summarize_cookie_sites(metadata)
+
+
+def bound_cookie_sites(sites: List[Dict[str, object]]) -> tuple[List[Dict[str, object]], bool]:
+    """Use the same 12KB serialized rows limit in Hub and SQLite CLI responses."""
+    bounded: List[Dict[str, object]] = []
+    size = 0
+    for row in sites:
+        size += len(json.dumps(row, ensure_ascii=True).encode("ascii")) + 2
+        if size > 12000:
+            break
+        bounded.append(row)
+    return bounded, len(bounded) < len(sites)
 
 
 def summarize_cookie_sites(metadata: List[tuple[str, int]]) -> List[Dict[str, object]]:

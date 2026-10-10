@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3114개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3138개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -425,11 +425,12 @@ agent-browser profile sites private
 agent-browser profile sites private --json
 ```
 
-`login URL [--profile NAME] [--server ID] [--timeout SEC]` 는 사람 명령입니다(기본 대기 600초).
+`login URL [--profile NAME] [--server ID] [--timeout SEC]` 는 사람 명령입니다(기본 대기 600초, 최대 3600초).
 실행 중인 서버가 하나면 그 서버의 프로필을 고르므로 `--profile` 을 생략할 수 있습니다.
 그 프로필을 쓰는 서버가 있으면 진행 중인 호출을 마친 뒤 사람에게 조작권을 넘기고 새 탭에
 URL 을 엽니다(on-demand 는 창으로 전환). 창에서 로그인하고 **'로그인 상태 유지'** 를 체크한 뒤
-Enter 를 누르거나 그 탭을 닫으면 조작권을 반납합니다. Ctrl-C·시간 만료에도 반납합니다.
+Enter 를 누르거나 그 탭을 닫으면 조작권을 반납합니다. Ctrl-C·SIGTERM·SIGHUP·시간 만료에도 반납합니다.
+강제 종료(kill -9) 뒤에는 서버가 대기 만료 시 반납합니다.
 서버가 없으면 같은 프로필을 잠근 뒤 headed Chromium 으로 열고, Enter·탭/창 닫기 뒤 브라우저를
 닫아 잠금을 풉니다. URL 은 HTTP(S)만 허용하며 서버 경유 시 기존 egress 정책을 그대로 적용합니다.
 headless 전용 서버나 화면 없는 환경에서는 실패합니다. 맥 앞에서 headless 서버를 끝내고 같은
@@ -439,7 +440,8 @@ headless 전용 서버나 화면 없는 환경에서는 실패합니다. 맥 앞
 `profile sites NAME [--json]` 은 쿠키가 있는 사이트, 가장 늦은 만료 시각(UTC), 세션 쿠키만 있는지
 표시합니다. **쿠키 있음은 로그인됨을 보증하지 않습니다.** 쿠키 이름·값은 출력하지 않습니다.
 서버 사용 중에는 Hub 로 서버가 집계한 메타데이터만 받고, 서버가 없으면 읽기 전용 SQLite
-사본으로 읽습니다. Hub 응답 크기를 넘으면 `truncated: true` 또는 잘림 안내가 나옵니다.
+사본으로 읽습니다. DB 잠금·복사는 최대 2초 또는 잠금 재시도 20회까지 기다린 뒤 이유와 함께 실패합니다.
+두 경로 모두 사이트 목록 12KB 상한을 넘으면 `truncated: true` 또는 잘림 안내가 나옵니다.
 등록 도메인 집계는 흔한 공용 접미사만 포함한 근사입니다. 그 밖은 호스트가 덜 묶이거나 더
 묶일 수 있으며 표시용일 뿐 보안 판정에 쓰지 않습니다.
 
@@ -448,6 +450,7 @@ headless 전용 서버나 화면 없는 환경에서는 실패합니다. 맥 앞
 데스크톱·맥 화면 공유 같은 원격 데스크톱 앱으로 맥 화면을 보며 같은 명령을 실행하세요.
 `browser_control_request` 의 `data.login_hint`·`how_to_respond` 와 무인 거부 결과의
 `data.login_hint` 는 에이전트가 사용자에게 전달할 한 줄 명령을 제공합니다.
+주소의 호스트가 안전한 문자 범위가 아니면 명령 대신 `<페이지 주소>` 를 확인하도록 안내합니다.
 
 ### 사람 인계 — 조작권과 승인 (MCP)
 

@@ -30,6 +30,83 @@ async def cli(*args):
 
 
 @requires_chromium
+@pytest.mark.parametrize("host", ["a$(id).invalid", "a;id.invalid", "a`id`.invalid", "a'b.invalid", "a!b.invalid"])
+async def test_probe_login_hint_host_metachars(site, host):
+    # Synthetic navigation is fulfilled in-process: Chromium parses these hosts,
+    # but no public DNS or HTTP request is made.
+    async with BrowserMCPServer(profile="mock") as s:
+        await s.call_tool("browser_navigate", {"url": site.url + "/pay"})
+        async def fulfill(route):
+            await route.fulfill(body='<meta charset="utf-8"><button>결제하기</button>', content_type="text/html; charset=utf-8")
+        await s._page.route("**/*", fulfill)
+        await s._page.goto(f"http://{host}/")
+        assert host in s._page.url
+        control = await s.call_server_tool("browser_control_request", {"reason": "로그인 필요"})
+        blocked = await s.call_tool("browser_click", {"selector": "button"})
+        assert not blocked.success and blocked.error_code.value == "E_HITL_UNATTENDED_BLOCKED"
+        for data in (control["data"], blocked.data):
+            hint = data["login_hint"]
+            assert not any(char in hint for char in "$();'!`"), hint
+            assert "<페이지 주소>" in hint
+        assert host not in control.get("how_to_respond", "")
+
+
+@requires_chromium
+@requires_display
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGKILL])
+async def test_login_cli_signal_recovery(site, sig):
+    async with BrowserMCPServer(profile="mock", browser_mode="on-demand") as s:
+        await s.call_tool("browser_navigate", {"url": site.url + "/"})
+        timeout = 5 if sig == signal.SIGKILL else 60
+        p = await cli("login", site.url + "/login", "--timeout", str(timeout))
+        try:
+            await eventually(lambda: s.hub.login and s.hub.login.status == "ready")
+            assert s.hub.holder == "human"
+            deadline = s.hub.login.deadline
+            p.send_signal(sig)
+            await asyncio.wait_for(p.communicate(), 8)
+            if sig == signal.SIGKILL:
+                assert p.returncode == -signal.SIGKILL
+                await eventually(lambda: s.hub.holder == "agent" and s.hub.login is None,
+                                 max(0, deadline - time.monotonic()) + 3)
+            else:
+                assert p.returncode == 128 + sig
+                await eventually(lambda: s.hub.holder == "agent" and s.hub.login is None, 3)
+                assert time.monotonic() < deadline
+            await _wait_window(s, "headless")
+            assert (await s.call_tool("browser_navigate", {"url": site.url + "/"})).success
+        finally:
+            if p.returncode is None:
+                p.kill()
+                await p.communicate()
+
+
+@requires_chromium
+@requires_display
+async def test_login_window_x_allows_next_login(site):
+    async with BrowserMCPServer(profile="mock", browser_mode="on-demand") as s:
+        await s.call_tool("browser_navigate", {"url": site.url + "/"})
+        for close_window in (True, False):
+            p = await cli("login", site.url + "/login", "--timeout", "30")
+            try:
+                await eventually(lambda: s.hub.login and s.hub.login.status == "ready")
+                if close_window:
+                    for tab in list(s._core.tabs()):
+                        await tab.page.close()
+                else:
+                    p.stdin.write(b"\n")
+                    await p.stdin.drain()
+                stdout, stderr = await asyncio.wait_for(p.communicate(), 8)
+                assert p.returncode == 0, (stdout, stderr)
+                await eventually(lambda: s.hub.holder == "agent" and s.hub.login is None)
+                await _wait_window(s, "headless")
+            finally:
+                if p.returncode is None:
+                    p.kill()
+                    await p.communicate()
+
+
+@requires_chromium
 @requires_display
 @pytest.mark.parametrize("ending", ["enter", "close", "interrupt", "timeout"])
 async def test_live_server_login(site, ending, capsys):
@@ -44,7 +121,13 @@ async def test_live_server_login(site, ending, capsys):
             await eventually(lambda: s.hub.login and s.hub.login.status == "ready")
             assert s.hub.holder == "human" and _headed(s) == 1
             assert len(s._core.tabs()) == before + 1
+            for tool in ("browser_observe_page", "browser_take_screenshot"):
+                result = await s.call_tool(tool, {})
+                assert not result.success, tool
+                assert result.error_code.value == "E_HITL_UNATTENDED_BLOCKED"
             page = next(t.page for t in s._core.tabs() if t.page.url.endswith("/login"))
+            assert s._control_banner and "로그인" in s._control_banner
+            assert s._banner and s._banner[2] is page
             await page.locator("button[type=submit]").click()
             await page.wait_for_url("**/shop")
             await page.locator("#solve").click()
@@ -76,6 +159,28 @@ async def test_live_server_login(site, ending, capsys):
                 await asyncio.wait_for(p.communicate(), 35)
     assert main(["profile", "sites", "mock", "--json"]) == 0
     assert "127.0.0.1" in capsys.readouterr().out
+
+
+@requires_chromium
+@requires_display
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+async def test_direct_login_signal_unlocks(site, sig):
+    p = await cli("login", site.url + "/login", "--profile", "mock", "--timeout", "60")
+    try:
+        line = await asyncio.wait_for(p.stdout.readline(), 15)
+        assert "창에서 로그인" in line.decode()
+        path = serve_profile.profile_dir("mock")
+        assert serve_profile.holder("mock") is not None
+        assert any(row["headed"] for row in _procs_for(path))
+        p.send_signal(sig)
+        await asyncio.wait_for(p.communicate(), 8)
+        assert p.returncode == 128 + sig
+        assert serve_profile.holder("mock") is None
+        await eventually(lambda: not _procs_for(path), 3)
+    finally:
+        if p.returncode is None:
+            p.kill()
+            await p.communicate()
 
 
 @requires_chromium

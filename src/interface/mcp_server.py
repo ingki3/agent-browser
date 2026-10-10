@@ -934,7 +934,7 @@ class BrowserMCPServer:
             self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
         for event in events:
             if event == "cookie_sites":
-                from browser.serve_profile import cookie_sites, summarize_cookie_sites
+                from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
                 from interface.handoff import _write_private
 
                 jobs, self.hub.site_jobs = self.hub.site_jobs, []
@@ -944,17 +944,11 @@ class BrowserMCPServer:
                     sites = (cookie_sites(self.profile) if context is None and self.profile else
                              summarize_cookie_sites([(c["domain"], int((c["expires"] + 11644473600) * 1_000_000)
                              if c["expires"] > 0 else 0) for c in cookies]))
-                    bounded = []
-                    size = 0
-                    for row in sites:
-                        size += len(json.dumps(row, ensure_ascii=True)) + 2
-                        if size > 12000:
-                            break
-                        bounded.append(row)
+                    bounded, truncated = bound_cookie_sites(sites)
                     for nonce in jobs:
                         # No control/reason/URL metadata in this response: sites only.
                         _write_private(self.hub.dir / f"ack-{nonce}.json",
-                                       {"ok": True, "sites": bounded, "truncated": len(bounded) < len(sites)})
+                                       {"ok": True, "sites": bounded, "truncated": truncated})
                 except Exception:
                     for nonce in jobs:
                         _write_private(self.hub.dir / f"ack-{nonce}.json", {"ok": False})
@@ -994,18 +988,30 @@ class BrowserMCPServer:
         if self.profile is None:
             return "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
         from urllib.parse import urlsplit
+        import re
+        import shlex
+        from browser.serve_profile import ProfileError, validate_name
 
-        origin = "<페이지 origin>"
+        origin = None
         try:
             parts = urlsplit(self._current_origin())
             if parts.scheme in ("http", "https") and parts.hostname:
                 host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-                origin = f"{parts.scheme}://{host}"
-                if parts.port:
-                    origin += f":{parts.port}"
+                port = parts.port
+                if (re.fullmatch(r"[a-z0-9.-]+|\[[0-9a-f:.]+\]", host)
+                        and (port is None or isinstance(port, int))):
+                    origin = f"{parts.scheme}://{host}"
+                    if port is not None:
+                        origin += f":{port}"
         except ValueError:
             pass
-        return f"맥에서: agent-browser login {origin} --profile {self.profile}"
+        try:
+            profile = validate_name(self.profile)
+        except ProfileError:
+            profile = "<프로필 이름>"
+        if origin is None:
+            return f"맥에서: 페이지 주소를 확인한 뒤 agent-browser login <페이지 주소> --profile {profile}"
+        return f"맥에서: agent-browser login {shlex.quote(origin)} --profile {profile}"
 
     def _spawn_login(self) -> None:
         """Human CLI job: same drain/window/release paths as control take, no MCP action added."""
@@ -1049,6 +1055,17 @@ class BrowserMCPServer:
                 await page.bring_to_front()
                 if self.hub.login is not job:
                     return
+                # Reuse take's window-only banner on the new human login tab.
+                # Preserve the agent's active tab; its dispatcher resumes there.
+                active = self._core.active_tab_id
+                tab = self._core.tab_for_page(page)
+                if tab is not None:
+                    self._core.set_active_tab(tab.tab_id)
+                    try:
+                        await self._show_control_banner("사람이 로그인 중 — 끝나면 터미널에서 Enter 또는 로그인 탭 닫기")
+                    finally:
+                        if self._core.get_tab(active) is not None:
+                            self._core.set_active_tab(active)
                 job.status = "ready"
                 page.on("close", lambda: write_command(self.hub.root, self.hub.server_id,
                         "login_finish", login_id=job.login_id) if self.hub.opened and self.hub.login is job else None)
