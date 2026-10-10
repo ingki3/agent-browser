@@ -4,35 +4,36 @@
   부른다. 성공 + 사후 확인 통과만 궤적에 넣고, 실패·치유·승인 재생·사람 조작·미지원 동작에서 끊는다.
 * 관찰: `observe()` 가 observe_page 결과에 `data.recipes` 후보를 단다 — 레시피 없는 출처는 dict 조회
   하나로 끝(골격 계산 없음), 후보가 있을 때만 골격 1회.
+* 자동 저장(WS-38b): 통과 단계를 현재 구간(Segment)에 쌓고, 2단계 이상이면 그 구간 전체를 레시피로 upsert
+  (구간당 1개 — 자라면 같은 레시피 갱신, 같은 구조가 이미 있으면 합침). 구간이 처음 저장된 단계 결과에만
+  `data.recipe_saved = {id, steps, params}`. 저장하면 안 되는 구간(비밀 단계 이후·민감 키 이동·원문 누출)은
+  조용히 넘어간다(에이전트에게 오류 없음).
 * 서버 도구 `browser_recipe {op: save|run|list|delete}` 처리.
-* 저장 권유 `data.recipe_hint` — 같은 출처 연속 통과 ≥3 + 그 페이지 레시피 없음, 세션·출처당 1회.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from recipes import keys
-from recipes.recorder import HINT_STREAK, NEUTRAL, Trajectory, make_entry
+from recipes.recorder import NEUTRAL, Segment, Trajectory, entry_origin, make_entry
 from recipes.replay import run_recipe
 from recipes.store import ELEMENT_ACTIONS, MAX_STEPS, RECORDABLE, RecipeError, RecipeStore, \
-    clean_text, compile_recipe
+    clean_text, compile_auto, compile_recipe
 
 logger = logging.getLogger(__name__)
 
 #: observe data.recipes 의 안내 한 줄.
-HOW = "browser_recipe run 으로 한 번에 실행 — 멈추면 그 지점부터 직접 진행"
+HOW = "단계별로 하기 전에 browser_recipe run 먼저(통과한 흐름은 자동 저장됨) — 멈추면 그 지점부터 직접 진행"
+#: 자동 저장 최소 단계 수(1단계짜리 구간은 저장하지 않는다).
+AUTO_MIN_STEPS = 2
 #: 관찰 후보 상한.
 MAX_CANDIDATES = 5
 #: 레시피 파일 이름(serve --profile 폴더 안).
 FILE_NAME = "recipes.json"
-
-
-def hint_text(last_n: int) -> str:
-    return (f"이 흐름을 다시 할 일이면 browser_recipe save last_n={last_n} 로 저장하세요"
-            "(입력 글자는 params 로)")
 
 
 class ServerHost:
@@ -97,6 +98,9 @@ class RecipeService:
     def __init__(self, server: Any) -> None:
         self.server = server
         self.trajectory = Trajectory()
+        self.segment = Segment()
+        #: 자동 저장 기록 비용(초) — 지연 측정용(최근 값만).
+        self.autosave_cost: List[float] = []
         self.running = False
         self._store: Optional[RecipeStore] = None
         self.host = ServerHost(server)
@@ -117,13 +121,15 @@ class RecipeService:
         return self._store
 
     def close(self) -> None:
+        self._end_segment()  # 미뤄 둔 구간 판(기존 레시피의 앞부분)을 저장
         if self._store is not None:
-            self._store.close()
+            self._store.close()  # 미뤄 둔 자동 저장·실행 통계 마지막 쓰기
 
     # -- 기록 ---------------------------------------------------------------
 
     def reset(self, why: str) -> None:
         self.trajectory.reset(why)
+        self._end_segment()
 
     async def pre(self, action: Any, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """액션 직전 기록 스냅숏. 기록하지 않는 동작이면 None(필요하면 궤적을 끊는다)."""
@@ -180,24 +186,64 @@ class RecipeService:
             self.reset("nav_error")  # R1 NB-3: 오류 페이지(차단·실패)로 간 단계는 기록하지 않는다
             return
         self.trajectory.add(entry)
-        self._maybe_hint(entry, result)
+        self.segment_add(entry, result)
 
-    def _maybe_hint(self, entry: Dict[str, Any], result: Any) -> None:
-        streak = min(self.trajectory.origin_streak(), MAX_STEPS)
-        if streak < HINT_STREAK:
+    # -- 자동 저장(WS-38b) ----------------------------------------------------
+
+    def _end_segment(self) -> None:
+        seg, self.segment = self.segment, Segment()
+        pending, seg.pending = seg.pending, None
+        if pending is None:
             return
-        if entry["action"] == "navigate":
-            origin = keys.origin_of(str(entry["args"].get("url") or ""))
-        else:
-            origin = entry["origin"]
-        if not origin or origin in self.trajectory.hinted:
+        try:  # 구간이 기존 레시피의 앞부분에서 끝났다 — 이제 그 판을 저장한다
+            self.store.save_auto(pending, replace=seg.rid if seg.owned else None)
+        except Exception:  # noqa: BLE001 - 자동 저장 실패는 조용히
+            logger.debug("레시피 자동 저장 실패(구간 끝)", exc_info=True)
+
+    def segment_add(self, entry: Dict[str, Any], result: Any) -> None:
+        """통과 단계 하나를 현재 구간에 넣고, 2단계 이상이면 구간 전체를 자동 저장(upsert)한다."""
+        seg = self.segment
+        if seg.starts_new(entry, MAX_STEPS):
+            self._end_segment()
+            seg = self.segment
+            seg.origin = entry_origin(entry)
+        if seg.stuck:
             return
-        first = self.trajectory.last(streak)[0]
-        pat = (first["expect"].get("url_pat") if first["action"] == "navigate" else first["url_pat"]) or ""
-        if self.store.candidates(origin, pat):
+        if entry.get("secret") or (entry.get("desc") or {}).get("secret"):
+            seg.stuck = True  # 비밀 단계에서 끊는다 — 이 단계와 이후(다음 구간 전까지)는 저장하지 않는다
             return
-        self.trajectory.hinted.add(origin)
-        result.data["recipe_hint"] = {"text": hint_text(streak), "last_n": streak}
+        seg.entries.append(entry)
+        if len(seg.entries) < AUTO_MIN_STEPS:
+            return
+        started = time.perf_counter()
+        try:
+            rec = compile_auto(seg.entries)
+            mine = seg.rid if seg.owned else None
+            if self.store.extended_by(rec, exclude=mine):
+                # 같은 흐름의 더 긴 레시피가 이미 있다 — 임시 짧은 판을 만들지 않고 구간 끝까지 미룬다
+                # (반복할 때마다 짧은 판이 생겼다 지워지며 상한에서 다른 레시피를 밀어내지 않게).
+                seg.pending = rec
+                return
+            seg.pending = None
+            out = self.store.save_auto(rec, replace=mine)
+        except RecipeError as exc:
+            # 민감 키 이동·원문 누출 등 — 조용히(에이전트에게 오류 없이) 이 구간을 그만 저장한다.
+            logger.debug("레시피 자동 저장 안 함: %s", exc)
+            seg.stuck = True
+            return
+        except Exception:  # noqa: BLE001 - 자동 저장 실패가 액션 결과를 망치지 않는다
+            logger.debug("레시피 자동 저장 실패", exc_info=True)
+            seg.stuck = True
+            return
+        finally:
+            self.autosave_cost = (self.autosave_cost + [time.perf_counter() - started])[-1000:]
+        seg.rid = out["id"]
+        seg.owned = not out["merged"]
+        if not seg.announced:
+            seg.announced = True
+            data = getattr(result, "data", None)
+            if isinstance(data, dict):
+                data["recipe_saved"] = {"id": out["id"], "steps": out["steps"], "params": out["params"]}
 
     # -- 관찰 후보 -----------------------------------------------------------
 
@@ -225,7 +271,8 @@ class RecipeService:
             if first["action"] != "navigate" and not any(v.get("skel") == skel for v in first["variants"]):
                 continue
             out.append({"id": rec["id"], "name": rec["name"], "steps": len(rec["steps"]),
-                        "params": list(rec.get("params") or [])})
+                        "params": list(rec.get("params") or []), "auto": bool(rec.get("auto")),
+                        "ok": int(rec["stats"].get("ok") or 0)})
             if len(out) >= MAX_CANDIDATES:
                 break
         if out:
@@ -303,7 +350,7 @@ class RecipeService:
             st = rec["stats"]
             out.append({"id": rec["id"], "name": rec["name"], "origin": rec["origin"],
                         "steps": len(rec["steps"]), "params": list(rec.get("params") or []),
-                        "runs": st.get("runs", 0), "ok": st.get("ok", 0),
+                        "auto": bool(rec.get("auto")), "runs": st.get("runs", 0), "ok": st.get("ok", 0),
                         "disabled": bool(st.get("disabled"))})
         return {"success": True, "data": {
             "recipes": out, "storage": "profile" if self.store.persistent else "memory"}}

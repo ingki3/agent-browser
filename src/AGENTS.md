@@ -417,7 +417,7 @@ python -m harness.ipi_test
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
 
-# 10. 동작 캐시(레시피) 재생 — 시나리오 9종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38)
+# 10. 동작 캐시(레시피) 재생 — 시나리오 10종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38·38b)
 python -m harness.recipe_replay
 ```
 
@@ -1084,9 +1084,16 @@ AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList, 배열·@gra
 
 #### 동작 캐시 — 레시피 (WS-38)
 
-`src/recipes/`(keys·store·recorder·replay·service). 에이전트가 **명시적으로 save** 한 동작 묶음을 PageKey(출처·URL 패턴·
+`src/recipes/`(keys·store·recorder·replay·service). 통과한 동작 묶음을 PageKey(출처·URL 패턴·
 골격 서명·준비 수) + Target(slot·ui·identity) + Expect 로 저장하고, `browser_recipe run` 으로 재생한다. 기본 켬
-(`serve --no-recipes` 로 끔), `--profile` 이면 프로필 폴더 `recipes.json`(0600), 없으면 메모리.
+(`serve --no-recipes` 로 끔 — 자동 저장 포함), `--profile` 이면 프로필 폴더 `recipes.json`(0600), 없으면 메모리.
+
+WS-38b 자동 저장(2026-10-10 사용자 결정): 통과 단계를 **구간**(navigate·출처 변경·끊김·20단계 초과에서 새로 시작)으로
+나눠, 2단계 이상이면 구간 전체를 레시피 하나로 upsert(구간당 1개·같은 구조면 합침·기존 레시피 앞부분이면 구간 끝까지
+미룸). 입력 글자는 전부 자동 params(칸 라벨 → `검색어`, 없으면 `text1`…), 비밀 단계 이후·민감 키 이동·원문 누출 구간은
+조용히 저장 안 함 — R1: 토큰·이메일·전화번호가 보이는 흐름(경로 JWT·base64url·이메일, 대상 이름 PII)도 저장 안 함(save 는 이유와 함께 거부), select_option 값도 자동 params, 누출 비교는 NFKC+casefold, 상한 정리는 자동 레시피부터(`.hermes/state/ws38b-r1/report.md`). 알림은 구간 첫 저장 때 `data.recipe_saved` 한 번(`recipe_hint` 폐지). save 는 이름·params 를 바꿀
+때만(같은 구조 자동 레시피를 덮어씀, `auto: false`). 오염은 재생 쪽 관문(골격·유일성·Expect·신원 가드·3회 실패 끔)이 막는다.
+기록 단계당 추가 지연(200개·~1MB, write-through)은 p50 0.6ms — `.hermes/state/ws38b/report.md`.
 
 | 원칙 | 구현 |
 | :--- | :--- |
@@ -1095,7 +1102,8 @@ AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList, 배열·@gra
 | 텍스트 유사도·좌표 재생 금지 | M-1 오일치 사례(해외여행→해외여행자보험, 같은 자리 다른 광고) — 이름은 정확히 같음, 위치는 ui 450px 가드에만 |
 | 기본 경로 비용 | 레시피 없는 출처의 관찰은 dict 조회 하나(골격 계산 없음). 기록은 액션당 evaluate 1회 |
 
-측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 9종, 오클릭 하나라도 exit 2, 커버리지 9/9. 사보타주
+측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 10종(⑩ save 없이 자동 저장 → 새 세션 run), 오클릭 하나라도
+exit 2, 커버리지 10/10. 사보타주
 (틀 확인 제거·순번 무시·골격 확인 제거·URL 패턴 확인 제거)에서 exit 2 확인. 뮤테이션 표·성능은 `.hermes/state/ws38/report.md`,
 R1(독립 검증 NB 수정)은 `.hermes/state/ws38-r1/report.md`.
 

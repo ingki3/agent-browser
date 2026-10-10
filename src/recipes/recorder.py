@@ -6,7 +6,9 @@ shadow 대상, selector·좌표 클릭, 탭·프레임 전환 등)에서 끊는�
 (관찰·추출·스크린샷·대기)과 스크롤·호버는 넣지도 끊지도 않는다.
 
 각 항목은 **기록 시점** 스냅숏(PageKey: 출처·URL 패턴·골격·준비 수, 대상 기술, Expect)을 담는다 —
-저장(save) 때 이것으로 레시피를 만든다. 입력 글자 원문은 메모리에만 있고 저장 때 params 로 바뀐다.
+저장(save·자동 저장) 때 이것으로 레시피를 만든다. 입력 글자 원문은 메모리에만 있고 저장 때 params 로 바뀐다.
+
+같은 통과 단계를 현재 구간(Segment, WS-38b)에도 넣는다 — 구간이 2단계 이상이면 서비스가 자동 저장한다.
 """
 
 from __future__ import annotations
@@ -18,8 +20,6 @@ from recipes import keys
 from recipes.store import RECORDABLE
 
 MAX_ENTRIES = 30
-#: 저장 권유(recipe_hint) 기준 — 같은 출처에서 연속 통과 단계 수.
-HINT_STREAK = 3
 
 #: 궤적에 넣지도 끊지도 않는 동작.
 NEUTRAL = frozenset({"observe_page", "take_screenshot", "extract", "wait_for", "scroll", "hover"})
@@ -61,12 +61,11 @@ def build_expect(action: str, before_url: str, after_url: str, data: Dict[str, A
 
 
 class Trajectory:
-    """최근 통과 단계(메모리)."""
+    """최근 통과 단계(메모리) — 에이전트 save(last_n)용."""
 
     def __init__(self, maxlen: int = MAX_ENTRIES) -> None:
         self.entries: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
         self.last_break: str = ""
-        self.hinted: set = set()
 
     def reset(self, why: str) -> None:
         if self.entries:
@@ -81,21 +80,38 @@ class Trajectory:
             return []
         return list(self.entries)[-n:]
 
-    def origin_streak(self) -> int:
-        """끝에서부터 같은 출처로 이어진 단계 수(navigate 는 이동한 곳의 출처)."""
-        n = 0
-        origin: Optional[str] = None
-        for e in reversed(self.entries):
-            if e.get("action") == "navigate":
-                o = keys.origin_of(str((e.get("args") or {}).get("url") or ""))
-            else:
-                o = str(e.get("origin") or "")
-            if origin is None:
-                origin = o
-            if not o or o != origin:
-                break
-            n += 1
-        return n
+
+def entry_origin(entry: Dict[str, Any]) -> str:
+    """단계의 출처(navigate 는 이동한 곳의 출처)."""
+    if entry.get("action") == "navigate":
+        return keys.origin_of(str((entry.get("args") or {}).get("url") or ""))
+    return str(entry.get("origin") or "")
+
+
+class Segment:
+    """현재 구간(흐름) — 자동 저장 단위(WS-38b).
+
+    새 구간: navigate 단계(그 단계가 첫 단계), 출처가 바뀜, 궤적 끊김(reset), MAX_STEPS 초과.
+    stuck 이면 이 구간은 더 저장하지 않는다(비밀 단계 이후·민감 키 이동·컴파일 거부) — 다음 새 구간까지.
+    rid/owned: 이 구간이 저장한 레시피 id 와, 그것을 이 구간이 만들었는지(만든 것만 짧은 판 대체·삭제).
+    pending: 기존 더 긴 레시피의 앞부분이라 저장을 미룬 판 — 구간이 끝날 때(새 구간·끊김·종료) 저장.
+    """
+
+    def __init__(self) -> None:
+        self.entries: List[Dict[str, Any]] = []
+        self.origin: str = ""
+        self.rid: Optional[str] = None
+        self.owned: bool = False
+        self.stuck: bool = False
+        self.announced: bool = False
+        #: 저장을 미룬 최신 판(기존 더 긴 레시피의 앞부분과 같은 구조) — 구간이 끝날 때 저장.
+        self.pending: Optional[Dict[str, Any]] = None
+
+    def starts_new(self, entry: Dict[str, Any], max_steps: int) -> bool:
+        if not self.entries and not self.stuck:
+            return True
+        return (entry.get("action") == "navigate" or entry_origin(entry) != self.origin
+                or len(self.entries) >= max_steps)
 
 
 def make_entry(action: str, params: Dict[str, Any], pre: Dict[str, Any], after_url: str,
