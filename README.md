@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-2712개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+2726개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -235,7 +235,7 @@ Claude Desktop 설정에서 방식을 고르려면 `args` 에 붙입니다(Claud
 ### 고위험 액션 허용 (`serve --pre-approve`, `--mode`)
 
 무인 모드(기본)에서는 결제·주문·삭제·동의 같은 이름의 클릭, 폼 제출(`type_text(press_enter)`, 폼 안 입력칸에서 `press_key("Enter")`, 한 줄 입력칸에 줄바꿈 입력), 업로드·다운로드를 `E_HITL_UNATTENDED_BLOCKED`로 막습니다. 운영자가 서버를 띄울 때 `--pre-approve <액션>:<요소 이름>`(반복 가능, 예: `--pre-approve "click:결제 진행"`) 또는 `<액션>:*`로 미리 허용합니다. 차단 결과의 `data.pre_approve_hint`는 그 액션을 여는 값이고, 메시지 끝에 운영자용 안내가 붙습니다. `--mode interactive`는 차단 대신 승인 요청(`data.dialog`)을 돌려줍니다.
-`click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개·여러 개에 맞으면 판정할 수 없으므로 막습니다. 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
+`click(selector=…)`은 selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정합니다. selector가 요소 0개에 맞거나 읽을 수 없으면 판정할 수 없으므로 막습니다. 여러 개(2~50개)에 맞으면 누르지 않고, 후보를 하나씩 같은 규칙으로 판정해 모두 저위험이면 사람 승인 대신 `E_ELEMENT_NOT_FOUND`("selector 가 N개 요소에 맞습니다 — browser_observe_page 로 관찰한 뒤 element_id 로 다시 고르세요", `data.ambiguous_target={count, candidates:[{role, name, visible}] 최대 5개}`, `reobserve_required: true`)로 돌려줍니다 — 에이전트가 관찰 후 `element_id`로 다시 고르면 됩니다. 후보 중 하나라도 고위험(결제·제출·삭제 등 이름·selector·문맥 신호)이거나 50개를 넘으면 지금처럼 판정 불가로 막습니다(승인 경로). 이 이름은 `observe_page`와 같은 규칙(aria-label > aria-labelledby > label > 버튼형 input 의 value > 텍스트 > placeholder > title > alt …)으로 읽어, 같은 요소를 `element_id`·`selector`·포커스 후 `press_key("Enter"/"Space")`로 눌러도 판정이 같습니다.
 `press_key`의 Enter·Space는 키가 실제로 가는 요소(최상위 문서부터 포커스를 따라 iframe·shadow 안까지)로 판정합니다. Chromium 실측으로 Enter가 폼을 제출하는 포커스 대상 — 폼 안 한 줄 입력칸(text·search·email·number·password·tel·url·date·time·datetime-local·month·week), checkbox·radio·range, `<select>`, 제출 버튼(`<button>`·`input[type=submit|image]`, Space 포함) — 은 모두 폼 제출로 막습니다. 다른 출처 iframe 안 포커스는 포커스를 가진 프레임 사슬이 하나로 확정될 때 그 프레임 안에서 읽고, 포커스를 읽을 수 없거나 사슬을 확정할 수 없거나 폼 안의 알 수 없는 요소(사용자 정의 요소)면 판정 불가로 막습니다.
 
 **판정 근거 — 이름 + 문맥 신호.** 이름에 위험 단어가 없어도 아래 원천 중 하나에 있으면 고위험입니다. `element_id`·`selector`·좌표 클릭과 포커스 후 Enter/Space(요소를 누르는 경우)가 같은 판정 함수를 씁니다.
