@@ -24,8 +24,12 @@ import os
 import signal
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from weakref import WeakSet
+
+from playwright.async_api import Frame
 
 from contracts import (
     ACTION_INPUT_MAP,
@@ -189,6 +193,22 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
 
 #: 레시피 서버 도구 이름(WS-38).
 RECIPE_TOOL = f"{TOOL_PREFIX}recipe"
+
+OBSERVE_INSTRUCTIONS = (
+    "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다"
+)
+UNOBSERVED_HINT = (
+    "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
+)
+
+
+@dataclass
+class _PageObservation:
+    context_id: int
+    url: str
+    observed: bool = False
+    hinted: bool = False
+
 
 #: MCP initialize 의 서버 instructions(WS-38·38b — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.
 RECIPE_INSTRUCTIONS = (
@@ -759,6 +779,9 @@ class BrowserMCPServer:
         self._http_status: Dict[str, Any] = {"last_http_status": None}
         #: 탭(페이지)별 메인 문서 상태(WS-26b). start() 가 context 에 단다.
         self._page_status: Any = None
+        #: WS-40: 탭별 마지막 문서/프레임 관찰 여부와 한 번만 내보내는 안내.
+        self._page_observations: Dict[str, _PageObservation] = {}
+        self._observation_watches: WeakSet = WeakSet()
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -1882,6 +1905,9 @@ class BrowserMCPServer:
                 result = await self._call_tool(name, arguments, capture)
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            action = action_from_tool(name)
+            if action is not None:
+                await self._attach_observation_guidance(action, arguments or {}, result)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -1900,6 +1926,83 @@ class BrowserMCPServer:
             self._inflight -= 1
             if capture:
                 self._captures_inflight -= 1
+
+    def _observation_state(self) -> Optional[_PageObservation]:
+        """Track active tab/context and URL without a browser round trip."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None)
+        if page is None:
+            return None
+        tab_id = str(getattr(ctx, "tab_id", ""))
+        url = str(getattr(page, "url", ""))
+        state = self._page_observations.get(tab_id)
+        if state is None or state.context_id != id(page) or state.url != url:
+            state = self._page_observations[tab_id] = _PageObservation(id(page), url)
+        top = getattr(ctx, "root_page", None) or page
+        # Page events also catch external/same-URL reloads. Frame contexts share
+        # their root's listener; unrelated subframe navigation does not reset it.
+        if hasattr(top, "on") and top not in self._observation_watches:
+            self._observation_watches.add(top)
+
+            def moved(frame: Frame) -> None:
+                current = self._page_observations.get(tab_id)
+                if current is not None and (frame.parent_frame is None
+                                            or current.context_id == id(frame)):
+                    current.observed = current.hinted = False
+                    current.url = frame.url
+
+            top.on("framenavigated", moved)
+            top.on("close", lambda: self._page_observations.pop(tab_id, None))
+        return state
+
+    @staticmethod
+    def _sparse_extract(result: ActionResult) -> bool:
+        """Sparse = >= half blank text rows, or < eight non-whitespace chars.
+
+        Count text only: raw attributes do not turn empty page text into a useful
+        extraction. Evaluate before the output cap so truncation cannot fake sparsity.
+        """
+        items = result.data.get("items", [])
+        rows = [items] if isinstance(items, dict) else items if isinstance(items, list) else []
+        texts = [str(row.get("text", "") or "") for row in rows if isinstance(row, dict)]
+        compact = ["".join(text.split()) for text in texts]
+        return not compact or 2 * sum(not text for text in compact) >= len(compact) or sum(
+            len(text) for text in compact) < 8
+
+    async def _attach_observation_guidance(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult,
+    ) -> None:
+        state = self._observation_state()
+        if state is None:
+            return
+        moved = action in {ActionType.NAVIGATE, ActionType.GO_BACK, ActionType.RELOAD,
+                           ActionType.SWITCH_FRAME} or (
+            action is ActionType.TAB_CONTROL and params.get("command") != "list")
+        if result.success and moved:
+            state.observed = state.hinted = False
+        if action is ActionType.OBSERVE_PAGE and result.success:
+            state.observed = True
+            from perception.page_data import summarize_page_data
+
+            summary = await summarize_page_data(self._dispatcher.ctx.page)
+            if summary:
+                result.data["page_data"] = summary
+        selector_failed = not result.success and result.error_code in {
+            ErrorCode.ELEMENT_NOT_FOUND, ErrorCode.ELEMENT_NOT_INTERACTABLE,
+            ErrorCode.FRAME_NOT_FOUND, ErrorCode.SHADOW_ROOT_NOT_FOUND,
+        }
+        # The existing HITL gate refuses ambiguous/unresolved selectors before
+        # dispatch. Its decision stays intact; guidance still helps resolve them.
+        basis = result.data.get("gate_basis")
+        selector_failed = selector_failed or (
+            not result.success and result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED
+            and isinstance(basis, dict) and basis.get("source") == "unresolved")
+        sparse = action is ActionType.EXTRACT and result.success and self._sparse_extract(result)
+        if (params.get("selector") or params.get("frame_selector")) and (
+                selector_failed or sparse) and not state.observed and not state.hinted:
+            if "hint" not in result.data:
+                result.data["hint"] = UNOBSERVED_HINT
+                state.hinted = True
 
     async def _call_wait_tool(self, name: str, arguments: Dict[str, Any],
                               capture: Dict[str, Any]) -> ActionResult:
@@ -2006,6 +2109,8 @@ class BrowserMCPServer:
         from actions.dispatcher import normalize_action_params
 
         params = normalize_action_params(action, params)
+
+        self._observation_state()
 
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         self._pending_gate_basis = None
@@ -2316,6 +2421,9 @@ class BrowserMCPServer:
                 element_name = str(target.get("name") or "")
                 unresolved = str(target.get("unresolved") or "")
                 signals = _signals_of(target.get("info"))
+                ambiguous = self._ambiguous_low_risk(action, selector, target.get("ambiguous"))
+                if ambiguous is not None:
+                    return ambiguous
         elif action is ActionType.CLICK and params.get("x") is not None:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
@@ -2416,6 +2524,49 @@ class BrowserMCPServer:
             message += approve_hint_text(approval_id_hint)
 
         return self._error_result(action, code, message, data=data)
+
+    def _ambiguous_low_risk(self, action: ActionType, selector: str,
+                            ambiguous: Any) -> Optional[ActionResult]:
+        """selector 가 여러 요소에 맞을 때 (WS-39): 후보가 **모두** 저위험이면 승인 대신 모호함 오류.
+
+        모호함은 에이전트가 스스로 풀 수 있다(관찰 → element_id) — 사람 승인으로 보내면 승인 명령을
+        칠 수 없는 사용자(텔레그램 등)에서 진행이 막힌다(실사용 2026-10-10, '항공편 더보기').
+        각 후보를 기존 판정(`assess_risk`: 이름·selector·문맥 신호)으로 보고 하나라도 HIGH 면 None —
+        기존 판정 불가 승인 경로(fail-closed)를 그대로 탄다. 어느 쪽이든 누르지 않는다.
+
+        E_ELEMENT_NOT_FOUND 인 까닭: '정확히 하나'인 대상을 찾지 못한 것이다(디스패처의 selector
+        0개·여러 개 응답, element_id 누락과 같은 코드). NOT_INTERACTABLE 은 찾은 요소가 비활성·가림 등
+        으로 못 누르는 경우라 뜻이 다르다.
+        """
+        if not isinstance(ambiguous, dict):
+            return None
+        infos = ambiguous.get("infos")
+        count = int(ambiguous.get("count") or 0)
+        if not isinstance(infos, list) or count < 2 or len(infos) != count:
+            return None
+        from actions.dispatcher import ambiguous_message, ambiguous_target_view
+        from security.hitl import assess_risk
+        from security import ActionContext, RiskLevel
+
+        for info in infos:
+            if not isinstance(info, dict):
+                return None
+            assessed = assess_risk(ActionContext(
+                action=action,
+                element_name=str(info.get("name") or ""),
+                selector=selector,
+                domain=self._current_domain(),
+                signals=_signals_of(info),
+            ))
+            if assessed.risk is RiskLevel.HIGH:
+                return None
+        result = self._error_result(
+            action,
+            ErrorCode.ELEMENT_NOT_FOUND,
+            ambiguous_message(count),
+            data={"ambiguous_target": ambiguous_target_view(count, infos)},
+        )
+        return result.model_copy(update={"reobserve_required": True, "retry_safe": True})
 
     async def _press_key_target(self, params: Dict[str, Any]) -> tuple:  # noqa: C901
         """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
@@ -2575,8 +2726,8 @@ def create_server(
         profile=profile,
         recipes=recipes,
     )
-    #: WS-38: MCP initialize 의 서버 instructions(레시피 쓰는 법). 꺼져 있으면 보내지 않는다.
-    instructions = RECIPE_INSTRUCTIONS if recipes else None
+    #: Independent instruction fragments keep recipes optional and observation guidance always present.
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.

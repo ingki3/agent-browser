@@ -523,7 +523,7 @@ def test_instructions_reach_client_via_sdk():
         return got
 
     on = anyio.run(_go)
-    assert on["instructions"] == RECIPE_INSTRUCTIONS
+    assert RECIPE_INSTRUCTIONS in on["instructions"] and "data.page_data" in on["instructions"]
     assert "browser_recipe" in on["instructions"] and RECIPE_TOOL in on["tools"]
     off = anyio.run(lambda: _go(recipes=False))
-    assert not off["instructions"] and RECIPE_TOOL not in off["tools"]
+    assert "data.page_data" in off["instructions"] and "browser_recipe" not in off["instructions"] and RECIPE_INSTRUCTIONS not in off["instructions"] and RECIPE_TOOL not in off["tools"]
