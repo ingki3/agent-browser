@@ -79,7 +79,7 @@ _FINISHED = frozenset({"used", "denied", "expired", "revoked"})
 _CMD_RE = re.compile(r"^cmd-([A-Za-z0-9_-]{4,64})\.json$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _CODE_RE = re.compile(r"^\d{%d}$" % CODE_DIGITS)
-_OPS = frozenset({"take", "release", "approve", "deny", "show_code", "describe"})
+_OPS = frozenset({"take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish", "cookie_sites"})
 #: describe 요청의 challenge(사람 CLI 가 요청마다 새로 만든 16바이트 hex).
 _CHALLENGE_RE = re.compile(r"^[0-9a-f]{32,128}$")
 
@@ -366,6 +366,17 @@ class CodeJob:
 
 
 @dataclass
+class LoginJob:
+    """A human CLI request; URL remains in memory, never in status output."""
+
+    url: str
+    login_id: str
+    deadline: float
+    nonce: str
+    status: str = "pending"
+
+
+@dataclass
 class HandoffHub:
     """서버 한 개의 조작권·승인 상태 + 명령 디렉터리 감시."""
 
@@ -373,6 +384,7 @@ class HandoffHub:
     browser_mode: str = "headless"
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S
     clock: Callable[[], float] = time.time
+    profile: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -400,6 +412,9 @@ class HandoffHub:
         self._code_pending_ack: Dict[str, str] = {}
         #: 창 상태(WS-34 on-demand). None 이면 상태에 싣지 않는다(다른 방식은 그대로).
         self.window: Optional[Dict[str, Any]] = None
+        self.login: Optional[LoginJob] = None
+        self._finished_logins: Dict[str, None] = {}
+        self.site_jobs: List[str] = []
 
     # -- 수명주기 ------------------------------------------------------------
 
@@ -419,6 +434,7 @@ class HandoffHub:
             "uid": self._uid,
             "started": time.time(),
             "browser_mode": self.browser_mode,
+            "profile": self.profile,
             "started_at": _now_iso(self.clock()),
         })
         self._opened = True
@@ -473,6 +489,8 @@ class HandoffHub:
         window = getattr(self, "window", None)
         if window is not None:
             out["window"] = dict(window)
+        if self.login is not None:
+            out["login"] = {"status": self.login.status}
         return out
 
     def set_window(self, info: Optional[Dict[str, Any]]) -> None:
@@ -824,6 +842,10 @@ class HandoffHub:
         except OSError:
             return []
         events: List[str] = []
+        if self.login and time.monotonic() >= self.login.deadline:
+            _, _, event = self._apply({"op": "login_finish", "login_id": self.login.login_id})
+            if event:
+                events.append(event)
         for name in sorted(names):
             m = _CMD_RE.match(name)
             if not m:
@@ -871,6 +893,52 @@ class HandoffHub:
                ) -> Tuple[Optional[bool], str, Optional[str]]:
         """명령 적용. ok=None 이면 ack 를 미룬다(show_code — 서버가 창에 띄운 뒤 code_shown)."""
         op = data["op"]
+        if op == "cookie_sites":
+            self.site_jobs.append(nonce)
+            return None, "쿠키 메타데이터 요청", "cookie_sites"
+        if op == "login":
+            from interface.login_cli import validate_url
+
+            try:
+                url = validate_url(data.get("url", ""))
+                duration = float(data.get("timeout", 600))
+                import math
+
+                if not math.isfinite(duration) or duration <= 0:
+                    raise ValueError
+                login_id = data.get("login_id")
+                if not isinstance(login_id, str) or not _ID_RE.fullmatch(login_id):
+                    raise ValueError
+            except (ValueError, TypeError, AttributeError):
+                return False, "로그인 요청 형식 오류(http/https URL·timeout·login_id)", None
+            if self.login or self.holder == HOLDER_HUMAN:
+                return False, "이미 사람이 조작 중입니다.", None
+            if login_id in self._finished_logins:
+                return False, "이미 취소한 로그인 요청입니다.", None
+            self.login = LoginJob(url=url, login_id=login_id, deadline=time.monotonic() + duration,
+                                  nonce=nonce)
+            self._write_control()
+            return None, "로그인 창 준비 중", "login"
+        if op == "login_finish":
+            login_id = data.get("login_id")
+            if not isinstance(login_id, str) or not _ID_RE.fullmatch(login_id):
+                return False, "login_id 형식 오류", None
+            # Command filenames contain random nonces, not arrival order. Remember
+            # cancellation even if poll sees finish BEFORE the matching login.
+            self._finished_logins[login_id] = None
+            if len(self._finished_logins) > 2048:
+                self._finished_logins.pop(next(iter(self._finished_logins)))
+            job = self.login
+            if not job or job.login_id != login_id:
+                return True, "이미 반납했습니다.", None
+            self.login = None
+            if job.status != "ready":
+                self._ack(job.nonce, False, "로그인 창 요청 취소/시간 만료")
+            if self.holder == HOLDER_HUMAN:
+                self.release_by_server()
+                return True, "로그인 조작권 반납", "released"
+            self._write_control()
+            return True, "로그인 요청 취소", None
         if op == "take":
             self.holder = HOLDER_HUMAN
             self.requested = False
@@ -878,6 +946,8 @@ class HandoffHub:
             self._changed("taken")
             return True, "조작권을 사람이 가져갔습니다. 해결 뒤 release 하세요.", "taken"
         if op == "release":
+            if self.login is not None:
+                self._apply({"op": "login_finish", "login_id": self.login.login_id})
             self.holder = HOLDER_AGENT
             self.requested = False
             self.secret_wanted = False

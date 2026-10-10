@@ -153,7 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "이름 붙인 영속 프로필로 시작(로그인 유지, WS-32). 폴더 ~/.agent-browser/profiles/"
             "serve-NAME(권한 700). NAME 은 영문 소문자·숫자·하이픈 1~32자. 미지정 시 매번 빈 브라우저. "
-            "--browser human 으로 한 번 로그인하면 이후 headless 에서도 유지."
+            "맥에서 agent-browser login URL --profile NAME 으로 미리 로그인하면 이후 headless 에서도 유지."
         ),
     )
 
@@ -176,6 +176,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from interface import profile_cli
 
     profile_cli.add_parser(sub)
+    from interface import login_cli
+
+    login_cli.add_parser(sub)
 
     # --- tui ---
     tui = sub.add_parser("tui", help="Textual 대시보드를 실행합니다.")
@@ -447,6 +450,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from interface import profile_cli
 
         return profile_cli.run(args)
+    if args.command == "login":
+        from interface import login_cli
+
+        return login_cli.run(args)
     if args.command == "control":
         from interface import handoff
 
