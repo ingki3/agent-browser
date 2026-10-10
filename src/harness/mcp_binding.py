@@ -149,10 +149,13 @@ def main() -> int:
         )
     if not findings["call_ok"]:
         violations.append("tools/call 왕복 실패")
-    from interface.mcp_server import RECIPE_INSTRUCTIONS, SERVER_TOOLS
+    from interface.mcp_server import OBSERVE_INSTRUCTIONS, RECIPE_INSTRUCTIONS, SERVER_TOOLS
 
-    if findings["instructions"] != RECIPE_INSTRUCTIONS:
-        violations.append("initialize 의 서버 instructions(WS-38 레시피 안내)가 클라이언트에 도착하지 않음")
+    instructions = findings["instructions"] or ""
+    instructions_delivered = (RECIPE_INSTRUCTIONS in instructions
+                              and OBSERVE_INSTRUCTIONS in instructions)
+    if not instructions_delivered:
+        violations.append("initialize 의 서버 instructions(레시피·관찰 안내)가 클라이언트에 도착하지 않음")
     if findings["server_tools_listed"] != sorted(SERVER_TOOLS):
         violations.append(
             f"서버 도구 불일치: {findings['server_tools_listed']} != {sorted(SERVER_TOOLS)}"
@@ -171,7 +174,7 @@ def main() -> int:
             "server_tools_listed": len(findings["server_tools_listed"]),
             "schemas_valid": findings["schemas_valid"],
             "call_roundtrip": findings["call_ok"],
-            "instructions_delivered": findings["instructions"] == RECIPE_INSTRUCTIONS,
+            "instructions_delivered": instructions_delivered,
             "violations": violations or None,
             "note": "SDK 바인딩을 우회하지 않는 실사용 경로 검증",
         },

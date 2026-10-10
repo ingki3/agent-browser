@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-2712개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+2739개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -282,6 +282,10 @@ browser_navigate          URL 이동
 
 `observe_page`가 반환하는 `element_id`와 `epoch`을 액션에 그대로 넘깁니다.
 
+페이지를 열거나 이동·새로고침·탭 전환한 뒤에는 먼저 `browser_observe_page`를 부르십시오. 관찰 없이 쓴 selector가 요소를 못 찾거나 모호해서 실패하면 `data.hint`로 관찰을 안내합니다. 성공한 `extract`도 텍스트 항목의 절반 이상이 공백이거나 전체 공백 제외 글자가 8자 미만이면 안내합니다. 정상 결과에는 붙이지 않고 같은 페이지에서는 한 번만 보냅니다. 이동하면 다시 한 번 보낼 수 있습니다.
+
+상품·가격이 화면의 상호작용 요소에 없더라도 관찰 결과의 `data.page_data`에 **페이지 JSON-LD 요약**이 있을 수 있습니다. Product·Offer/AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList를 배열·`@graph`·중첩에서 찾고, 이름·sku·brand·offers(가격·통화·재고 상태, AggregateOffer의 가격 범위)·평점 요약을 싣습니다. BreadcrumbList는 이름만 제공합니다. 항목은 최대 5개, 압축 JSON은 1,200자 이하이고 문자열은 제어문자를 제거해 이름·brand 128자, sku·가격 등 64자, URL 256자로 제한합니다. offer의 `url`은 같은 출처(scheme·host·port)의 HTTP(S) 주소만 남깁니다. 없거나 깨진 JSON-LD는 해당 필드를 생략합니다. 이는 사이트가 제공한 값이므로 현재 결제 가격을 보증하지 않으며, 다른 웹 텍스트처럼 `data.injection_suspected` 검사 대상입니다. `extract` 인자는 그대로입니다.
+
 응답 형식: 응답(`ActionResult` JSON)에서 **빠진 필드는 계약 기본값**입니다(`healed=false`, `downloaded_path`·`popup_tab_id`·`error_code`·`error_message`=`null`, `data`=`{}`, 관찰 요소의 `value`=`null`·`is_shadow`=`false`). `success`·`action`·`current_url`·`snapshot_epoch`·`tab_id`·`retry_safe`·`reobserve_required`는 항상 있고, 실패면 `error_code`·`error_message`도 있습니다. `data` 안의 `null`은 그대로 싣습니다(`data.challenge: null` = 차단 없음). 계약 모델(`ActionResult.model_validate`)로 다시 읽으면 빠짐없는 결과와 같은 객체입니다.
 
 결과 크기 상한: `observe_page`·`extract` 응답이 `serve --max-result-chars`(기본 20,000자)를 넘으면 **항목 경계**(관찰 요소는 점수 순, 추출 행은 문서 순 앞쪽)에서 잘라 싣고 `data.truncated`에 `total_items`·`returned_items`·`total_chars`·`returned_chars`·`hint`를 붙입니다. 기본값 근거: Claude Code 는 MCP 도구 결과가 25,000 토큰을 넘으면 결과를 통째로 버리고, 한글 본문은 1자 ≈ 1토큰(cl100k 실측 0.97)이라 2만 자면 여유가 있습니다(비교 시험에서 `observe_page(force_full_tree)` 143,456자·`extract` 58,620자가 버려졌습니다). 추출 항목 **하나**가 이미 상한을 넘으면 그 항목의 `text`만 글자 묶음(이모지·결합 문자) 경계, 가능하면 공백에서 자르고 `text_truncated: true`·`text_chars`(원래 글자 수), `data.truncated.item_text_truncated: true`를 붙입니다. 더 보려면 `extract`의 `selector`를 좁히거나 `observe_page`의 `prune_top_n`을 쓰십시오.
@@ -319,7 +323,7 @@ agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않�
 
 ### 프롬프트 주입 신호 (`data.injection_suspected`)
 
-웹 페이지에 "이전 지시를 무시하고 …" 같은 문구가 있으면 그 문구가 부르는 에이전트를 조종할 수 있습니다(간접 프롬프트 주입). 액션 툴 19종의 결과(실패·HITL 차단 결과 포함)에 실린 **웹에서 온 텍스트** — 관찰 요소 이름·`value`·페이지 제목, `extract` 텍스트·속성, `data.dialogs` 문구, 스크린샷 SoM 태그 이름, 프레임 목록의 `selector_hint`, HITL 차단의 대상 이름(`gate_basis`·`dialog`·`error_message`) — 를 결정론적 패턴(15종)으로 검사해, 의심되면 `data`에 신호를 붙입니다.
+웹 페이지에 "이전 지시를 무시하고 …" 같은 문구가 있으면 그 문구가 부르는 에이전트를 조종할 수 있습니다(간접 프롬프트 주입). 액션 툴 19종의 결과(실패·HITL 차단 결과 포함)에 실린 **웹에서 온 텍스트** — 관찰 요소 이름·`value`·페이지 제목·`data.page_data`의 JSON-LD 요약, `extract` 텍스트·속성, `data.dialogs` 문구, 스크린샷 SoM 태그 이름, 프레임 목록의 `selector_hint`, HITL 차단의 대상 이름(`gate_basis`·`dialog`·`error_message`) — 를 결정론적 패턴(15종)으로 검사해, 의심되면 `data`에 신호를 붙입니다.
 
 ```json
 "injection_suspected": {
