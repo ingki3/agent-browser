@@ -784,6 +784,9 @@ class BrowserMCPServer:
         #: WS-40: 탭별 마지막 문서/프레임 관찰 여부와 한 번만 내보내는 안내.
         self._page_observations: Dict[str, _PageObservation] = {}
         self._observation_watches: WeakSet = WeakSet()
+        from security.robots_signal import RobotsSignals
+
+        self._robots = RobotsSignals()  # WS-41: server-memory intent signal cache
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -1947,6 +1950,7 @@ class BrowserMCPServer:
         return None
 
     async def close(self) -> None:
+        await self._robots.close()  # WS-41: join background requests before closing their context
         if self._recipes is not None:
             self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)
         task, self._hub_task = self._hub_task, None
@@ -2025,6 +2029,12 @@ class BrowserMCPServer:
                 result.data["login_hint"] = self._login_hint()
             if action is not None:
                 await self._attach_observation_guidance(action, arguments or {}, result)
+            if action in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
+                from security.robots_signal import attach_robots_signal
+
+                ctx = getattr(self._dispatcher, "ctx", None)
+                page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+                await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -2843,8 +2853,10 @@ def create_server(
         profile=profile,
         recipes=recipes,
     )
-    #: Independent instruction fragments keep recipes optional and observation guidance always present.
-    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS
+    #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
+    from security.robots_signal import ROBOTS_INSTRUCTIONS
+
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
