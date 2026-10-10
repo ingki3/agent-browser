@@ -507,6 +507,7 @@ def test_instructions_reach_client_via_sdk():
     from mcp.shared.memory import create_client_server_memory_streams
 
     from interface.mcp_server import RECIPE_INSTRUCTIONS, create_server
+    from security.robots_signal import ROBOTS_INSTRUCTIONS
 
     async def _go(**kw):
         server, backend = create_server(**kw)
@@ -523,7 +524,10 @@ def test_instructions_reach_client_via_sdk():
         return got
 
     on = anyio.run(_go)
-    assert RECIPE_INSTRUCTIONS in on["instructions"] and "data.page_data" in on["instructions"]
+    assert (RECIPE_INSTRUCTIONS in on["instructions"] and "data.page_data" in on["instructions"]
+            and ROBOTS_INSTRUCTIONS in on["instructions"])
     assert "browser_recipe" in on["instructions"] and RECIPE_TOOL in on["tools"]
     off = anyio.run(lambda: _go(recipes=False))
-    assert "data.page_data" in off["instructions"] and "browser_recipe" not in off["instructions"] and RECIPE_INSTRUCTIONS not in off["instructions"] and RECIPE_TOOL not in off["tools"]
+    assert (RECIPE_INSTRUCTIONS not in off["instructions"] and "browser_recipe" not in off["instructions"]
+            and "data.page_data" in off["instructions"] and ROBOTS_INSTRUCTIONS in off["instructions"]
+            and RECIPE_TOOL not in off["tools"])

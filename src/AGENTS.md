@@ -1082,6 +1082,26 @@ AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList, 배열·@gra
 실제로 파손해 테스트 실패를 확인하고 복구합니다. 전후 관찰 지연과 전체 테스트 수는
 `.hermes/state/ws40/report.md`에 기록합니다.
 
+#### robots.txt 의사 표시 신호 (WS-41)
+
+`security.robots_signal`은 MCP `navigate`의 최종 URL과 `observe_page`의 현재 최상위 URL을
+판정한다. `*` 그룹 금지 또는 알려진 AI UA 금지가 있으면 `data.robots`를 붙이며 **이동은 막지
+않는다**. 이는 법적 판단이 아니라 사이트의 자동 접근 의사 표시이고, 계속할지는 부르는
+에이전트가 사용자 뜻에 따라 판단한다. 허용·판정 불가에는 키를 넣지 않는다.
+
+동결 계약·ErrorCode·UA는 바꾸지 않는다. httpx 스트리밍은 기존 EgressProxy를 경유하고
+각 요청·리다이렉트 URL을 기존 egress 가드로 별도 확인한다. 컨텍스트에서 읽은 UA만 사용하며
+쿠키·인증 헤더를 보내지 않는다. Playwright 공유 파이프로 본문을 받지 않는다. 같은 출처
+(scheme·host·port) 안의 리다이렉트만 5회까지, 다운로드는 최대 512KiB에서 중단(초과는 판정 불가),
+파싱은 앞 500KiB까지다. 캐시는 최근 사용한 1,000개 출처로 제한한다. 성공·404 등 확정 결과는
+24시간, 5xx·시간초과·실패·401/403은 10분 캐시한다. 결과 대기는 최대 1.5초, 같은 fetch의 배경
+상한은 총 10초(코디네이터 명세 해석 승인); 같은 출처 동시 호출은 하나를 공유하고 종료 때 정리한다.
+
+회귀 검증은 `tests/security/test_ws41_robots_parser.py`와
+`tests/interface/test_ws41_robots_signal.py`의 합성 robots 본문·로컬 HTTP Mock만 사용한다.
+가장 긴 일치 제거·AI 판정 제거·캐시 제거·MCP 연결 제거 사보타주로 미탐을 확인한다.
+형식·의미·한계는 README의 "robots.txt 신호" 절, R1 측정과 결과는 `.hermes/state/ws41-r1/report.md`를 참조한다.
+
 #### 동작 캐시 — 레시피 (WS-38)
 
 `src/recipes/`(keys·store·recorder·replay·service). 통과한 동작 묶음을 PageKey(출처·URL 패턴·
