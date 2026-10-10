@@ -2316,6 +2316,9 @@ class BrowserMCPServer:
                 element_name = str(target.get("name") or "")
                 unresolved = str(target.get("unresolved") or "")
                 signals = _signals_of(target.get("info"))
+                ambiguous = self._ambiguous_low_risk(action, selector, target.get("ambiguous"))
+                if ambiguous is not None:
+                    return ambiguous
         elif action is ActionType.CLICK and params.get("x") is not None:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
@@ -2416,6 +2419,49 @@ class BrowserMCPServer:
             message += approve_hint_text(approval_id_hint)
 
         return self._error_result(action, code, message, data=data)
+
+    def _ambiguous_low_risk(self, action: ActionType, selector: str,
+                            ambiguous: Any) -> Optional[ActionResult]:
+        """selector 가 여러 요소에 맞을 때 (WS-39): 후보가 **모두** 저위험이면 승인 대신 모호함 오류.
+
+        모호함은 에이전트가 스스로 풀 수 있다(관찰 → element_id) — 사람 승인으로 보내면 승인 명령을
+        칠 수 없는 사용자(텔레그램 등)에서 진행이 막힌다(실사용 2026-10-10, '항공편 더보기').
+        각 후보를 기존 판정(`assess_risk`: 이름·selector·문맥 신호)으로 보고 하나라도 HIGH 면 None —
+        기존 판정 불가 승인 경로(fail-closed)를 그대로 탄다. 어느 쪽이든 누르지 않는다.
+
+        E_ELEMENT_NOT_FOUND 인 까닭: '정확히 하나'인 대상을 찾지 못한 것이다(디스패처의 selector
+        0개·여러 개 응답, element_id 누락과 같은 코드). NOT_INTERACTABLE 은 찾은 요소가 비활성·가림 등
+        으로 못 누르는 경우라 뜻이 다르다.
+        """
+        if not isinstance(ambiguous, dict):
+            return None
+        infos = ambiguous.get("infos")
+        count = int(ambiguous.get("count") or 0)
+        if not isinstance(infos, list) or count < 2 or len(infos) != count:
+            return None
+        from actions.dispatcher import ambiguous_message, ambiguous_target_view
+        from security.hitl import assess_risk
+        from security import ActionContext, RiskLevel
+
+        for info in infos:
+            if not isinstance(info, dict):
+                return None
+            assessed = assess_risk(ActionContext(
+                action=action,
+                element_name=str(info.get("name") or ""),
+                selector=selector,
+                domain=self._current_domain(),
+                signals=_signals_of(info),
+            ))
+            if assessed.risk is RiskLevel.HIGH:
+                return None
+        result = self._error_result(
+            action,
+            ErrorCode.ELEMENT_NOT_FOUND,
+            ambiguous_message(count),
+            data={"ambiguous_target": ambiguous_target_view(count, infos)},
+        )
+        return result.model_copy(update={"reobserve_required": True, "retry_safe": True})
 
     async def _press_key_target(self, params: Dict[str, Any]) -> tuple:  # noqa: C901
         """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
