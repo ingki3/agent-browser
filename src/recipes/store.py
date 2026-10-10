@@ -181,6 +181,10 @@ _TOKEN_SEG = re.compile(r"^[A-Za-z0-9._~%+=-]{16,}$")
 _TOKEN_MARK = re.compile(r"[._~%+=-]")
 _MIXED_ALNUM = re.compile(r"^(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{16,}$")
 _TOKEN_HOST = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+_HYPHEN_SLUG = re.compile(r"^[a-z0-9-]+$")
+_SUB_DELIMS = str.maketrans("", "", "!$&'()*+,=:@")
+_TEXT_URL = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*://|/)[^\s<>\"“”]+")
+_TEXT_WORD = re.compile(r"[A-Za-z0-9._~%+=-]+")
 #: 저장 형태의 URL 필드 전부(대상 identity.path 는 상대 경로 또는 절대 URL).
 _URL_FIELDS = frozenset({"origin", "index_pat", "url", "url_pat", "href_pat", "path"})
 #: 개인 식별자(R1 NB-1): 이메일, 국내 휴대전화(구분자 있거나 10~11자리 숫자), +국가번호 형식.
@@ -202,6 +206,20 @@ def _decode_segment(seg: str) -> Optional[str]:
     return out
 
 
+def _ordinary_slug(seg: str) -> bool:
+    """소문자·숫자 하이픈 슬러그: 부분 ≤12자, 혼합 영숫자 부분은 6자 미만(R3)."""
+    if "-" not in seg or not _HYPHEN_SLUG.fullmatch(seg):
+        return False
+    return all(len(part) <= 12 and not (len(part) >= 6 and re.search(r"[a-z]", part)
+                                       and re.search(r"[0-9]", part)) for part in seg.split("-"))
+
+
+def _token_form(seg: str) -> bool:
+    if _ordinary_slug(seg):
+        return False
+    return bool(_MIXED_ALNUM.fullmatch(seg) or (_TOKEN_SEG.match(seg) and _TOKEN_MARK.search(seg)))
+
+
 def _token_segment(seg: str) -> bool:
     """경로 조각 하나가 토큰·이메일이면 True(BLOCKING-1). 자리표시자·접힌 패턴(`{id}`)은 아님."""
     if not seg:
@@ -211,7 +229,7 @@ def _token_segment(seg: str) -> bool:
         return True
     if ";" in dec or "@" in dec or "%40" in dec.lower():
         return True
-    return bool(_MIXED_ALNUM.fullmatch(dec) or (_TOKEN_SEG.match(dec) and _TOKEN_MARK.search(dec)))
+    return _token_form(dec) or _token_form(dec.translate(_SUB_DELIMS))
 
 
 def _path_of(text: str, *, is_url: bool) -> str:
@@ -226,39 +244,69 @@ def _path_of(text: str, *, is_url: bool) -> str:
 
 
 def _token_in_path(text: Any, *, is_url: bool) -> bool:
-    """경로와 호스트 라벨을 모두 검사. 패턴은 host/path 또는 /path(R2)."""
+    """경로·호스트 라벨·쿼리 키 검사. 잘못된 포트도 거부(R3). 패턴은 host/path 또는 /path."""
     if not isinstance(text, str) or not text:
         return False
     stripped = _PLACEHOLDER.sub("", text)
     if any(_token_segment(s) for s in _path_of(stripped, is_url=is_url).split("/")):
         return True
     try:
-        host = urlsplit(stripped if is_url or "://" in stripped else "//" + stripped).hostname or ""
+        parts = urlsplit(stripped if is_url or "://" in stripped else "//" + stripped)
+        host = parts.hostname or ""
+        parts.port  # 숫자가 아니거나 범위 밖인 포트는 ValueError(fail-closed).
     except ValueError:
+        return True
+    if any(_token_segment(raw.partition("=")[0]) for raw in parts.query.split("&") if raw):
         return True
     for label in host.split("."):
         dec = _decode_segment(label)
         if dec is None:
             return True
-        if _TOKEN_HOST.fullmatch(dec) and (_MIXED_ALNUM.fullmatch(dec) or "-" in dec or "_" in dec):
+        if (not _ordinary_slug(dec) and _TOKEN_HOST.fullmatch(dec)
+                and (_MIXED_ALNUM.fullmatch(dec) or "-" in dec or "_" in dec)):
             return True
     return False
 
 
-def _has_url_token(obj: Any) -> bool:
-    """중첩 저장 필드도 검사: variants 의 ui/slot href_pat·identity path, 단계 출처 포함."""
+def _token_in_text(text: str) -> bool:
+    """페이지 유래 자유 문자열: URL 모양 부분은 URL 검사, 나머지는 낱말·구두점 경계로 검사."""
+    # 자유 문자열의 {낱말}은 params라고 가정해 지우지 않는다(중괄호 속 토큰도 검사).
+    stripped = text
+    for match in _TEXT_URL.finditer(stripped):
+        url = _decode_segment(match.group())
+        if url is None:
+            return True
+        url = url.replace("{", "").replace("}", "")
+        if _token_in_path(url, is_url="://" in url):
+            return True
+    rest = _TEXT_URL.sub(" ", stripped)
+    dec = _decode_segment(rest)
+    if dec is None:
+        return True
+    return (any(_token_segment(word) for word in dec.split())
+            or any(_token_segment(word) for word in _TEXT_WORD.findall(dec)))
+
+
+def _has_url_token(obj: Any, key: str = "") -> bool:
+    """URL·자유 문자열 leaf 전수 검사. 코드가 만든 골격 해시·사후 신호 종류는 제외(R3)."""
+    if key in _HASH_KEYS or key == "signals":
+        return False
     if isinstance(obj, dict):
-        return any((_token_in_path(value, is_url=key in {"origin", "url"}) if key in _URL_FIELDS
-                    else _has_url_token(value)) for key, value in obj.items())
+        return any(_has_url_token(value, str(field)) for field, value in obj.items())
     if isinstance(obj, list):
-        return any(_has_url_token(value) for value in obj)
+        return any(_has_url_token(value, key) for value in obj)
+    if isinstance(obj, str):
+        return (_token_in_path(obj, is_url=key in {"origin", "url"}) if key in _URL_FIELDS
+                else _token_in_text(obj))
     return False
 
 
 def _check_paths(rec: Dict[str, Any]) -> None:
-    """모든 저장 URL·패턴의 경로·호스트에 토큰·이메일 조각이 있으면 거부. 자동 이름도 index_pat 기반."""
-    if _has_url_token(rec):
-        raise RecipeError("이동 주소·URL 패턴의 경로·호스트에 토큰(JWT·base64url 등) 또는 이메일로 보이는 조각이 있어 "
+    """모든 저장 URL·페이지 유래 문자열에 토큰·이메일 조각이 있으면 거부."""
+    # 최상위 이름은 에이전트가 지정하거나 검사된 경로·params로 만드는 요약(페이지 원문 아님).
+    if _has_url_token({field: value for field, value in rec.items() if field != "name"}):
+        _check_pii(rec)  # 이메일·전화번호는 기존의 구체적 거부 이유를 유지한다.
+        raise RecipeError("이동 주소·URL 패턴·대상 이름·식별값에 토큰(JWT·base64url 등) 또는 이메일로 보이는 조각이 있어 "
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
