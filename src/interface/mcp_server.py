@@ -19,6 +19,7 @@ MCP 서버는 stdio로 구동되며 클라이언트 연결당 하나의 브라�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -719,6 +720,7 @@ class BrowserMCPServer:
         self.hub = HandoffHub(
             root=handoff_root if handoff_root is not None else state_root(),
             browser_mode=browser_mode,
+            profile=profile,
             approval_ttl_s=approval_ttl_s,
         )
         self._hub_task: Any = None
@@ -931,6 +933,27 @@ class BrowserMCPServer:
         if events and self._recipes is not None and ("taken" in events or "released" in events):
             self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
         for event in events:
+            if event == "cookie_sites":
+                from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
+                from interface.handoff import _write_private
+
+                jobs, self.hub.site_jobs = self.hub.site_jobs, []
+                try:
+                    context = self._core.context_for("mcp-session") if self._core else None
+                    cookies = await context.cookies() if context else []
+                    sites = (cookie_sites(self.profile) if context is None and self.profile else
+                             summarize_cookie_sites([(c["domain"], int((c["expires"] + 11644473600) * 1_000_000)
+                             if c["expires"] > 0 else 0) for c in cookies]))
+                    bounded, truncated = bound_cookie_sites(sites)
+                    for nonce in jobs:
+                        # No control/reason/URL metadata in this response: sites only.
+                        _write_private(self.hub.dir / f"ack-{nonce}.json",
+                                       {"ok": True, "sites": bounded, "truncated": truncated})
+                except Exception:
+                    for nonce in jobs:
+                        _write_private(self.hub.dir / f"ack-{nonce}.json", {"ok": False})
+            if event == "login":
+                self._spawn_login()
             if event == "released":
                 self._release_unreported = True
                 # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
@@ -960,6 +983,105 @@ class BrowserMCPServer:
         # 이 함수가 돌아온 뒤 호출자가 보는 상태(반납·탭 알림)가 어긋나지 않게.
         await self._await_release_recovery()
         return events
+
+    def _login_hint(self) -> str:
+        if self.profile is None:
+            return "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
+        from urllib.parse import urlsplit
+        import re
+        import shlex
+        from browser.serve_profile import ProfileError, validate_name
+
+        origin = None
+        try:
+            parts = urlsplit(self._current_origin())
+            if parts.scheme in ("http", "https") and parts.hostname:
+                host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+                port = parts.port
+                if (re.fullmatch(r"[a-z0-9.-]+|\[[0-9a-f:.]+\]", host)
+                        and (port is None or isinstance(port, int))):
+                    origin = f"{parts.scheme}://{host}"
+                    if port is not None:
+                        origin += f":{port}"
+        except ValueError:
+            pass
+        try:
+            profile = validate_name(self.profile)
+        except ProfileError:
+            profile = "<프로필 이름>"
+        if origin is None:
+            return f"맥에서: 페이지 주소를 확인한 뒤 agent-browser login <페이지 주소> --profile {profile}"
+        return f"맥에서: agent-browser login {shlex.quote(origin)} --profile {profile}"
+
+    def _spawn_login(self) -> None:
+        """Human CLI job: same drain/window/release paths as control take, no MCP action added."""
+        job = self.hub.login
+        if job is None or job.status != "pending":
+            return
+        job.status = "opening"
+        self._hold_gate()
+
+        async def run() -> None:
+            from interface.login_cli import display_available
+            from interface.handoff import write_command
+
+            try:
+                if not self._human_can_see() or not display_available():
+                    raise ValueError("창 없는 환경(headless 전용 또는 DISPLAY 없음). 맥 앞에서 실행하세요.")
+                self.hub._apply({"op": "take"})
+                self.hub.secret_wanted = True  # Human login contents stay out of observations.
+                self.hub._write_control()
+                if self._recipes is not None:
+                    self._recipes.reset("human_control")
+                if not await self._drain_calls():
+                    raise ValueError("진행 중인 도구 호출이 끝나지 않았습니다.")
+                if self.hub.login is not job:
+                    return
+                # run_stdio reserves the profile but starts Chromium lazily.
+                if not self._started:
+                    await self.start()
+                if self.hub.login is not job:
+                    return
+                if self._window is not None:
+                    out = await self._switch_window(True, "taken")
+                    if not out.get("ok"):
+                        raise ValueError("로그인 창 전환 실패")
+                if self.hub.login is not job:
+                    return
+                context = self._core.context_for("mcp-session")
+                # context.new_page guarantees a NEW tab (core.new_tab may adopt a blank one).
+                page = await context.new_page()
+                await page.goto(job.url, wait_until="domcontentloaded")
+                await page.bring_to_front()
+                if self.hub.login is not job:
+                    return
+                # Reuse take's window-only banner on the new human login tab.
+                # Preserve the agent's active tab; its dispatcher resumes there.
+                active = self._core.active_tab_id
+                tab = self._core.tab_for_page(page)
+                if tab is not None:
+                    self._core.set_active_tab(tab.tab_id)
+                    try:
+                        await self._show_control_banner("사람이 로그인 중 — 끝나면 터미널에서 Enter 또는 로그인 탭 닫기")
+                    finally:
+                        if self._core.get_tab(active) is not None:
+                            self._core.set_active_tab(active)
+                job.status = "ready"
+                page.on("close", lambda: write_command(self.hub.root, self.hub.server_id,
+                        "login_finish", login_id=job.login_id) if self.hub.opened and self.hub.login is job else None)
+                self.hub._write_control()
+                self.hub._ack(job.nonce, True, "로그인 창을 열었습니다.")
+            except Exception:
+                # Never echo a navigation exception (may contain a URL query/token).
+                self.hub._ack(job.nonce, False, "로그인 창을 열 수 없습니다. 맥 앞에서 서버/화면/egress 정책을 확인하세요.")
+                if self.hub.login is job:
+                    write_command(self.hub.root, self.hub.server_id, "login_finish", login_id=job.login_id)
+            finally:
+                self._release_gate()
+
+        task = asyncio.create_task(run())
+        self._window_tasks.add(task)
+        task.add_done_callback(self._window_tasks.discard)
 
     async def _recover_closed_tab_serialized(self) -> None:
         """닫힌 탭 복구를 Future 로 감싸 진행 중임을 알린다(WS-37 반납 알림 경쟁 조건).
@@ -1251,7 +1373,9 @@ class BrowserMCPServer:
                 data["tab_closed_by_human"] = self._tab_notice
             return {"success": True, "data": data}
         if short == "control_request":
-            return await self._control_request(args)
+            result = await self._control_request(args)
+            result.setdefault("data", {}).setdefault("login_hint", self._login_hint())
+            return result
         timeout = _wait_timeout(args.get("timeout_s"))
         if short == "control_wait":
             return await self._control_wait(timeout)
@@ -1292,6 +1416,7 @@ class BrowserMCPServer:
                 "중 하나로 다시 띄우도록 요청하세요."
             )
             data: Dict[str, Any] = {"control": self.hub.status(), "browser_mode": self.browser_mode}
+            data["login_hint"] = self._login_hint()
             if self.profile is not None:
                 # WS-32: 영속 프로필이면 창 있는 서버로 한 번 로그인해 두면 headless 에서도 유지된다.
                 message += (
@@ -1324,6 +1449,8 @@ class BrowserMCPServer:
                     "data": {"window": window_out.get("window") or self._window.info()},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
+        out["login_hint"] = self._login_hint()
+        out["how_to_respond"] += " " + out["login_hint"]
         page = getattr(getattr(self._dispatcher, "ctx", None), "page", None) or self._page
         try:
             await page.bring_to_front()
@@ -1894,7 +2021,12 @@ class BrowserMCPServer:
         WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
         캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
         """
+        from interface.on_demand import SWITCH_WAIT_S
+
         capture: Dict[str, Any] = {}
+        if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
+            return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                     ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
         if self._window is not None:
             # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
             blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
@@ -1910,6 +2042,8 @@ class BrowserMCPServer:
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
             action = action_from_tool(name)
+            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+                result.data["login_hint"] = self._login_hint()
             if action is not None:
                 await self._attach_observation_guidance(action, arguments or {}, result)
             if action in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
