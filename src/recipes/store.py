@@ -176,10 +176,13 @@ def _sub_url(url: str, params: Dict[str, str], used: set,
     return urlunsplit((parts.scheme, netloc, path, "&".join(pairs), ""))
 
 
-#: 경로 토큰(WS-38b R1 BLOCKING-1): 퍼센트 디코드한 조각이 16자 이상, 이 글자들로만 이뤄졌고 영숫자 밖 글자를
-#: 하나 이상 품으면(JWT·base64url·하이픈 토큰) 자격 증명으로 본다. 영숫자만인 긴 조각은 keys 가 `{id}` 로 접는다.
+#: 경로 토큰: 16자 이상 토큰형 구두점 조각 또는 영문·숫자 혼합 조각. 영문만·숫자만은 허용(R2).
 _TOKEN_SEG = re.compile(r"^[A-Za-z0-9._~%+=-]{16,}$")
 _TOKEN_MARK = re.compile(r"[._~%+=-]")
+_MIXED_ALNUM = re.compile(r"^(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{16,}$")
+_TOKEN_HOST = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+#: 저장 형태의 URL 필드 전부(대상 identity.path 는 상대 경로 또는 절대 URL).
+_URL_FIELDS = frozenset({"origin", "index_pat", "url", "url_pat", "href_pat", "path"})
 #: 개인 식별자(R1 NB-1): 이메일, 국내 휴대전화(구분자 있거나 10~11자리 숫자), +국가번호 형식.
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 _PHONE = re.compile(
@@ -206,14 +209,14 @@ def _token_segment(seg: str) -> bool:
     dec = _decode_segment(seg)
     if dec is None:
         return True
-    if "@" in dec or "%40" in dec.lower():
+    if ";" in dec or "@" in dec or "%40" in dec.lower():
         return True
-    return bool(_TOKEN_SEG.match(dec) and _TOKEN_MARK.search(dec))
+    return bool(_MIXED_ALNUM.fullmatch(dec) or (_TOKEN_SEG.match(dec) and _TOKEN_MARK.search(dec)))
 
 
 def _path_of(text: str, *, is_url: bool) -> str:
     """URL(scheme 포함) 또는 패턴(`host/path?keys`)의 경로 부분."""
-    if is_url:
+    if is_url or "://" in text:
         try:
             return urlsplit(text).path
         except ValueError:
@@ -223,24 +226,39 @@ def _path_of(text: str, *, is_url: bool) -> str:
 
 
 def _token_in_path(text: Any, *, is_url: bool) -> bool:
+    """경로와 호스트 라벨을 모두 검사. 패턴은 host/path 또는 /path(R2)."""
     if not isinstance(text, str) or not text:
         return False
     stripped = _PLACEHOLDER.sub("", text)
-    return any(_token_segment(s) for s in _path_of(stripped, is_url=is_url).split("/"))
+    if any(_token_segment(s) for s in _path_of(stripped, is_url=is_url).split("/")):
+        return True
+    try:
+        host = urlsplit(stripped if is_url or "://" in stripped else "//" + stripped).hostname or ""
+    except ValueError:
+        return True
+    for label in host.split("."):
+        dec = _decode_segment(label)
+        if dec is None:
+            return True
+        if _TOKEN_HOST.fullmatch(dec) and (_MIXED_ALNUM.fullmatch(dec) or "-" in dec or "_" in dec):
+            return True
+    return False
+
+
+def _has_url_token(obj: Any) -> bool:
+    """중첩 저장 필드도 검사: variants 의 ui/slot href_pat·identity path, 단계 출처 포함."""
+    if isinstance(obj, dict):
+        return any((_token_in_path(value, is_url=key in {"origin", "url"}) if key in _URL_FIELDS
+                    else _has_url_token(value)) for key, value in obj.items())
+    if isinstance(obj, list):
+        return any(_has_url_token(value) for value in obj)
+    return False
 
 
 def _check_paths(rec: Dict[str, Any]) -> None:
-    """이동 URL·모든 url_pat·index_pat 경로에 토큰·이메일 조각이 있으면 거부(BLOCKING-1). 레시피 이름은
-    index_pat 에서 만들므로 함께 막힌다."""
-    found = _token_in_path(rec.get("index_pat"), is_url=False)
-    for s in rec.get("steps") or []:
-        if found:
-            break
-        found = (_token_in_path((s.get("args") or {}).get("url"), is_url=True)
-                 or _token_in_path(s.get("url_pat"), is_url=False)
-                 or _token_in_path((s.get("expect") or {}).get("url_pat"), is_url=False))
-    if found:
-        raise RecipeError("이동 주소·URL 패턴의 경로에 토큰(JWT·base64url 등) 또는 이메일로 보이는 조각이 있어 "
+    """모든 저장 URL·패턴의 경로·호스트에 토큰·이메일 조각이 있으면 거부. 자동 이름도 index_pat 기반."""
+    if _has_url_token(rec):
+        raise RecipeError("이동 주소·URL 패턴의 경로·호스트에 토큰(JWT·base64url 등) 또는 이메일로 보이는 조각이 있어 "
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
@@ -363,7 +381,8 @@ def compile_recipe(
                            "target": target}]),
             "expect": {"nav": str(expect.get("nav") or "none"),
                        "url_pat": expect.get("url_pat"),
-                       "signals": sorted({str(s) for s in expect.get("signals") or []})},
+                       "signals": sorted({kind for s in expect.get("signals") or []
+                                          if (kind := str(s).split(":", 1)[0].strip())})},
         }
         if not origin:
             if action == "navigate":

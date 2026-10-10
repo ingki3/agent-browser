@@ -90,7 +90,7 @@ def test_undecodable_or_control_char_segment_is_treated_as_token():
     "/search/" + quote("노트북과무선이어폰가방"),   # 한글 퍼센트 경로(인코딩 뒤 16자 훨씬 넘음)
     "/blog/my-post",                              # 짧은 하이픈 조각
     "/item/12345",                                # 숫자 → {n}
-    "/doc/ABCDEFGHIJKLMNOPQRST1234",              # 영숫자만 긴 조각 → {id}
+    "/doc/ABCDEFGHIJKLMNOPQRSTUVWX",              # 긴 영문만 조각은 허용(R2)
 ])
 def test_ordinary_paths_still_autosave(path):
     url = "http://mock.test" + path
