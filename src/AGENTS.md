@@ -1061,6 +1061,27 @@ Gate 3-B #8 "IPI 차단율 1.0"은 `detect_injection`을 **직접** 불러 잰 �
 신호 형식·권장 처리·한계는 README의 "프롬프트 주입 신호" 절을 보십시오. 요약: 정규식 기반이라
 우회 가능하고, 이미지 속 글자는 보지 않으며, 신호가 없다고 안전하다는 뜻이 아닙니다.
 
+#### 관찰 안내와 JSON-LD 요약 (WS-40)
+
+MCP initialize의 서버 instructions는 레시피 설정과 무관하게 먼저 `browser_observe_page`를 안내합니다.
+탭별 문서·활성 프레임·URL을 기억하고 이동(navigate·go_back·reload·탭/프레임 전환·외부 URL 변경) 뒤
+관찰하지 않은 selector 탐색 실패/모호 결과에 `data.hint`를 한 번만 붙입니다. extract 성공도 텍스트
+행의 절반 이상이 공백이거나 전체 공백 제외 글자 수가 8 미만이면 같은 안내를 받습니다. 정상 결과는
+안내를 소모하지 않고, 성공한 observe 뒤에는 붙이지 않습니다. HITL 결정은 유지하고 안내만 덧붙입니다.
+
+`perception.page_data`는 관찰 문서에서 JSON-LD를 evaluate 한 번으로 요약합니다. Product·Offer/
+AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList, 배열·@graph·중첩을 지원합니다.
+최대 5항목·압축 JSON 1,200자, 제어문자 제거·이름/brand 128자·가격/sku 등 64자·URL 256자, offers URL은
+동일 scheme·host·port의 HTTP(S)만 남깁니다. 깨진/없는 JSON은 page_data를 생략하며, 원격 context를
+가져오거나 실행하지 않습니다. 읽기 상한: 32개 script·개별 110만 자·전체 220만 자, 깊이 24·노드 5,000.
+요약도 WS-36 신호 검사 후 기존 응답 크기 상한을 거칩니다. 계약·extract 입력·ErrorCode는 무수정입니다.
+
+회귀 테스트: `tests/interface/test_ws40_observe.py` 22개 + `tests/perception/test_ws40_page_data.py` 5개,
+전체 2,739 passed·7 skipped·4 xfailed(README의 통과 수와 동일).
+로컬 독자 제작 상품/항공 Mock(`harness.ws40_mock`)만 사용합니다. hint 비활성화와 출처 필터 제거를
+실제로 파손해 테스트 실패를 확인하고 복구합니다. 전후 관찰 지연과 전체 테스트 수는
+`.hermes/state/ws40/report.md`에 기록합니다.
+
 #### 동작 캐시 — 레시피 (WS-38)
 
 `src/recipes/`(keys·store·recorder·replay·service). 에이전트가 **명시적으로 save** 한 동작 묶음을 PageKey(출처·URL 패턴·
