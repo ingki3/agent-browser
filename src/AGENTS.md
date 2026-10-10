@@ -335,7 +335,7 @@ python -m harness.egress_test
 pytest tests/harness -q
 
 # 6. Mock 사이트 20종 기동 검증 (13대 필수 시나리오 분산 배치)
-python -m harness.selfcheck --mock-sites 22
+python -m harness.selfcheck --mock-sites 25
 
 # 7. 하네스 골든셋 정합성 검증 (정답 10종 완벽 일치: recall == 1.0)
 python -m harness.recall --golden
@@ -411,16 +411,23 @@ python -m harness.latency_test --steps 100
 # 7. 참조 에이전트 태스크 완수율 (>= 60.0%, 멀티스텝 필수 포함)
 python -m harness.webarena --tasks 20
 
-# 8. 결정론적 IPI 차단율 (>= 90.0%) 및 오탐율 (FPR <= 2.0%) 동시 측정
+# 8. 결정론적 IPI 탐지율 (>= 90.0%) 및 오탐율 (FPR <= 2.0%) 동시 측정 — 제품(MCP) 경로
 python -m harness.ipi_test
 
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
+
+# 10. 동작 캐시(레시피) 재생 — 시나리오 10종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38·38b)
+python -m harness.recipe_replay
 ```
 
 > **명령어 주석**:
 > * 5·6번은 하나의 실행에서 p50과 p95를 함께 산출합니다. p95 초과 시에도 exit 1입니다.
 > * 8번은 `harness.ipi_test`입니다. `harness.wasp`는 Gate 4(v1.1) 전용입니다.
+> * 8번은 탐지기를 직접 부르지 않고 MCP 서버로 Mock 표본 페이지를 열어 `observe_page`·`extract`
+>   결과의 `data.injection_suspected` 신호로 잽니다(WS-36). 제품은 **차단하지 않고 신호만** 줍니다
+>   — 지표 이름 `ipi_block_rate`는 게이트 호환용이며 값은 '신호가 붙은 공격 표본 비율'입니다.
+>   패턴별 1:1 고유 표본이 제품 경로에서 자기 패턴 하나로 신호를 받지 못하면 exit 2입니다.
 > * 7번의 참조 에이전트는 **LLM을 호출하지 않는 결정론적 정책**입니다. 런타임 능력만
 >   측정하며, 모델 교체로 수치가 흔들리지 않아 회귀 탐지가 가능합니다.
 
@@ -1031,6 +1038,116 @@ AttributeError: 'Server' object has no attribute 'list_tools'
 > **교훈**: 사용자가 실제로 통과하는 경로와 하네스가 통과하는 경로가
 > 다르면, 지표가 만점이어도 제품은 동작하지 않습니다. 어댑터·바인딩
 > 계층은 반드시 바깥에서 안으로 호출해 검증하십시오.
+
+#### 게이트 미탐 사례: 제품 경로에 없는 탐지기 (WS-36)
+
+Gate 3-B #8 "IPI 차단율 1.0"은 `detect_injection`을 **직접** 불러 잰 수치였습니다. 그 탐지기는
+제품 경로 어디에서도 호출되지 않았습니다(`run`은 델리미터 격리만, `serve`는 아무것도 안 함).
+게다가 표본 14개는 패턴 고유성이 없어 패턴 하나를 지워도 1.0이었습니다(뮤테이션 감사).
+규칙 4 위반 — 부품 단독 수치를 제품 수치처럼 보고했습니다.
+
+| | 이전 | WS-36 |
+| :--- | :--- | :--- |
+| 측정 경로 | `detect_injection(text)` 직접 | MCP `call_tool` → 결과 `data.injection_suspected` |
+| 제품 동작 | 없음 | 모든 액션 결과의 웹 유래 텍스트에 신호(차단 아님) |
+| 패턴 고유 표본 | 0 | 15종 1:1 (빠지면 exit 2) |
+| 일반 문구 오탐 | 20건 중 18건 | 0건 (패턴을 명령형·지시 단서 요구로 좁힘) |
+| 긴 반복 입력 | 줄바꿈 2만 개 2.5초, 대시 2만 개 3.2초 | 각 < 0.2초 (이차 백트래킹 제거) |
+
+> **교훈**: "그 기능이 제품 경로에서 호출되는가"를 먼저 확인하십시오. 하네스가 부품을 직접
+> 부르면 연결이 끊겨도(또는 처음부터 없어도) 게이트는 만점입니다. 사보타주는 부품만이 아니라
+> **연결 코드**도 지워 봐야 합니다(`tests/harness/test_ws36_ipi_harness.py::test_product_path_fails_without_wiring`).
+
+신호 형식·권장 처리·한계는 README의 "프롬프트 주입 신호" 절을 보십시오. 요약: 정규식 기반이라
+우회 가능하고, 이미지 속 글자는 보지 않으며, 신호가 없다고 안전하다는 뜻이 아닙니다.
+
+#### 관찰 안내와 JSON-LD 요약 (WS-40)
+
+MCP initialize의 서버 instructions는 레시피 설정과 무관하게 먼저 `browser_observe_page`를 안내합니다.
+탭별 문서·활성 프레임·URL을 기억하고 이동(navigate·go_back·reload·탭/프레임 전환·외부 URL 변경) 뒤
+관찰하지 않은 selector 탐색 실패/모호 결과에 `data.hint`를 한 번만 붙입니다. extract 성공도 텍스트
+행의 절반 이상이 공백이거나 전체 공백 제외 글자 수가 8 미만이면 같은 안내를 받습니다. 정상 결과는
+안내를 소모하지 않고, 성공한 observe 뒤에는 붙이지 않습니다. HITL 결정은 유지하고 안내만 덧붙입니다.
+
+`perception.page_data`는 관찰 문서에서 JSON-LD를 evaluate 한 번으로 요약합니다. Product·Offer/
+AggregateOffer·Flight·Event·Article/NewsArticle·BreadcrumbList, 배열·@graph·중첩을 지원합니다.
+최대 5항목·압축 JSON 1,200자, 제어문자 제거·이름/brand 128자·가격/sku 등 64자·URL 256자, offers URL은
+동일 scheme·host·port의 HTTP(S)만 남깁니다. 깨진/없는 JSON은 page_data를 생략하며, 원격 context를
+가져오거나 실행하지 않습니다. 읽기 상한: 32개 script·개별 110만 자·전체 220만 자, 깊이 24·노드 5,000.
+요약도 WS-36 신호 검사 후 기존 응답 크기 상한을 거칩니다. 계약·extract 입력·ErrorCode는 무수정입니다.
+
+회귀 테스트: `tests/interface/test_ws40_observe.py` 22개 + `tests/perception/test_ws40_page_data.py` 5개,
+전체 2,739 passed·7 skipped·4 xfailed(README의 통과 수와 동일).
+로컬 독자 제작 상품/항공 Mock(`harness.ws40_mock`)만 사용합니다. hint 비활성화와 출처 필터 제거를
+실제로 파손해 테스트 실패를 확인하고 복구합니다. 전후 관찰 지연과 전체 테스트 수는
+`.hermes/state/ws40/report.md`에 기록합니다.
+
+#### robots.txt 의사 표시 신호 (WS-41)
+
+`security.robots_signal`은 MCP `navigate`의 최종 URL과 `observe_page`의 현재 최상위 URL을
+판정한다. `*` 그룹 금지 또는 알려진 AI UA 금지가 있으면 `data.robots`를 붙이며 **이동은 막지
+않는다**. 이는 법적 판단이 아니라 사이트의 자동 접근 의사 표시이고, 계속할지는 부르는
+에이전트가 사용자 뜻에 따라 판단한다. 허용·판정 불가에는 키를 넣지 않는다.
+
+동결 계약·ErrorCode·UA는 바꾸지 않는다. httpx 스트리밍은 기존 EgressProxy를 경유하고
+각 요청·리다이렉트 URL을 기존 egress 가드로 별도 확인한다. 컨텍스트에서 읽은 UA만 사용하며
+쿠키·인증 헤더를 보내지 않는다. Playwright 공유 파이프로 본문을 받지 않는다. 같은 출처
+(scheme·host·port) 안의 리다이렉트만 5회까지, 다운로드는 최대 512KiB에서 중단(초과는 판정 불가),
+파싱은 앞 500KiB까지다. 캐시는 최근 사용한 1,000개 출처로 제한한다. 성공·404 등 확정 결과는
+24시간, 5xx·시간초과·실패·401/403은 10분 캐시한다. 결과 대기는 최대 1.5초, 같은 fetch의 배경
+상한은 총 10초(코디네이터 명세 해석 승인); 같은 출처 동시 호출은 하나를 공유하고 종료 때 정리한다.
+
+회귀 검증은 `tests/security/test_ws41_robots_parser.py`와
+`tests/interface/test_ws41_robots_signal.py`의 합성 robots 본문·로컬 HTTP Mock만 사용한다.
+가장 긴 일치 제거·AI 판정 제거·캐시 제거·MCP 연결 제거 사보타주로 미탐을 확인한다.
+형식·의미·한계는 README의 "robots.txt 신호" 절, R1 측정과 결과는 `.hermes/state/ws41-r1/report.md`를 참조한다.
+
+#### 동작 캐시 — 레시피 (WS-38)
+
+`src/recipes/`(keys·store·recorder·replay·service). 통과한 동작 묶음을 PageKey(출처·URL 패턴·
+골격 서명·준비 수) + Target(slot·ui·identity) + Expect 로 저장하고, `browser_recipe run` 으로 재생한다. 기본 켬
+(`serve --no-recipes` 로 끔 — 자동 저장 포함), `--profile` 이면 프로필 폴더 `recipes.json`(0600), 없으면 메모리.
+
+WS-38b 자동 저장(2026-10-10 사용자 결정): 통과 단계를 **구간**(navigate·출처 변경·끊김·20단계 초과에서 새로 시작)으로
+나눠, 2단계 이상이면 구간 전체를 레시피 하나로 upsert(구간당 1개·같은 구조면 합침·기존 레시피 앞부분이면 구간 끝까지
+미룸). 입력 글자는 전부 자동 params(칸 라벨 → `검색어`, 없으면 `text1`…), 비밀 단계 이후·민감 키 이동·원문 누출 구간은
+조용히 저장 안 함 — R1: 토큰·이메일·전화번호가 보이는 흐름(경로 JWT·base64url·이메일, 대상 이름 PII)도 저장 안 함(save 는 이유와 함께 거부), select_option 값도 자동 params, 누출 비교는 NFKC+casefold, 상한 정리는 자동 레시피부터(`.hermes/state/ws38b-r1/report.md`). 알림은 구간 첫 저장 때 `data.recipe_saved` 한 번(`recipe_hint` 폐지). save 는 이름·params 를 바꿀
+때만(같은 구조 자동 레시피를 덮어씀, `auto: false`). 오염은 재생 쪽 관문(골격·유일성·Expect·신원 가드·3회 실패 끔)이 막는다.
+기록 단계당 추가 지연(200개·~1MB, write-through)은 p50 0.6ms — `.hermes/state/ws38b/report.md`.
+
+| 원칙 | 구현 |
+| :--- | :--- |
+| 재생도 같은 관문 | 단계마다 새 핸들 → 서버 `call_tool`(HITL·egress·TOCTOU·WS-37 신원 가드·IPI 신호), 치유 끔(`heal_disabled`) |
+| 어긋나면 멈춤 | 7종 사유(`page_changed`·`not_ready`·`target_not_found`·`target_ambiguous`·`expect_mismatch`·`approval_required`·`action_failed`) + 현재 관찰 |
+| 텍스트 유사도·좌표 재생 금지 | M-1 오일치 사례(해외여행→해외여행자보험, 같은 자리 다른 광고) — 이름은 정확히 같음, 위치는 ui 450px 가드에만 |
+| 기본 경로 비용 | 레시피 없는 출처의 관찰은 dict 조회 하나(골격 계산 없음). 기록은 액션당 evaluate 1회 |
+
+측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 10종(⑩ save 없이 자동 저장 → 새 세션 run), 오클릭 하나라도
+exit 2, 커버리지 10/10. 사보타주
+(틀 확인 제거·순번 무시·골격 확인 제거·URL 패턴 확인 제거)에서 exit 2 확인. 뮤테이션 표·성능은 `.hermes/state/ws38/report.md`,
+R1(독립 검증 NB 수정)은 `.hermes/state/ws38-r1/report.md`.
+
+R1 보강: navigate 의 params 치환은 경로 조각·쿼리 값에만(scheme·host·port 금지, 자리표시자는 늘 퍼센트 인코딩)
++ 재생 때 렌더된 URL 출처 ≠ 저장된 틀 출처면 `page_changed`. 치환 안 된 쿼리 값은 버리고(키만, save 응답
+`data.dropped_query_values`), 민감 키(token·session·sid·auth·key·code·email·password·secret 류) 값은 params 로도 거부.
+이동 뒤 `chrome-error://`·빈 출처는 이동 성공이 아니다(재생 `expect_mismatch`, 기록 안 함). 목록 항목 ≥3 개의 대상
+href 가 완전히 같으면 자리표시자로 보고 준비 대기와 같은 상한(2초)까지 기다린 뒤 `not_ready`.
+
+> **교훈**: 하네스의 '오클릭' 판정은 재생 엔진의 자기 보고가 아니라 Mock 서버 요청 기록(무엇이 열렸나)으로 한다 —
+> 엔진이 성공이라 해도 다른 기사를 열었으면 오클릭이다.
+
+#### 모호한 selector — 승인 대신 모호함 오류 (WS-39)
+
+`click(selector)` 가 2~50개 요소에 맞으면 게이트(`BrowserMCPServer._ambiguous_low_risk`)가 후보 전부를 기존
+`assess_risk`(이름·selector·문맥 신호)로 보고, **모두** HIGH 가 아니면 누르지 않고 `E_ELEMENT_NOT_FOUND` +
+`data.ambiguous_target`(후보 최대 5개, 이름은 `safe_page_text`) + `reobserve_required` 로 돌려준다(승인 증표 없음).
+하나라도 HIGH·50개 초과·0개·읽기 실패는 기존 판정 불가(승인 경로) 그대로. `click:*` 로 게이트가 열려도
+디스패처(`_handle_for_selector`)가 같은 모양으로 거부한다. 형제 액션은 계약상 selector 를 받지 않아 이 경로에 오지
+않는다. 레시피 재생은 element_id 로만 실행하므로 `target_ambiguous` 와 겹치지 않는다. 테스트
+`tests/interface/test_ws39_ambiguous_selector.py`(14개, 사보타주: 고위험 후보 검사 제거·첫 요소 클릭에서 실패 확인).
+
+> **교훈**: fail-closed 는 '누르지 않음'이지 '사람에게 보냄'이 아니다. 에이전트가 스스로 풀 수 있는 실패(모호함)를
+> 사람 승인으로 보내면 승인 명령을 칠 수 없는 사용자(텔레그램)에서 진행이 멈춘다(실사용 2026-10-10, '항공편 더보기').
 
 #### SDK 메이저 호환 (WS-14)
 

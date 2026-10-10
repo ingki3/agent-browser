@@ -45,6 +45,7 @@ JUDGMENT_HARNESSES: List[Tuple[str, str]] = [
     ("latency_test", "관찰+액션 구간 모두 측정"),
     ("ipi_test", "정상 표본 대비 오탐율 동시 측정"),
     ("webarena", "멀티스텝 태스크 포함"),
+    ("recipe_replay", "레시피 재생 시나리오 10종 전수 + 오클릭 0(하나라도 exit 2)"),  # WS-38
     # --- WS-9 실환경 ---
     ("agent_eval", "난이도 3단계 전수 실행 + 자기보고와 독립 검증 분리"),
     # --- Gate 4 (Stage 4 Tier-2 SoM) ---

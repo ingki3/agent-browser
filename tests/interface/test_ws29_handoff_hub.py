@@ -167,9 +167,19 @@ def test_human_holder_blocks_manipulation(hub: HandoffHub, action: ActionType):
 
 @pytest.mark.parametrize("command", ["create", "switch", "close"])
 def test_human_holder_blocks_tab_changes(hub: HandoffHub, command: str):
+    args = {"command": command}
+    # 대조: agent 가 쥐고 있으면 같은 명령은 허용(None) — '항상 막는' 구현을 걸러낸다.
+    assert hub.control_blocks(ActionType.TAB_CONTROL, args) is None
     write_command(hub.root, hub.server_id, "take")
     hub.poll()
-    assert hub.control_blocks(ActionType.TAB_CONTROL, {"command": command}) is not None
+    blocked = hub.control_blocks(ActionType.TAB_CONTROL, args)
+    assert blocked is not None
+    assert blocked["holder"] == "human"
+    assert blocked["how_to_wait"] == "browser_control_wait"
+    assert blocked["secret_wanted"] is False
+    assert blocked["since"]  # 사람이 언제부터 쥐었는지 안내
+    assert set(blocked) == {"holder", "reason", "since", "secret_wanted", "request_id",
+                            "how_to_wait"}
 
 
 @pytest.mark.parametrize("action,args", [(a, {}) for a in OBSERVATION]
@@ -514,7 +524,12 @@ def test_agent_cannot_lower_secret_wanted_by_rerequesting(hub: HandoffHub):
     hub.request("비밀번호 입력", secret_wanted=True)
     hub.request("다시", secret_wanted=False)
     assert hub.status()["secret_wanted"] is True
-    assert hub.control_blocks(ActionType.OBSERVE_PAGE, {}) is not None
+    blocked = hub.control_blocks(ActionType.OBSERVE_PAGE, {})
+    assert blocked is not None
+    # 차단 내용: 비밀 입력 대기라 관찰까지 막고, 그 사유가 낮아지지 않았음을 싣는다.
+    assert blocked["secret_wanted"] is True
+    assert blocked["how_to_wait"] == "browser_control_wait"
+    assert blocked["request_id"] == hub.status()["request_id"]
     write_command(hub.root, hub.server_id, "release")
     hub.poll()
     assert hub.control_blocks(ActionType.OBSERVE_PAGE, {}) is None

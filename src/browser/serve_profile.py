@@ -324,6 +324,91 @@ def acquire(name: str, *, server_id: str, root: Optional[Path] = None) -> Profil
 # ---------------------------------------------------------------------------- 목록·삭제
 
 
+def cookie_sites(name: str) -> List[Dict[str, object]]:
+    """Read only domain/expiry metadata via a consistent SQLite backup (includes WAL).
+
+    No cookie name/value column is selected. A 0700 scratch directory and 0600
+    snapshot are deleted even on failure; a running Chromium keeps its own lock.
+    """
+    import sqlite3
+    import tempfile
+
+    path = profile_dir(name)
+    _refuse_symlink(path.parent)
+    _refuse_symlink(path)
+    if not path.exists():
+        raise ProfileError(f"프로필 {name!r} 이 없습니다.")
+    candidates = [path / "Default" / "Network" / "Cookies", path / "Default" / "Cookies"]
+    source = next((p for p in candidates if p.exists()), None)
+    if source is None:
+        return []
+    for parent in (path / "Default", source.parent):
+        _refuse_symlink(parent)
+    if source.is_symlink() or not source.is_file():
+        raise ProfileError("Cookies DB 가 일반 파일이 아닙니다.")
+    scratch = Path.home() / ".hermes" / "cache" / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ab-cookie-sites-", dir=scratch) as tmp:
+        snapshot = Path(tmp) / "cookies.sqlite"
+        snapshot.touch(mode=0o600)
+        deadline = time.monotonic() + 2
+
+        def progress(status: int, remaining: int, total: int) -> None:
+            # SQLite's backup retries BUSY/LOCKED indefinitely even when the
+            # connection timeout is set. Bound retries as well as elapsed time.
+            nonlocal retries
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                retries += 1
+            if retries >= 20 or time.monotonic() >= deadline:
+                raise ProfileError("쿠키 DB 잠금 또는 복사 시간이 초과됐습니다; 잠시 뒤 다시 실행하세요.")
+
+        retries = 0
+        try:
+            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0.1) as db:
+                with sqlite3.connect(snapshot) as copy:
+                    db.backup(copy, pages=256, progress=progress, sleep=0.05)
+            with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as copy:
+                metadata = copy.execute("SELECT host_key, expires_utc FROM cookies").fetchall()
+        except sqlite3.Error:
+            raise ProfileError("쿠키 메타데이터를 읽을 수 없습니다(Chromium DB 상태 확인).") from None
+    return summarize_cookie_sites(metadata)
+
+
+def bound_cookie_sites(sites: List[Dict[str, object]]) -> tuple[List[Dict[str, object]], bool]:
+    """Use the same 12KB serialized rows limit in Hub and SQLite CLI responses."""
+    bounded: List[Dict[str, object]] = []
+    size = 0
+    for row in sites:
+        size += len(json.dumps(row, ensure_ascii=True).encode("ascii")) + 2
+        if size > 12000:
+            break
+        bounded.append(row)
+    return bounded, len(bounded) < len(sites)
+
+
+def summarize_cookie_sites(metadata: List[tuple[str, int]]) -> List[Dict[str, object]]:
+    """Domain/expiry only; never accepts cookie names or values."""
+    from interface.on_demand import registrable_domain
+
+    grouped: Dict[str, List[int]] = {}
+    for host, expires in metadata:
+        domain = registrable_domain(str(host).lstrip("."))
+        if domain:
+            grouped.setdefault(domain, []).append(int(expires))
+    rows: List[Dict[str, object]] = []
+    for domain, expiries in sorted(grouped.items()):
+        latest = max(expiries)
+        # Chromium microseconds since 1601-01-01, zero means session cookie.
+        try:
+            expiry = _dt.datetime.fromtimestamp(latest / 1_000_000 - 11644473600,
+                                               _dt.timezone.utc).isoformat() if latest > 0 else None
+        except (ValueError, OverflowError, OSError):
+            expiry = None
+        rows.append({"domain": domain, "expires_at": expiry,
+                     "session_only": all(e <= 0 for e in expiries)})
+    return rows
+
+
 def _size(path: Path) -> int:
     total = 0
     for dirpath, _dirs, files in os.walk(path, followlinks=False):

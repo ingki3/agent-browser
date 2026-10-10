@@ -33,6 +33,37 @@ def test_create_server_does_not_crash():
     assert server is not None
     assert backend is not None
 
+    # 살아 있기만 하고 tools/list 가 비거나 어긋나면 Claude Desktop 연동은 여전히 죽은 것이다.
+    # 브라우저 없이 실제 ClientSession -> SDK -> 서버 바인딩 경로로 목록을 받아 이름 집합을 비교한다.
+    import anyio
+    from mcp.client.session import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from contracts import ActionType
+
+    async def _list_names() -> list:
+        names: list = []
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    lambda: server.run(server_streams[0], server_streams[1],
+                                       server.create_initialization_options())
+                )
+                async with ClientSession(*client_streams) as session:
+                    await session.initialize()
+                    names = [t.name for t in (await session.list_tools()).tools]
+                tg.cancel_scope.cancel()
+        return names
+
+    names = anyio.run(_list_names)
+    expected = {f"browser_{a.value}" for a in ActionType} | {
+        "browser_control_request", "browser_control_status",
+        "browser_control_wait", "browser_approval_wait",
+        "browser_recipe",  # WS-38 동작 캐시(기본 켬)
+    }
+    assert len(names) == len(set(names)) == 24
+    assert set(names) == expected
+
 
 def test_schema_field_is_resolved_dynamically():
     """Tool 스키마 필드명을 하드코딩하면 안 된다.

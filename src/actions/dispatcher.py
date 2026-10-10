@@ -40,11 +40,13 @@ from actions.healing import (
     HealingCandidate,
     HealingResult,
     heal,
+    identity_change_refused,
     is_retry_safe,
 )
 from actions.verification import (
     PostConditionResult,
     capture_state,
+    safe_page_text,
     verify_post_condition,
     verify_staleness,
 )
@@ -507,6 +509,76 @@ _TARGET_INFO_JS = (
     .replace("__GATE_SIGNALS__", _GATE_SIGNALS_JS.strip())
 )
 
+#: WS-39: 여러 요소에 맞는 selector 의 후보 전부 — 게이트 판정 정보(_TARGET_INFO_JS) + role·가시성.
+#: role 추론은 관찰 수집기(perception.sanitizer.COLLECT_SCRIPT 의 inferRole)와 같은 규칙.
+_CANDIDATES_INFO_JS = (
+    """
+(els) => {
+  const info = __INFO__;
+  function inferRole(el) {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit.toLowerCase();
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'a') return el.hasAttribute('href') ? 'link' : 'generic';
+    if (tag === 'button' || tag === 'summary') return 'button';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'option') return 'option';
+    if (tag === 'input') {
+      const t = (el.type || 'text').toLowerCase();
+      if (t === 'checkbox') return 'checkbox';
+      if (t === 'radio') return 'radio';
+      if (t === 'submit' || t === 'button' || t === 'reset' || t === 'image') return 'button';
+      if (t === 'hidden') return 'none';
+      return 'textbox';
+    }
+    return 'generic';
+  }
+  function visible(el) {
+    const cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  return els.map((el) => {
+    const out = info(el);
+    out.role = inferRole(el);
+    out.visible = visible(el);
+    return out;
+  });
+}
+""".replace("__INFO__", _TARGET_INFO_JS.strip())
+)
+
+#: WS-39: 모호한 selector 의 후보를 몇 개까지 읽어 판정하는가. 넘으면 후보 전부를 볼 수 없으니
+#: 기존 판정 불가(fail-closed, 승인 경로)로 둔다 — 고위험 후보가 섞였는지 확인하지 못한다.
+AMBIGUOUS_SCAN_CAP = 50
+#: 결과에 싣는 후보 수 상한.
+AMBIGUOUS_REPORT_CAP = 5
+
+
+def ambiguous_message(count: int) -> str:
+    """모호한 selector 의 오류 문구(서버 문구 — 페이지 유래 문자열을 섞지 않는다)."""
+    return (f"selector 가 {int(count)}개 요소에 맞습니다 — browser_observe_page 로 관찰한 뒤 "
+            "element_id 로 다시 고르세요")
+
+
+def ambiguous_target_view(count: int, infos: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """결과 data.ambiguous_target — {count, candidates:[{role, name, visible}] 최대 5개}.
+
+    이름은 페이지가 정한 문자열이라 공백을 하나로 접고 `safe_page_text` 로 제어문자를 보이는 표기로
+    바꿔 자른다(WS-37 규칙). IPI 신호는 서버 call_tool 의 결과 검사가 이 칸까지 본다(WS-36).
+    """
+    candidates = []
+    for info in list(infos)[:AMBIGUOUS_REPORT_CAP]:
+        name = " ".join(str(info.get("name") or "").split())
+        candidates.append({
+            "role": safe_page_text(info.get("role") or "", 40),
+            "name": safe_page_text(name),
+            "visible": bool(info.get("visible")),
+        })
+    return {"count": int(count), "candidates": candidates}
+
 #: WS-31: 좌표 클릭이 실제로 누르는 요소 — 최상위 뷰포트 좌표에서 elementFromPoint 로 찾고
 #: 같은 출처 iframe(테두리·패딩만큼 좌표를 옮겨)·open shadow 를 따라 내려간다. 반환은 요소
 #: 자체(CDP 원격 객체) 또는 판정 불가 사유 문자열('opaque' 다른 출처 iframe, 'none' 요소 없음).
@@ -943,6 +1015,10 @@ class ActionDispatcher:
 
         정확히 1개일 때만 {"name": …}. 0개·여러 개·읽기 실패면 {"unresolved": 사유} —
         게이트는 이를 고위험으로 본다(fail-closed).
+
+        WS-39: 2개 이상(상한 `AMBIGUOUS_SCAN_CAP` 이하)이면 후보 전부의 판정 정보를 함께 싣는다 —
+        {"unresolved", "ambiguous": {"count", "infos": [...]}}. 게이트가 후보를 하나씩 기존 판정으로
+        보고, 모두 저위험일 때만 승인 대신 '모호함' 오류로 돌려준다(어느 쪽이든 누르지 않는다).
         """
         try:
             locator = self.ctx.page.locator(selector)
@@ -950,7 +1026,16 @@ class ActionDispatcher:
         except Exception as exc:  # noqa: BLE001
             return {"unresolved": f"selector 해석 실패: {type(exc).__name__}"}
         if count != 1:
-            return {"unresolved": f"selector 가 {count}개 요소에 맞음"}
+            out: Dict[str, Any] = {"unresolved": f"selector 가 {count}개 요소에 맞음"}
+            if 2 <= count <= AMBIGUOUS_SCAN_CAP:
+                try:
+                    infos = await locator.evaluate_all(_CANDIDATES_INFO_JS)
+                except Exception:  # noqa: BLE001 — 못 읽으면 기존 판정 불가 그대로
+                    infos = None
+                # 읽는 사이 수가 바뀌었으면(동적 페이지) 후보를 다 봤다고 할 수 없다.
+                if isinstance(infos, list) and len(infos) == count:
+                    out["ambiguous"] = {"count": count, "infos": infos}
+            return out
         try:
             info = await locator.first.evaluate(_TARGET_INFO_JS)
         except Exception as exc:  # noqa: BLE001
@@ -1432,20 +1517,52 @@ class ActionDispatcher:
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
+        if not staleness.fresh and identity_change_refused(staleness.reason, action):
+            # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
+            # 바뀌었다(제자리 교체). 치유 사다리의 어느 단계로 골라도(testid 유지·비슷한
+            # 이름·같은 경로) 다른 요소를 누를 수 있으므로 사다리를 돌리지 않고 재관찰을 요구한다.
+            before_role = params.get("expected_role") or handle.role
+            before_name = (
+                params.get("expected_name")
+                if params.get("expected_name") is not None
+                else handle.name
+            )
+            return self._identity_changed_result(
+                action,
+                staleness.error_code or ErrorCode.TOCTOU_MISMATCH,
+                f"Staleness 검증 실패({staleness.reason.value}) — 치유하지 않음",
+                (before_role, before_name),
+                (staleness.observed_role, staleness.observed_name),
+                {},
+            )
         if not staleness.fresh:
             # 부작용이 없는 시점이므로 치유가 안전하다.
-            healing = await self._attempt_heal(handle)
+            healing = await self._attempt_heal(handle, action)
             if not healing.healed or healing.candidate is None:
+                fail_data: Dict[str, Any] = {"healing_attempts": healing.attempts}
+                swapped = healing.identity_refused
+                if swapped is not None:
+                    # WS-37 R2: 앞단 가드를 지나온 사유(요소가 사라진 NODE_DETACHED)에서 사다리의
+                    # 어느 단계가 role/name 이 다른 요소를 골랐다 — heal() 채택 지점이 부작용
+                    # 액션이라 거부했고 누르지 않았다. (디스패처에서 EPOCH_MISMATCH 는 핸들 조회가
+                    # 먼저 막아 여기 오지 않는다.) 요소를 '못 찾은' 것이 아니라 관찰과 다른 요소를
+                    # 찾은 것이므로 앞단 가드와 같은 E_TOCTOU_MISMATCH 로 보고한다.
+                    return self._identity_changed_result(
+                        action,
+                        ErrorCode.TOCTOU_MISMATCH,
+                        f"Staleness 검증 실패({staleness.reason.value}) 및 자가 치유 거부",
+                        (handle.role, handle.name),
+                        (swapped.role, swapped.name),
+                        fail_data,
+                    )
                 return self._result(
                     success=False,
                     action=action,
                     retry_safe=True,
                     error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
-                    error_message=(
-                        f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패"
-                    ),
+                    error_message=f"Staleness 검증 실패({staleness.detail}) 및 자가 치유 실패",
                     reobserve_required=True,
-                    data={"healing_attempts": healing.attempts},
+                    data=fail_data,
                 )
             new_handle = self.ctx.engine.get_handle(healing.candidate.element_id)
             if new_handle is None:
@@ -1471,6 +1588,21 @@ class ActionDispatcher:
                 success=False, action=action, retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_FOUND,
                 error_message=f"selector 를 해석할 수 없습니다: {selector} ({exc})",
+            )
+        if count > 1:
+            # WS-39: 게이트(사전 승인 click:* 등)를 지나와도 모호하면 누르지 않는다 — 게이트의 모호함
+            # 오류와 같은 모양(ambiguous_target·재관찰)으로 알린다.
+            target = await self.describe_selector_target(selector)
+            amb = target.get("ambiguous") or {}
+            data: Dict[str, Any] = {"match_count": count}
+            if amb.get("infos"):
+                data["ambiguous_target"] = ambiguous_target_view(count, amb["infos"])
+            return self._result(
+                success=False, action=action, retry_safe=True,
+                error_code=ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=ambiguous_message(count),
+                reobserve_required=True,
+                data=data,
             )
         if count != 1:
             return self._result(
@@ -1831,8 +1963,50 @@ class ActionDispatcher:
 
     # -- 치유 ---------------------------------------------------------------
 
-    async def _attempt_heal(self, handle: ElementHandle) -> HealingResult:
-        """재관찰 후 자가 치유 사다리를 가동한다."""
+    def _identity_changed_result(
+        self,
+        action: ActionType,
+        error_code: ErrorCode,
+        lead: str,
+        before: Tuple[Optional[str], Optional[str]],
+        after: Tuple[Optional[str], Optional[str]],
+        data: Dict[str, Any],
+    ) -> ActionResult:
+        """제자리 교체 거부 응답: E_TOCTOU_MISMATCH 계열 + 재관찰 + element_changed/hint.
+
+        이름·role 은 페이지가 정한 문자열이라 `safe_page_text` 로 제어문자를 보이는 표기로
+        바꾸고 80자로 자른다. error_message 는 안내(hint)를 한 번만 싣는다 — staleness.detail
+        에 같은 이름이 또 들어 있으므로 함께 붙이지 않는다(검증 NB-4: 같은 문자열 4중 적재).
+        """
+        b_role, b_name = (safe_page_text(v) for v in before)
+        a_role, a_name = (safe_page_text(v) for v in after)
+        hint = (
+            f"요소가 바뀜(이전 {b_role} '{b_name}' → 현재 {a_role} '{a_name}') — 다시 관찰하라"
+        )
+        out = dict(data)
+        out["element_changed"] = {
+            "before": {"role": b_role, "name": b_name},
+            "after": {"role": a_role, "name": a_name},
+        }
+        out["hint"] = hint
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=error_code,
+            error_message=f"{lead}: {hint}",
+            reobserve_required=True,
+            data=out,
+        )
+
+    async def _attempt_heal(
+        self, handle: ElementHandle, action: Optional[ActionType] = None
+    ) -> HealingResult:
+        """재관찰 후 자가 치유 사다리를 가동한다.
+
+        ``action`` 이 부작용 액션이면 어느 단계든 role/name 이 바뀐 요소를 채택하지
+        않는다(`actions.healing.heal` 채택 지점, `path_heal_allowed`).
+        """
         self._healing_attempts += 1
 
         result = await self.ctx.engine.observe_page(
@@ -1852,7 +2026,7 @@ class ActionDispatcher:
                 )
             )
 
-        healing = heal(handle, candidates)
+        healing = heal(handle, candidates, action=action)
         if healing.healed:
             self._healing_successes += 1
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)

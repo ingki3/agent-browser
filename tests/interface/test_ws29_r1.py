@@ -556,10 +556,21 @@ def test_approvals_are_capped(hub: HandoffHub):
 # ======================================================================= 8. pid 재사용 (NB-6)
 
 
-def test_server_json_records_uid_and_start(hub: HandoffHub):
-    info = json.loads((hub.dir / "server.json").read_text())
+def test_server_json_records_uid_and_start(tmp_path: Path):
+    import time
+
+    t0 = time.time()
+    h = HandoffHub(tmp_path / "servers", browser_mode="human")
+    h.open()
+    try:
+        t1 = time.time()
+        info = json.loads((h.dir / "server.json").read_text())
+    finally:
+        h.close()
     assert info["uid"] == os.geteuid()
     assert isinstance(info["started"], (int, float))
+    # pid 재사용 판정(NB-6)의 기준 시각이므로 0·과거값이 아니라 open 시각이어야 한다.
+    assert t0 - 1.0 <= info["started"] <= t1 + 1.0, (t0, info["started"], t1)
 
 
 def test_pid_reused_by_other_user_counts_as_dead(root: Path, monkeypatch):
@@ -732,6 +743,73 @@ async def test_real_human_closes_agent_tab_then_release(site):
         assert obs.error_code is None and "/esc" in obs.current_url
 
 
+@requires_chromium
+async def test_release_notice_survives_watcher_winning_the_poll(site, monkeypatch):
+    """결정적 재현: 감시 태스크가 반납을 먼저 집어가고 복구가 느린(CDP 세션 생성 지연) 순서를 고정.
+
+    WS-37: 복구를 Future 로 직렬화해(_recover_closed_tab_serialized) control_wait 가 진행 중인 복구를
+    기다린 뒤 응답한다 — 전에는 ~10% 로 tab_closed_by_human 이 빠졌다(WS-35 R2 §3)."""
+    async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
+        _visible(s)
+        await s.call_tool("browser_navigate", {"url": site + "/"})
+        first = s._core.active_tab_id
+        await s.call_server_tool("browser_control_request", {"reason": "확인"})
+        assert await _human("control", "take") == 0
+        ctx = s._core.context_for("mcp-session")
+        other = await ctx.new_page()
+        await other.goto(site + "/esc")
+        await s._page.close()
+        real_cdp = s._core.new_cdp_session
+
+        async def slow_cdp(*a: Any, **k: Any) -> Any:
+            await asyncio.sleep(0.5)  # 복구가 느린 순간(실측 실패 때의 순서를 늘려 고정)
+            return await real_cdp(*a, **k)
+
+        monkeypatch.setattr(s._core, "new_cdp_session", slow_cdp)
+        waiter = asyncio.ensure_future(s.call_server_tool("browser_control_wait", {"timeout_s": 20}))
+        await asyncio.sleep(0.2)  # waiter 가 대기 루프(0.05초 잠) 안에 있다
+        write_command(s.hub.root, s.hub.server_id, "release")
+        watcher_poll = asyncio.ensure_future(s._poll_handoff())  # _watch_handoff 한 바퀴와 같다
+        got = await waiter
+        await watcher_poll
+        assert got["data"]["changed"] == "released"
+        notice = got["data"].get("tab_closed_by_human")
+        assert notice is not None and notice["closed_tab_id"] == first, got["data"]
+
+
+@requires_chromium
+async def test_tool_call_during_watcher_recovery_waits_for_new_tab(site, monkeypatch):
+    """WS-37 형제 경로: 감시 태스크가 복구 중일 때 들어온 도구 호출(observe·control_status)도 복구를
+    기다린다 — 닫힌 탭을 관찰하지 않고, status 에 알림이 실린다."""
+    async with BrowserMCPServer(handoff_root=Path(handoff.state_root())) as s:
+        _visible(s)
+        await s.call_tool("browser_navigate", {"url": site + "/"})
+        first = s._core.active_tab_id
+        await s.call_server_tool("browser_control_request", {"reason": "확인"})
+        assert await _human("control", "take") == 0
+        ctx = s._core.context_for("mcp-session")
+        other = await ctx.new_page()
+        await other.goto(site + "/esc")
+        await s._page.close()
+        real_cdp = s._core.new_cdp_session
+
+        async def slow_cdp(*a: Any, **k: Any) -> Any:
+            await asyncio.sleep(0.5)
+            return await real_cdp(*a, **k)
+
+        monkeypatch.setattr(s._core, "new_cdp_session", slow_cdp)
+        write_command(s.hub.root, s.hub.server_id, "release")
+        watcher_poll = asyncio.ensure_future(s._poll_handoff())  # 감시 태스크가 반납을 먼저 집는다
+        await asyncio.sleep(0.05)  # 복구가 느린 CDP 세션 생성에서 멈춰 있다
+        assert s._release_recovery is not None and not s._release_recovery.done()
+        status = await s.call_server_tool("browser_control_status", {})
+        obs = await s.call_tool("browser_observe_page", {})
+        await watcher_poll
+        notice = status["data"].get("tab_closed_by_human")
+        assert notice is not None and notice["closed_tab_id"] == first, status["data"]
+        assert obs.success and obs.error_code is None and "/esc" in obs.current_url, obs
+
+
 # ======================================================================= 뮤테이션 보강 (R1)
 
 
@@ -796,6 +874,9 @@ async def test_dispatcher_heal_disabled_never_substitutes(site):
             s._dispatcher.heal_disabled = False
         assert not r.success and r.healed is False and r.data.get("heal_disabled") is True
         assert await s._page.text_content("#out") == "대기"
-        # 대조: 끄지 않으면 치유가 일어난다(검증자 probe_heal 의 원래 동작)
+        # 대조: 끄지 않으면 치유 사다리가 돈다(검증자 probe_heal 의 원래 동작). WS-37 R2 부터
+        # 부작용 액션은 이름이 다른 후보('결제 하기')를 채택하지 않아 3단계에서 거부·재관찰.
         r2 = await s._dispatcher.dispatch(ActionType.CLICK, {"element_id": eid, "epoch": ep})
-        assert r2.healed is True
+        assert "text_similarity(identity_changed)" in r2.data.get("healing_attempts", []), r2.data
+        assert r2.healed is False and r2.reobserve_required is True
+        assert await s._page.text_content("#out") == "대기"

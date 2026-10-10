@@ -14,6 +14,7 @@ from perception.engine import ElementHandle
 from actions import (
     DEFAULT_LADDER,
     IDEMPOTENT_ACTIONS,
+    READ_ONLY_ACTIONS,
     SHADOW_LADDER,
     SIDE_EFFECT_ACTIONS,
     FailurePhase,
@@ -24,7 +25,9 @@ from actions import (
     heal,
     is_retry_safe,
     ladder_for,
+    path_heal_allowed,
     verify_post_condition,
+    verify_staleness,
 )
 
 
@@ -82,7 +85,8 @@ def test_stage2_testid_when_name_changed():
     """이름이 바뀌어도 testid가 같으면 2단계에서 치유되어야 한다."""
     target = make_handle(name="로그인", testid="login-btn")
     candidate = make_candidate(name="Sign In", testid="login-btn", css_path="다름")
-    result = heal(target, [candidate])
+    # 이름이 다른 대체는 읽기 액션만 채택한다(WS-37 R2, 부작용 액션은 test_ws37_r2_adopt_guard).
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TESTID
 
@@ -91,7 +95,7 @@ def test_stage3_text_similarity_for_minor_change():
     """문구가 조금 바뀐 경우 3단계 유사도로 치유한다."""
     target = make_handle(name="장바구니 담기")
     candidate = make_candidate(name="장바구니에 담기", css_path="다름")
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
 
@@ -114,7 +118,7 @@ def test_stage3_handles_short_label_suffix_extension(before, after):
     """
     target = make_handle(name=before)
     candidate = make_candidate(name=after, css_path="다름")
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True, f"{before!r} -> {after!r} 치유 실패"
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
 
@@ -158,7 +162,7 @@ def test_stage3_proceeds_when_one_candidate_is_clearly_better():
         make_candidate(element_id="@e1", name="로그인하기", css_path="a"),
         make_candidate(element_id="@e2", name="회원가입", css_path="b"),
     ]
-    result = heal(target, candidates)
+    result = heal(target, candidates, action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.TEXT_SIMILARITY
     assert result.candidate is not None
@@ -172,14 +176,84 @@ def test_label_similarity_is_symmetric():
 
 
 def test_stage4_css_path_last_resort():
-    """role/name/testid가 모두 달라도 CSS 경로가 같으면 4단계로 치유한다."""
+    """읽기 액션이면 role/name/testid가 모두 달라도 CSS 경로가 같으면 4단계로 치유한다."""
     target = make_handle(role="button", name="확인", css_path="form > button#go")
     candidate = make_candidate(
-        role="button", name="전혀 다른 이름", css_path="form > button#go"
+        role="menuitem", name="전혀 다른 이름", css_path="form > button#go"
     )
-    result = heal(target, [candidate])
+    result = heal(target, [candidate], action=ActionType.HOVER)
     assert result.healed is True
     assert result.strategy is HealingStrategy.CSS_PATH
+    assert result.identity_refused is None
+
+
+#: WS-37: 같은 자리(css_path)에 role/name 이 바뀐 요소 — 이름만 / 역할만 / 둘 다
+_SWAPPED = [
+    ("name", "button", "회원 탈퇴"),
+    ("role", "checkbox", "확인"),
+    ("both", "menuitem", "광고: 대출 상담"),
+]
+
+
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+@pytest.mark.parametrize(
+    "action", sorted(set(ActionType) - set(READ_ONLY_ACTIONS), key=lambda a: a.value)
+)
+def test_stage4_refuses_swapped_element_for_side_effect_actions(action, kind, role, name):
+    """WS-37 결함1: 부작용 액션은 경로 단계로 제자리 교체된 요소를 고르지 않는다."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    swapped = make_candidate(role=role, name=name, css_path="form > button#go")
+    result = heal(target, [swapped], action=action)
+    assert result.healed is False and result.candidate is None
+    assert result.identity_refused is swapped
+    assert result.attempts[-1] == "css_path(identity_changed)"
+    assert "확인" in result.reason and name in result.reason and role in result.reason
+
+
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+def test_stage4_unknown_action_is_fail_closed(kind, role, name):
+    """action 을 모르면(None) 부작용으로 본다."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    result = heal(target, [make_candidate(role=role, name=name, css_path="form > button#go")])
+    assert result.healed is False and result.identity_refused is not None
+
+
+def test_shadow_piercing_stage_has_same_guard():
+    target = make_handle(name="확인", css_path="x-app >>> button", is_shadow=True)
+    swapped = make_candidate(name="회원 탈퇴", css_path="x-app >>> button", is_shadow=True)
+    refused = heal(target, [swapped], action=ActionType.CLICK)
+    assert refused.healed is False and refused.attempts[-1] == "css_piercing(identity_changed)"
+    ok = heal(target, [swapped], action=ActionType.EXTRACT)
+    assert ok.healed is True and ok.strategy is HealingStrategy.CSS_PIERCING
+
+
+@pytest.mark.parametrize("action", sorted(READ_ONLY_ACTIONS, key=lambda a: a.value))
+@pytest.mark.parametrize("kind,role,name", _SWAPPED, ids=[k for k, _, _ in _SWAPPED])
+def test_stage4_read_actions_keep_path_healing(action, kind, role, name):
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    result = heal(target, [make_candidate(role=role, name=name, css_path="form > button#go")],
+                  action=action)
+    assert result.healed is True and result.strategy is HealingStrategy.CSS_PATH
+
+
+def test_read_only_actions_exclude_every_state_changing_action():
+    """읽기 집합에 부작용 액션(재시도 불가 집합 + 선택·체크)이 섞이면 가드가 뚫린다."""
+    assert not (set(READ_ONLY_ACTIONS) & set(SIDE_EFFECT_ACTIONS))
+    for action in (*SIDE_EFFECT_ACTIONS, ActionType.SELECT_OPTION, ActionType.CHECK_BOX):
+        assert path_heal_allowed(action) is False, action
+    assert path_heal_allowed(None) is False
+    assert set(READ_ONLY_ACTIONS) == {
+        ActionType.OBSERVE_PAGE, ActionType.TAKE_SCREENSHOT, ActionType.SCROLL,
+        ActionType.HOVER, ActionType.WAIT_FOR, ActionType.EXTRACT,
+    }
+
+
+def test_side_effect_action_still_heals_same_identity_at_other_path():
+    """가드는 경로 단계만 막는다: 같은 role+name 이 옮겨지면 클릭도 1단계로 치유."""
+    target = make_handle(role="button", name="확인", css_path="form > button#go")
+    moved = make_candidate(role="button", name="확인", css_path="section > button")
+    result = heal(target, [moved], action=ActionType.CLICK)
+    assert result.healed is True and result.strategy is HealingStrategy.ROLE_NAME
 
 
 def test_ladder_order_prefers_earlier_stage():
@@ -241,6 +315,51 @@ def test_harness_requires_all_ladder_stages():
     assert not missing, f"하네스가 유발하지 않는 치유 단계: {missing}"
 
 
+def test_harness_stage4_positive_uses_read_action_and_refusals_are_side_effect():
+    """WS-37: 4단계 양성은 읽기 액션으로, 부작용 액션 제자리 교체는 거부(음성) 케이스로."""
+    from harness.self_healing import MUTATION_CASES, REQUIRED_REFUSALS, REQUIRED_STAGES
+
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    negative = [c for c in MUTATION_CASES if c.expect_refusal]
+    assert {c.expected_stage for c in positive} == set(REQUIRED_STAGES)
+    stage4 = [c for c in positive if c.expected_stage == "css_path"]
+    assert stage4 and all(c.action in READ_ONLY_ACTIONS for c in stage4)
+    assert {c.expect_refusal for c in negative} == set(REQUIRED_REFUSALS)
+    assert all(c.action not in READ_ONLY_ACTIONS for c in negative)
+
+
+def test_harness_cases_reach_product_heal_path():
+    """WS-37 R1: 음성은 testid·비슷한 이름 경로까지(검증 B1·NB-2), 양성은 제품에서 사다리에 닿는 액션.
+
+    extract 는 디스패처가 element_id 를 받지 않아 제품 경로에서 치유에 닿지 않는다(검증 NB-5).
+    """
+    from harness.self_healing import ADOPT_GUARD, FRONT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
+
+    assert {"testid", "similar"} <= set(REQUIRED_REFUSALS)
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    negative = [c for c in MUTATION_CASES if c.expect_refusal]
+    assert all(c.action is not ActionType.EXTRACT for c in positive)
+    assert all(c.expected_stage in (FRONT_GUARD, ADOPT_GUARD) for c in negative)
+    assert not {FRONT_GUARD, ADOPT_GUARD} & {c.expected_stage for c in positive}
+
+
+def test_harness_r2_adopt_guard_cases():
+    """WS-37 R2: 2·3단계는 부작용(click, 같은 정규화 신원) 양성과 읽기(hover, 다른 이름) 양성을
+    모두 갖고, 요소가 사라진 자리의 다른 신원(N1·N1b·N2 형 + 역할만 다름)은 채택 지점 거부 음성."""
+    from harness.self_healing import ADOPT_GUARD, MUTATION_CASES, REQUIRED_REFUSALS
+
+    positive = [c for c in MUTATION_CASES if not c.expect_refusal]
+    for stage in ("testid", "text_similarity"):
+        actions = {c.action in READ_ONLY_ACTIONS for c in positive if c.expected_stage == stage}
+        assert actions == {True, False}, (stage, actions)
+    detached = {"detached_testid", "detached_testid_role", "detached_role_only", "detached_similar"}
+    assert detached <= set(REQUIRED_REFUSALS)
+    adopt = [c for c in MUTATION_CASES if c.expect_refusal in detached]
+    assert {c.expect_refusal for c in adopt} == detached
+    assert all(c.expected_stage == ADOPT_GUARD and c.script and "remove()" in c.script
+               for c in adopt)
+
+
 def test_harness_required_stages_match_ladder():
     """REQUIRED_STAGES가 실제 사다리 정의와 어긋나면 안 된다."""
     from harness.self_healing import REQUIRED_STAGES
@@ -288,10 +407,47 @@ def test_idempotent_and_side_effect_sets_are_disjoint():
     assert IDEMPOTENT_ACTIONS & SIDE_EFFECT_ACTIONS == set()
 
 
+#: (액션 × 실패 단계) 기대 판정 — 소스가 아니라 PRD §4.1 멱등성 열과 §4.3 흐름도에서 옮겼다.
+#: PRE_DISPATCH: 브라우저에 아무 이벤트도 가지 않았으므로 모든 액션이 안전(§4.3 1단계).
+#: POST_DISPATCH: §4.1 멱등성 Yes 만 안전. No(부작용: 키 입력·대화상자 응답·파일 업·다운로드)와
+#: '실패단계 종속'(click·type_text = 발송 뒤엔 이중 제출 위험)은 불가. tab_control 은 'Depends'
+#: 지만 create/close 가 탭을 만들고 닫는 부작용이라 명령을 모르는 판정에서는 보수적으로 불가.
+_POST_DISPATCH_SAFE = {
+    ActionType.OBSERVE_PAGE: True,
+    ActionType.TAKE_SCREENSHOT: True,
+    ActionType.NAVIGATE: True,
+    ActionType.GO_BACK: True,
+    ActionType.RELOAD: True,
+    ActionType.CLICK: False,
+    ActionType.TYPE_TEXT: False,
+    ActionType.SELECT_OPTION: True,
+    ActionType.CHECK_BOX: True,
+    ActionType.SCROLL: True,
+    ActionType.HOVER: True,
+    ActionType.PRESS_KEY: False,
+    ActionType.WAIT_FOR: True,
+    ActionType.EXTRACT: True,
+    ActionType.SWITCH_FRAME: True,
+    ActionType.HANDLE_DIALOG: False,
+    ActionType.UPLOAD_FILE: False,
+    ActionType.DOWNLOAD_FILE: False,
+    ActionType.TAB_CONTROL: False,
+}
+
+
 def test_every_action_type_has_a_retry_verdict():
-    """19종 전부가 판정 가능해야 한다."""
-    for action in ActionType:
-        assert isinstance(is_retry_safe(action, FailurePhase.POST_DISPATCH), bool)
+    """19종 각각이 단계별로 PRD 가 정한 판정을 내야 한다(bool 이기만 하면 통과하던 것을 조임)."""
+    assert set(_POST_DISPATCH_SAFE) == set(ActionType) and len(_POST_DISPATCH_SAFE) == 19
+    wrong = {
+        action.value: (
+            is_retry_safe(action, FailurePhase.PRE_DISPATCH),
+            is_retry_safe(action, FailurePhase.POST_DISPATCH),
+        )
+        for action in ActionType
+        if is_retry_safe(action, FailurePhase.PRE_DISPATCH) is not True
+        or is_retry_safe(action, FailurePhase.POST_DISPATCH) is not _POST_DISPATCH_SAFE[action]
+    }
+    assert wrong == {}, f"(PRE, POST) 판정이 PRD 와 다름: {wrong}"
 
 
 # ---------------------------------------------------------------------------
@@ -946,3 +1102,69 @@ def test_combo_keys_normalize_each_part():
 def test_empty_key_stays_empty():
     assert _normalize_key("") == ""
     assert _normalize_key("   ") == ""
+
+
+# ---------------------------------------------------------------------------
+# 5. staleness 판정 겹별 단독 고정 (WS-35 R2 — 뮤테이션 V1·V2·V3)
+# ---------------------------------------------------------------------------
+
+
+class _ProbePage:
+    """STALENESS_CHECK_SCRIPT 의 재조회 결과를 정해 주는 페이지 대역. 호출 여부도 센다."""
+
+    def __init__(self, probe: dict) -> None:
+        self.probe, self.calls = probe, 0
+
+    async def evaluate(self, script: str, arg: object = None) -> dict:
+        self.calls += 1
+        return self.probe
+
+
+async def test_staleness_epoch_mismatch_alone():
+    """V1: 에포크가 다르면 노드가 멀쩡해도(같은 role/name) 재조회 없이 EPOCH_MISMATCH.
+
+    엔진 bump_epoch 의 핸들 비우기·get_handle 에포크 검사와 겹치는 방어라 다른 테스트로는
+    이 겹 하나만 빠진 것을 못 잡는다(감사 EQUIVALENT) — 여기서 단독으로 고정한다.
+    """
+    page = _ProbePage({"connected": True, "role": "button", "name": "로그인"})
+    result = await verify_staleness(page, make_handle(epoch=0), current_epoch=1)
+    assert result.fresh is False
+    assert result.reason is StalenessReason.EPOCH_MISMATCH
+    assert result.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert "0" in result.detail and "1" in result.detail
+    assert page.calls == 0, "에포크가 다르면 페이지를 다시 볼 필요도 없다"
+    same = await verify_staleness(page, make_handle(epoch=1), current_epoch=1)
+    assert same.fresh and same.reason is StalenessReason.FRESH  # 대조
+
+
+@pytest.mark.parametrize(
+    "probe,reason,observed",
+    [
+        ({"connected": True, "role": "button", "name": "회원 탈퇴"},
+         StalenessReason.NAME_CHANGED, ("button", "회원 탈퇴")),
+        ({"connected": True, "role": "checkbox", "name": "로그인"},
+         StalenessReason.ROLE_CHANGED, ("checkbox", "로그인")),
+        # 둘 다 바뀌면 role 이 먼저 보고된다(판정 순서 고정)
+        ({"connected": True, "role": "link", "name": "광고"},
+         StalenessReason.ROLE_CHANGED, ("link", "광고")),
+    ],
+    ids=["name", "role", "both"],
+)
+async def test_staleness_role_name_change_is_toctou(probe, reason, observed):
+    """V2·V3: 같은 css_path 에 연결된 노드라도 role/name 이 다르면 TOCTOU (광고 로테이션 방어)."""
+    result = await verify_staleness(_ProbePage(probe), make_handle(), current_epoch=0)
+    assert result.fresh is False
+    assert result.reason is reason
+    assert result.error_code is ErrorCode.TOCTOU_MISMATCH
+    assert (result.observed_role, result.observed_name) == observed
+
+
+async def test_staleness_expected_overrides_handle():
+    """호출자의 expected_role/expected_name 이 핸들 값보다 우선한다."""
+    page = _ProbePage({"connected": True, "role": "button", "name": "로그인"})
+    r = await verify_staleness(page, make_handle(), 0, expected_name="로그아웃")
+    assert r.reason is StalenessReason.NAME_CHANGED
+    r = await verify_staleness(page, make_handle(), 0, expected_role="link")
+    assert r.reason is StalenessReason.ROLE_CHANGED
+    r = await verify_staleness(page, make_handle(), 0)
+    assert r.fresh and r.reason is StalenessReason.FRESH  # 대조

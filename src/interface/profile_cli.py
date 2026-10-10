@@ -16,6 +16,9 @@ def add_parser(sub: Any) -> None:
     psub = prof.add_subparsers(dest="profile_action", required=True)
     p_list = psub.add_parser("list", help="영속 프로필 목록(이름·크기·마지막 사용·사용 중).")
     p_list.add_argument("--json", action="store_true", help="JSON 으로 출력")
+    p_sites = psub.add_parser("sites", help="쿠키가 있는 사이트만 표시(로그인 여부를 보증하지 않음).")
+    p_sites.add_argument("name", help="프로필 이름")
+    p_sites.add_argument("--json", action="store_true", help="JSON 으로 출력")
     p_rm = psub.add_parser("remove", help="영속 프로필을 지웁니다(로그인이 사라집니다).")
     p_rm.add_argument("name", help="프로필 이름")
     p_rm.add_argument("--yes", "-y", action="store_true", help="확인 없이 지웁니다")
@@ -98,6 +101,41 @@ def _cmd_remove(name: str, yes: bool) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.profile_action == "sites":
+        from browser.serve_profile import ProfileError, bound_cookie_sites, cookie_sites
+        from interface.handoff import display_safe
+        from interface import handoff
+
+        try:
+            truncated = False
+            from browser.serve_profile import validate_name
+
+            validate_name(args.name)
+            live = [s for s in handoff.list_servers() if s.get("profile") == args.name]
+            if live:
+                sid = live[0]["server_id"]
+                nonce = handoff.write_command(None, sid, "cookie_sites")
+                ack = handoff.wait_ack(None, sid, nonce)
+                if not ack or not ack.get("ok"):
+                    raise ProfileError("서버의 쿠키 메타데이터 응답이 없습니다; 잠시 뒤 다시 실행하세요.")
+                rows = ack["sites"]
+                truncated = bool(ack.get("truncated"))
+            else:
+                rows, truncated = bound_cookie_sites(cookie_sites(args.name))
+        except ProfileError as exc:
+            print(f"agent-browser profile sites: {display_safe(str(exc))}", file=sys.stderr)
+            return 2
+        notice = "쿠키 있음 표시이며 로그인 상태를 보증하지 않습니다."
+        if args.json:
+            print(json.dumps({"sites": rows, "notice": notice, "truncated": truncated}, ensure_ascii=True))
+        else:
+            print(notice)
+            if truncated:
+                print("사이트 목록이 응답 크기 상한으로 잘렸습니다.")
+            for row in rows:
+                print(f"{display_safe(row['domain'])}: 만료={row['expires_at'] or '없음'} "
+                      f"세션 쿠키만={'예' if row['session_only'] else '아니오'}")
+        return 0
     if args.profile_action == "list":
         return _cmd_list(bool(args.json))
     return _cmd_remove(args.name, bool(args.yes))

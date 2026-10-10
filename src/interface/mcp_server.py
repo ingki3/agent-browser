@@ -19,13 +19,18 @@ MCP 서버는 stdio로 구동되며 클라이언트 연결당 하나의 브라�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from weakref import WeakSet
+
+from playwright.async_api import Frame
 
 from contracts import (
     ACTION_INPUT_MAP,
@@ -165,17 +170,70 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
             "required": ["approval_id"],
         },
     },
+    # WS-38 동작 캐시(레시피). serve --no-recipes 면 목록에서 뺀다(build_server_tools).
+    f"{TOOL_PREFIX}recipe": {
+        "description": (
+            "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 "
+            "이어감. save: 이름·params 바꿀 때만(last_n). list·delete"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {"enum": ["save", "run", "list", "delete"]},
+                "id": {"type": "string", "description": "run·delete 대상 레시피 id"},
+                "name": {"type": "string", "description": "save 할 이름"},
+                "last_n": {"type": "integer", "minimum": 1, "maximum": 20,
+                           "description": "save: 최근 통과 단계 수"},
+                "params": {"type": "object", "description": "{이름: 값} — save 는 입력한 글자, run 은 새 값"},
+                "pins": {"type": "object", "description": "save: {\"단계번호\": \"identity\"} (slot|ui|identity)"},
+            },
+            "required": ["op"],
+        },
+    },
 }
 
+#: 레시피 서버 도구 이름(WS-38).
+RECIPE_TOOL = f"{TOOL_PREFIX}recipe"
 
-def build_server_tools() -> List[Dict[str, Any]]:
-    """계약 밖 서버 도구 정의(WS-29). 액션 툴 목록(build_all_tools)과 합쳐 tools/list 가 된다."""
-    return [{"name": name, **spec} for name, spec in SERVER_TOOLS.items()]
+OBSERVE_INSTRUCTIONS = (
+    "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다"
+)
+UNOBSERVED_HINT = (
+    "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
+)
 
 
-def build_listed_tools() -> List[Dict[str, Any]]:
+@dataclass
+class _PageObservation:
+    context_id: int
+    url: str
+    observed: bool = False
+    hinted: bool = False
+
+
+#: MCP initialize 의 서버 instructions(WS-38·38b — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.
+RECIPE_INSTRUCTIONS = (
+    "agent-browser: 통과한 흐름(2단계 이상)은 레시피로 자동 저장됩니다(입력 글자는 params, 결과 "
+    "data.recipe_saved).\n"
+    "observe_page 결과 data.recipes 에 후보가 있으면 단계별로 하기 전에 browser_recipe run 을 먼저 "
+    "시도하세요. save 는 이름·params 를 바꾸고 싶을 때만.\n"
+    "run 이 멈추면(data.recipe.reason + 현재 관찰) 그 지점부터 평소대로 진행하세요. 재생도 승인·차단 "
+    "관문을 그대로 지납니다."
+)
+
+
+def build_server_tools(recipes: bool = True) -> List[Dict[str, Any]]:
+    """계약 밖 서버 도구 정의(WS-29). 액션 툴 목록(build_all_tools)과 합쳐 tools/list 가 된다.
+
+    recipes=False(serve --no-recipes)면 레시피 도구(WS-38)를 뺀다.
+    """
+    return [{"name": name, **spec} for name, spec in SERVER_TOOLS.items()
+            if recipes or name != RECIPE_TOOL]
+
+
+def build_listed_tools(recipes: bool = True) -> List[Dict[str, Any]]:
     """MCP tools/list 전체 = 액션 툴 19종 + 서버 도구."""
-    return build_all_tools() + build_server_tools()
+    return build_all_tools() + build_server_tools(recipes)
 
 
 _DESCRIPTIONS: Dict[ActionType, str] = {
@@ -394,6 +452,8 @@ def code_overlay_text(code: str, kind: str, target: str, ttl_s: int) -> str:
 #: WS-29 R2: 확인 코드를 띄우기 전, 이미 진행 중인 화면 캡처가 끝나길 기다리는 상한(초). 넘으면
 #: 표시를 취소한다(코드 무효 — fail-closed). 무거운 페이지 SoM 캡처 실측 수백 ms 의 10배 이상.
 CAPTURE_DRAIN_TIMEOUT_S = 5.0
+#: WS-37: 조작권 반납 때 진행 중인 닫힌 탭 복구(CDP 세션 생성 등)를 기다리는 상한(초).
+RELEASE_RECOVERY_WAIT_S = 10.0
 
 #: 승인 증표로 실행했는데 결과가 이 코드면 실행 여부가 불확실하다(outcome_unknown, 재시도 금지).
 _UNCERTAIN_CODES = frozenset({
@@ -599,6 +659,7 @@ class BrowserMCPServer:
         approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
         handoff_root: Any = None,
         profile: Optional[str] = None,
+        recipes: bool = True,
     ) -> None:
         from interface.handoff import HandoffHub, state_root
 
@@ -614,6 +675,14 @@ class BrowserMCPServer:
                 )
         self.profile = profile
         self._profile_lock: Any = None
+        #: WS-38 동작 캐시(레시피). 기본 켬(serve --no-recipes 로 끔). --profile 이면 프로필 폴더의
+        #: recipes.json(0600), 없으면 메모리만.
+        self.recipes_enabled = bool(recipes)
+        self._recipes: Any = None
+        if self.recipes_enabled:
+            from recipes.service import RecipeService
+
+            self._recipes = RecipeService(self)
         #: WS-34 on-demand 창 상태(다른 방식이면 None — 기존 동작 그대로).
         from interface.on_demand import ON_DEMAND, WindowState
 
@@ -651,6 +720,7 @@ class BrowserMCPServer:
         self.hub = HandoffHub(
             root=handoff_root if handoff_root is not None else state_root(),
             browser_mode=browser_mode,
+            profile=profile,
             approval_ttl_s=approval_ttl_s,
         )
         self._hub_task: Any = None
@@ -668,6 +738,9 @@ class BrowserMCPServer:
         self._captures_inflight = 0
         #: 사람이 에이전트 활성 탭을 닫았음(조작권 반납 때 확인, NB-3) — control_wait/status 로 알린다.
         self._tab_notice: Optional[Dict[str, Any]] = None
+        #: WS-37: 진행 중인 닫힌 탭 복구(반납 처리). 감시 태스크가 반납을 먼저 집어 복구하는 동안
+        #: 다른 호출(control_wait 등)이 복구가 끝나기 전에 '반납됨' 을 알리지 않도록 기다리는 데 쓴다.
+        self._release_recovery: Optional["asyncio.Future[None]"] = None
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
         self.allow_private_network = allow_private_network
         self.block_loopback = block_loopback
@@ -708,6 +781,12 @@ class BrowserMCPServer:
         self._http_status: Dict[str, Any] = {"last_http_status": None}
         #: 탭(페이지)별 메인 문서 상태(WS-26b). start() 가 context 에 단다.
         self._page_status: Any = None
+        #: WS-40: 탭별 마지막 문서/프레임 관찰 여부와 한 번만 내보내는 안내.
+        self._page_observations: Dict[str, _PageObservation] = {}
+        self._observation_watches: WeakSet = WeakSet()
+        from security.robots_signal import RobotsSignals
+
+        self._robots = RobotsSignals()  # WS-41: server-memory intent signal cache
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -851,7 +930,30 @@ class BrowserMCPServer:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if events and self._recipes is not None and ("taken" in events or "released" in events):
+            self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
         for event in events:
+            if event == "cookie_sites":
+                from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
+                from interface.handoff import _write_private
+
+                jobs, self.hub.site_jobs = self.hub.site_jobs, []
+                try:
+                    context = self._core.context_for("mcp-session") if self._core else None
+                    cookies = await context.cookies() if context else []
+                    sites = (cookie_sites(self.profile) if context is None and self.profile else
+                             summarize_cookie_sites([(c["domain"], int((c["expires"] + 11644473600) * 1_000_000)
+                             if c["expires"] > 0 else 0) for c in cookies]))
+                    bounded, truncated = bound_cookie_sites(sites)
+                    for nonce in jobs:
+                        # No control/reason/URL metadata in this response: sites only.
+                        _write_private(self.hub.dir / f"ack-{nonce}.json",
+                                       {"ok": True, "sites": bounded, "truncated": truncated})
+                except Exception:
+                    for nonce in jobs:
+                        _write_private(self.hub.dir / f"ack-{nonce}.json", {"ok": False})
+            if event == "login":
+                self._spawn_login()
             if event == "released":
                 self._release_unreported = True
                 # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
@@ -862,7 +964,7 @@ class BrowserMCPServer:
                     # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
                     self._on_demand_released()
                 else:
-                    await self._recover_closed_tab()
+                    await self._recover_closed_tab_serialized()
                 await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
@@ -877,7 +979,142 @@ class BrowserMCPServer:
         if self._window is not None:
             await self._watch_window()
         await self._sync_code_overlay()
+        # WS-37: 다른 태스크(감시 태스크)가 반납을 먼저 집어 복구 중이면 끝날 때까지 기다린다 —
+        # 이 함수가 돌아온 뒤 호출자가 보는 상태(반납·탭 알림)가 어긋나지 않게.
+        await self._await_release_recovery()
         return events
+
+    def _login_hint(self) -> str:
+        if self.profile is None:
+            return "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
+        from urllib.parse import urlsplit
+        import re
+        import shlex
+        from browser.serve_profile import ProfileError, validate_name
+
+        origin = None
+        try:
+            parts = urlsplit(self._current_origin())
+            if parts.scheme in ("http", "https") and parts.hostname:
+                host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+                port = parts.port
+                if (re.fullmatch(r"[a-z0-9.-]+|\[[0-9a-f:.]+\]", host)
+                        and (port is None or isinstance(port, int))):
+                    origin = f"{parts.scheme}://{host}"
+                    if port is not None:
+                        origin += f":{port}"
+        except ValueError:
+            pass
+        try:
+            profile = validate_name(self.profile)
+        except ProfileError:
+            profile = "<프로필 이름>"
+        if origin is None:
+            return f"맥에서: 페이지 주소를 확인한 뒤 agent-browser login <페이지 주소> --profile {profile}"
+        return f"맥에서: agent-browser login {shlex.quote(origin)} --profile {profile}"
+
+    def _spawn_login(self) -> None:
+        """Human CLI job: same drain/window/release paths as control take, no MCP action added."""
+        job = self.hub.login
+        if job is None or job.status != "pending":
+            return
+        job.status = "opening"
+        self._hold_gate()
+
+        async def run() -> None:
+            from interface.login_cli import display_available
+            from interface.handoff import write_command
+
+            try:
+                if not self._human_can_see() or not display_available():
+                    raise ValueError("창 없는 환경(headless 전용 또는 DISPLAY 없음). 맥 앞에서 실행하세요.")
+                self.hub._apply({"op": "take"})
+                self.hub.secret_wanted = True  # Human login contents stay out of observations.
+                self.hub._write_control()
+                if self._recipes is not None:
+                    self._recipes.reset("human_control")
+                if not await self._drain_calls():
+                    raise ValueError("진행 중인 도구 호출이 끝나지 않았습니다.")
+                if self.hub.login is not job:
+                    return
+                # run_stdio reserves the profile but starts Chromium lazily.
+                if not self._started:
+                    await self.start()
+                if self.hub.login is not job:
+                    return
+                if self._window is not None:
+                    out = await self._switch_window(True, "taken")
+                    if not out.get("ok"):
+                        raise ValueError("로그인 창 전환 실패")
+                if self.hub.login is not job:
+                    return
+                context = self._core.context_for("mcp-session")
+                # context.new_page guarantees a NEW tab (core.new_tab may adopt a blank one).
+                page = await context.new_page()
+                await page.goto(job.url, wait_until="domcontentloaded")
+                await page.bring_to_front()
+                if self.hub.login is not job:
+                    return
+                # Reuse take's window-only banner on the new human login tab.
+                # Preserve the agent's active tab; its dispatcher resumes there.
+                active = self._core.active_tab_id
+                tab = self._core.tab_for_page(page)
+                if tab is not None:
+                    self._core.set_active_tab(tab.tab_id)
+                    try:
+                        await self._show_control_banner("사람이 로그인 중 — 끝나면 터미널에서 Enter 또는 로그인 탭 닫기")
+                    finally:
+                        if self._core.get_tab(active) is not None:
+                            self._core.set_active_tab(active)
+                job.status = "ready"
+                page.on("close", lambda: write_command(self.hub.root, self.hub.server_id,
+                        "login_finish", login_id=job.login_id) if self.hub.opened and self.hub.login is job else None)
+                self.hub._write_control()
+                self.hub._ack(job.nonce, True, "로그인 창을 열었습니다.")
+            except Exception:
+                # Never echo a navigation exception (may contain a URL query/token).
+                self.hub._ack(job.nonce, False, "로그인 창을 열 수 없습니다. 맥 앞에서 서버/화면/egress 정책을 확인하세요.")
+                if self.hub.login is job:
+                    write_command(self.hub.root, self.hub.server_id, "login_finish", login_id=job.login_id)
+            finally:
+                self._release_gate()
+
+        task = asyncio.create_task(run())
+        self._window_tasks.add(task)
+        task.add_done_callback(self._window_tasks.discard)
+
+    async def _recover_closed_tab_serialized(self) -> None:
+        """닫힌 탭 복구를 Future 로 감싸 진행 중임을 알린다(WS-37 반납 알림 경쟁 조건).
+
+        Future 는 첫 await 전에 만든다 — hub.poll() 이 'released' 를 돌려준 같은 동기 구간 안이라,
+        hub.version 이 바뀐 것을 본 다른 태스크는 반드시 이 Future 도 본다.
+        """
+        fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self._release_recovery = fut
+        try:
+            await self._recover_closed_tab()
+        finally:
+            if not fut.done():
+                fut.set_result(None)
+            if self._release_recovery is fut:
+                self._release_recovery = None
+
+    async def _await_release_recovery(self) -> None:
+        """진행 중인 닫힌 탭 복구가 있으면 끝날 때까지(상한 RELEASE_RECOVERY_WAIT_S) 기다린다."""
+        deadline = time.monotonic() + RELEASE_RECOVERY_WAIT_S
+        while True:
+            fut = self._release_recovery
+            if fut is None or fut.done():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("닫힌 탭 복구가 %.0f초 안에 끝나지 않음", RELEASE_RECOVERY_WAIT_S)
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), remaining)
+            except asyncio.TimeoutError:
+                logger.warning("닫힌 탭 복구가 %.0f초 안에 끝나지 않음", RELEASE_RECOVERY_WAIT_S)
+                return
 
     # -- 확인 코드 오버레이 (WS-29 R1) ------------------------------------------
 
@@ -1116,6 +1353,8 @@ class BrowserMCPServer:
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
+        if name == RECIPE_TOOL:
+            return await self._recipe_tool(args)
         if not self.hub.opened:
             self.open_handoff()
         if not self.hub.opened:
@@ -1134,11 +1373,35 @@ class BrowserMCPServer:
                 data["tab_closed_by_human"] = self._tab_notice
             return {"success": True, "data": data}
         if short == "control_request":
-            return await self._control_request(args)
+            result = await self._control_request(args)
+            result.setdefault("data", {}).setdefault("login_hint", self._login_hint())
+            return result
         timeout = _wait_timeout(args.get("timeout_s"))
         if short == "control_wait":
             return await self._control_wait(timeout)
         return await self._approval_wait(str(args.get("approval_id") or ""), timeout)
+
+    async def _recipe_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """browser_recipe(WS-38). 응답 data 도 IPI 신호 경로를 거친다(레시피 이름·중단 사유·관찰)."""
+        if self._recipes is None:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "레시피가 꺼져 있습니다(serve --no-recipes)."}
+        payload = await self._recipes.tool(args)
+        data = payload.get("data")
+        if isinstance(data, dict) and "injection_suspected" not in data:
+            from security.injection_signal import injection_signal
+
+            signal = injection_signal(data, None, 10 * self.max_result_chars)
+            if signal is not None:
+                data["injection_suspected"] = signal
+        return payload
+
+    def _recipe_page(self) -> Any:
+        """레시피 기록·재생 대상 페이지. 프레임 안이면 None(지원하지 않음)."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        if ctx is None or getattr(ctx, "root_page", None) is not None:
+            return None
+        return getattr(ctx, "page", None)
 
     async def _control_request(self, args: Dict[str, Any]) -> Dict[str, Any]:
         reason = str(args.get("reason") or "").strip()
@@ -1153,6 +1416,7 @@ class BrowserMCPServer:
                 "중 하나로 다시 띄우도록 요청하세요."
             )
             data: Dict[str, Any] = {"control": self.hub.status(), "browser_mode": self.browser_mode}
+            data["login_hint"] = self._login_hint()
             if self.profile is not None:
                 # WS-32: 영속 프로필이면 창 있는 서버로 한 번 로그인해 두면 headless 에서도 유지된다.
                 message += (
@@ -1185,6 +1449,8 @@ class BrowserMCPServer:
                     "data": {"window": window_out.get("window") or self._window.info()},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
+        out["login_hint"] = self._login_hint()
+        out["how_to_respond"] += " " + out["login_hint"]
         page = getattr(getattr(self._dispatcher, "ctx", None), "page", None) or self._page
         try:
             await page.bring_to_front()
@@ -1258,6 +1524,9 @@ class BrowserMCPServer:
             window = self._take_window_report()
         data: Dict[str, Any] = {"control": self._control_view(), "changed": changed}
         if changed == "released":
+            # WS-37: 감시 태스크가 복구 중이었다면 위 _poll_handoff 가 그 복구를 기다린 뒤 돌아왔다
+            # (복구 Future) — 창이 없는(복구를 하는) 경로에서는 그 뒤로 await 가 없으므로 아래
+            # tab_closed_by_human 은 빠지지 않는다.
             self._release_unreported = False
             data["hint"] = _RELEASE_HINT
             data["snapshot_epoch"] = self._engine.epoch if self._engine else 0
@@ -1698,6 +1967,9 @@ class BrowserMCPServer:
         return None
 
     async def close(self) -> None:
+        await self._robots.close()  # WS-41: join background requests before closing their context
+        if self._recipes is not None:
+            self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)
         task, self._hub_task = self._hub_task, None
         if task is not None:
             task.cancel()
@@ -1749,7 +2021,12 @@ class BrowserMCPServer:
         WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
         캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
         """
+        from interface.on_demand import SWITCH_WAIT_S
+
         capture: Dict[str, Any] = {}
+        if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
+            return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                     ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
         if self._window is not None:
             # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
             blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
@@ -1764,6 +2041,28 @@ class BrowserMCPServer:
                 result = await self._call_tool(name, arguments, capture)
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            action = action_from_tool(name)
+            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+                result.data["login_hint"] = self._login_hint()
+            if action is not None:
+                await self._attach_observation_guidance(action, arguments or {}, result)
+            if action in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
+                from security.robots_signal import attach_robots_signal
+
+                ctx = getattr(self._dispatcher, "ctx", None)
+                page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+                await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+            # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
+            # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
+            # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
+            # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
+            from security.injection_signal import attach_injection_signal
+
+            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
+            # 부분은 늘 검사 범위 안이다.
+            attach_injection_signal(result, max_scan_chars=10 * self.max_result_chars)
+            # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
+            cap_result_size(result, self.max_result_chars)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
                 self._attach_window_report(result)
             return result
@@ -1771,6 +2070,83 @@ class BrowserMCPServer:
             self._inflight -= 1
             if capture:
                 self._captures_inflight -= 1
+
+    def _observation_state(self) -> Optional[_PageObservation]:
+        """Track active tab/context and URL without a browser round trip."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None)
+        if page is None:
+            return None
+        tab_id = str(getattr(ctx, "tab_id", ""))
+        url = str(getattr(page, "url", ""))
+        state = self._page_observations.get(tab_id)
+        if state is None or state.context_id != id(page) or state.url != url:
+            state = self._page_observations[tab_id] = _PageObservation(id(page), url)
+        top = getattr(ctx, "root_page", None) or page
+        # Page events also catch external/same-URL reloads. Frame contexts share
+        # their root's listener; unrelated subframe navigation does not reset it.
+        if hasattr(top, "on") and top not in self._observation_watches:
+            self._observation_watches.add(top)
+
+            def moved(frame: Frame) -> None:
+                current = self._page_observations.get(tab_id)
+                if current is not None and (frame.parent_frame is None
+                                            or current.context_id == id(frame)):
+                    current.observed = current.hinted = False
+                    current.url = frame.url
+
+            top.on("framenavigated", moved)
+            top.on("close", lambda: self._page_observations.pop(tab_id, None))
+        return state
+
+    @staticmethod
+    def _sparse_extract(result: ActionResult) -> bool:
+        """Sparse = >= half blank text rows, or < eight non-whitespace chars.
+
+        Count text only: raw attributes do not turn empty page text into a useful
+        extraction. Evaluate before the output cap so truncation cannot fake sparsity.
+        """
+        items = result.data.get("items", [])
+        rows = [items] if isinstance(items, dict) else items if isinstance(items, list) else []
+        texts = [str(row.get("text", "") or "") for row in rows if isinstance(row, dict)]
+        compact = ["".join(text.split()) for text in texts]
+        return not compact or 2 * sum(not text for text in compact) >= len(compact) or sum(
+            len(text) for text in compact) < 8
+
+    async def _attach_observation_guidance(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult,
+    ) -> None:
+        state = self._observation_state()
+        if state is None:
+            return
+        moved = action in {ActionType.NAVIGATE, ActionType.GO_BACK, ActionType.RELOAD,
+                           ActionType.SWITCH_FRAME} or (
+            action is ActionType.TAB_CONTROL and params.get("command") != "list")
+        if result.success and moved:
+            state.observed = state.hinted = False
+        if action is ActionType.OBSERVE_PAGE and result.success:
+            state.observed = True
+            from perception.page_data import summarize_page_data
+
+            summary = await summarize_page_data(self._dispatcher.ctx.page)
+            if summary:
+                result.data["page_data"] = summary
+        selector_failed = not result.success and result.error_code in {
+            ErrorCode.ELEMENT_NOT_FOUND, ErrorCode.ELEMENT_NOT_INTERACTABLE,
+            ErrorCode.FRAME_NOT_FOUND, ErrorCode.SHADOW_ROOT_NOT_FOUND,
+        }
+        # The existing HITL gate refuses ambiguous/unresolved selectors before
+        # dispatch. Its decision stays intact; guidance still helps resolve them.
+        basis = result.data.get("gate_basis")
+        selector_failed = selector_failed or (
+            not result.success and result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED
+            and isinstance(basis, dict) and basis.get("source") == "unresolved")
+        sparse = action is ActionType.EXTRACT and result.success and self._sparse_extract(result)
+        if (params.get("selector") or params.get("frame_selector")) and (
+                selector_failed or sparse) and not state.observed and not state.hinted:
+            if "hint" not in result.data:
+                result.data["hint"] = UNOBSERVED_HINT
+                state.hinted = True
 
     async def _call_wait_tool(self, name: str, arguments: Dict[str, Any],
                               capture: Dict[str, Any]) -> ActionResult:
@@ -1826,6 +2202,8 @@ class BrowserMCPServer:
             await self._poll_handoff()
         control = self.hub.control_blocks(action, params)
         if control is not None:
+            if self._recipes is not None:
+                self._recipes.reset("human_control")
             what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
             return self._error_result(
                 action,
@@ -1876,6 +2254,8 @@ class BrowserMCPServer:
 
         params = normalize_action_params(action, params)
 
+        self._observation_state()
+
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         self._pending_gate_basis = None
         self._used_approval = None
@@ -1883,9 +2263,13 @@ class BrowserMCPServer:
         if blocked is not None:
             return blocked
 
+        # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
+        recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None else None
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
+        # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
+        target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
         if used is not None:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
@@ -1901,19 +2285,36 @@ class BrowserMCPServer:
                 self._dispatcher.heal_disabled = False
         if used is not None:
             self._attach_approval_outcome(used, result)
-        result = self._attach_egress_block(action, params, result, blocks_before)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS:
             await self._attach_challenge(result)
-        # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-        cap_result_size(result, self.max_result_chars)
+        if self._recipes is not None:
+            # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
+            self._recipes.post(action, params, recipe_pre, result, used is not None)
+            if action is ActionType.OBSERVE_PAGE:
+                await self._recipes.observe(result)
+        # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
+    def _handle_href(self, params: Dict[str, Any]) -> Optional[str]:
+        """element_id 대상 핸들의 href(링크가 아니거나 핸들이 없으면 None)."""
+        eid = params.get("element_id")
+        if not eid or self._engine is None:
+            return None
+        try:
+            handle = self._engine.get_handle(eid)
+        except Exception:  # noqa: BLE001 - 진단용 보조 정보일 뿐
+            return None
+        href = getattr(handle, "href", None) if handle is not None else None
+        return href if isinstance(href, str) and href else None
+
     def _attach_egress_block(
-        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int,
+        *, target_href: Optional[str] = None,
     ) -> ActionResult:
         """이번 호출 중 Egress 가 막은 이동을 에이전트에게 알린다 (WS-29b).
 
@@ -1921,6 +2322,8 @@ class BrowserMCPServer:
         data.egress 에 이유(code=egress_blocked, host, category, reason, open_with)를 싣는다.
         navigate 가 막혔으면 실패(E_INVALID_URL)로 돌려준다 — 막힌 문서를 성공으로 보고하지
         않는다. 하위 요청(이미지·비콘 등) 차단은 싣지 않는다(문서 이동만).
+        클릭한 링크의 호스트(target_href, WS-38 R1 NB-3)도 이동 대상으로 본다 — 막히면 탭이
+        chrome-error:// 로 바뀌어 현재 주소로는 호스트를 알 수 없기 때문이다.
         """
         if self._egress is None:
             return result
@@ -1930,7 +2333,7 @@ class BrowserMCPServer:
         from urllib.parse import urlparse
 
         hosts = set()
-        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url):
+        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url, target_href):
             try:
                 h = urlparse(raw or "").hostname
             except ValueError:
@@ -2162,6 +2565,9 @@ class BrowserMCPServer:
                 element_name = str(target.get("name") or "")
                 unresolved = str(target.get("unresolved") or "")
                 signals = _signals_of(target.get("info"))
+                ambiguous = self._ambiguous_low_risk(action, selector, target.get("ambiguous"))
+                if ambiguous is not None:
+                    return ambiguous
         elif action is ActionType.CLICK and params.get("x") is not None:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
@@ -2262,6 +2668,49 @@ class BrowserMCPServer:
             message += approve_hint_text(approval_id_hint)
 
         return self._error_result(action, code, message, data=data)
+
+    def _ambiguous_low_risk(self, action: ActionType, selector: str,
+                            ambiguous: Any) -> Optional[ActionResult]:
+        """selector 가 여러 요소에 맞을 때 (WS-39): 후보가 **모두** 저위험이면 승인 대신 모호함 오류.
+
+        모호함은 에이전트가 스스로 풀 수 있다(관찰 → element_id) — 사람 승인으로 보내면 승인 명령을
+        칠 수 없는 사용자(텔레그램 등)에서 진행이 막힌다(실사용 2026-10-10, '항공편 더보기').
+        각 후보를 기존 판정(`assess_risk`: 이름·selector·문맥 신호)으로 보고 하나라도 HIGH 면 None —
+        기존 판정 불가 승인 경로(fail-closed)를 그대로 탄다. 어느 쪽이든 누르지 않는다.
+
+        E_ELEMENT_NOT_FOUND 인 까닭: '정확히 하나'인 대상을 찾지 못한 것이다(디스패처의 selector
+        0개·여러 개 응답, element_id 누락과 같은 코드). NOT_INTERACTABLE 은 찾은 요소가 비활성·가림 등
+        으로 못 누르는 경우라 뜻이 다르다.
+        """
+        if not isinstance(ambiguous, dict):
+            return None
+        infos = ambiguous.get("infos")
+        count = int(ambiguous.get("count") or 0)
+        if not isinstance(infos, list) or count < 2 or len(infos) != count:
+            return None
+        from actions.dispatcher import ambiguous_message, ambiguous_target_view
+        from security.hitl import assess_risk
+        from security import ActionContext, RiskLevel
+
+        for info in infos:
+            if not isinstance(info, dict):
+                return None
+            assessed = assess_risk(ActionContext(
+                action=action,
+                element_name=str(info.get("name") or ""),
+                selector=selector,
+                domain=self._current_domain(),
+                signals=_signals_of(info),
+            ))
+            if assessed.risk is RiskLevel.HIGH:
+                return None
+        result = self._error_result(
+            action,
+            ErrorCode.ELEMENT_NOT_FOUND,
+            ambiguous_message(count),
+            data={"ambiguous_target": ambiguous_target_view(count, infos)},
+        )
+        return result.model_copy(update={"reobserve_required": True, "retry_safe": True})
 
     async def _press_key_target(self, params: Dict[str, Any]) -> tuple:  # noqa: C901
         """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
@@ -2394,6 +2843,7 @@ def create_server(
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
+    recipes: bool = True,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -2418,7 +2868,12 @@ def create_server(
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
         profile=profile,
+        recipes=recipes,
     )
+    #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
+    from security.robots_signal import ROBOTS_INSTRUCTIONS
+
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
@@ -2433,7 +2888,7 @@ def create_server(
         """
         field = "input_schema" if "input_schema" in Tool.model_fields else "inputSchema"
         out: List[Tool] = []
-        for spec in build_listed_tools():  # 액션 툴 19종 + 서버 도구(WS-29)
+        for spec in build_listed_tools(recipes):  # 액션 툴 19종 + 서버 도구(WS-29·WS-38)
             kwargs = {
                 "name": spec["name"],
                 "description": spec["description"],
@@ -2446,7 +2901,7 @@ def create_server(
         return _build_tools()
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-        if name in SERVER_TOOLS:
+        if name in SERVER_TOOLS and (recipes or name != RECIPE_TOOL):
             import json
 
             payload = await backend.call_server_tool(name, arguments)
@@ -2461,8 +2916,13 @@ def create_server(
     # 실측 — 데코레이터만 쓰면 create_server()가 AttributeError로 즉사해
     # `agent-browser serve` 경로 전체가 막힌다.
     if hasattr(Server("__probe__"), "list_tools"):
-        # mcp 1.x — 데코레이터 등록
-        server = Server("agent-browser")
+        # mcp 1.x — 데코레이터 등록. instructions 인자가 없는 옛 1.x 는 속성으로 넣는다
+        # (create_initialization_options 가 self.instructions 를 읽는다).
+        try:
+            server = Server("agent-browser", instructions=instructions)
+        except TypeError:
+            server = Server("agent-browser")
+            server.instructions = instructions  # type: ignore[attr-defined]
         server.list_tools()(_list_tools_impl)  # type: ignore[attr-defined]
         server.call_tool()(_call_tool_impl)  # type: ignore[attr-defined]
         return server, backend
@@ -2479,6 +2939,7 @@ def create_server(
 
     server = Server(
         "agent-browser",
+        instructions=instructions,
         on_list_tools=_on_list_tools,
         on_call_tool=_on_call_tool,
     )
@@ -2501,6 +2962,7 @@ async def run_stdio(
     block_loopback: bool = False,
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
+    recipes: bool = True,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -2534,6 +2996,7 @@ async def run_stdio(
         block_loopback=block_loopback,
         approval_ttl_s=approval_ttl_s,
         **({"profile": profile} if profile is not None else {}),
+        **({} if recipes else {"recipes": False}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None
@@ -2553,6 +3016,7 @@ async def run_stdio(
     if browser_mode == "on-demand":
         extra += (" [평소 headless — 사람 인계·승인 코드 때만 창"
                   + ("" if profile is not None else ", 서버 전용 임시 프로필(종료 때 삭제)") + "]")
+    extra += " recipes=" + (("on(profile)" if profile is not None else "on(memory)") if recipes else "off")
     extra += (
         f" egress(loopback={'blocked' if block_loopback else 'allowed'},"
         f" private={'allowed' if allow_private_network else 'blocked'})"
