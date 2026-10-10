@@ -1087,6 +1087,19 @@ href 가 완전히 같으면 자리표시자로 보고 준비 대기와 같은 �
 > **교훈**: 하네스의 '오클릭' 판정은 재생 엔진의 자기 보고가 아니라 Mock 서버 요청 기록(무엇이 열렸나)으로 한다 —
 > 엔진이 성공이라 해도 다른 기사를 열었으면 오클릭이다.
 
+#### 모호한 selector — 승인 대신 모호함 오류 (WS-39)
+
+`click(selector)` 가 2~50개 요소에 맞으면 게이트(`BrowserMCPServer._ambiguous_low_risk`)가 후보 전부를 기존
+`assess_risk`(이름·selector·문맥 신호)로 보고, **모두** HIGH 가 아니면 누르지 않고 `E_ELEMENT_NOT_FOUND` +
+`data.ambiguous_target`(후보 최대 5개, 이름은 `safe_page_text`) + `reobserve_required` 로 돌려준다(승인 증표 없음).
+하나라도 HIGH·50개 초과·0개·읽기 실패는 기존 판정 불가(승인 경로) 그대로. `click:*` 로 게이트가 열려도
+디스패처(`_handle_for_selector`)가 같은 모양으로 거부한다. 형제 액션은 계약상 selector 를 받지 않아 이 경로에 오지
+않는다. 레시피 재생은 element_id 로만 실행하므로 `target_ambiguous` 와 겹치지 않는다. 테스트
+`tests/interface/test_ws39_ambiguous_selector.py`(14개, 사보타주: 고위험 후보 검사 제거·첫 요소 클릭에서 실패 확인).
+
+> **교훈**: fail-closed 는 '누르지 않음'이지 '사람에게 보냄'이 아니다. 에이전트가 스스로 풀 수 있는 실패(모호함)를
+> 사람 승인으로 보내면 승인 명령을 칠 수 없는 사용자(텔레그램)에서 진행이 멈춘다(실사용 2026-10-10, '항공편 더보기').
+
 #### SDK 메이저 호환 (WS-14)
 
 MCP SDK는 1.x와 2.x의 API가 다릅니다.
