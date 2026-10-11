@@ -1,4 +1,4 @@
-"""One disclosed headless-name retry; no browser fingerprint/JS modifications.
+"""One disclosed headless-name attempt, remembering success in server memory.
 
 Fetch.continueRequest changes only this paused request's headers, unlike a
 target-wide UA override or Playwright route headers inherited by redirects.
@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from itertools import permutations
 import re
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page
@@ -68,7 +68,12 @@ async def cookie_free_origin(context: BrowserContext, url: str) -> bool:
 class HeadlessRetry:
     def __init__(self) -> None:
         # Server lifetime, independent of tab/context replacement (on-demand).
-        self.attempted: set[str] = set()
+        self.states: dict[str, Literal["succeeded", "failed"]] = {}
+
+    @property
+    def attempted(self) -> set[str]:
+        """Origins reserved or attempted, including remembered successes."""
+        return set(self.states)
 
     @asynccontextmanager
     async def present(self, page: Page, url: str, original: str, robots: RobotsSignals,
@@ -86,7 +91,7 @@ class HeadlessRetry:
             raise ValueError("unavailable native headless version")
         major = int(version[1])
         session = await page.context.new_cdp_session(page)
-        attempt = RetryRequest()
+        attempt = RetryRequest(origin=destination)
 
         async def paused(event: dict) -> None:
             request = event["request"]
@@ -136,3 +141,4 @@ class RetryRequest:
     """Whether a renamed main-document request actually left interception."""
 
     document_requested: bool = False
+    origin: str | None = None

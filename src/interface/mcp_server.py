@@ -25,13 +25,15 @@ import os
 import signal
 import time
 import unicodedata
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 from weakref import WeakSet
 
 from playwright.async_api import Frame
+from browser.headless_retry import RetryRequest
 
 from contracts import (
     ACTION_INPUT_MAP,
@@ -2296,8 +2298,9 @@ class BrowserMCPServer:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
         try:
-            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
-                                             self._egress_proxy, self._robots, self.max_result_chars)
+            async with self._present_remembered_navigation(action, params) as remembered:
+                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                                 self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
@@ -2314,6 +2317,12 @@ class BrowserMCPServer:
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
             await self._attach_challenge(result)
+        if remembered is not None and remembered.document_requested:
+            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True}
+            if result.data.get("last_http_status") == 403:
+                self._headless_retry.states[remembered.origin] = "failed"
+                identity["retry_failed"] = True
+            result.data["identity"] = identity
         if action is ActionType.NAVIGATE and "document" not in result.data:
             retried = await self._retry_headless_navigation(name, arguments, params, result)
             if retried is not None:
@@ -2328,6 +2337,39 @@ class BrowserMCPServer:
                 await self._recipes.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
+
+    @asynccontextmanager
+    async def _present_remembered_navigation(
+        self, action: ActionType, params: Dict[str, Any],
+    ) -> AsyncIterator[RetryRequest | None]:
+        """Reuse success only during this navigate and with current eligibility.
+
+        Temporarily ineligible origins retain memory: the per-request checks
+        still prevent renamed requests while cookies or REP restrictions exist.
+        """
+        from browser.headless_retry import cookie_free_origin
+        from security.robots_signal import _origin
+
+        url = params.get("url", "") if action is ActionType.NAVIGATE else ""
+        origin = _origin(url)
+        page = self._recipe_page()
+        if (origin is None or self._headless_retry.states.get(origin) != "succeeded"
+                or self._retry_recipe_boundary.get() or not self.headless_retry
+                or not getattr(self._core, "headless", False) or page is None or self._egress is None):
+            yield None
+            return
+        if (await self._robots.allowed(page.context, url, self._egress, self._egress_proxy) is not True
+                or not await cookie_free_origin(page.context, url)):
+            yield None
+            return
+        original = await self._robots._context_user_agent(page.context)
+        if (original is None or "HeadlessChrome" not in original
+                or self._headless_retry.states.get(origin) != "succeeded"):
+            yield None
+            return
+        async with self._headless_retry.present(page, url, original, self._robots,
+                                                self._egress, self._egress_proxy) as attempt:
+            yield attempt
 
     async def _retry_headless_navigation(
         self, name: str, arguments: Dict[str, Any], params: Dict[str, Any], result: ActionResult,
@@ -2354,7 +2396,7 @@ class BrowserMCPServer:
         if (not result.success or status != 403 or not self.headless_retry
                 or not getattr(self._core, "headless", False) or allowed is not True
                 or origin is None or _origin(params.get("url", "")) != origin
-                or origin in self._headless_retry.attempted
+                or origin in self._headless_retry.states
                 or not await cookie_free_origin(page.context, page.url)):
             return None
         # Also confirm the original navigate path when it redirected within this origin.
@@ -2363,9 +2405,9 @@ class BrowserMCPServer:
         original = await self._robots._context_user_agent(page.context)
         if original is None or "HeadlessChrome" not in original:
             return None
-        if origin in self._headless_retry.attempted:
+        if origin in self._headless_retry.states:
             return None  # another caller can reserve the origin while UA discovery awaits
-        self._headless_retry.attempted.add(origin)  # reserve before any await/recursive navigation
+        self._headless_retry.states[origin] = "failed"  # reserve before any await/recursive navigation
         token = self._retry_recipe_boundary.set(True)
         attempt = None
         retry_arguments = dict(arguments)
@@ -2377,7 +2419,7 @@ class BrowserMCPServer:
         finally:
             self._retry_recipe_boundary.reset(token)
             if attempt is None or not attempt.document_requested:
-                self._headless_retry.attempted.discard(origin)
+                self._headless_retry.states.pop(origin, None)
         if not attempt.document_requested:
             # Preserve genuine gate failures, but a same-document no-op is not a retry.
             return retried if not retried.success else None
@@ -2386,6 +2428,8 @@ class BrowserMCPServer:
         if (not retried.success or retried.data.get("challenge") is not None
                 or not isinstance(retry_status, int) or not 200 <= retry_status < 300):
             identity["retry_failed"] = True
+        else:
+            self._headless_retry.states[origin] = "succeeded"
         retried.data["identity"] = identity
         return retried
 

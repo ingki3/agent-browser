@@ -415,7 +415,7 @@ def test_trailing_dot_origins_share_retry_and_robots_identity():
 
 
 @requires_chromium
-async def test_trailing_dot_host_cannot_retry_twice(sites):
+async def test_trailing_dot_host_shares_successful_memory(sites):
     site, _ = sites
     base = site.url.replace("127.0.0.1", "localhost")
     dotted = site.url.replace("127.0.0.1", "localhost.")
@@ -423,9 +423,87 @@ async def test_trailing_dot_host_cannot_retry_twice(sites):
         first = await navigate(server, dotted + "/read")
         assert first.data["last_http_status"] == 200 and first.data["identity"]
         second = await navigate(server, base + "/read")
-        assert second.data["last_http_status"] == 403 and "identity" not in second.data
+        assert second.data["last_http_status"] == 200 and second.data["identity"]["remembered"] is True
         assert server._headless_retry.attempted == {base}
     assert len(site.received()) == 3
+
+
+@requires_chromium
+async def test_remembered_origin_starts_with_headed_name_and_keeps_scope(sites):
+    site, other = sites
+    other.status = 200
+    async with BrowserMCPServer(nav_settle=False) as server:
+        first = await navigate(server, site.url + "/read")
+        second = await navigate(server, site.url + "/next")
+        assert first.data["identity"]["original_status"] == 403
+        assert second.data["last_http_status"] == 200
+        assert second.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
+                                           "remembered": True}
+        assert len(server._recipes.trajectory.entries) == 2
+        assert "HeadlessChrome" in await server._page.evaluate("navigator.userAgent")
+        await server._page.evaluate("fetch('/late')")
+        assert "identity" not in (await navigate(server, other.url + "/next")).data
+    original = site.received()[0]["user-agent"]
+    assert len(site.received()) == 2 and len(site.received("/next")) == 1
+    assert site.received("/next")[0]["user-agent"] == site.received()[1]["user-agent"]
+    assert "HeadlessChrome" not in site.received("/next")[0]["sec-ch-ua"]
+    assert site.received("/late")[0]["user-agent"] == original
+    assert other.received("/next")[0]["user-agent"] == original
+
+
+@requires_chromium
+@pytest.mark.parametrize("condition", ["disallow", "unknown", "cookie", "disabled", "headed"])
+async def test_remembered_origin_rechecks_conditions_and_retains_memory(sites, condition):
+    site, _ = sites
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        assert (await navigate(server, site.url + "/read")).data["last_http_status"] == 200
+        if condition == "disallow":
+            site.robots = b"User-agent: *\nDisallow: /\n"
+        if condition == "unknown":
+            site.robots_status = 503
+        if condition in {"disallow", "unknown"}:
+            # Expire the existing REP cache to model newly fetched site policy.
+            server._robots._cache.clear()
+        if condition == "cookie":
+            await server._page.context.add_cookies([
+                {"name": "synthetic", "value": "local-mock", "url": site.url}])
+        if condition == "disabled":
+            server.headless_retry = False
+        if condition == "headed":
+            server._core.headless = False
+        excluded = await navigate(server, site.url + "/excluded")
+        assert excluded.data["last_http_status"] == 403 and "identity" not in excluded.data
+        assert site.received("/excluded")[0]["user-agent"] == site.received()[0]["user-agent"]
+        assert len(site.received("/excluded")) == 1
+        # Suspended eligibility preserves success; removing the condition resumes it.
+        site.robots = GEEK_ROBOTS
+        site.robots_status = 200
+        server._robots._cache.clear()
+        await server._page.context.clear_cookies()
+        server.headless_retry = True
+        server._core.headless = True
+        resumed = await navigate(server, site.url + "/resumed")
+        assert resumed.data["last_http_status"] == 200
+        assert resumed.data["identity"]["remembered"] is True
+        assert len(site.received("/resumed")) == 1
+
+
+@requires_chromium
+async def test_remembered_403_becomes_failed_without_another_retry(sites):
+    site, _ = sites
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        assert (await navigate(server, site.url + "/read")).data["last_http_status"] == 200
+        site.retry_status = 403
+        denied = await navigate(server, site.url + "/denied")
+        assert denied.data["last_http_status"] == 403
+        assert denied.data["identity"]["remembered"] is True
+        assert denied.data["identity"]["retry_failed"] is True
+        site.retry_status = 200
+        later = await navigate(server, site.url + "/later")
+        assert later.data["last_http_status"] == 403 and "identity" not in later.data
+    assert len(site.received("/denied")) == len(site.received("/later")) == 1
+    assert "HeadlessChrome" not in site.received("/denied")[0]["user-agent"]
+    assert site.received("/later")[0]["user-agent"] == site.received()[0]["user-agent"]
 
 
 @requires_chromium
