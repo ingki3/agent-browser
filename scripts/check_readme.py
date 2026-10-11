@@ -36,6 +36,43 @@ def run(cmd: str, timeout: int = 300) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr)
 
 
+#: 같은 CI job 의 앞 단계가 남긴 전체 pytest 출력 파일. 설정돼 있으면 테스트를 다시 돌리지 않고
+#: 그 요약 줄의 passed 수를 쓴다(v1.12.0: 3138개 재실행이 CI 에서 16분을 넘어 900초 제한에 걸림).
+PYTEST_LOG_ENV = "AGENT_BROWSER_PYTEST_LOG"
+
+_SUMMARY = re.compile(r"^=*\s*(?P<body>(?:\d+ \w+(?:, )?)+) in [\d.]+s", re.M)
+
+
+def passed_from_log(text: str) -> int:
+    """pytest -q 출력의 **마지막** 요약 줄에서 passed 수. failed·error 가 있거나 요약이 없으면 -1."""
+    found = list(_SUMMARY.finditer(text))
+    if not found:
+        return -1
+    body = found[-1].group("body")
+    if re.search(r"\d+ (failed|errors?)\b", body):
+        return -1
+    m = re.search(r"(\d+) passed", body)
+    return int(m.group(1)) if m else -1
+
+
+def pytest_passed_count() -> tuple[int, str]:
+    """(passed 수, 출처). 환경변수가 가리키는 파일이 있으면 그것을, 없으면 직접 실행한다.
+
+    환경변수가 설정됐는데 파일이 없거나 요약을 못 읽으면 -1(직접 실행으로 대신하지 않음 — 앞 단계가
+    무엇을 했는지 모르는 채 다른 수로 통과시키지 않는다).
+    """
+    import os
+
+    log = os.environ.get(PYTEST_LOG_ENV)
+    if log:
+        path = Path(log)
+        if not path.is_file():
+            return -1, f"{PYTEST_LOG_ENV} 파일 없음: {log}"
+        return passed_from_log(path.read_text(encoding="utf-8", errors="replace")), f"앞 단계 출력 {log}"
+    _code, out = run("uv run pytest tests -q", timeout=1800)
+    return passed_from_log(out), "직접 실행"
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -109,9 +146,8 @@ def main() -> int:
     # 포함되므로 그대로 비교하면 어긋난다(실제로 427 vs 428로 틀렸다).
     m = re.search(r"(\d+)개가 통과", text)
     claimed_tests = int(m.group(1)) if m else -1
-    code, out = run("uv run pytest tests -q", timeout=900)
-    m2 = re.search(r"(\d+) passed", out)
-    actual_tests = int(m2.group(1)) if m2 else -1
+    actual_tests, source = pytest_passed_count()
+    print(f"  (통과 수 출처: {source})")
     ok = claimed_tests == actual_tests
     if not ok:
         failures.append(

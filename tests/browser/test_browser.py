@@ -144,6 +144,17 @@ def test_save_creates_file_with_0600(store):
     assert store.verify_permissions("default")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 권한 검사")
+def test_verify_permissions_rejects_loosened_mode(store):
+    """반대 케이스(WS-35 R2 SS3): 0644 로 풀리면 False, 0600 으로 되돌리면 True. 파일 없으면 False."""
+    assert store.verify_permissions("nobody") is False
+    path = store.save("default", SAMPLE_STATE, PASSPHRASE)
+    os.chmod(path, 0o644)
+    assert store.verify_permissions("default") is False
+    os.chmod(path, 0o600)
+    assert store.verify_permissions("default") is True
+
+
 def test_auth_dir_is_not_world_readable(store):
     store.save("default", SAMPLE_STATE, PASSPHRASE)
     if os.name != "nt":

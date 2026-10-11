@@ -108,6 +108,23 @@ STALENESS_CHECK_SCRIPT = """
 )
 
 
+#: 페이지 유래 이름·role 을 오류 문구(detail·hint·element_changed)에 실을 때의 길이 상한(글자).
+#: 관찰(ObservedElement.name)은 원문 그대로지만, 오류 문구는 같은 문자열을 여러 번 싣고 사람·
+#: 에이전트가 그대로 읽으므로 제어문자를 보이는 표기로 바꾸고 자른다(WS-37 R1, 검증 NB-4).
+PAGE_TEXT_LIMIT = 80
+
+
+def safe_page_text(value: Any, limit: int = PAGE_TEXT_LIMIT) -> str:
+    """페이지 유래 문자열을 오류 문구용으로 살균한다(`interface.handoff.display_safe` 재사용).
+
+    지연 import: interface 패키지가 actions 를 import 하므로 모듈 수준에서 당기면 순환한다.
+    실패(stale) 경로에서만 불린다.
+    """
+    from interface.handoff import display_safe
+
+    return display_safe("" if value is None else value, limit)
+
+
 class StalenessReason(str, Enum):
     """staleness 판정 사유."""
 
@@ -186,7 +203,7 @@ async def verify_staleness(
         return StalenessResult(
             fresh=False,
             reason=StalenessReason.ROLE_CHANGED,
-            detail=f"role '{want_role}' -> '{got_role}'",
+            detail=f"role '{safe_page_text(want_role)}' -> '{safe_page_text(got_role)}'",
             observed_role=got_role,
             observed_name=probe.get("name"),
         )
@@ -198,7 +215,7 @@ async def verify_staleness(
         return StalenessResult(
             fresh=False,
             reason=StalenessReason.NAME_CHANGED,
-            detail=f"name '{want_name}' -> '{got_name}'",
+            detail=f"name '{safe_page_text(want_name)}' -> '{safe_page_text(got_name)}'",
             observed_role=got_role,
             observed_name=got_name,
         )

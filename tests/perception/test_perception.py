@@ -86,12 +86,44 @@ def test_testid_adds_score():
     assert with_testid.score > without.score
 
 
+#: 서로 다른 이름의 소음(반복 패턴 감점이 끼어들지 않게 숫자만 다른 이름을 쓰지 않는다).
+_DISTINCT_NOISE = (
+    "뉴스", "스포츠", "날씨", "증권", "부동산", "쇼핑", "메일", "카페", "블로그", "지도",
+    "사전", "번역", "웹툰", "영화", "음악", "게임", "여행", "요리", "자동차", "건강",
+    "교육", "패션", "뷰티", "육아", "반려동물", "도서", "공연", "전시", "캠핑", "낚시",
+)
+
+
 def test_goal_keyword_dominates_ranking():
-    """목표 키워드 일치가 가장 강한 신호여야 한다."""
-    target = make_element(5, "link", "결제 진행")
-    noise = [make_element(i, "button", f"버튼 {i}") for i in range(20)]
-    ranked = prune([*noise, target], top_n=3, goal_keywords=["결제"])
-    assert any(s.name == "결제 진행" for s in ranked)
+    """목표 키워드 일치가 가장 강한 신호여야 한다 (W_KEYWORD — 점수 밀집을 뚫는 축).
+
+    실환경 밀집 재현: 같은 role·위치의 서로 다른 링크 30개가 0.3점 밴드 안에 몰리고 정답
+    '로그인'은 DOM 뒤쪽이라 키워드 없이는 Top-20 밖이다. goal_keywords 를 주면 1위가 된다.
+    (이전 픽스처는 '버튼 {i}' 반복 감점이 정답을 대신 끌어올려 W_KEYWORD=0 이어도 통과했다.)
+    """
+    from perception.scorer import W_KEYWORD
+
+    noise = [make_element(i, "link", n) for i, n in enumerate(_DISTINCT_NOISE)]
+    target = make_element(len(noise), "link", "로그인")
+    elements = [*noise, target]
+
+    plain = prune(elements, top_n=len(elements))
+    # 전제(규칙 4): 반복 감점이 개입하지 않고, 점수가 밀집해 있으며, 키워드 없이는 Top-20 밖
+    assert not any("repeat_penalty" in r for s in plain for r in s.reasons)
+    scores = [s.score for s in plain]
+    assert max(scores) - min(scores) < 0.3, "밀집 밴드가 아니다 — 픽스처가 측정 조건을 못 만든다"
+    plain_rank = [s.name for s in plain].index("로그인")
+    assert plain_rank >= 20, f"키워드 없이도 Top-20({plain_rank + 1}위) — 키워드 효과를 못 잰다"
+
+    ranked = prune(elements, top_n=20, goal_keywords=["로그인"])
+    assert ranked[0].name == "로그인"
+    assert "keyword~로그인(1.00)" in ranked[0].reasons
+    assert not any("keyword~" in r for s in ranked[1:] for r in s.reasons)
+
+    before = score_element(target)
+    after = score_element(target, goal_keywords=["로그인"])
+    assert after.score - before.score == pytest.approx(W_KEYWORD * 1.0)
+    assert ranked[0].score - ranked[1].score > 3.0, "키워드 하나가 밴드 전체를 넘어서야 한다"
 
 
 def test_pruning_is_deterministic():

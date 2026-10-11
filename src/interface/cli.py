@@ -3,7 +3,7 @@
     agent-browser serve   [--mode] [--allow-domain] [--secrets] [--som-vision]  # MCP 서버 (stdio)
                           [--browser {headless,human,user-chrome,on-demand}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
-                          [--allow-private-network] [--block-loopback] [--profile NAME]
+                          [--allow-private-network] [--block-loopback] [--profile NAME] [--no-recipes]
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -138,13 +138,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="고위험 행동 승인 증표 수명(초, 기본 1800). 사람이 `agent-browser approve` 로 승인.",
     )
     serve.add_argument(
+        "--no-recipes",
+        dest="recipes",
+        action="store_false",
+        help=(
+            "동작 캐시(레시피, WS-38) 끄기 — 기록·browser_recipe 도구·관찰 data.recipes 없음. 기본 켬: "
+            "--profile 이 있으면 프로필 폴더 recipes.json(0600), 없으면 메모리(종료 시 소멸)."
+        ),
+    )
+    serve.add_argument(
         "--profile",
         default=None,
         metavar="NAME",
         help=(
             "이름 붙인 영속 프로필로 시작(로그인 유지, WS-32). 폴더 ~/.agent-browser/profiles/"
             "serve-NAME(권한 700). NAME 은 영문 소문자·숫자·하이픈 1~32자. 미지정 시 매번 빈 브라우저. "
-            "--browser human 으로 한 번 로그인하면 이후 headless 에서도 유지."
+            "맥에서 agent-browser login URL --profile NAME 으로 미리 로그인하면 이후 headless 에서도 유지."
         ),
     )
 
@@ -167,6 +176,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from interface import profile_cli
 
     profile_cli.add_parser(sub)
+    from interface import login_cli
+
+    login_cli.add_parser(sub)
 
     # --- tui ---
     tui = sub.add_parser("tui", help="Textual 대시보드를 실행합니다.")
@@ -338,6 +350,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 block_loopback=bool(args.block_loopback),
                 **({"approval_ttl_s": args.approval_ttl} if args.approval_ttl else {}),
                 profile=args.profile,
+                **({} if getattr(args, "recipes", True) else {"recipes": False}),
             )
         )
     except KeyboardInterrupt:
@@ -437,6 +450,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from interface import profile_cli
 
         return profile_cli.run(args)
+    if args.command == "login":
+        from interface import login_cli
+
+        return login_cli.run(args)
     if args.command == "control":
         from interface import handoff
 

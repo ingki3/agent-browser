@@ -75,9 +75,41 @@ def test_stopwords_are_dropped():
 
 
 def test_extraction_is_deterministic():
-    """같은 목표는 항상 같은 키워드를 내야 한다 (플레이키율 KPI)."""
-    goal = "장바구니에 담고 결제 진행하기"
-    assert extract_keywords(goal) == extract_keywords(goal)
+    """같은 목표는 실행이 바뀌어도 같은 키워드를 같은 순서로 내야 한다 (플레이키율 KPI).
+
+    한 프로세스 안에서 두 번 비교하면 set 순회 순서가 같아 항상 참이다. 막으려는 위험은
+    실행 간 비결정성(PYTHONHASHSEED 에 따라 바뀌는 set/문자열 해시 순서)이므로, 해시 시드가
+    다른 하위 프로세스들의 결과(순서 포함)를 비교한다.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    goals = [
+        "장바구니에 담고 결제 진행하기",
+        "Create account on this site 로그인하기",
+        "검색창에 노트북 입력하고 검색 버튼 클릭",
+    ]
+    script = (
+        "import json, sys\n"
+        "from agent import extract_keywords\n"
+        "print(json.dumps([extract_keywords(g) for g in json.loads(sys.argv[1])]))\n"
+    )
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    outputs = []
+    for seed in ("0", "1", "12345"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": src}
+        proc = subprocess.run(
+            [sys.executable, "-c", script, json.dumps(goals)],
+            env=env, capture_output=True, text=True, timeout=30, check=True,
+        )
+        outputs.append(json.loads(proc.stdout))
+    assert all(len(kws) >= 3 for kws in outputs[0])  # 비교할 만큼 키워드가 나와야 의미가 있다
+    assert outputs[1] == outputs[0]
+    assert outputs[2] == outputs[0]
+    assert outputs[0] == [extract_keywords(g) for g in goals]
 
 
 def test_empty_goal_returns_empty():

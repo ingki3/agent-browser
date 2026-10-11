@@ -86,6 +86,27 @@ def test_prepare_refuses_symlink(_root, tmp_path):
         sp.prepare(_root / "serve-t1")
 
 
+def _assert_held(lock, root: Path, name: str, server_id: str) -> None:
+    """잠금이 실제로 쥐어졌고 잠금 파일·holder() 가 이 서버를 가리키는지."""
+    assert lock.held and lock.name == name and lock.path == root / f"serve-{name}"
+    body = json.loads((lock.path / sp.LOCK_FILE).read_text(encoding="utf-8"))
+    assert body["server_id"] == server_id and body["pid"] == os.getpid()
+    assert sp.holder(name) == {"server_id": server_id, "pid": os.getpid()}
+
+
+def _assert_released_and_reacquirable(lock, name: str) -> None:
+    """반납하면 잠금 파일이 비고 아무도 안 쥐며, 다른 서버가 다시 잡을 수 있다."""
+    lock.release()
+    assert not lock.held
+    assert (lock.path / sp.LOCK_FILE).read_text(encoding="utf-8") == ""
+    assert sp.holder(name) is None
+    again = sp.acquire(name, server_id="9-re")
+    try:
+        assert sp.holder(name) == {"server_id": "9-re", "pid": os.getpid()}
+    finally:
+        again.release()
+
+
 # ------------------------------------------------------------------ 잠금
 
 
@@ -117,8 +138,12 @@ def test_second_acquire_refused_with_server_id(_root):
 def test_other_profile_not_blocked(_root):
     a = sp.acquire("t1", server_id="1-a")
     b = sp.acquire("t2", server_id="2-b")
-    a.release()
-    b.release()
+    # 서로의 잠금 파일을 덮어쓰지 않고 각자 자기 서버를 가리킨다
+    _assert_held(a, _root, "t1", "1-a")
+    _assert_held(b, _root, "t2", "2-b")
+    _assert_released_and_reacquirable(a, "t1")
+    _assert_held(b, _root, "t2", "2-b")  # t1 반납이 t2 를 건드리지 않는다
+    _assert_released_and_reacquirable(b, "t2")
 
 
 def test_live_chromium_singleton_lock_refused(_root):
@@ -132,7 +157,9 @@ def test_live_chromium_singleton_lock_refused(_root):
 def test_stale_chromium_singleton_lock_ignored(_root):
     d = sp.prepare(sp.profile_dir("t1"))
     os.symlink(f"{socket.gethostname()}-999999", d / "SingletonLock")
-    sp.acquire("t1", server_id="1-a").release()
+    lock = sp.acquire("t1", server_id="1-a")
+    _assert_held(lock, _root, "t1", "1-a")
+    _assert_released_and_reacquirable(lock, "t1")
 
 
 def test_lock_file_is_private(_root):
@@ -242,9 +269,12 @@ def test_nb1_acquire_absorbs_momentary_peek(_root):
 
     sp.acquire("t1", server_id="1-a").release()
     fd = _hold_shared(_root / "serve-t1")
-    threading.Timer(0.02, os.close, args=(fd,)).start()
+    timer = threading.Timer(0.02, os.close, args=(fd,))
+    timer.start()
     lock = sp.acquire("t1", server_id="2-b")
-    lock.release()
+    timer.join()
+    _assert_held(lock, _root, "t1", "2-b")
+    _assert_released_and_reacquirable(lock, "t1")
 
 
 def test_nb1_real_holder_still_refused_quickly(_root):

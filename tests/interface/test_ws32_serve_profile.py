@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -195,18 +196,24 @@ def test_run_stdio_releases_lock_on_normal_exit(monkeypatch):
             return None
 
         async def run(self, *a: Any) -> None:
-            assert sp.holder("t1") is not None  # 서빙 중에는 잠겨 있다
+            seen.append(sp.holder("t1"))  # 서빙 중에는 이 서버가 잠그고 있다
             return None
 
     real_create = mcp_server.create_server
+    seen: List[Any] = []
+    backends: List[Any] = []
 
     def fake_create_server(**kw: Any):
         _server, backend = real_create(**kw)
+        backends.append(backend)
         return _S(), backend
 
     monkeypatch.setattr(mcp_server, "create_server", fake_create_server)
     monkeypatch.setattr(stdio_mod, "stdio_server", fake_stdio)
     asyncio.run(mcp_server.run_stdio(profile="t1"))
+    assert len(seen) == 1 and len(backends) == 1
+    # 다른 잠금이 아니라 바로 이 서버(server_id)·이 프로세스가 쥐고 있었다.
+    assert seen[0] == {"server_id": backends[0].hub.server_id, "pid": os.getpid()}, seen
     assert sp.holder("t1") is None
 
 

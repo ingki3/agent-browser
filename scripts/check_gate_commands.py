@@ -23,6 +23,10 @@ AGENTS_MD = "src/AGENTS.md"
 # 인라인 one-liner 허용 길이 상한. 초과 시 scripts/ 아래 파일로 분리할 것을 권고한다.
 MAX_INLINE_LEN = 180
 
+#: §5 게이트 목록에 `python -m harness.<이름>` 으로 반드시 적혀 있어야 하고 실제 모듈이 있어야 하는
+#: 하네스(WS-38 recipe_replay 부터 등록). 문서에서 빠지거나 모듈이 사라지면 CI 가 잡는다.
+REQUIRED_HARNESS_COMMANDS = ("recipe_replay",)
+
 
 def extract_inline_commands(text: str):
     """`python -c "..."` 형태의 인라인 스크립트를 (행번호, 코드) 목록으로 반환."""
@@ -89,6 +93,18 @@ def main() -> None:
         except py_compile.PyCompileError as exc:
             print(f"[-] {path}: compile failed -> {exc}")
             passed = False
+
+    documented = set(re.findall(r"python -m harness\.(\w+)", text))
+    for name in REQUIRED_HARNESS_COMMANDS:
+        path = os.path.join("src", "harness", f"{name}.py")
+        if name not in documented:
+            print(f"[-] {AGENTS_MD} §5 에 `python -m harness.{name}` 이 없습니다")
+            passed = False
+        elif not os.path.exists(path):
+            print(f"[-] harness.{name}: 모듈 없음 ({path})")
+            passed = False
+        else:
+            print(f"[+] harness.{name}: documented in §5 and module exists")
 
     if passed:
         print("\n[SUCCESS] All gate commands are syntactically valid.")
