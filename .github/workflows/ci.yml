@@ -176,10 +176,12 @@ jobs:
           fi
 
       - name: 전체 회귀 테스트
+        shell: bash  # PIPESTATUS(pytest 종료 코드) 는 bash 전용
         run: |
           set +e
-          uv run pytest tests -q
-          code=$?
+          # 출력은 다음 단계(README 검사)가 통과 수로 다시 쓴다 — 같은 스위트를 두 번 돌리지 않는다.
+          uv run pytest tests -q 2>&1 | tee "$RUNNER_TEMP/pytest-full.log"
+          code=${PIPESTATUS[0]}
           if [ $code -eq 5 ]; then
             echo "::notice::수집된 테스트가 없습니다 (Stage 0 착수 전 정상)."
             exit 0
@@ -191,4 +193,6 @@ jobs:
       # 명령을 실제로 실행하고, 툴 개수·테스트 수·버전을 대조한다.
       # (Chromium과 CLI 설치가 끝난 릴리스 게이트에서만 실행 가능)
       - name: README 설치 안내 검증
+        env:
+          AGENT_BROWSER_PYTEST_LOG: ${{ runner.temp }}/pytest-full.log
         run: uv run python scripts/check_readme.py
