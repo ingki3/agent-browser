@@ -265,7 +265,14 @@ class BrowserCore:
         self._active_tab_id = None
         self._adoptable_page = None
         if ctx is not None:
-            await ctx.close()
+            try:
+                await ctx.close()
+            except Exception as exc:  # noqa: BLE001
+                # 사람이 창의 마지막 탭을 닫으면 Chromium 이 영속 컨텍스트를 스스로 닫는다 — 그 직후의 close() 는
+                # TargetClosedError. 목표(닫힘)는 이미 이뤘으므로 실패가 아니다(CI 실측: 창 X 뒤 headless 복귀가
+                # state=failed 로 끝나던 경합). 그 밖의 오류는 그대로 올린다.
+                if type(exc).__name__ != "TargetClosedError":
+                    raise
 
     async def _start_user_chrome(self) -> "BrowserCore":
         """전용 프로필 Chrome 을 띄우고 CDP(127.0.0.1)로 붙는다.
