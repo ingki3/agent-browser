@@ -177,6 +177,11 @@ class RecipeService:
             return
         data = result.data or {}
         a = action.value
+        if data.get("egress"):
+            # 이동이 egress 에 막혔다 — 오류 페이지 주소가 결과에 늦게 반영되면(click 이 먼저 끝남, CI 실측) nav 가
+            # "none" 으로 보여 단계가 궤적에 들어갔다. 막힌 이동은 주소와 무관하게 기록하지 않는다.
+            self.reset("nav_error")
+            return
         if a in ELEMENT_ACTIONS and not data.get("signals"):
             self.reset("no_postcondition")
             return
