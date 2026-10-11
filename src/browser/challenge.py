@@ -27,8 +27,8 @@ from urllib.parse import urlparse
 LONG_PAGE_CHARS = 3000
 #: 차단 상태코드 + 이보다 짧은 본문이면 차단 화면으로 본다.
 SHORT_BODY_CHARS = 800
-#: 차단 화면에서 흔한 상태코드(403 거부, 418 네이버, 429 과다 요청).
-BLOCK_STATUSES = frozenset({403, 418, 429})
+#: 401 은 인증 필요(이름 재시도 제외), 403 거부, 418 네이버, 429 과다 요청.
+BLOCK_STATUSES = frozenset({401, 403, 418, 429})
 
 
 class ChallengeKind(str, Enum):

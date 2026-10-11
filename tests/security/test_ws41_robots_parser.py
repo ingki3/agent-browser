@@ -115,6 +115,7 @@ def test_ai_specific_ban_and_bounded_signal():
     assert parsed.signal("/private", "http://local/robots.txt") == {
         "disallowed": False, "ai_agents_disallowed": ["GPTBot"],
         "rule": "Disallow: /private", "robots_url": "http://local/robots.txt",
+        "user_fetch_agents_allowed": [], "content_signal": "",
     }
     assert parsed.signal("/public", "http://local/robots.txt") is None
     all_banned = RobotsRules.parse(b"User-agent: *\nDisallow: /").signal("/", "http://local/robots.txt")

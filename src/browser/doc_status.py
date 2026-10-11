@@ -59,6 +59,7 @@ class PageDocumentStatus:
         #: page -> (seq, url, status)
         self._by_page: Dict[Any, Tuple[int, str, int]] = {}
         self._pending: List[Tuple[int, Any]] = []
+        self._retry_after: Dict[Any, str] = {}
 
     # -- 기록 ---------------------------------------------------------------
 
@@ -88,7 +89,8 @@ class PageDocumentStatus:
                 self._pending.append((self._seq, response))
                 del self._pending[: -self.MAX_PENDING]
                 return
-            self._store(page, self._seq, response.url, response.status)
+            self._store(page, self._seq, response.url, response.status,
+                        getattr(response, "headers", {}).get("retry-after", ""))
         except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
             pass
 
@@ -99,11 +101,13 @@ class PageDocumentStatus:
 
     def forget(self, page: Any) -> None:
         self._by_page.pop(page, None)
+        self._retry_after.pop(page, None)
 
-    def _store(self, page: Any, seq: int, url: str, status: int) -> None:
+    def _store(self, page: Any, seq: int, url: str, status: int, retry_after: str = "") -> None:
         current = self._by_page.get(page)
         if current is None or current[0] < seq:
             self._by_page[page] = (seq, url, status)
+            self._retry_after[page] = retry_after[:256]
 
     def _resolve_pending(self) -> None:
         if not self._pending:
@@ -116,12 +120,17 @@ class PageDocumentStatus:
                 still.append((seq, response))
                 continue
             try:
-                self._store(page, seq, response.url, response.status)
+                self._store(page, seq, response.url, response.status,
+                            getattr(response, "headers", {}).get("retry-after", ""))
             except Exception:  # noqa: BLE001
                 pass
         self._pending = still
 
     # -- 조회 ---------------------------------------------------------------
+
+    def retry_after_for(self, page: Any) -> str:
+        self._resolve_pending()
+        return self._retry_after.get(page, "") if self.judge_status_for(page) == 429 else ""
 
     def status_for(self, page: Any) -> Optional[int]:
         """page 가 마지막으로 받은 메인 문서 응답 상태(없으면 None)."""

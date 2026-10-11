@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3191개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3218개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -319,7 +319,24 @@ click         ->  element_id="@e3", epoch=0
 
 탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다.
 
-agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
+agent-browser는 **캡차 자동 풀이·Cloudflare/Akamai 등의 확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
+
+**헤드리스 이름 재시도(WS-44)** — headless `navigate`가 HTTP 403 + 짧은 generic 차단 본문을 받았고,
+robots 조회가 확정되어 그 경로를 `*` 기준 허용하며 그 출처에 유효한 쿠키가 전혀 없을 때만,
+서버 수명 중 출처(scheme·host·port)당 **한 번** 같은 URL을 다시 엽니다. 기본 켬이며
+`serve --no-headless-retry`로 끕니다. 실제 브라우저 UA의 `HeadlessChrome`만 `Chrome`으로 바꾸고,
+Client Hints의 headless 브랜드만 제거해 같은 버전 창 모드의 순서로 맞춥니다(버전·플랫폼·GREASE 유지).
+변경은 재시도 중 그 출처의 요청에만 적용하며 다른 출처 리다이렉트·하위 요청에는 원래 이름을 보내고,
+재시도 종료·실패·취소 때 복원합니다. `navigator.webdriver`·JS UA·플러그인·지문은 건드리지 않습니다.
+robots 금지·조회 불가·쿠키 있음·알려진 확인 화면·401(로그인)·429(속도 제한)은 재시도 대상이 아닙니다.
+재시도도 같은 MCP 관문(egress·robots·IPI·레시피)을 거치며, 레시피에는 최초 이동 전 상태와
+최종 성공 결과를 한 단계로 기록합니다. 차단된 재시도는 저장하지 않습니다.
+
+재시도 결과에는 `data.identity = {presented_as: "chrome", reason: "headless_ua_blocked",
+original_status: 403}`가 붙고, 실패하면 `retry_failed: true`도 붙습니다. 403/401의 짧은 본문이
+robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단임을 알립니다. 429는 속도 제한 안내와
+`Retry-After`(있으면 상한 128자의 안전한 텍스트)를 돌려주며 자동 재요청하지 않습니다.
+헤더 원문은 `data.retry_after`에도 실어 기존 IPI 신호 검사를 거칩니다.
 
 ### 프롬프트 주입 신호 (`data.injection_suspected`)
 
@@ -344,21 +361,29 @@ agent-browser는 **캡차를 자동으로 풀거나 차단을 우회하지 않�
 ### robots.txt 신호 (`data.robots`)
 
 `navigate`는 도착한 최종 URL, `observe_page`는 현재 최상위 페이지 URL을 확인합니다. robots.txt의
-`*` 그룹이나 알려진 AI 에이전트 그룹이 그 경로를 막으면 결과에 다음 신호를 붙입니다.
+`*` 그룹이나 알려진 AI 에이전트 그룹이 그 경로를 막거나, 사용자 요청 봇의 명시적 Allow 또는
+Content-Signal이 있으면 결과에 다음 신호를 붙입니다.
 
 ```json
 "robots": {
   "disallowed": false,
   "ai_agents_disallowed": ["GPTBot"],
   "rule": "Disallow: /private",
-  "robots_url": "https://example.invalid/robots.txt"
+  "robots_url": "https://example.invalid/robots.txt",
+  "user_fetch_agents_allowed": ["Claude-User", "ChatGPT-User"],
+  "content_signal": "ai-train=no, search=yes, ai-input=yes"
 }
 ```
 
 `disallowed`는 `*` 그룹 기준입니다. `ai_agents_disallowed`는 해당 경로가 금지된 알려진 AI UA 이름
-최대 10개이며, 특정 UA 그룹이 있으면 그 규칙을 우선하고 없으면 `*`로 판정합니다. 실제 브라우저의
-UA를 바꾸지 않습니다. `rule`은 일치한 금지 규칙을 최대 80자로 정리한 것이고, `robots_url`은 해당
-출처의 robots.txt 주소입니다. 허용·판정 불가이면 키 자체가 없습니다. **도구는 이동을 막지 않습니다.**
+최대 10개이며, 특정 UA 그룹이 있으면 그 규칙을 우선하고 없으면 `*`로 판정합니다.
+학습·수집 봇의 금지는 사용자 요청 읽기 자체를 금지한다는 뜻이 아닙니다(기존 목록에는 사용자 요청
+봇도 포함됩니다). `user_fetch_agents_allowed`는 Claude-User·ChatGPT-User·OAI-SearchBot·Claude-SearchBot·
+PerplexityBot·Perplexity-User 중 이 경로의 **명시적 Allow**가 이긴 토큰 목록이며, `*`의 허용을
+명시적 봇 허용으로 세지 않습니다. `content_signal`은 Content-Signal 값 원문을 제어·방향·보이지 않는
+서식 문자 제거와 공백 정리 후 최대 256자로 제공하며 권한으로 해석하지 않습니다.
+`rule`은 일치한 규칙을 최대 80자로 정리한 것이고, `robots_url`은 해당
+출처의 robots.txt 주소입니다. 신호 없는 일반 허용·판정 불가이면 키 자체가 없습니다. **이 신호는 이동을 막지 않습니다.**
 계속할지는 사용자의 뜻에 따라 부르는 에이전트가 판단합니다.
 
 브라우저와 같은 UA 및 기존 egress 프록시·가드로 출처(scheme·host·port)당 스트리밍으로 가져옵니다.
@@ -368,7 +393,7 @@ UA는 웹 페이지 JS를 실행하지 않고 브라우저 CDP 값(컨텍스트�
 각 리다이렉트는 같은 출처 안에서만 최대 5회 허용합니다. 캐시가 없을 때 결과의 추가 대기는 최대
 1.5초이며, 늦은 요청은 배경에서 총 10초까지 이어져 다음 결과에 반영됩니다. 같은 출처의 동시
 호출도 요청 하나를 공유합니다. 성공·404 등 확정 결과는 서버 메모리에 24시간, 5xx·실패·시간초과·
-401/403 등 판정 불가 결과는 10분 보관한 뒤 다시 시도합니다. 캐시는 최근 사용한 1,000개 출처로 제한합니다.
+401/403/429 등 판정 불가 결과는 10분 보관한 뒤 다시 시도합니다. 캐시는 최근 사용한 1,000개 출처로 제한합니다.
 egress가 막으면 요청하거나 판정하지
 않으며, `about:`·`data:`·`chrome-error://`·`file:`도 검사하지 않습니다.
 
