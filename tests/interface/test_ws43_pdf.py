@@ -5,6 +5,8 @@ import asyncio
 import io
 import secrets
 import threading
+import time
+import zlib
 from pathlib import Path
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,6 +87,8 @@ class Site:
     streamed: int = 0
     ua: dict[str, str] = field(default_factory=dict)
     url: str = ""
+    cookies: list[tuple[str, str, str, frozenset[str]]] = field(default_factory=list)
+    encoded: bool = False
 
 
 @pytest.fixture
@@ -96,13 +100,16 @@ def site():
             path = self.path.split("?", 1)[0]
             state.requests.append(path)
             state.ua[path] = self.headers.get("User-Agent", "")
-            if path == "/redirect":
+            state.cookies.append((self.headers.get("Host", "").split(":")[0], path,
+                "refetch" if self.headers.get("Accept-Encoding") == "identity" else "browser",
+                frozenset(filter(None, self.headers.get("Cookie", "").split("; ")))))
+            if path in {"/redirect", "/foo/redirect"}:
                 self.send_response(302)
                 self.send_header("Location", state.redirect)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            pdf = path in {"/report.pdf", "/cookie.pdf", "/opaque", "/noext", "/large.pdf", "/unknown.pdf"}
+            pdf = path.endswith(".pdf") or path in {"/opaque", "/noext", "/foo"}
             data = state.pdf if pdf else (state.binary if path == "/binary" else
                 b"<!doctype html><title>Mock</title><a id=pdf href='/report.pdf'>PDF</a>"
                 b"<embed type='application/pdf' src='/opaque'><iframe src='/report.pdf'></iframe>"
@@ -114,6 +121,9 @@ def site():
                 self.end_headers()
                 return
             self.send_response(200)
+            if state.encoded and pdf:
+                data = zlib.compress(data)
+                self.send_header("Content-Encoding", "deflate")
             self.send_header("Content-Type", "application/pdf" if pdf and path not in {"/opaque", "/noext"} else
                              "application/octet-stream" if path in {"/opaque", "/binary", "/noext"} else "text/html")
             if path == "/opaque":
@@ -169,6 +179,219 @@ async def test_navigate_pdf_korean_range_cookie_and_stale(site):
             assert not (await server.call_tool("browser_extract", {"selector": selector})).success
         await server.call_tool("browser_navigate", {"url": site.url + "/html"})
         assert not (await server.call_tool("browser_extract", {"selector": "pdf:pages=1"})).success
+
+
+@requires_chromium
+@pytest.mark.parametrize("host,path", [
+    ("localhost", "/doc.pdf"), ("sub.localhost", "/doc.pdf"),
+    ("child.sub.localhost", "/doc.pdf"), ("localhost", "/foobar/doc.pdf"),
+    ("localhost", "/foo/doc.pdf"), ("localhost", "/foo"),
+    ("127.0.0.1", "/doc.pdf"),
+])
+async def test_pdf_cookie_headers_match_chromium(site, host, path):
+    async with BrowserMCPServer() as server:
+        await server.start()
+        await server._page.context.add_cookies([
+            {"name": "hostonly", "value": "fixture", "domain": "localhost", "path": "/"},
+            {"name": "domain", "value": "fixture", "domain": ".sub.localhost", "path": "/"},
+            {"name": "pathfoo", "value": "fixture", "domain": "localhost", "path": "/foo"},
+            {"name": "pathexact", "value": "fixture", "domain": "localhost", "path": "/foo/doc.pdf"},
+            {"name": "secure", "value": "fixture", "domain": "localhost", "path": "/", "secure": True},
+            {"name": "secureip", "value": "fixture", "domain": "127.0.0.1", "path": "/", "secure": True},
+            {"name": "expired", "value": "fixture", "domain": "localhost", "path": "/", "expires": time.time() - 10},
+            {"name": "strict", "value": "fixture", "domain": "localhost", "path": "/", "sameSite": "Strict"},
+            {"name": "ip", "value": "fixture", "domain": "127.0.0.1", "path": "/"},
+        ])
+        port = site.url.rsplit(":", 1)[1]
+        result = await server.call_tool("browser_navigate", {"url": f"http://{host}:{port}{path}"})
+        assert result.success and result.data["document"]["pages_total"] == 6
+        requests = [(who, cookies) for h, p, who, cookies in site.cookies if h == host and p == path]
+        assert len(requests) == 2, requests
+        browser = next(c for who, c in requests if who == "browser")
+        refetch = next(c for who, c in requests if who == "refetch")
+        assert browser == refetch, requests
+        assert "expired=fixture" not in refetch
+        if host != "localhost":
+            assert "hostonly=fixture" not in refetch
+        if path.startswith("/foobar"):
+            assert "pathfoo=fixture" not in refetch
+        if host.endswith("sub.localhost"):
+            assert "domain=fixture" in refetch
+
+
+@requires_chromium
+async def test_pdf_secure_cookie_absent_on_insecure_mock_host(site, monkeypatch):
+    from browser.core import BrowserCore
+    launch_kwargs = BrowserCore._launch_kwargs
+
+    def mapped_launch(self):
+        options = launch_kwargs(self)
+        options["args"] = [*options.get("args", []),
+            "--host-resolver-rules=MAP plain.ws43.test 127.0.0.1"]
+        return options
+
+    monkeypatch.setattr(BrowserCore, "_launch_kwargs", mapped_launch)
+    async with BrowserMCPServer() as server:
+        await server.start()
+
+        async def resolve(host):
+            assert host == "plain.ws43.test", "only the reserved local Mock host may resolve"
+            return ["127.0.0.1"]
+
+        # Both Chromium and the auxiliary GET use the guarded, pinned proxy.
+        # No system hosts, external DNS or product resolver options are changed.
+        monkeypatch.setattr(server._egress, "resolver", resolve)
+        context = server._page.context
+        await context.add_cookies([
+            {"name": "plain", "value": "fixture", "domain": "plain.ws43.test", "path": "/"},
+            {"name": "secure", "value": "fixture", "domain": "plain.ws43.test", "path": "/", "secure": True},
+        ])
+        assert any(c["name"] == "secure" and c["secure"] for c in await context.cookies())
+        port = site.url.rsplit(":", 1)[1]
+        result = await server.call_tool("browser_navigate", {
+            "url": f"http://plain.ws43.test:{port}/doc.pdf"})
+        assert result.success, result
+        requests = [(who, cookies) for host, path, who, cookies in site.cookies
+                    if host == "plain.ws43.test" and path == "/doc.pdf"]
+        assert len(requests) == 2, requests
+        assert next(c for who, c in requests if who == "browser") == frozenset({"plain=fixture"})
+        assert next(c for who, c in requests if who == "refetch") == frozenset({"plain=fixture"})
+
+
+def test_cookie_expiry_and_secure_boundaries():
+    from actions.pdf_document import cookie_matches
+    cookie = {"domain": "plain.ws43.test", "path": "/", "secure": True, "expires": -1}
+    assert cookie_matches(cookie, "https://plain.ws43.test/")
+    assert not cookie_matches(cookie, "http://plain.ws43.test/")
+    assert not cookie_matches({**cookie, "expires": 0}, "https://plain.ws43.test/")
+    assert not cookie_matches({**cookie, "expires": time.time() - 1}, "https://plain.ws43.test/")
+    assert cookie_matches({**cookie, "expires": time.time() + 60}, "https://plain.ws43.test/")
+
+
+@requires_chromium
+async def test_cookie_selection_recomputed_on_redirect_hop(site):
+    from actions.pdf_document import fetch_pdf
+    site.redirect = site.url + "/foobar/doc.pdf"
+    async with BrowserMCPServer() as server:
+        await server.start()
+        context = server._page.context
+        await context.add_cookies([
+            {"name": "pathfoo", "value": "fixture", "domain": "127.0.0.1", "path": "/foo"},
+            {"name": "root", "value": "fixture", "domain": "127.0.0.1", "path": "/"},
+        ])
+        navigated = await server.call_tool("browser_navigate", {"url": site.url + "/foo/redirect"})
+        assert navigated.success, navigated
+        fetched = await fetch_pdf(context, site.url + "/foo/redirect", server._egress,
+                                  server._egress_proxy, server._robots)
+        assert not fetched.reason and fetched.body == site.pdf
+        for path in ("/foo/redirect", "/foobar/doc.pdf"):
+            browser = [c for _, p, who, c in site.cookies if p == path and who == "browser"]
+            refetch = [c for _, p, who, c in site.cookies if p == path and who == "refetch"]
+            assert browser and refetch
+            assert all(c == browser[0] for c in refetch)
+            assert ("pathfoo=fixture" in browser[0]) == (path == "/foo/redirect")
+
+
+@requires_chromium
+async def test_pdf_content_encoding_rejected_in_mcp(site):
+    site.encoded = True
+    async with BrowserMCPServer() as server:
+        result = await server.call_tool("browser_navigate", {"url": site.url + "/report.pdf"})
+    assert result.success, result
+    assert result.data["document"]["reason"] == "content_encoding"
+    assert result.data["document"]["pages"] == []
+    assert result.data["hint"]
+    assert {who for _, path, who, _ in site.cookies if path == "/report.pdf"} == {"browser", "refetch"}
+
+
+@requires_chromium
+async def test_zero_page_pdf_navigate_has_hint_and_extract_range_fails(site):
+    site.pdf = pdf_bytes([])
+    async with BrowserMCPServer() as server:
+        result = await server.call_tool("browser_navigate", {"url": site.url + "/report.pdf"})
+        assert result.success, result
+        assert result.data["document"]["pages_total"] == 0
+        assert result.data["document"]["pages"] == []
+        assert result.data["document"]["reason"] == "no_pages"
+        assert "쪽" in result.data["hint"]
+        extracted = await server.call_tool("browser_extract", {"selector": "pdf:pages=1"})
+        assert not extracted.success and extracted.error_code.value == "E_ELEMENT_NOT_FOUND"
+
+
+@requires_chromium
+async def test_overlapping_pdf_late_download_artifacts_cleaned(site, monkeypatch):
+    from playwright.async_api import Download
+    paths = []
+    cancelled = []
+    original_delete, original_cancel = Download.delete, Download.cancel
+
+    async def delete(self):
+        path = Path(self._impl_obj._artifact.absolute_path)
+        path.write_bytes(b"late fixture")
+        partial = Path(str(path) + ".crdownload")
+        partial.write_bytes(b"late partial fixture")
+        paths.extend([path, partial])
+        return await original_delete(self)
+
+    async def cancel(self):
+        cancelled.append(self)
+        return await original_cancel(self)
+
+    monkeypatch.setattr(Download, "delete", delete)
+    monkeypatch.setattr(Download, "cancel", cancel)
+    async with BrowserMCPServer() as server:
+        await server.start()
+        page = server._page
+        events = []
+        page.on("download", lambda download: events.append(download))
+        original_on = page.on
+        original_remove = page.remove_listener
+        callbacks = {}
+        queued = []
+        active = set()
+
+        def delayed_on(event, callback):
+            if event != "download":
+                return original_on(event, callback)
+
+            def delayed(download):
+                # Hold real Chromium events until every overlapping call returns.
+                queued.append((callback, download))
+
+            callbacks[callback] = delayed
+            active.add(callback)
+            return original_on(event, delayed)
+
+        def remove(event, callback):
+            active.discard(callback)
+            return original_remove(event, callbacks.get(callback, callback))
+
+        monkeypatch.setattr(page, "on", delayed_on)
+        monkeypatch.setattr(page, "remove_listener", remove)
+        await asyncio.gather(*(server.call_tool("browser_navigate", {
+            "url": site.url + f"/late{i}.pdf"}) for i in range(3)))
+        await asyncio.sleep(0.1)
+        assert events and queued, "real Chromium download event required"
+        for callback, download in queued:
+            if callback in active:
+                callback(download)
+        await asyncio.sleep(0.5)
+        assert len(cancelled) == len(events), "each late download must be cancelled once"
+        assert paths and all(not p.exists() for p in paths)
+
+
+@requires_chromium
+async def test_pdf_cleanup_preserves_explicit_download_file(site, tmp_path):
+    from contracts import ActionType
+    async with BrowserMCPServer() as server:
+        await server.call_tool("browser_navigate", {"url": site.url + "/html"})
+        observed = await server.call_tool("browser_observe_page", {})
+        link = next(e for e in observed.data["observation"]["elements"] if e["name"] == "PDF")
+        result = await server._pdf.dispatch(server._dispatcher, ActionType.DOWNLOAD_FILE, {
+            "element_id": link["element_id"], "save_dir": str(tmp_path),
+            "epoch": observed.snapshot_epoch}, server._egress, server._egress_proxy, server._robots)
+        assert result.success, result
+        assert Path(result.downloaded_path).read_bytes() == site.pdf
 
 
 @requires_chromium
@@ -326,10 +549,10 @@ async def test_fetch_checks_policy_before_cookie_access_and_each_redirect(site, 
             events.append(("guard", url))
             return await original_guard(url)
 
-        async def cookies(urls):
-            assert events and events[-1] == ("guard", urls[0])
-            events.append(("cookies", urls[0]))
-            return await original_cookies(urls)
+        async def cookies():
+            assert events and events[-1][0] == "guard"
+            events.append(("cookies", events[-1][1]))
+            return await original_cookies()
 
         monkeypatch.setattr(server._egress, "evaluate_async", checked)
         monkeypatch.setattr(context, "cookies", cookies)

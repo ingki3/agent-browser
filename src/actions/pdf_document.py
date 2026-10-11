@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
 import re
 import subprocess
 import sys
+import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
@@ -62,6 +64,36 @@ def safe_url(url: str) -> bool:
         return False
 
 
+def cookie_matches(cookie: dict, url: str) -> bool:
+    """RFC 6265 domain/path/expiry rules, with Chromium's localhost trust.
+
+    Chromium represents host-only cookies without a leading domain dot.
+    SameSite is left inclusive, as for the browser-initiated top-level GET.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower().encode("idna").decode("ascii")
+    domain = cookie["domain"].lower()
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if domain.startswith("."):
+        if host != domain[1:] and (address is not None or not host.endswith(domain)):
+            return False
+    elif host != domain:
+        return False
+    path, cookie_path = parts.path or "/", cookie.get("path") or "/"
+    if not (path == cookie_path or (path.startswith(cookie_path) and
+            (cookie_path.endswith("/") or path[len(cookie_path):].startswith("/")))):
+        return False
+    localhost = host.rstrip(".") == "localhost" or host.rstrip(".").endswith(".localhost")
+    trustworthy = localhost or (address is not None and address.is_loopback)
+    if cookie.get("secure") and parts.scheme != "https" and not trustworthy:
+        return False
+    expires = cookie.get("expires", -1)
+    return expires == -1 or expires > time.time()
+
+
 @dataclass
 class FetchResult:
     body: bytes = b""
@@ -73,7 +105,7 @@ async def fetch_pdf(context: BrowserContext, url: str, guard: EgressGuard | None
                     proxy: EgressProxy | None, robots: RobotsSignals, *, sniff: bool = False) -> FetchResult:
     """Same pinned egress/UA as Chromium, bounded bytes, same-origin redirects.
 
-    Cookies are queried only for the validated destination on each hop. They
+    Cookies are filtered for the validated destination on each hop. They
     never appear in results/logs and cross-origin redirects fail closed.
     """
     import httpx
@@ -96,7 +128,10 @@ async def fetch_pdf(context: BrowserContext, url: str, guard: EgressGuard | None
                         return FetchResult(url=url, reason="egress_blocked")
                     if origin(url) != initial:
                         return FetchResult(url=url, reason="redirect_origin")
-                    cookies = await context.cookies([url])
+                    cookies = [c for c in await context.cookies() if cookie_matches(c, url)]
+                    # RFC 6265 recommends longer paths first; stable sorting
+                    # preserves context order for equally scoped cookies.
+                    cookies.sort(key=lambda c: -len(c.get("path") or "/"))
                     cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
                     client.cookies.clear()
                     async with client.stream("GET", url, headers={"Cookie": cookie} if cookie else {}) as response:
@@ -175,6 +210,10 @@ def _parse_worker(body: bytes, start: int, end: int, chars: int) -> None:
                 return
             total = len(reader.pages)
             doc["pages_total"] = total
+            if total == 0 and start == 1 and end == 10_000_000:
+                doc["reason"] = "no_pages"
+                emit()
+                return
             if start > total:
                 doc.update(reason="page_range", truncated=True)
                 emit()
@@ -282,6 +321,30 @@ _DOCUMENTS_JS = """() => {
 }"""
 
 
+@dataclass
+class DownloadCleanup:
+    tasks: set[asyncio.Task] = field(default_factory=set)
+    explicit_downloads: int = 0
+
+
+async def discard_download(download: Download) -> None:
+    try:
+        await download.cancel()
+    finally:
+        try:
+            await download.delete()
+        except Exception as exc:  # noqa: BLE001 - cancellation prevents API deletion
+            if "canceled" not in str(exc):
+                raise
+        finally:
+            # Only use the driver's opaque host-created artifact path.
+            artifact = getattr(getattr(download, "_impl_obj", None), "_artifact", None)
+            raw_path = getattr(artifact, "absolute_path", None)
+            if isinstance(raw_path, str) and Path(raw_path).is_absolute():
+                Path(raw_path).unlink(missing_ok=True)
+                Path(raw_path + ".crdownload").unlink(missing_ok=True)
+
+
 class PdfDocuments:
     """MCP-only document extension, keeping frozen action contracts intact."""
 
@@ -289,16 +352,34 @@ class PdfDocuments:
         self.current: WeakKeyDictionary = WeakKeyDictionary()
         self.watched: WeakKeyDictionary = WeakKeyDictionary()
 
-    def _watch(self, page: Page) -> None:
+    def _watch(self, page: Page) -> DownloadCleanup:
         if page in self.watched:
-            return
-        self.watched[page] = True
+            return self.watched[page]
+        state = DownloadCleanup()
+        self.watched[page] = state
 
         def moved(frame) -> None:
             if frame == page.main_frame:
                 self.current.pop(page, None)
 
         page.on("framenavigated", moved)
+
+        def completed(task: asyncio.Task) -> None:
+            state.tasks.discard(task)
+            if not task.cancelled():
+                task.exception()  # consume late cleanup failures during context shutdown
+
+        def late_download(download: Download) -> None:
+            if state.explicit_downloads:
+                return  # download_file owns its artifact and completion
+            task = asyncio.create_task(discard_download(download))
+            state.tasks.add(task)
+            task.add_done_callback(completed)
+
+        # Keep cleanup for this page's lifetime: goto may reject and another
+        # navigate may finish before Chromium delivers the download event.
+        page.on("download", late_download)
+        return state
 
     async def dispatch(self, dispatcher: ActionDispatcher, action: ActionType, params: dict,
                        guard: EgressGuard | None, proxy: EgressProxy | None,
@@ -315,33 +396,16 @@ class PdfDocuments:
             return await self._read(dispatcher, action, url, guard, proxy, robots,
                                     int(match[1]), int(match[2] or match[1]), max_chars)
         downloads: list[Download] = []
-        cleanup: list[asyncio.Task] = []
         primary_pdf = False
         primary_url = ""
         listening = action in {ActionType.NAVIGATE, ActionType.CLICK} and hasattr(page, "on")
-
-        async def discard(download: Download) -> None:
-            try:
-                await download.cancel()
-            finally:
-                try:
-                    await download.delete()
-                except Exception as exc:  # noqa: BLE001 - cancelled artifacts cannot use API deletion
-                    if "canceled" not in str(exc):
-                        raise
-                finally:
-                    # Playwright delete cannot reach unlink after cancellation.
-                    # Use only the driver's host-created opaque artifact path,
-                    # never suggested_filename (a page-controlled string).
-                    artifact = getattr(getattr(download, "_impl_obj", None), "_artifact", None)
-                    raw_path = getattr(artifact, "absolute_path", None)
-                    if isinstance(raw_path, str) and Path(raw_path).is_absolute():
-                        Path(raw_path).unlink(missing_ok=True)
-                        Path(raw_path + ".crdownload").unlink(missing_ok=True)
+        state = self._watch(page) if listening else self.watched.get(page)
+        explicit = action is ActionType.DOWNLOAD_FILE and state is not None
+        if explicit:
+            state.explicit_downloads += 1
 
         def on_download(download: Download) -> None:
             downloads.append(download)
-            cleanup.append(asyncio.create_task(discard(download)))
 
         def on_response(response) -> None:
             nonlocal primary_pdf, primary_url
@@ -358,11 +422,13 @@ class PdfDocuments:
                 # goto rejects just before the download event; only this path waits.
                 await asyncio.sleep(0.05)
         finally:
+            if explicit:
+                state.explicit_downloads -= 1
             if listening:
                 page.remove_listener("download", on_download)
                 page.remove_listener("response", on_response)
-            if cleanup:
-                await asyncio.gather(*cleanup)
+            if state is not None and state.tasks:
+                await asyncio.gather(*list(state.tasks), return_exceptions=True)
         pdf = next((d for d in downloads if d.suggested_filename.lower().endswith(".pdf")), None)
         if action is ActionType.NAVIGATE and (primary_pdf or (
                 downloads and result.error_code is ErrorCode.DOWNLOAD_FAILED)):
@@ -414,6 +480,7 @@ class PdfDocuments:
         if reason:
             data["hint"] = ("글자 없는 PDF(스캔 이미지) — 스크린샷으로 확인하세요." if reason == "no_text_layer"
                             else "암호 걸린 PDF — 텍스트를 읽을 수 없습니다." if reason == "encrypted"
+                            else "쪽이 없는 PDF — 읽을 쪽이 없습니다." if reason == "no_pages"
                             else f"PDF 부분 결과: {reason}. 나머지 쪽은 pdf:pages=3-5 로 읽으세요.")
         result = dispatcher._result(success=True, action=action, retry_safe=True, data=data)
         result.current_url = doc["url"]

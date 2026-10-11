@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3175개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3189개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -383,6 +383,7 @@ Allow/Disallow·와일드카드·가장 긴 일치(동률 Allow)를 해석하며
 `browser_navigate({"url": "https://example.com/report.pdf"})`는 PDF를 읽어 성공 결과의
 `data.document`에 `{kind: "pdf", url, pages_total, pages: [{page, text}], chars, truncated,
 text_layer}`를 돌려줍니다. 확장자가 없어도 PDF 응답이나 PDF 다운로드를 인식합니다.
+PDF navigate 1회는 서버 GET 2회(브라우저 시작 + 재요청)와 robots.txt 요청을 발생시킵니다 — 일회용·서명·과금 링크는 두 번째 요청이 실패할 수 있습니다.
 쪽 번호는 1부터 시작하며, 나머지 쪽은 `browser_extract({"selector": "pdf:pages=3-5"})`로 읽습니다.
 쪽 범위는 현재 탭의 마지막 PDF에 적용되며 새 문서로 이동하면 해제됩니다.
 
