@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3218개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3228개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -324,17 +324,21 @@ agent-browser는 **캡차 자동 풀이·Cloudflare/Akamai 등의 확인 화면 
 **헤드리스 이름 재시도(WS-44)** — headless `navigate`가 HTTP 403 + 짧은 generic 차단 본문을 받았고,
 robots 조회가 확정되어 그 경로를 `*` 기준 허용하며 그 출처에 유효한 쿠키가 전혀 없을 때만,
 서버 수명 중 출처(scheme·host·port)당 **한 번** 같은 URL을 다시 엽니다. 기본 켬이며
-`serve --no-headless-retry`로 끕니다. 실제 브라우저 UA의 `HeadlessChrome`만 `Chrome`으로 바꾸고,
+`serve --no-headless-retry`로 끕니다. 실제 브라우저 UA의 `HeadlessChrome`을 `Chrome`으로 바꾸고,
+UA 버전은 창 모드 Chromium의 축소값 `Chrome/<major>.0.0.0`으로 맞춥니다.
 Client Hints의 headless 브랜드만 제거해 같은 버전 창 모드의 순서로 맞춥니다(버전·플랫폼·GREASE 유지).
 변경은 재시도 중 그 출처의 요청에만 적용하며 다른 출처 리다이렉트·하위 요청에는 원래 이름을 보내고,
 재시도 종료·실패·취소 때 복원합니다. `navigator.webdriver`·JS UA·플러그인·지문은 건드리지 않습니다.
+바뀐 이름은 재시도 navigate가 끝날 때까지의 그 출처 요청에만 적용되며, 이후 지연 로드 하위 자원과 JS의 `navigator.userAgent`는 원래 값입니다.
 robots 금지·조회 불가·쿠키 있음·알려진 확인 화면·401(로그인)·429(속도 제한)은 재시도 대상이 아닙니다.
+`cf-mitigated` 헤더(값 무관) 또는 `server: cloudflare`가 있는 403도 확인 화면으로 보아 재시도하지 않습니다.
+재시도 URL에서 fragment를 제거하며, 문서 요청이 나가지 않으면 실패 재시도로 표시하거나 출처 예약을 소진하지 않습니다.
 재시도도 같은 MCP 관문(egress·robots·IPI·레시피)을 거치며, 레시피에는 최초 이동 전 상태와
 최종 성공 결과를 한 단계로 기록합니다. 차단된 재시도는 저장하지 않습니다.
 
 재시도 결과에는 `data.identity = {presented_as: "chrome", reason: "headless_ua_blocked",
-original_status: 403}`가 붙고, 실패하면 `retry_failed: true`도 붙습니다. 403/401의 짧은 본문이
-robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단임을 알립니다. 429는 속도 제한 안내와
+original_status: 403}`가 붙고, 실패하면 `retry_failed: true`도 붙습니다. 403의 짧은 차단 본문이나 401 응답이
+robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 필요를 알립니다(401 자체는 `challenge`가 아님). 429는 속도 제한 안내와
 `Retry-After`(있으면 상한 128자의 안전한 텍스트)를 돌려주며 자동 재요청하지 않습니다.
 헤더 원문은 `data.retry_after`에도 실어 기존 IPI 신호 검사를 거칩니다.
 

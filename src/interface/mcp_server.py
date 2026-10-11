@@ -2347,6 +2347,8 @@ class BrowserMCPServer:
             return None
         if self._egress is None:
             return None
+        if self._page_status is not None and self._page_status.confirmation_for(page):
+            return None
         allowed = await self._robots.allowed(page.context, page.url, self._egress, self._egress_proxy)
         origin = _origin(page.url)
         if (not result.success or status != 403 or not self.headless_retry
@@ -2365,12 +2367,20 @@ class BrowserMCPServer:
             return None  # another caller can reserve the origin while UA discovery awaits
         self._headless_retry.attempted.add(origin)  # reserve before any await/recursive navigation
         token = self._retry_recipe_boundary.set(True)
+        attempt = None
+        retry_arguments = dict(arguments)
+        retry_arguments["url"] = params["url"].split("#", 1)[0]
         try:
             async with self._headless_retry.present(page, page.url, original, self._robots,
-                                                    self._egress, self._egress_proxy):
-                retried = await self.call_tool(name, arguments)
+                                                    self._egress, self._egress_proxy) as attempt:
+                retried = await self.call_tool(name, retry_arguments)
         finally:
             self._retry_recipe_boundary.reset(token)
+            if attempt is None or not attempt.document_requested:
+                self._headless_retry.attempted.discard(origin)
+        if not attempt.document_requested:
+            # Preserve genuine gate failures, but a same-document no-op is not a retry.
+            return retried if not retried.success else None
         identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "original_status": 403}
         retry_status = retried.data.get("last_http_status")
         if (not retried.success or retried.data.get("challenge") is not None
@@ -2401,8 +2411,9 @@ class BrowserMCPServer:
                 hint += " Retry-After: " + result.data["retry_after"]
         else:
             challenge = result.data.get("challenge")
-            if (status in {401, 403} and isinstance(challenge, dict) and self._egress is not None
-                    and str(challenge.get("reason") or "").startswith(f"HTTP {status} + 짧은 본문")
+            short_denial = (isinstance(challenge, dict)
+                            and str(challenge.get("reason") or "").startswith(f"HTTP {status} + 짧은 본문"))
+            if (self._egress is not None and (status == 401 or status == 403 and short_denial)
                     and await self._robots.allowed(page.context, page.url, self._egress, self._egress_proxy) is True):
                 hint = "robots 때문이 아님 — 사이트 서버가 이 브라우저를 막음(헤드리스 이름 차단 가능)"
                 if status == 401:

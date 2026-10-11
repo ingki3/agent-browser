@@ -60,6 +60,7 @@ class PageDocumentStatus:
         self._by_page: Dict[Any, Tuple[int, str, int]] = {}
         self._pending: List[Tuple[int, Any]] = []
         self._retry_after: Dict[Any, str] = {}
+        self._confirmation: Dict[Any, bool] = {}
 
     # -- 기록 ---------------------------------------------------------------
 
@@ -90,7 +91,7 @@ class PageDocumentStatus:
                 del self._pending[: -self.MAX_PENDING]
                 return
             self._store(page, self._seq, response.url, response.status,
-                        getattr(response, "headers", {}).get("retry-after", ""))
+                        getattr(response, "headers", {}))
         except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
             pass
 
@@ -102,12 +103,17 @@ class PageDocumentStatus:
     def forget(self, page: Any) -> None:
         self._by_page.pop(page, None)
         self._retry_after.pop(page, None)
+        self._confirmation.pop(page, None)
 
-    def _store(self, page: Any, seq: int, url: str, status: int, retry_after: str = "") -> None:
+    def _store(self, page: Any, seq: int, url: str, status: int,
+               headers: Optional[Dict[str, str]] = None) -> None:
         current = self._by_page.get(page)
         if current is None or current[0] < seq:
             self._by_page[page] = (seq, url, status)
-            self._retry_after[page] = retry_after[:256]
+            headers = headers or {}
+            self._retry_after[page] = headers.get("retry-after", "")[:256]
+            self._confirmation[page] = ("cf-mitigated" in headers
+                                       or headers.get("server", "").strip().lower() == "cloudflare")
 
     def _resolve_pending(self) -> None:
         if not self._pending:
@@ -121,7 +127,7 @@ class PageDocumentStatus:
                 continue
             try:
                 self._store(page, seq, response.url, response.status,
-                            getattr(response, "headers", {}).get("retry-after", ""))
+                            getattr(response, "headers", {}))
             except Exception:  # noqa: BLE001
                 pass
         self._pending = still
@@ -131,6 +137,11 @@ class PageDocumentStatus:
     def retry_after_for(self, page: Any) -> str:
         self._resolve_pending()
         return self._retry_after.get(page, "") if self.judge_status_for(page) == 429 else ""
+
+    def confirmation_for(self, page: Any) -> bool:
+        """A current 403 with confirmation headers must never get a renamed retry."""
+        self._resolve_pending()
+        return self.judge_status_for(page) == 403 and self._confirmation.get(page, False)
 
     def status_for(self, page: Any) -> Optional[int]:
         """page 가 마지막으로 받은 메인 문서 응답 상태(없으면 None)."""

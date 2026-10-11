@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import re
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,8 @@ class Site:
     retry_status: int = 200
     redirect: str = ""
     retry_after: str = ""
+    block_headers: dict[str, str] = field(default_factory=dict)
+    success_body: bytes = b"<!doctype html><title>Read</title><a href='/next'>Next</a>"
     max_documents: int = 8  # terminate deliberately sabotaged recursive retries
     requests: list[tuple[str, dict[str, str]]] = field(default_factory=list)
 
@@ -50,9 +53,10 @@ def local_site():
             if not robots and len(state.received(self.path)) > state.max_documents:
                 status = 429
             redirect = state.redirect if not robots and headed else ""
-            data = state.robots if robots else (b"<!doctype html><title>Read</title><a href='/next'>Next</a>"
+            data = state.robots if robots else (state.success_body
                                               if status == 200 else state.body)
-            self.send_response(302 if redirect else status)
+            # Keep synthetic Server headers singular; send_response adds Python's own.
+            self.send_response_only(302 if redirect else status)
             self.send_header("Content-Type", "text/plain" if robots else "text/html")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Accept-CH", "Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, "
@@ -61,6 +65,9 @@ def local_site():
                 self.send_header("Location", redirect)
             if state.retry_after and not robots:
                 self.send_header("Retry-After", state.retry_after)
+            if not robots and not headed:
+                for key, value in state.block_headers.items():
+                    self.send_header(key, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -128,7 +135,8 @@ async def test_retry_success_wire_identity_and_native_client_hints(sites):
     headers = site.received()
     assert len(headers) == 2
     assert headers[0]["user-agent"] == original
-    assert headers[1]["user-agent"] == original.replace("HeadlessChrome", "Chrome")
+    major = re.search(r"HeadlessChrome/([0-9]+)", original)[1]
+    assert headers[1]["user-agent"] == re.sub(r"HeadlessChrome/[0-9.]+", f"Chrome/{major}.0.0.0", original)
     hints = {key: value for key, value in headers[1].items() if key.startswith("sec-ch-ua")}
     assert hints and "HeadlessChrome" not in hints["sec-ch-ua"]
     assert "sec-ch-ua-full-version-list" in hints and "HeadlessChrome" not in hints["sec-ch-ua-full-version-list"]
@@ -138,6 +146,7 @@ async def test_retry_success_wire_identity_and_native_client_hints(sites):
         await navigate(headed, site.url + "/headed")
     assert hints == {key: value for key, value in site.received("/headed")[0].items()
                      if key.startswith("sec-ch-ua")}
+    assert headers[1]["user-agent"] == site.received("/headed")[0]["user-agent"]
 
 
 @pytest.mark.parametrize("major,source,expected", [
@@ -186,7 +195,9 @@ async def test_each_exclusion_sends_zero_retries(sites, condition):
         if condition == "disabled":
             assert "robots 때문이 아님" in result.data["hint"]
         if condition == "401":
+            assert result.data["challenge"] is None
             assert "robots 때문이 아님" in result.data["hint"]
+            assert "401은 로그인" in result.data["hint"]
     assert len(site.received()) == 1
 
 
@@ -240,7 +251,8 @@ async def test_failed_retry_is_only_once_per_origin_and_restored(sites):
         await navigate(server, other.url + "/read")
     requests = site.received()
     assert len(requests) == 3
-    assert requests[1]["user-agent"] == requests[0]["user-agent"].replace("HeadlessChrome", "Chrome")
+    major = re.search(r"HeadlessChrome/([0-9]+)", requests[0]["user-agent"])[1]
+    assert requests[1]["user-agent"] == re.sub(r"HeadlessChrome/[0-9.]+", f"Chrome/{major}.0.0.0", requests[0]["user-agent"])
     assert requests[2]["user-agent"] == requests[0]["user-agent"]
     assert other.received()[0]["user-agent"] == requests[0]["user-agent"]
 
@@ -298,14 +310,15 @@ async def test_headed_browser_never_retries_and_egress_gate_is_reentered(sites, 
 
         @asynccontextmanager
         async def restricted(*args):
-            async with present(*args):
+            async with present(*args) as attempt:
                 server._egress.allow_loopback = False
-                yield
+                yield attempt
 
         monkeypatch.setattr(server._headless_retry, "present", restricted)
         result = await navigate(server, site.url + "/read")
         assert not result.success and result.data["egress"]
-        assert result.data["identity"]["retry_failed"] is True
+        assert "identity" not in result.data
+        assert not server._headless_retry.attempted
     assert len(site.received()) == 1
 
 
@@ -337,3 +350,93 @@ async def test_confirmed_allow_is_distinct_from_unknown(sites):
                                             server._egress_proxy) is True
         assert await server._robots.allowed(context, other.url + "/read", server._egress,
                                             server._egress_proxy) is None
+
+
+def test_short_401_does_not_change_shared_challenge_detection():
+    from browser.challenge import classify, ChallengeKind
+
+    assert classify("401 Unauthorized", "Session expired", 15, "", 401).kind is ChallengeKind.NONE
+
+
+@requires_chromium
+@pytest.mark.parametrize("headers", [{"cf-mitigated": "challenge"}, {"cf-mitigated": ""},
+                                     {"cf-mitigated": "arbitrary"}, {"Server": "CloudFlare"}])
+async def test_confirmation_response_headers_exclude_retry(sites, headers):
+    site, _ = sites
+    site.block_headers = headers
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        result = await navigate(server, site.url + "/read")
+        assert result.data["last_http_status"] == 403
+        assert "identity" not in result.data
+        assert not server._headless_retry.attempted
+    assert len(site.received()) == 1
+
+
+@requires_chromium
+async def test_fragment_retry_sends_document_request(sites):
+    site, _ = sites
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        result = await navigate(server, site.url + "/read?x=1#frag")
+        assert result.data["last_http_status"] == 200
+        assert result.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
+                                           "original_status": 403}
+    assert len(site.received("/read?x=1")) == 2
+
+
+@requires_chromium
+async def test_retry_without_request_keeps_origin_available(sites, monkeypatch):
+    site, _ = sites
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        call = server.call_tool
+
+        async def no_document(name, arguments):
+            if server._retry_recipe_boundary.get():
+                from contracts import ActionResult, ActionType
+                return ActionResult(success=True, action=ActionType.NAVIGATE, current_url=server._page.url,
+                                    snapshot_epoch=0, tab_id="synthetic", retry_safe=True,
+                                    data={"last_http_status": 403})
+            return await call(name, arguments)
+
+        monkeypatch.setattr(server, "call_tool", no_document)
+        result = await navigate(server, site.url + "/read")
+        assert result.data["challenge"] is not None
+        assert "identity" not in result.data
+        assert not server._headless_retry.attempted
+        monkeypatch.setattr(server, "call_tool", call)
+        assert (await navigate(server, site.url + "/read")).data["last_http_status"] == 200
+    assert len(site.received()) == 3
+
+
+def test_trailing_dot_origins_share_retry_and_robots_identity():
+    from security.robots_signal import _origin
+
+    assert _origin("http://LOCALHOST.:8080/read") == _origin("http://localhost:8080/next")
+    assert _origin("https://example.test.:443/read") == "https://example.test"
+
+
+@requires_chromium
+async def test_trailing_dot_host_cannot_retry_twice(sites):
+    site, _ = sites
+    base = site.url.replace("127.0.0.1", "localhost")
+    dotted = site.url.replace("127.0.0.1", "localhost.")
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        first = await navigate(server, dotted + "/read")
+        assert first.data["last_http_status"] == 200 and first.data["identity"]
+        second = await navigate(server, base + "/read")
+        assert second.data["last_http_status"] == 403 and "identity" not in second.data
+        assert server._headless_retry.attempted == {base}
+    assert len(site.received()) == 3
+
+
+@requires_chromium
+async def test_robots_disallowed_subresources_keep_native_name_during_retry(sites):
+    site, _ = sites
+    site.robots = b"User-agent: *\nAllow: /\nDisallow: /private/\n"
+    site.success_body = b"<!doctype html><title>Read</title><img src='/public.png'><img src='/private/image.png'>"
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        result = await navigate(server, site.url + "/read")
+        assert result.data["last_http_status"] == 200
+        await server._page.wait_for_load_state("load")
+    original = site.received()[0]["user-agent"]
+    assert site.received("/private/image.png")[0]["user-agent"] == original
+    assert "HeadlessChrome" not in site.received("/public.png")[0]["user-agent"]

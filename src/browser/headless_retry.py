@@ -3,11 +3,13 @@
 Fetch.continueRequest changes only this paused request's headers, unlike a
 target-wide UA override or Playwright route headers inherited by redirects.
 Client Hint lists remove only the additional headless brand and use Chromium's
-native version-seeded ordering; versions, GREASE and platform hints stay native.
+native version-seeded ordering; Client Hint versions, GREASE and platform stay
+native. The UA uses headed Chromium's native major-only version reduction.
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from itertools import permutations
 import re
 from typing import AsyncIterator
@@ -70,8 +72,8 @@ class HeadlessRetry:
 
     @asynccontextmanager
     async def present(self, page: Page, url: str, original: str, robots: RobotsSignals,
-                      guard: EgressGuard, proxy: EgressProxy | None) -> AsyncIterator[None]:
-        """Present only the HeadlessChrome -> Chrome name during this retry.
+                      guard: EgressGuard, proxy: EgressProxy | None) -> AsyncIterator[RetryRequest]:
+        """Present the native headed Chromium name and reduced UA during this retry.
 
         Every request/redirect is separately scoped; all existing egress routes
         and the pinned proxy remain installed. Cookie changes fail closed, and
@@ -84,6 +86,7 @@ class HeadlessRetry:
             raise ValueError("unavailable native headless version")
         major = int(version[1])
         session = await page.context.new_cdp_session(page)
+        attempt = RetryRequest()
 
         async def paused(event: dict) -> None:
             request = event["request"]
@@ -96,12 +99,16 @@ class HeadlessRetry:
                         and await cookie_free_origin(page.context, target)
                         and await robots.allowed(page.context, target, guard, proxy) is True):
                     updated = dict(headers)
-                    updated[ua_key] = original.replace("HeadlessChrome", "Chrome")
+                    # Headed Chromium's native UA reduction keeps only the major.
+                    updated[ua_key] = re.sub(r"HeadlessChrome/[0-9.]+", f"Chrome/{major}.0.0.0", original)
                     for key in updated:
                         if key.lower() in {"sec-ch-ua", "sec-ch-ua-full-version-list"}:
                             updated[key] = headed_brand_list(updated[key], major)
                     params["headers"] = [{"name": key, "value": value} for key, value in updated.items()]
                 await session.send("Fetch.continueRequest", params)
+                if ("headers" in params and event.get("resourceType") == "Document"
+                        and event.get("frameId") == main_frame):
+                    attempt.document_requested = True
             except Exception:  # noqa: BLE001 - preserve native headers if inspection fails
                 try:
                     await session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
@@ -110,8 +117,9 @@ class HeadlessRetry:
 
         session.on("Fetch.requestPaused", paused)
         try:
+            main_frame = (await session.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
             await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
-            yield
+            yield attempt
         finally:
             try:
                 await session.send("Fetch.disable")
@@ -121,3 +129,10 @@ class HeadlessRetry:
                 await session.detach()
             except Exception:  # noqa: BLE001 - already detached/closed
                 pass
+
+
+@dataclass
+class RetryRequest:
+    """Whether a renamed main-document request actually left interception."""
+
+    document_requested: bool = False

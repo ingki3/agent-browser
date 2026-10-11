@@ -207,7 +207,9 @@ def _origin(url: str) -> Optional[str]:
         parts = urlsplit(url)
         if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
             return None
-        host = parts.hostname.lower()
+        host = parts.hostname.lower().rstrip(".")
+        if not host:
+            return None
         host = f"[{host}]" if ":" in host else host
         port = parts.port
         if port is not None and port != (443 if parts.scheme == "https" else 80):
