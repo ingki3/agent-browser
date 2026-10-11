@@ -220,3 +220,31 @@ async def test_nb3_launch_failure_message_has_no_path(fake_pw, tmp_path):
     assert str(tmp_path) not in str(ei.value) and "serve-secret" not in str(ei.value)
     assert ei.value.__cause__ is None and ei.value.__suppress_context__
     assert fake_pw.stopped
+
+
+class TargetClosedError(Exception):
+    """playwright._impl._errors.TargetClosedError 와 같은 이름(이름으로 판정한다)."""
+
+
+@pytest.mark.parametrize("exc,raises", [(TargetClosedError("closed"), False), (RuntimeError("boom"), True)])
+async def test_close_persistent_tolerates_already_closed(fake_pw, tmp_path, exc, raises):
+    """사람이 창의 마지막 탭을 닫아 Chromium 이 컨텍스트를 먼저 닫은 뒤의 close() — 이미 닫힘은 실패가 아니다
+    (CI 경합: 창 X 뒤 headless 복귀가 state=failed). 다른 오류는 그대로 올린다."""
+    core = await BrowserCore(persistent_profile=tmp_path / "p").start()
+    try:
+        await core.new_tab("mcp-session")
+        ctx = fake_pw.chromium.contexts[-1]
+
+        async def _close() -> None:
+            raise exc
+
+        ctx.close = _close
+        if raises:
+            with pytest.raises(RuntimeError):
+                await core.close_persistent()
+        else:
+            await core.close_persistent()
+        assert core.tab_count == 0 and core.context_count == 0
+        await core.open_persistent(headless=True)
+    finally:
+        await core.close()

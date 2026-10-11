@@ -151,13 +151,15 @@ def main() -> int:
         violations.append("tools/call 왕복 실패")
     from interface.mcp_server import OBSERVE_INSTRUCTIONS, RECIPE_INSTRUCTIONS, SERVER_TOOLS
     from security.robots_signal import ROBOTS_INSTRUCTIONS
+    from actions.pdf_document import PDF_INSTRUCTIONS
 
     instructions = findings["instructions"] or ""
     instructions_delivered = (RECIPE_INSTRUCTIONS in instructions
                               and OBSERVE_INSTRUCTIONS in instructions
-                              and ROBOTS_INSTRUCTIONS in instructions)
+                              and ROBOTS_INSTRUCTIONS in instructions
+                              and PDF_INSTRUCTIONS in instructions)
     if not instructions_delivered:
-        violations.append("initialize 의 서버 instructions(레시피·관찰·robots 안내)가 클라이언트에 도착하지 않음")
+        violations.append("initialize 의 서버 instructions(레시피·관찰·robots·PDF 안내)가 클라이언트에 도착하지 않음")
     if findings["server_tools_listed"] != sorted(SERVER_TOOLS):
         violations.append(
             f"서버 도구 불일치: {findings['server_tools_listed']} != {sorted(SERVER_TOOLS)}"
