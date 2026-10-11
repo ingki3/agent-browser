@@ -212,6 +212,20 @@ def test_recorder_does_not_record_move_to_error_page():
     assert rc.nav_kind("http://a.test/list", "chrome-error://chromewebdata/") == "error"
 
 
+def test_recorder_does_not_record_egress_blocked_move_even_before_url_updates():
+    """click 결과가 오류 페이지 주소를 아직 반영하지 못해도(주소 그대로), egress 차단이 실린 단계는 기록하지 않는다
+    (v1.13.0 릴리스 게이트 실측 경합 — test_click_blocked_by_egress_reports_egress_and_is_not_recorded)."""
+    from recipes.service import RecipeService
+
+    svc = RecipeService(SimpleNamespace(profile=None))
+    action = SimpleNamespace(value="click")
+    pre = {"url": "http://a.test/list", "skel": "s" * 12, "ready": 5, "target": {"ui": {}}}
+    blocked = SimpleNamespace(success=True, healed=False, current_url="http://a.test/list",
+                              data={"signals": ["dom_changed"], "egress": {"host": "ads.invalid"}})
+    svc.post(action, {"element_id": "@e1"}, pre, blocked, False)
+    assert len(svc.trajectory.entries) == 0 and svc.trajectory.last_break == "nav_error"
+
+
 # ---------------------------------------------------------------------------
 # NB-5: 같은 href 자리표시자
 # ---------------------------------------------------------------------------
