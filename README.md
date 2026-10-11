@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3152개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3175개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -377,6 +377,30 @@ Allow/Disallow·와일드카드·가장 긴 일치(동률 Allow)를 해석하며
 적힌 금지 문구나 알려지지 않은 UA는 따로 판단하지 않습니다. `/`로 시작하지 않는 규칙 패턴은 무시합니다.
 캐시 중 사이트 정책이 바뀌거나
 가져오기가 실패할 수 있으므로 신호가 없다고 자동 접근을 허용한다는 뜻은 아닙니다.
+
+### PDF 읽기
+
+`browser_navigate({"url": "https://example.com/report.pdf"})`는 PDF를 읽어 성공 결과의
+`data.document`에 `{kind: "pdf", url, pages_total, pages: [{page, text}], chars, truncated,
+text_layer}`를 돌려줍니다. 확장자가 없어도 PDF 응답이나 PDF 다운로드를 인식합니다.
+쪽 번호는 1부터 시작하며, 나머지 쪽은 `browser_extract({"selector": "pdf:pages=3-5"})`로 읽습니다.
+쪽 범위는 현재 탭의 마지막 PDF에 적용되며 새 문서로 이동하면 해제됩니다.
+
+한 번에 파일 25MiB, 처리 50쪽, 텍스트 20,000자까지 앞쪽부터 읽습니다. 상한·파싱 시간 초과·
+손상·암호화는 성공 결과의 `document.reason`과 `data.hint`에 설명하며, 완료한 쪽은 보존합니다.
+쪽 범위를 잘못 지정하거나 egress가 차단하면 기존 오류 코드로 실패합니다. 제어·bidi·zero-width
+문자는 제거하고 주입 문구에는 기존 `data.injection_suspected` 신호를 붙입니다.
+
+끼워 넣은 PDF와 PDF 링크는 `browser_observe_page`의 `data.documents`에 절대 HTTP(S) URL로
+최대 5개 표시합니다. PDF 링크 클릭에는 `browser_navigate`로 읽을 URL을 안내합니다.
+글자 층이 없는 스캔 PDF는 `text_layer: false`와 스크린샷 확인 안내를 돌려주며 OCR은 수행하지 않습니다.
+
+브라우저 다운로드는 즉시 취소·삭제하고 같은 egress 프록시·가드·UA와 해당 주소에 적용되는
+컨텍스트 쿠키로 메모리에 스트리밍합니다. 추가 가져오기는 같은 출처의 리다이렉트만 5회까지
+허용합니다. 파일을 저장하거나 PDF 본문을 캐시하지 않으므로 쪽 범위마다 다시 가져옵니다.
+파서는 별도 프로세스에서 5초 안에 중단하고, 압축 해제 8MiB·페이지 트리·RSS 감시로 자원을 제한합니다.
+PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 표시되지 않습니다. 스캔 PDF의
+스크린샷은 PDF를 표시하는 사람의 브라우저에서 확인해야 합니다.
 
 ### 동작 캐시 — 레시피 (`browser_recipe`)
 

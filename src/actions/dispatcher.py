@@ -2174,7 +2174,8 @@ class ActionDispatcher:
                     success=False,
                     action=action,
                     retry_safe=True,
-                    error_code=ErrorCode.NAVIGATE_TIMEOUT,
+                    error_code=(ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
+                                else ErrorCode.NAVIGATE_TIMEOUT),
                     error_message=str(exc),
                 )
             self.ctx.engine.bump_epoch("navigate")

@@ -787,6 +787,9 @@ class BrowserMCPServer:
         from security.robots_signal import RobotsSignals
 
         self._robots = RobotsSignals()  # WS-41: server-memory intent signal cache
+        from actions.pdf_document import PdfDocuments
+
+        self._pdf = PdfDocuments()
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -2051,7 +2054,13 @@ class BrowserMCPServer:
 
                 ctx = getattr(self._dispatcher, "ctx", None)
                 page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
-                await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+                document = result.data.get("document")
+                if isinstance(document, dict) and document.get("url") and page is not None and self._egress is not None:
+                    signal = await self._robots.signal(page.context, document["url"], self._egress, self._egress_proxy)
+                    if signal:
+                        result.data["robots"] = signal
+                else:
+                    await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -2116,6 +2125,8 @@ class BrowserMCPServer:
     async def _attach_observation_guidance(
         self, action: ActionType, params: Dict[str, Any], result: ActionResult,
     ) -> None:
+        if "document" in result.data:
+            return  # PDF is a virtual document; the previous DOM is not its observation.
         state = self._observation_state()
         if state is None:
             return
@@ -2275,7 +2286,8 @@ class BrowserMCPServer:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
         try:
-            result = await self._dispatcher.dispatch(action, params)
+            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                             self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
@@ -2290,7 +2302,7 @@ class BrowserMCPServer:
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
-        if action in CHALLENGE_CHECK_ACTIONS:
+        if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
             await self._attach_challenge(result)
         if self._recipes is not None:
             # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
@@ -2872,8 +2884,9 @@ def create_server(
     )
     #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
     from security.robots_signal import ROBOTS_INSTRUCTIONS
+    from actions.pdf_document import PDF_INSTRUCTIONS
 
-    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
