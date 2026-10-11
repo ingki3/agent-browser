@@ -138,6 +138,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="고위험 행동 승인 증표 수명(초, 기본 1800). 사람이 `agent-browser approve` 로 승인.",
     )
     serve.add_argument(
+        "--no-headless-retry", dest="headless_retry", action="store_false",
+        help="헤드리스 이름으로 인한 짧은 403의 출처당 1회 재시도 끄기(기본 켬).",
+    )
+    serve.add_argument(
         "--no-recipes",
         dest="recipes",
         action="store_false",
@@ -351,6 +355,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 **({"approval_ttl_s": args.approval_ttl} if args.approval_ttl else {}),
                 profile=args.profile,
                 **({} if getattr(args, "recipes", True) else {"recipes": False}),
+                **({} if getattr(args, "headless_retry", True) else {"headless_retry": False}),
             )
         )
     except KeyboardInterrupt:

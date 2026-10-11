@@ -25,12 +25,15 @@ import os
 import signal
 import time
 import unicodedata
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 from weakref import WeakSet
 
 from playwright.async_api import Frame
+from browser.headless_retry import RetryRequest
 
 from contracts import (
     ACTION_INPUT_MAP,
@@ -660,6 +663,7 @@ class BrowserMCPServer:
         handoff_root: Any = None,
         profile: Optional[str] = None,
         recipes: bool = True,
+        headless_retry: bool = True,
     ) -> None:
         from interface.handoff import HandoffHub, state_root
 
@@ -758,6 +762,11 @@ class BrowserMCPServer:
         self.allowed_domains = allowed_domains
         self.pre_approved_actions = pre_approved_actions
         self.headless = headless
+        self.headless_retry = bool(headless_retry)
+        from browser.headless_retry import HeadlessRetry
+
+        self._headless_retry = HeadlessRetry()
+        self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
         #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
         #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
         self.browser_mode = browser_mode
@@ -787,6 +796,9 @@ class BrowserMCPServer:
         from security.robots_signal import RobotsSignals
 
         self._robots = RobotsSignals()  # WS-41: server-memory intent signal cache
+        from actions.pdf_document import PdfDocuments
+
+        self._pdf = PdfDocuments()
 
     # -- 수명주기 -----------------------------------------------------------
 
@@ -2051,7 +2063,15 @@ class BrowserMCPServer:
 
                 ctx = getattr(self._dispatcher, "ctx", None)
                 page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
-                await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+                document = result.data.get("document")
+                if isinstance(document, dict) and document.get("url") and page is not None and self._egress is not None:
+                    signal = await self._robots.signal(page.context, document["url"], self._egress, self._egress_proxy)
+                    if signal:
+                        result.data["robots"] = signal
+                else:
+                    await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+            if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
+                await self._attach_block_hint(result)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -2116,6 +2136,8 @@ class BrowserMCPServer:
     async def _attach_observation_guidance(
         self, action: ActionType, params: Dict[str, Any], result: ActionResult,
     ) -> None:
+        if "document" in result.data:
+            return  # PDF is a virtual document; the previous DOM is not its observation.
         state = self._observation_state()
         if state is None:
             return
@@ -2264,7 +2286,8 @@ class BrowserMCPServer:
             return blocked
 
         # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
-        recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None else None
+        retry_boundary = action is ActionType.NAVIGATE and self._retry_recipe_boundary.get()
+        recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None and not retry_boundary else None
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
@@ -2275,7 +2298,9 @@ class BrowserMCPServer:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
         try:
-            result = await self._dispatcher.dispatch(action, params)
+            async with self._present_remembered_navigation(action, params) as remembered:
+                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                                 self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
@@ -2290,15 +2315,155 @@ class BrowserMCPServer:
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
-        if action in CHALLENGE_CHECK_ACTIONS:
+        if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
             await self._attach_challenge(result)
-        if self._recipes is not None:
+        if remembered is not None and remembered.document_requested:
+            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True}
+            if result.data.get("last_http_status") == 403:
+                self._headless_retry.states[remembered.origin] = "failed"
+                identity["retry_failed"] = True
+            result.data["identity"] = identity
+        if action is ActionType.NAVIGATE and "document" not in result.data:
+            retried = await self._retry_headless_navigation(name, arguments, params, result)
+            if retried is not None:
+                result = retried  # original pre-snapshot + final result form one recipe boundary
+        if self._recipes is not None and not retry_boundary:
             # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
-            self._recipes.post(action, params, recipe_pre, result, used is not None)
+            if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
+                self._recipes.reset("navigation_blocked")
+            else:
+                self._recipes.post(action, params, recipe_pre, result, used is not None)
             if action is ActionType.OBSERVE_PAGE:
                 await self._recipes.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
+
+    @asynccontextmanager
+    async def _present_remembered_navigation(
+        self, action: ActionType, params: Dict[str, Any],
+    ) -> AsyncIterator[RetryRequest | None]:
+        """Reuse success only during this navigate and with current eligibility.
+
+        Temporarily ineligible origins retain memory: the per-request checks
+        still prevent renamed requests while cookies or REP restrictions exist.
+        """
+        from browser.headless_retry import cookie_free_origin
+        from security.robots_signal import _origin
+
+        url = params.get("url", "") if action is ActionType.NAVIGATE else ""
+        origin = _origin(url)
+        page = self._recipe_page()
+        if (origin is None or self._headless_retry.states.get(origin) != "succeeded"
+                or self._retry_recipe_boundary.get() or not self.headless_retry
+                or not getattr(self._core, "headless", False) or page is None or self._egress is None):
+            yield None
+            return
+        if (await self._robots.allowed(page.context, url, self._egress, self._egress_proxy) is not True
+                or not await cookie_free_origin(page.context, url)):
+            yield None
+            return
+        original = await self._robots._context_user_agent(page.context)
+        if (original is None or "HeadlessChrome" not in original
+                or self._headless_retry.states.get(origin) != "succeeded"):
+            yield None
+            return
+        async with self._headless_retry.present(page, url, original, self._robots,
+                                                self._egress, self._egress_proxy) as attempt:
+            yield attempt
+
+    async def _retry_headless_navigation(
+        self, name: str, arguments: Dict[str, Any], params: Dict[str, Any], result: ActionResult,
+    ) -> Optional[ActionResult]:
+        """WS-44: short generic 403, confirmed REP Allow, empty-cookie origin, once."""
+        from browser.headless_retry import cookie_free_origin
+        from security.robots_signal import _origin
+
+        page = self._recipe_page()
+        if page is None:
+            return None
+        status = result.data.get("last_http_status")
+        challenge = result.data.get("challenge")
+        if not (isinstance(challenge, dict) and challenge.get("kind") == "blocked"
+                and challenge.get("vendor") == "generic" and status == 403
+                and str(challenge.get("reason") or "").startswith(f"HTTP {status} + 짧은 본문")):
+            return None
+        if self._egress is None:
+            return None
+        if self._page_status is not None and self._page_status.confirmation_for(page):
+            return None
+        allowed = await self._robots.allowed(page.context, page.url, self._egress, self._egress_proxy)
+        origin = _origin(page.url)
+        if (not result.success or status != 403 or not self.headless_retry
+                or not getattr(self._core, "headless", False) or allowed is not True
+                or origin is None or _origin(params.get("url", "")) != origin
+                or origin in self._headless_retry.states
+                or not await cookie_free_origin(page.context, page.url)):
+            return None
+        # Also confirm the original navigate path when it redirected within this origin.
+        if await self._robots.allowed(page.context, params["url"], self._egress, self._egress_proxy) is not True:
+            return None
+        original = await self._robots._context_user_agent(page.context)
+        if original is None or "HeadlessChrome" not in original:
+            return None
+        if origin in self._headless_retry.states:
+            return None  # another caller can reserve the origin while UA discovery awaits
+        self._headless_retry.states[origin] = "failed"  # reserve before any await/recursive navigation
+        token = self._retry_recipe_boundary.set(True)
+        attempt = None
+        retry_arguments = dict(arguments)
+        retry_arguments["url"] = params["url"].split("#", 1)[0]
+        try:
+            async with self._headless_retry.present(page, page.url, original, self._robots,
+                                                    self._egress, self._egress_proxy) as attempt:
+                retried = await self.call_tool(name, retry_arguments)
+        finally:
+            self._retry_recipe_boundary.reset(token)
+            if attempt is None or not attempt.document_requested:
+                self._headless_retry.states.pop(origin, None)
+        if not attempt.document_requested:
+            # Preserve genuine gate failures, but a same-document no-op is not a retry.
+            return retried if not retried.success else None
+        identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "original_status": 403}
+        retry_status = retried.data.get("last_http_status")
+        if (not retried.success or retried.data.get("challenge") is not None
+                or not isinstance(retry_status, int) or not 200 <= retry_status < 300):
+            identity["retry_failed"] = True
+        else:
+            self._headless_retry.states[origin] = "succeeded"
+        retried.data["identity"] = identity
+        return retried
+
+    async def _attach_block_hint(self, result: ActionResult) -> None:
+        """Explain server denial separately from REP, and report rate-limit timing."""
+        from actions.verification import safe_page_text
+
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+        if page is None:
+            return
+        status = result.data.get("last_http_status")
+        if self._page_status is not None and self._page_status.judge_status_for(page) != status:
+            return  # stale SPA response status is not this document's status
+        hint = ""
+        if status == 429:
+            retry_after = self._page_status.retry_after_for(page) if self._page_status is not None else ""
+            hint = "속도 제한 — 잠시 뒤에 다시 요청하세요."
+            if retry_after:
+                # Keep web-derived header text in a separately scanned field:
+                # IPI intentionally skips the server's fixed hint prose.
+                result.data["retry_after"] = safe_page_text(retry_after, 128)
+                hint += " Retry-After: " + result.data["retry_after"]
+        else:
+            challenge = result.data.get("challenge")
+            short_denial = (isinstance(challenge, dict)
+                            and str(challenge.get("reason") or "").startswith(f"HTTP {status} + 짧은 본문"))
+            if (self._egress is not None and (status == 401 or status == 403 and short_denial)
+                    and await self._robots.allowed(page.context, page.url, self._egress, self._egress_proxy) is True):
+                hint = "robots 때문이 아님 — 사이트 서버가 이 브라우저를 막음(헤드리스 이름 차단 가능)"
+                if status == 401:
+                    hint += "; 401은 로그인·인증이 필요하며 이름 재시도 대상이 아닙니다."
+        if hint and hint not in str(result.data.get("hint") or ""):
+            result.data["hint"] = (str(result.data.get("hint") or "") + " " + hint).strip()
 
     def _handle_href(self, params: Dict[str, Any]) -> Optional[str]:
         """element_id 대상 핸들의 href(링크가 아니거나 핸들이 없으면 None)."""
@@ -2844,6 +3009,7 @@ def create_server(
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
     recipes: bool = True,
+    headless_retry: bool = True,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -2869,11 +3035,13 @@ def create_server(
         approval_ttl_s=approval_ttl_s,
         profile=profile,
         recipes=recipes,
+        headless_retry=headless_retry,
     )
     #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
     from security.robots_signal import ROBOTS_INSTRUCTIONS
+    from actions.pdf_document import PDF_INSTRUCTIONS
 
-    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS
+    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
@@ -2963,6 +3131,7 @@ async def run_stdio(
     approval_ttl_s: float = DEFAULT_APPROVAL_TTL_S,
     profile: Optional[str] = None,
     recipes: bool = True,
+    headless_retry: bool = True,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -2997,6 +3166,7 @@ async def run_stdio(
         approval_ttl_s=approval_ttl_s,
         **({"profile": profile} if profile is not None else {}),
         **({} if recipes else {"recipes": False}),
+        **({} if headless_retry else {"headless_retry": False}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None

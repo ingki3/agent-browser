@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Optional, TypedDict
@@ -31,9 +32,20 @@ AI_USER_AGENTS = (
     "anthropic-ai", "PerplexityBot", "Google-Extended", "CCBot", "Bytespider",
     "Applebot-Extended", "meta-externalagent", "meta-externalfetcher",
 )
+# Provider-documented user/search fetch product tokens (as opposed to training):
+# support.claude.com/en/articles/8896518 (Claude-User/Claude-SearchBot),
+# developers.openai.com/api/docs/bots (ChatGPT-User/OAI-SearchBot),
+# docs.perplexity.ai/guides/bots (PerplexityBot/Perplexity-User).
+# Presence here is descriptive only; Allow must be explicit for this path.
+USER_FETCH_AGENTS = (
+    "Claude-User", "ChatGPT-User", "OAI-SearchBot", "Claude-SearchBot",
+    "PerplexityBot", "Perplexity-User",
+)
 ROBOTS_INSTRUCTIONS = (
-    "결과에 data.robots 가 있으면 그 사이트가 자동 접근을 막고 있다는 뜻입니다 — "
-    "계속할지는 사용자 뜻에 따라 판단하세요."
+    "결과의 data.robots 는 그 사이트의 자동 접근 의사 표시입니다 — "
+    "계속할지는 사용자 뜻에 따라 판단하세요. "
+    "ai_agents_disallowed 는 주로 학습·수집 봇 목록이며 사용자가 요청한 읽기 자체를 막는 뜻은 "
+    "아닙니다(기존 목록에는 사용자 요청 봇도 포함) — disallowed·user_fetch_agents_allowed·content_signal 을 참고하세요."
 )
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
 _AGENT = re.compile(r"[A-Za-z_-]+|\*(?=\s|$)")
@@ -45,6 +57,8 @@ class RobotsSignal(TypedDict):
     ai_agents_disallowed: list[str]
     rule: str
     robots_url: str
+    user_fetch_agents_allowed: list[str]
+    content_signal: str
 
 
 def _octets(value: str) -> str:
@@ -100,6 +114,7 @@ class Match:
 @dataclass(frozen=True)
 class RobotsRules:
     groups: dict[str, tuple[Rule, ...]]
+    content_signal: str = ""
 
     @classmethod
     def parse(cls, body: bytes) -> RobotsRules:
@@ -111,13 +126,20 @@ class RobotsRules:
         groups: dict[str, list[Rule]] = {}
         agents: list[str] = []
         has_rules = False
+        content_signals: list[str] = []
         for raw in re.split(r"\r\n|\r|\n", text):
             line = raw.partition("#")[0].strip()
             key, sep, value = line.partition(":")
             if not sep:
                 continue
             key, value = key.strip().lower(), value.strip()
-            if key == "user-agent":
+            if key == "content-signal":
+                # Treat this as untrusted text, not an interpreted permission.
+                safe = " ".join("".join(c for c in value if unicodedata.category(c)
+                                       not in {"Cc", "Cf", "Cs"}).split())
+                if safe and len("; ".join(content_signals)) < 256:
+                    content_signals.append(safe[:256])
+            elif key == "user-agent":
                 if has_rules:
                     agents, has_rules = [], False
                 # A malformed header still separates groups; its rules must
@@ -142,7 +164,7 @@ class RobotsRules:
                 rule = Rule(key == "allow", _octets(value), f"{key.title()}: {value}"[:80])
                 for token in agents:
                     groups[token].append(rule)
-        return cls({token: tuple(rules) for token, rules in groups.items()})
+        return cls({token: tuple(rules) for token, rules in groups.items()}, "; ".join(content_signals)[:256])
 
     def match(self, path: str, agent: str) -> Match:
         rules = self.groups.get(agent.lower(), self.groups.get("*", ()))
@@ -157,13 +179,17 @@ class RobotsRules:
         wildcard = self.match(path, "*")
         blocked = [(agent, self.match(path, agent)) for agent in AI_USER_AGENTS]
         blocked = [(agent, match) for agent, match in blocked if match.disallowed][:10]
-        if not wildcard.disallowed and not blocked:
+        allowed = [agent for agent in USER_FETCH_AGENTS if agent.lower() in self.groups
+                   and (match := self.match(path, agent)).rule.startswith("Allow:") and not match.disallowed]
+        if not wildcard.disallowed and not blocked and not allowed and not self.content_signal:
             return None
         return {
             "disallowed": wildcard.disallowed,
             "ai_agents_disallowed": [agent for agent, _ in blocked],
-            "rule": wildcard.rule if wildcard.disallowed else blocked[0][1].rule,
+            "rule": wildcard.rule if wildcard.disallowed else blocked[0][1].rule if blocked else wildcard.rule,
             "robots_url": robots_url,
+            "user_fetch_agents_allowed": allowed,
+            "content_signal": self.content_signal,
         }
 
 
@@ -181,7 +207,9 @@ def _origin(url: str) -> Optional[str]:
         parts = urlsplit(url)
         if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
             return None
-        host = parts.hostname.lower()
+        host = parts.hostname.lower().rstrip(".")
+        if not host:
+            return None
         host = f"[{host}]" if ":" in host else host
         port = parts.port
         if port is not None and port != (443 if parts.scheme == "https" else 80):
@@ -218,6 +246,25 @@ class RobotsSignals:
 
     async def signal(self, context: BrowserContext, url: str, guard: EgressGuard,
                      proxy: Optional[EgressProxy] = None) -> Optional[RobotsSignal]:
+        rules = await self._rules_for(context, url, guard, proxy)
+        if rules is None:
+            return None
+        parts = urlsplit(url)
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        return rules.signal(path, (_origin(url) or "") + "/robots.txt")
+
+    async def allowed(self, context: BrowserContext, url: str, guard: EgressGuard,
+                      proxy: Optional[EgressProxy] = None) -> Optional[bool]:
+        """Confirmed wildcard-path permission; None means retrieval/policy unknown."""
+        rules = await self._rules_for(context, url, guard, proxy)
+        if rules is None:
+            return None
+        parts = urlsplit(url)
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        return not rules.match(path, "*").disallowed
+
+    async def _rules_for(self, context: BrowserContext, url: str, guard: EgressGuard,
+                         proxy: Optional[EgressProxy] = None) -> Optional[RobotsRules]:
         origin = _origin(url)
         if origin is None:
             return None
@@ -244,9 +291,7 @@ class RobotsSignals:
             self._cache.move_to_end(origin)
         if entry is None or entry.rules is None:
             return None
-        parts = urlsplit(url)
-        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
-        return entry.rules.signal(path, robots_url)
+        return entry.rules
 
     async def _populate(self, context: BrowserContext, origin: str, guard: EgressGuard,
                         proxy: Optional[EgressProxy] = None) -> None:
@@ -314,7 +359,7 @@ class RobotsSignals:
                                         return None
                                     break
                             return RobotsRules.parse(bytes(body))
-                        elif 400 <= status < 500 and status not in {401, 403}:
+                        elif 400 <= status < 500 and status not in {401, 403, 429}:
                             return RobotsRules({})
                         else:
                             return None
