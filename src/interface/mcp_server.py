@@ -25,7 +25,7 @@ import os
 import signal
 import time
 import unicodedata
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -767,6 +767,7 @@ class BrowserMCPServer:
 
         self._headless_retry = HeadlessRetry()
         self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
+        self._navigation_scope: ContextVar[AsyncExitStack | None] = ContextVar("headless_navigation_scope", default=None)
         #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
         #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
         self.browser_mode = browser_mode
@@ -2046,6 +2047,8 @@ class BrowserMCPServer:
                 return blocked
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
+        navigation_scope = AsyncExitStack()
+        navigation_token = self._navigation_scope.set(navigation_scope)
         try:
             if self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
                 result = await self._call_wait_tool(name, arguments, capture)
@@ -2087,9 +2090,14 @@ class BrowserMCPServer:
                 self._attach_window_report(result)
             return result
         finally:
-            self._inflight -= 1
-            if capture:
-                self._captures_inflight -= 1
+            try:
+                # Same lifetime as the recursive first retry, including MCP postprocessing.
+                await navigation_scope.aclose()
+            finally:
+                self._navigation_scope.reset(navigation_token)
+                self._inflight -= 1
+                if capture:
+                    self._captures_inflight -= 1
 
     def _observation_state(self) -> Optional[_PageObservation]:
         """Track active tab/context and URL without a browser round trip."""
@@ -2298,9 +2306,11 @@ class BrowserMCPServer:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
         try:
-            async with self._present_remembered_navigation(action, params) as remembered:
-                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
-                                                 self._egress_proxy, self._robots, self.max_result_chars)
+            scope = self._navigation_scope.get()
+            remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
+                          if scope is not None else None)
+            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                             self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
@@ -2317,11 +2327,17 @@ class BrowserMCPServer:
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
             await self._attach_challenge(result)
-        if remembered is not None and remembered.document_requested:
-            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True}
+        from browser.headless_retry import FAILED_NOTE, REMEMBERED_NOTE
+        from security.robots_signal import _origin
+
+        if (remembered is not None and remembered.document_requested and "document" not in result.data
+                and _origin(result.current_url) == remembered.origin):
+            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
+                        "note": REMEMBERED_NOTE}
             if result.data.get("last_http_status") == 403:
                 self._headless_retry.states[remembered.origin] = "failed"
                 identity["retry_failed"] = True
+                identity["note"] = FAILED_NOTE
             result.data["identity"] = identity
         if action is ActionType.NAVIGATE and "document" not in result.data:
             retried = await self._retry_headless_navigation(name, arguments, params, result)
@@ -2375,7 +2391,7 @@ class BrowserMCPServer:
         self, name: str, arguments: Dict[str, Any], params: Dict[str, Any], result: ActionResult,
     ) -> Optional[ActionResult]:
         """WS-44: short generic 403, confirmed REP Allow, empty-cookie origin, once."""
-        from browser.headless_retry import cookie_free_origin
+        from browser.headless_retry import FAILED_NOTE, SUCCESS_NOTE, cookie_free_origin
         from security.robots_signal import _origin
 
         page = self._recipe_page()
@@ -2423,11 +2439,17 @@ class BrowserMCPServer:
         if not attempt.document_requested:
             # Preserve genuine gate failures, but a same-document no-op is not a retry.
             return retried if not retried.success else None
-        identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "original_status": 403}
+        if "document" in retried.data or _origin(retried.current_url) != origin:
+            # PDF bytes use native httpx UA; a different origin's final status
+            # cannot establish success/failure of the reserved source's retry.
+            return retried
+        identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "original_status": 403,
+                    "note": SUCCESS_NOTE}
         retry_status = retried.data.get("last_http_status")
         if (not retried.success or retried.data.get("challenge") is not None
                 or not isinstance(retry_status, int) or not 200 <= retry_status < 300):
             identity["retry_failed"] = True
+            identity["note"] = FAILED_NOTE
         else:
             self._headless_retry.states[origin] = "succeeded"
         retried.data["identity"] = identity
@@ -3040,8 +3062,10 @@ def create_server(
     #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
     from security.robots_signal import ROBOTS_INSTRUCTIONS
     from actions.pdf_document import PDF_INSTRUCTIONS
+    from browser.headless_retry import IDENTITY_INSTRUCTIONS
 
-    instructions = (RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n" + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS
+    instructions = ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
+                    + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS)
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.

@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3236개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3246개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -331,8 +331,9 @@ robots 조회가 확정되어 그 경로를 `*` 기준 허용하며 그 출처�
 `serve --no-headless-retry`로 끕니다. 실제 브라우저 UA의 `HeadlessChrome`을 `Chrome`으로 바꾸고,
 UA 버전은 창 모드 Chromium의 축소값 `Chrome/<major>.0.0.0`으로 맞춥니다.
 Client Hints의 headless 브랜드만 제거해 같은 버전 창 모드의 순서로 맞춥니다(버전·플랫폼·GREASE 유지).
-변경은 재시도 또는 기억을 재사용하는 navigate 동안 그 출처의 요청에만 적용하며,
-다른 출처 리다이렉트·하위 요청·팝업·새 탭에는 원래 이름을 보내고 종료·실패·취소 때 복원합니다.
+변경은 재시도 또는 기억을 재사용하는 `navigate`가 끝날 때까지 메인 문서와 같은 출처의 하위 자원에 적용하며,
+두 경로의 적용 구간은 같습니다. 다른 출처(리다이렉트·하위 요청 포함)·팝업·새 탭·Service Worker·WebSocket에는
+원래 이름을 보내고 종료·실패·취소 때 복원합니다.
 `navigator.webdriver`·JS UA·플러그인·지문은 건드리지 않습니다.
 이후 지연 로드 하위 자원과 JS의 `navigator.userAgent`는 원래 값입니다.
 robots 금지·조회 불가·쿠키 있음·알려진 확인 화면·401(로그인)·429(속도 제한)은 재시도 대상이 아닙니다.
@@ -345,6 +346,15 @@ robots 금지·조회 불가·쿠키 있음·알려진 확인 화면·401(로그
 original_status: 403}`가 붙고, 실패하면 `retry_failed: true`도 붙습니다.
 기억을 재사용한 이동에는 `data.identity = {presented_as: "chrome", reason: "headless_ua_blocked",
 remembered: true}`가 붙으며, 그 요청이 403이면 `retry_failed: true`도 붙습니다.
+각 identity에는 사용자에게 그대로 설명할 고정 문구 `note`도 붙습니다(일시적 차단이 아닙니다).
+
+- 재시도 성공: "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)"
+- 기억 재사용: "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다"
+- 재시도 실패: "일반 Chrome 이름으로도 막혔습니다 — 사이트가 자동화 접근을 막고 있습니다"
+
+최종 문서가 다른 출처로 이동했거나 문서 요청 없는 fragment 이동이면 identity를 붙이지 않습니다.
+다른 출처의 403은 기억 출처를 실패로 바꾸지 않습니다. `data.document`가 있는 PDF 결과도
+보조 `fetch_pdf`가 원래 UA로 PDF 바이트를 받으므로 identity를 붙이지 않습니다.
 403의 짧은 차단 본문이나 401 응답이
 robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 필요를 알립니다(401 자체는 `challenge`가 아님). 429는 속도 제한 안내와
 `Retry-After`(있으면 상한 128자의 안전한 텍스트)를 돌려주며 자동 재요청하지 않습니다.

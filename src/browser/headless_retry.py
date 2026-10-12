@@ -22,6 +22,14 @@ from security.egress import EgressGuard
 from security.egress_proxy import EgressProxy
 from security.robots_signal import RobotsSignals, _origin
 
+SUCCESS_NOTE = "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)"
+REMEMBERED_NOTE = "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다"
+FAILED_NOTE = "일반 Chrome 이름으로도 막혔습니다 — 사이트가 자동화 접근을 막고 있습니다"
+IDENTITY_INSTRUCTIONS = (
+    "data.identity 가 있으면 사이트가 헤드리스 이름을 막아 도구가 이름만 바꿔 열었다는 뜻 — "
+    "사용자에게 설명할 때 note 를 그대로 쓸 것(일시적 차단 아님)"
+)
+
 
 def headed_brand_list(value: str, major: int) -> str:
     """Undo the native shuffle, remove HeadlessChrome, reshuffle the smaller list.
