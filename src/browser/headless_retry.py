@@ -19,6 +19,7 @@ import hmac
 from itertools import permutations
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -107,6 +108,25 @@ async def origin_cookies(context: BrowserContext, url: str) -> list[dict]:
         if cookie_matches(cookie, destination):
             found.append(cookie)
     return found
+
+
+def proxy_challenge_credentials(challenge: dict, proxy: EgressProxy | None) -> dict | None:
+    """Our proxy's credentials only for its own challenge, else None.
+
+    CDP reports a site's own ``407 + Proxy-Authenticate`` as ``source=Proxy`` at
+    our proxy's origin too (measured), so the origin alone does not identify the
+    challenger: the scheme and per-instance realm our proxy sends must match.
+    """
+    if proxy is None:
+        return None
+    creds = proxy.playwright_proxy()
+    realm = getattr(proxy, "auth_realm", None)
+    if (challenge.get("source") == "Proxy" and creds.get("username") and realm
+            and str(challenge.get("origin") or "").rstrip("/") == creds["server"].rstrip("/")
+            and str(challenge.get("scheme") or "").lower() == "basic"
+            and challenge.get("realm") == realm):
+        return {"username": creds["username"], "password": creds["password"]}
+    return None
 
 
 LedgerEntry = dict  # {"name", "domain", "path", "value_digest"} — never the value itself
@@ -257,7 +277,8 @@ class HeadlessRetry:
                 raise ValueError("bad origin")
             state, when, cookies = entry.get("state"), entry.get("updated"), entry.get("cookies")
             if (state not in ("succeeded", "failed", None) or isinstance(when, bool)
-                    or not isinstance(when, (int, float)) or not isinstance(cookies, list)
+                    or not isinstance(when, (int, float)) or not math.isfinite(when)
+                    or not isinstance(cookies, list)
                     or not all(_valid_entry(c) for c in cookies)):
                 raise ValueError("bad entry")
             if state is not None:
@@ -279,16 +300,36 @@ class HeadlessRetry:
                 self.ledger.pop(origin, None)
                 self.updated.pop(origin, None)
 
+    def _entry(self, origin: str) -> dict:
+        return {"state": self.states.get(origin), "updated": self.updated.get(origin, 0.0),
+                "cookies": self.ledger.get(origin, [])}
+
+    def _entry_json(self, origin: str) -> bytes:
+        return json.dumps({origin: self._entry(origin)}, separators=(",", ":")).encode()
+
+    def _payload(self) -> bytes:
+        origins = {origin: self._entry(origin) for origin in
+                   sorted(set(self.states) | set(self.ledger), key=lambda o: self.updated.get(o, 0.0))}
+        return json.dumps({"version": 1, "key": self._key.hex(), "origins": origins},
+                          separators=(",", ":")).encode()
+
     def save(self) -> bool:
         """Atomic 0600 write (temp + fsync + rename). Without a profile: memory only."""
         if self.path is None:
             return False
-        origins = {}
-        for origin in sorted(set(self.states) | set(self.ledger), key=lambda o: self.updated.get(o, 0.0)):
-            origins[origin] = {"state": self.states.get(origin), "updated": self.updated.get(origin, 0.0),
-                               "cookies": self.ledger.get(origin, [])}
-        payload = json.dumps({"version": 1, "key": self._key.hex(), "origins": origins},
-                             separators=(",", ":")).encode()
+        payload = self._payload()
+        while len(payload) > MAX_FILE_BYTES:
+            # Never write what load() would reject: forget the oldest origins
+            # (memory too, so memory and file agree) until the payload fits.
+            excess = len(payload) - MAX_FILE_BYTES
+            for origin in sorted(set(self.states) | set(self.ledger), key=lambda o: self.updated.get(o, 0.0)):
+                excess -= len(self._entry_json(origin))
+                self.states.pop(origin, None)
+                self.ledger.pop(origin, None)
+                self.updated.pop(origin, None)
+                if excess <= 0:
+                    break
+            payload = self._payload()
         tmp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}-{secrets.token_hex(3)}")
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -360,17 +401,22 @@ class HeadlessRetry:
 
         session.on("Fetch.requestPaused", paused)
 
+        answered: set[str] = set()
+
         async def auth_required(event: dict) -> None:
             # With interception on, this session must answer auth itself. Only the
-            # pinned egress proxy's own 407 gets its credentials; a site's auth
-            # challenge keeps the browser default (no credentials invented).
-            challenge = event.get("authChallenge") or {}
+            # pinned egress proxy's own 407 gets its credentials, once per request
+            # (a repeat is cancelled so the 407 surfaces instead of looping); any
+            # other challenge keeps the browser default (no credentials invented).
             response: dict = {"response": "Default"}
-            creds = proxy.playwright_proxy() if proxy is not None else {}
-            if (challenge.get("source") == "Proxy" and creds.get("username")
-                    and str(challenge.get("origin") or "").rstrip("/") == creds["server"].rstrip("/")):
-                response = {"response": "ProvideCredentials", "username": creds["username"],
-                            "password": creds["password"]}
+            creds = proxy_challenge_credentials(event.get("authChallenge") or {}, proxy)
+            if creds is not None:
+                request_id = str(event.get("requestId"))
+                if request_id in answered:
+                    response = {"response": "CancelAuth"}
+                else:
+                    answered.add(request_id)
+                    response = {"response": "ProvideCredentials", **creds}
             try:
                 await session.send("Fetch.continueWithAuth", {"requestId": event["requestId"],
                                                               "authChallengeResponse": response})

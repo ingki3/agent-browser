@@ -441,3 +441,253 @@ def test_ledger_file_never_reaches_profile_listing(_isolated_profile_root):
     listing = json.dumps(serve_profile.list_profiles(root=_isolated_profile_root), ensure_ascii=False)
     assert VISITOR not in listing and "secret_marker" not in listing
     assert os.path.exists(folder / "headless_retry.json")
+
+
+# -- 4. R1: proxy-auth boundary inside retry interception ---------------------
+# Only our egress proxy's own challenge (source Proxy + its origin + its Basic
+# per-instance realm) gets credentials, once per request; everything else is
+# the browser default and a repeat is cancelled (no request amplification).
+
+
+class _AuthSession:
+    def __init__(self):
+        self.handlers = {}
+        self.responses = []
+
+    def on(self, event, callback):
+        self.handlers[event] = callback
+
+    async def send(self, method, params=None):
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "main"}}}
+        if method == "Fetch.continueWithAuth":
+            self.responses.append(params["authChallengeResponse"])
+        return {}
+
+    async def detach(self):
+        pass
+
+
+class _AuthContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def cookies(self):
+        return []
+
+    async def new_cdp_session(self, page):
+        return self.session
+
+
+class _AuthPage:
+    def __init__(self, context):
+        self.context = context
+
+
+def _test_proxy():
+    from security import EgressGuard, EgressPolicy
+    from security.egress_proxy import EgressProxy
+
+    proxy = EgressProxy(EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True), port=19999)
+    return proxy
+
+
+async def test_auth_callback_answers_only_our_proxy_challenge_once():
+    from browser.headless_retry import HeadlessRetry
+
+    proxy = _test_proxy()
+    own, realm = proxy.server_url, proxy.auth_realm
+    session = _AuthSession()
+    cases = {
+        "own_proxy": ("Proxy", own, "basic", realm),
+        "own_proxy_trailing_slash": ("Proxy", own + "/", "Basic", realm),
+        "other_proxy": ("Proxy", "http://127.0.0.1:20000", "basic", realm),
+        "proxy_prefix": ("Proxy", own + ".evil", "basic", realm),
+        "forged_realm": ("Proxy", own, "basic", "local-synthetic"),
+        "public_realm_name": ("Proxy", own, "basic", "agent-browser"),
+        "missing_realm": ("Proxy", own, "basic", None),
+        "proxy_digest": ("Proxy", own, "digest", realm),
+        "proxy_ntlm": ("Proxy", own, "ntlm", realm),
+        "site_basic": ("Server", "http://site.test", "basic", "local-synthetic"),
+        "site_digest": ("Server", "http://site.test", "digest", "local-synthetic"),
+        "site_ntlm": ("Server", "http://site.test", "ntlm", ""),
+        "site_forged_origin_and_realm": ("Server", own, "basic", realm),
+    }
+    answers = {}
+    async with HeadlessRetry().present(_AuthPage(_AuthContext(session)), "http://site.test",
+                                       "HeadlessChrome/140.0.0.0", None, None, proxy):
+        handler = session.handlers["Fetch.authRequired"]
+        for name, (source, origin, scheme, challenge_realm) in cases.items():
+            challenge = {"source": source, "origin": origin, "scheme": scheme}
+            if challenge_realm is not None:
+                challenge["realm"] = challenge_realm
+            await handler({"requestId": name, "authChallenge": challenge})
+            answers[name] = session.responses[-1]
+        # A repeated challenge on the same request is cancelled, never re-answered.
+        for _ in range(3):
+            await handler({"requestId": "own_proxy", "authChallenge": {
+                "source": "Proxy", "origin": own, "scheme": "basic", "realm": realm}})
+            assert session.responses[-1] == {"response": "CancelAuth"}
+    creds = proxy.playwright_proxy()
+    assert answers.pop("own_proxy") == {"response": "ProvideCredentials", "username": creds["username"],
+                                        "password": creds["password"]}
+    assert answers.pop("own_proxy_trailing_slash")["response"] == "ProvideCredentials"
+    for name, answer in answers.items():
+        assert answer == {"response": "Default"}, name
+    provided = [r for r in session.responses if r["response"] == "ProvideCredentials"]
+    assert len(provided) == 2  # one per request id, never more
+
+
+async def test_auth_callback_without_token_or_proxy_never_provides():
+    from browser.headless_retry import HeadlessRetry
+
+    for proxy in (None, _test_proxy()):
+        if proxy is not None:
+            proxy.token = None
+        session = _AuthSession()
+        async with HeadlessRetry().present(_AuthPage(_AuthContext(session)), "http://site.test",
+                                           "HeadlessChrome/140.0.0.0", None, None, proxy):
+            handler = session.handlers["Fetch.authRequired"]
+            await handler({"requestId": "r", "authChallenge": {
+                "source": "Proxy", "origin": proxy.server_url if proxy else "http://127.0.0.1:1",
+                "scheme": "basic", "realm": proxy.auth_realm if proxy else "agent-browser"}})
+        assert session.responses == [{"response": "Default"}]
+
+
+async def test_egress_proxy_challenge_realm_is_per_instance():
+    """The realm we compare against is the one our proxy actually sends in its 407."""
+    import asyncio
+    import re
+
+    first, second = _test_proxy(), _test_proxy()
+    assert first.auth_realm != second.auth_realm and first.auth_realm.startswith("agent-browser-")
+    first.port = 0
+    await first.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", first.port)
+        writer.write(b"GET http://127.0.0.1:9/x HTTP/1.1\r\nHost: a\r\n\r\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+    finally:
+        await first.close()
+    assert raw.startswith(b"HTTP/1.1 407")
+    header = re.search(rb"(?im)^Proxy-Authenticate:\s*(.+?)\r$", raw)[1].decode()
+    assert header == f'Basic realm="{first.auth_realm}"'
+
+
+def _record_auth(server):
+    """Record our interception session's Fetch.continueWithAuth answers."""
+    calls = []
+    context = server._page.context
+    new_session = context.new_cdp_session
+
+    async def watched(page):
+        session = await new_session(page)
+        send = session.send
+
+        async def recorder(method, params=None):
+            if method == "Fetch.continueWithAuth":
+                calls.append(dict(params["authChallengeResponse"]))
+            return await send(method, params)
+
+        session.send = recorder
+        return session
+
+    context.new_cdp_session = watched
+    return calls
+
+
+@requires_chromium
+@pytest.mark.parametrize("challenge", [
+    'Basic realm="local-synthetic"', 'Digest realm="local-synthetic", nonce="abc", qop="auth"', "NTLM"])
+async def test_site_401_inside_retry_gets_no_credentials(site, challenge):
+    site.retry_status = 401
+    site.headers = {"WWW-Authenticate": challenge}
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        calls = _record_auth(server)
+        result = await navigate(server, site.url + "/one")
+    assert result.data["last_http_status"] == 401
+    assert all(c["response"] != "ProvideCredentials" and "password" not in c for c in calls), calls
+    received = site.received("/one")
+    assert len(received) == 2  # native 403 + one renamed attempt, no auth replay
+    assert not any("authorization" in h or "proxy-authorization" in h for h in received)
+
+
+@requires_chromium
+@pytest.mark.parametrize("forged", [False, True])
+async def test_site_407_inside_retry_is_not_amplified(site, forged):
+    """A site's own 407 surfaces to CDP as source=Proxy at our proxy origin."""
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        assert (await navigate(server, site.url + "/warm")).data["last_http_status"] == 200
+        realm = server._egress_proxy.auth_realm if forged else "local-synthetic"
+        site.retry_status = 407
+        site.headers = {"Proxy-Authenticate": f'Basic realm="{realm}"'}
+        calls = _record_auth(server)
+        result = await navigate(server, site.url + "/target")  # remembered: inside interception
+    assert result.data["identity"]["remembered"] is True
+    assert result.data["last_http_status"] == 407
+    provided = [c for c in calls if c["response"] == "ProvideCredentials"]
+    assert len(provided) <= (1 if forged else 0), calls
+    received = site.received("/target")
+    assert 1 <= len(received) <= 2, len(received)
+    assert not any("authorization" in h or "proxy-authorization" in h for h in received)
+
+
+# -- 5. R1: file byte cap on write, finite timestamps on read -----------------
+
+
+def test_save_keeps_file_under_read_cap_dropping_oldest(tmp_path):
+    from browser.headless_retry import MAX_FILE_BYTES, MAX_ORIGINS, HeadlessRetry
+
+    now = [2_000_000.0]
+    path = tmp_path / "headless_retry.json"
+    retry = HeadlessRetry(clock=lambda: now[0])
+    retry.load(path)
+    for index in range(MAX_ORIGINS):
+        now[0] += 1
+        origin = f"http://s{index}.test"
+        retry.states[origin] = "succeeded"
+        retry.updated[origin] = now[0]
+        retry.ledger[origin] = [{"name": f"c{n}-" + "x" * 2000, "domain": f"s{index}.test", "path": "/",
+                                 "value_digest": f"{n:064x}"} for n in range(5)]
+    assert retry.save() is True
+    size = path.stat().st_size
+    assert size <= MAX_FILE_BYTES
+    reloaded = HeadlessRetry()
+    reloaded.load(path)
+    assert 0 < len(reloaded.states) < MAX_ORIGINS
+    newest = f"http://s{MAX_ORIGINS - 1}.test"
+    assert reloaded.state(newest) == "succeeded" and len(reloaded.ledger[newest]) == 5
+    assert "http://s0.test" not in reloaded.states  # oldest forgotten first
+    assert set(reloaded.states) == set(retry.states)  # memory matches what was written
+
+
+@pytest.mark.parametrize("when", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_timestamp_is_corrupt(tmp_path, when):
+    from browser.headless_retry import HeadlessRetry
+
+    path = tmp_path / "headless_retry.json"
+    path.write_text('{"version":1,"key":"' + "00" * 32 + '","origins":{"http://a.test":'
+                    '{"state":"failed","updated":' + when + ',"cookies":[]}}}')
+    retry = HeadlessRetry()
+    retry.load(path)
+    assert retry.states == {} and retry.ledger == {} and retry.state("http://a.test") is None
+
+
+@requires_chromium
+async def test_own_proxy_challenge_inside_retry_answered_once(site, _isolated_profile_root):
+    """Our proxy's real 407 inside interception still gets its credentials (once).
+
+    A restarted server whose first navigate is remembered meets the proxy's
+    challenge inside our interception (no cached proxy auth yet).
+    """
+    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
+        assert (await navigate(server, site.url + "/one")).data["identity"]["original_status"] == 403
+    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
+        calls = _record_auth(server)
+        again = await navigate(server, site.url + "/two")
+    assert again.data["last_http_status"] == 200 and again.data["identity"]["remembered"] is True
+    assert [c["response"] for c in calls] == ["ProvideCredentials"], calls
+    assert len(site.received("/two")) == 1
+    assert not any("authorization" in h or "proxy-authorization" in h for h in site.received("/two"))

@@ -91,6 +91,9 @@ class EgressProxy:
     port: int = 0
     token: Optional[str] = field(default_factory=lambda: secrets.token_urlsafe(24))
 
+    #: 407 의 Basic realm — 인스턴스마다 고유. 재시도 가로채기(headless_retry)가 우리 프록시의
+    #: challenge 인지 이 값과 정확히 비교한다(사이트가 보낸 407 은 이 값을 알 수 없다).
+    auth_realm: str = field(default_factory=lambda: f"agent-browser-{secrets.token_hex(8)}", init=False)
     _server: Optional[asyncio.base_events.Server] = field(default=None, init=False, repr=False)
     _tasks: "set[asyncio.Task]" = field(default_factory=set, init=False, repr=False)
     #: 프록시가 처리한 연결 수(관측용)
@@ -181,7 +184,7 @@ class EgressProxy:
 
         if not self._authorized(headers):
             await self._reply(writer, 407, "Proxy Authentication Required", "",
-                              extra={"Proxy-Authenticate": 'Basic realm="agent-browser"'})
+                              extra={"Proxy-Authenticate": f'Basic realm="{self.auth_realm}"'})
             return
 
         if method.upper() == "CONNECT":
