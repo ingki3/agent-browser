@@ -617,10 +617,22 @@ async def test_site_401_inside_retry_gets_no_credentials(site, challenge):
 @requires_chromium
 @pytest.mark.parametrize("forged", [False, True])
 async def test_site_407_inside_retry_is_not_amplified(site, forged):
-    """A site's own 407 surfaces to CDP as source=Proxy at our proxy origin."""
+    """A site's own 407 surfaces to CDP as source=Proxy at our proxy origin.
+
+    The forging site only uses what a page can actually learn: it first tries the
+    DNS-alias self-connection probe to read our challenge, and replays whatever
+    realm that yielded (or the public product prefix when it yielded nothing).
+    """
+    import re
+
     async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
         assert (await navigate(server, site.url + "/warm")).data["last_http_status"] == 200
-        realm = server._egress_proxy.auth_realm if forged else "local-synthetic"
+        realm = "local-synthetic"
+        if forged:
+            observed = await _rebind_probe(server)
+            learned = re.search(r'realm="([^"]*)"', json.dumps(observed).replace('\\"', '"'))
+            realm = learned[1] if learned else "agent-browser"
+            assert (await navigate(server, site.url + "/warm2")).data["last_http_status"] == 200
         site.retry_status = 407
         site.headers = {"Proxy-Authenticate": f'Basic realm="{realm}"'}
         calls = _record_auth(server)
@@ -628,10 +640,85 @@ async def test_site_407_inside_retry_is_not_amplified(site, forged):
     assert result.data["identity"]["remembered"] is True
     assert result.data["last_http_status"] == 407
     provided = [c for c in calls if c["response"] == "ProvideCredentials"]
-    assert len(provided) <= (1 if forged else 0), calls
+    assert provided == [], calls
     received = site.received("/target")
     assert 1 <= len(received) <= 2, len(received)
     assert not any("authorization" in h or "proxy-authorization" in h for h in received)
+
+
+# -- 4b. R2: a page cannot read our challenge through a DNS alias to the proxy ---------
+
+
+async def _rebind_probe(server, *, intercepted=False):
+    """Local re-run of the R1 verifier's attack (audit_realm_rebind.py) via the resolver seam.
+
+    ``rebind.test`` first resolves to ``::1`` where a local page is served on the proxy's
+    own port number; then it re-resolves to ``127.0.0.1`` (the proxy listener) and the
+    page fetches same-origin ``/probe``. Returns what the page JavaScript saw.
+    """
+    import asyncio
+
+    from browser.headless_retry import HeadlessRetry
+
+    guard, proxy = server._egress, server._egress_proxy
+    port = proxy.port
+    target = ["::1"]
+    old = guard.resolver, guard.dns_cache_ttl_s
+
+    async def resolver(host):
+        assert host == "rebind.test", host
+        return [target[0]]
+
+    async def origin(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        data = ROBOTS if b"/robots.txt " in head else b"<!doctype html><title>local attacker page</title>"
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                     + str(len(data)).encode() + b"\r\nConnection: close\r\n\r\n" + data)
+        await writer.drain()
+        writer.close()
+
+    guard.resolver, guard.dns_cache_ttl_s = resolver, 0
+    upstream = await asyncio.start_server(origin, "::1", port)
+    try:
+        url = f"http://rebind.test:{port}"
+        loaded = await navigate(server, url + "/page")
+        assert loaded.success and loaded.data["last_http_status"] == 200  # other IP, same port: allowed
+        page = server._page
+        ua = await page.evaluate("navigator.userAgent")
+
+        async def probe():
+            target[0] = "127.0.0.1"
+            return await page.evaluate("""async () => {
+                try {
+                    const r = await fetch('/probe');
+                    const headers = {};
+                    r.headers.forEach((v, k) => { headers[k] = v; });
+                    return {status: r.status, headers, body: await r.text()};
+                } catch (e) { return {error: String(e)}; }
+            }""")
+
+        if intercepted:
+            async with HeadlessRetry().present(page, url, ua, server._robots, guard, proxy):
+                return await asyncio.wait_for(probe(), 20)
+        return await asyncio.wait_for(probe(), 20)
+    finally:
+        guard.resolver, guard.dns_cache_ttl_s = old
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@requires_chromium
+@pytest.mark.parametrize("intercepted", [False, True])
+async def test_page_cannot_read_proxy_realm_through_dns_alias(intercepted):
+    async with BrowserMCPServer(nav_settle=False, recipes=False, headless_retry=False) as server:
+        seen = await _rebind_probe(server, intercepted=intercepted)
+        realm, token = server._egress_proxy.auth_realm, server._egress_proxy.token
+    dumped = json.dumps(seen)
+    assert realm not in dumped and token not in dumped, seen
+    assert "proxy-authenticate" not in seen.get("headers", {}), seen
+    # the outer hop itself refused the self-connection as an egress block
+    assert seen.get("status") == 403, seen
+    assert seen["headers"].get("x-agent-browser-egress") == "blocked; category=loopback", seen
 
 
 # -- 5. R1: file byte cap on write, finite timestamps on read -----------------

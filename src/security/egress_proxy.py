@@ -25,18 +25,23 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import ipaddress
 import logging
 import secrets
+import socket
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from security.egress import (
+    CAT_LOOPBACK,
     UPSTREAM_CONNECT_FAILED,
     UPSTREAM_RESOLVE_FAILED,
     EgressDecision,
     EgressGuard,
+    IPAddress,
     UpstreamFailure,
+    _unwrap,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +65,10 @@ class UpstreamError(ConnectionError):
     def __init__(self, message: str, code: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class SelfConnectRefused(Exception):
+    """연결하려는 해석된 IP·포트가 이 프록시 자신의 리스너 (WS-47 R2) — egress 차단으로 응답한다."""
 
 
 #: 업스트림에 넘기지 않는 hop-by-hop 머리
@@ -182,12 +191,19 @@ class EgressProxy:
             await self._reply(writer, 400, "Bad Request", "요청 머리를 판정할 수 없음")
             return
 
+        method_upper = method.upper()
+        if method_upper != "CONNECT" and "://" not in target:
+            # origin-form 은 프록시 클라이언트가 보내지 않는다 — 다른 경로로 중계돼 들어온 요청이다.
+            # 챌린지(인스턴스별 realm)를 주지 않고 거절한다(WS-47 R2 심층 방어).
+            await self._reply(writer, 400, "Bad Request", "absolute-form http 요청만 받습니다")
+            return
+
         if not self._authorized(headers):
             await self._reply(writer, 407, "Proxy Authentication Required", "",
                               extra={"Proxy-Authenticate": f'Basic realm="{self.auth_realm}"'})
             return
 
-        if method.upper() == "CONNECT":
+        if method_upper == "CONNECT":
             await self._connect(target, reader, writer)
             return
         await self._forward_http(method, target, version, headers, reader, writer)
@@ -204,6 +220,22 @@ class EgressProxy:
     def _is_self(self, host: str, port: int) -> bool:
         return port == self.port and host.strip("[]") in ("127.0.0.1", "localhost", "::1", self.host)
 
+    def _listeners(self) -> List[Tuple[str, int]]:
+        """이 프록시가 실제로 듣는 주소·포트 전부(바인드한 소켓 기준)."""
+        out: List[Tuple[str, int]] = []
+        server = self._server
+        for sock in (server.sockets if server is not None else ()):
+            with contextlib.suppress(OSError):
+                name = sock.getsockname()
+                out.append((str(name[0]), int(name[1])))
+        if not out:
+            out.append((self.host, self.port))
+        return out
+
+    def _self_blocked(self, decision: EgressDecision) -> EgressDecision:
+        return EgressDecision(False, decision.url, None, "프록시 자기 자신(해석된 IP·포트)",
+                              host=decision.host, category=CAT_LOOPBACK)
+
     async def _decide(self, url: str, host: str, port: int) -> EgressDecision:
         if self._is_self(host, port):
             d = EgressDecision(False, url, None, "프록시 자기 자신", host=host, category="loopback")
@@ -218,6 +250,10 @@ class EgressProxy:
         """검증한 IP 로만 접속한다. 검증한 IP 가 없으면(해석 실패) 접속하지 않는다."""
         if not decision.resolved:
             raise UpstreamError(f"업스트림 해석 실패: {decision.host}", UPSTREAM_RESOLVE_FAILED)
+        listeners = self._listeners()
+        # 해석된 IP 중 하나라도 이 프록시 리스너면 요청 전체를 막는다(다음 IP 로 넘어가지 않음).
+        if any(targets_listener(ip, port, listeners) for ip in decision.resolved):
+            raise SelfConnectRefused(decision.host)
         last: Optional[BaseException] = None
         for ip in decision.resolved:
             try:
@@ -241,6 +277,19 @@ class EgressProxy:
         await self._reply(writer, 502, "Bad Gateway", exc.code,
                           extra={BLOCK_HEADER: f"{UPSTREAM_FAIL_MARK}; code={exc.code}"})
 
+    async def _upstream_or_reply(self, writer, decision: EgressDecision, port: int):
+        """업스트림을 연다 — 못 열면 응답(자기 자신: egress 차단 403, 그 밖: 프록시 표시 502)하고 None."""
+        try:
+            return await self._open_upstream(decision, port)
+        except SelfConnectRefused:
+            blocked = self._self_blocked(decision)
+            logger.info("Egress 프록시 자기접속 차단: %s:%d", decision.host, port)
+            await self._reply(writer, 403, "Forbidden", "egress_blocked",
+                              extra={BLOCK_HEADER: f"blocked; category={blocked.category}"})
+        except UpstreamError as exc:
+            await self._reply_upstream_failure(writer, decision, port, exc)
+        return None
+
     async def _connect(self, target: str, reader, writer) -> None:
         host, port = _split_authority(target, default_port=443)
         if host is None:
@@ -252,11 +301,10 @@ class EgressProxy:
             await self._reply(writer, 403, "Forbidden", "egress_blocked",
                               extra={BLOCK_HEADER: f"blocked; category={decision.category}"})
             return
-        try:
-            up_reader, up_writer = await self._open_upstream(decision, port)
-        except UpstreamError as exc:
-            await self._reply_upstream_failure(writer, decision, port, exc)
+        upstream = await self._upstream_or_reply(writer, decision, port)
+        if upstream is None:
             return
+        up_reader, up_writer = upstream
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         await _pipe_both(reader, writer, up_reader, up_writer)
@@ -280,11 +328,10 @@ class EgressProxy:
             await self._reply(writer, 403, "Forbidden", "egress_blocked",
                               extra={BLOCK_HEADER: f"blocked; category={decision.category}"})
             return
-        try:
-            up_reader, up_writer = await self._open_upstream(decision, port)
-        except UpstreamError as exc:
-            await self._reply_upstream_failure(writer, decision, port, exc)
+        upstream = await self._upstream_or_reply(writer, decision, port)
+        if upstream is None:
             return
+        up_reader, up_writer = upstream
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -308,6 +355,56 @@ class EgressProxy:
         writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + data)
         with contextlib.suppress(Exception):
             await writer.drain()
+
+
+def _plain_ip(text: str) -> Optional[IPAddress]:
+    """접속에 쓰일 IP 문자열 → 주소(IPv4-mapped 등 안의 IPv4 는 꺼냄). 판정 불가면 None."""
+    try:
+        addr = ipaddress.ip_address(str(text).strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    return _unwrap(addr)
+
+
+def _is_local_address(addr: IPAddress) -> bool:
+    """이 컴퓨터의 주소인가 — 루프백·미지정이거나 실제로 bind 할 수 있으면(로컬 인터페이스)."""
+    if addr.is_loopback or addr.is_unspecified:
+        return True
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind((str(addr), 0))
+        return True
+    except OSError:
+        return False
+
+
+def targets_listener(ip: str, port: int, listeners: Sequence[Tuple[str, int]]) -> bool:
+    """``ip:port`` 로 접속하면 ``listeners`` 중 하나(이 프록시 자신)에 닿는가 (WS-47 R2).
+
+    호스트 문자열이 아니라 실제로 연결할 IP 로 판정한다 — DNS 별칭·재해석·``localhost.``·
+    10진/8진 표기·IPv4-mapped IPv6 와 무관하다. 판정 불가 IP 는 자기 자신으로 본다(fail-closed).
+    * 정확히 같은 주소·포트 → 자기 자신.
+    * 목적지가 미지정 주소(0.0.0.0·::) → 같은 포트의 로컬 리스너에 닿는다(흔한 스택 동작).
+    * 리스너가 0.0.0.0/:: 바인드 → 같은 포트의 모든 로컬 주소가 자기 자신.
+    다른 포트, 또는 같은 포트라도 리스너가 받지 않는 다른 IP(예: 127.0.0.1 리스너와 ::1)는 아니다.
+    """
+    target = _plain_ip(ip)
+    for host, lport in listeners:
+        if int(lport) != int(port):
+            continue
+        if target is None:
+            return True
+        bound = _plain_ip(host)
+        if bound is None:
+            return True
+        if bound.is_unspecified:
+            if _is_local_address(target):
+                return True
+            continue
+        if target.is_unspecified or target == bound:
+            return True
+    return False
 
 
 def _parse_head(head: bytes) -> Tuple[str, List[Tuple[str, str]]]:
