@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3246개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3264개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -390,6 +390,8 @@ Content-Signal이 있으면 결과에 다음 신호를 붙입니다.
 "robots": {
   "disallowed": false,
   "ai_agents_disallowed": ["GPTBot"],
+  "scope": "named_ai",
+  "note": "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다.",
   "rule": "Disallow: /private",
   "robots_url": "https://example.invalid/robots.txt",
   "user_fetch_agents_allowed": ["Claude-User", "ChatGPT-User"],
@@ -397,8 +399,14 @@ Content-Signal이 있으면 결과에 다음 신호를 붙입니다.
 }
 ```
 
-`disallowed`는 `*` 그룹 기준입니다. `ai_agents_disallowed`는 해당 경로가 금지된 알려진 AI UA 이름
-최대 10개이며, 특정 UA 그룹이 있으면 그 규칙을 우선하고 없으면 `*`로 판정합니다.
+`disallowed`는 `*` 그룹 기준입니다. `ai_agents_disallowed`는 robots.txt에 **이름 지정 그룹이 실제로
+있고** 그 그룹이 해당 경로를 금지한 알려진 AI UA 이름 최대 10개입니다. `*`에서 상속한 금지는
+이 목록에 넣지 않습니다. 이름 그룹의 가장 긴 일치 규칙이 Allow이면 금지 목록에서 제외합니다.
+`scope`는 `all_bots`(`*`만 금지), `named_ai`(이름 지정 AI만 금지),
+`all_bots_and_named_ai`(둘 다 금지), `none`(금지 없이 Content-Signal·명시적 사용자 요청 봇 Allow만
+있음) 중 하나입니다. `note`는 범위에 맞는 고정 한국어 안내이고 `none`에서는 키를 생략합니다.
+사용자에게 robots를 설명할 때는 `note`를 그대로 쓰세요. `*`만 금지하는 경우 AI만 골라 막은
+것으로 설명하지 않습니다. 일반 봇 허용 판정(재시도 조건·403 안내)은 기존 `*` 기준 그대로입니다.
 학습·수집 봇의 금지는 사용자 요청 읽기 자체를 금지한다는 뜻이 아닙니다(기존 목록에는 사용자 요청
 봇도 포함됩니다). `user_fetch_agents_allowed`는 Claude-User·ChatGPT-User·OAI-SearchBot·Claude-SearchBot·
 PerplexityBot·Perplexity-User 중 이 경로의 **명시적 Allow**가 이긴 토큰 목록이며, `*`의 허용을

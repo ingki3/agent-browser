@@ -116,10 +116,12 @@ def test_ai_specific_ban_and_bounded_signal():
         "disallowed": False, "ai_agents_disallowed": ["GPTBot"],
         "rule": "Disallow: /private", "robots_url": "http://local/robots.txt",
         "user_fetch_agents_allowed": [], "content_signal": "",
+        "scope": "named_ai",
+        "note": "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다.",
     }
     assert parsed.signal("/public", "http://local/robots.txt") is None
     all_banned = RobotsRules.parse(b"User-agent: *\nDisallow: /").signal("/", "http://local/robots.txt")
-    assert all_banned["ai_agents_disallowed"] == list(AI_USER_AGENTS[:10])
+    assert all_banned["ai_agents_disallowed"] == []
 
 
 @pytest.mark.parametrize("agent", ["GPTBot", "ChatGPT-User", "OAI-SearchBot", "ClaudeBot", "Claude-User",
