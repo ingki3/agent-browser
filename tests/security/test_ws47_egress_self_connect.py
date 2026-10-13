@@ -3,6 +3,8 @@
 The R1 re-verification rebound a site hostname to the proxy's listener IP: the
 proxy relayed the request to itself (dropping Proxy-Authorization on the way)
 and the inner hop answered with the instance's 407 realm, which the page read.
+(WS-47 R3: the proxy no longer has credentials or a challenge at all; the self
+block stays — a page must never reach the proxy's own listener.)
 The self check now compares the resolved IP and port actually about to be
 connected against every listener address, for plain HTTP forwarding and CONNECT.
 """
@@ -16,13 +18,13 @@ from typing import List, Tuple
 import pytest
 
 from security import EgressGuard, EgressPolicy
-from security.egress_proxy import BLOCK_HEADER, PROXY_USER, EgressProxy, targets_listener
+from security.egress_proxy import BLOCK_HEADER, EgressProxy, targets_listener
 
 TOKEN = "t0k-ws47"
 
 
 def _auth() -> str:
-    return "Basic " + base64.b64encode(f"{PROXY_USER}:{TOKEN}".encode()).decode()
+    return "Basic " + base64.b64encode(f"agent-browser:{TOKEN}".encode()).decode()
 
 
 def _guard(answers: List[str]) -> EgressGuard:
@@ -78,7 +80,6 @@ class _Upstream:
 def _assert_self_blocked(raw: bytes, proxy: EgressProxy) -> None:
     assert raw.startswith(b"HTTP/1.1 403"), raw[:60]
     assert f"{BLOCK_HEADER}: blocked; category=loopback".encode() in raw, raw[:300]
-    assert proxy.auth_realm.encode() not in raw
     assert b"proxy-authenticate" not in raw.lower()
     # The outer hop refused before opening a socket: the listener saw one client only.
     assert proxy.handled == 1, proxy.handled
@@ -94,7 +95,7 @@ def _assert_self_blocked(raw: bytes, proxy: EgressProxy) -> None:
 ])
 @pytest.mark.parametrize("method", ["http", "connect"])
 async def test_alias_resolving_to_listener_is_blocked(answers, method):
-    px = await EgressProxy(_guard(answers), token=TOKEN).start()
+    px = await EgressProxy(_guard(answers)).start()
     try:
         raw = await _ask(px, _get("alias.test", px.port) if method == "http" else _connect("alias.test", px.port))
     finally:
@@ -106,7 +107,7 @@ async def test_alias_resolving_to_listener_is_blocked(answers, method):
                                   "[::ffff:127.0.0.1]", "[::ffff:7f00:1]"])
 @pytest.mark.parametrize("method", ["http", "connect"])
 async def test_literal_spellings_of_listener_are_blocked(host, method):
-    px = await EgressProxy(_guard([]), token=TOKEN).start()
+    px = await EgressProxy(_guard([])).start()
     try:
         raw = await _ask(px, _get(host, px.port) if method == "http" else _connect(host, px.port))
     finally:
@@ -116,7 +117,7 @@ async def test_literal_spellings_of_listener_are_blocked(host, method):
 
 @pytest.mark.parametrize("method", ["http", "connect"])
 async def test_ipv6_listener_alias_is_blocked(method):
-    px = await EgressProxy(_guard(["::1"]), host="::1", token=TOKEN).start()
+    px = await EgressProxy(_guard(["::1"]), host="::1").start()
     try:
         raw = await _ask(px, _get("alias.test", px.port) if method == "http" else _connect("alias.test", px.port))
     finally:
@@ -129,7 +130,7 @@ async def test_ipv6_listener_alias_is_blocked(method):
 
 async def test_same_ip_other_port_is_relayed():
     up = await _Upstream().start("127.0.0.1")
-    px = await EgressProxy(_guard(["127.0.0.1"]), token=TOKEN).start()
+    px = await EgressProxy(_guard(["127.0.0.1"])).start()
     try:
         http = await _ask(px, _get("alias.test", up.port))
         r, w = await asyncio.open_connection("127.0.0.1", px.port)
@@ -150,7 +151,7 @@ async def test_same_ip_other_port_is_relayed():
 
 async def test_other_ip_same_port_is_relayed():
     """A local service on ::1 at the proxy's own port number is not the proxy."""
-    px = await EgressProxy(_guard(["::1"]), token=TOKEN).start()
+    px = await EgressProxy(_guard(["::1"])).start()
     up = await _Upstream().start("::1", px.port)
     try:
         raw = await _ask(px, _get("alias.test", px.port))
@@ -198,21 +199,21 @@ def test_targets_listener_wildcard_bind_covers_local_interfaces(bind):
     assert not targets_listener("192.0.2.55", 5000, listeners)  # TEST-NET: not a local address
 
 
-# -- defence in depth: the challenge only answers proxy-form requests -----------------
+# -- defence in depth: only proxy-form requests are served -----------------------------
 
 
-async def test_origin_form_request_never_gets_the_realm():
+async def test_origin_form_request_is_refused_at_the_gate():
     """A request that reached the listener as origin-form (relayed, not from a proxy client)
-    gets 400 without the per-instance realm, authorised or not."""
-    px = await EgressProxy(_guard([]), token=TOKEN).start()
+    gets 400 whatever it carries; a proxy client's absolute-form request is served (no 407)."""
+    px = await EgressProxy(_guard([])).start()
     try:
         bare = await _ask(px, b"GET /probe HTTP/1.1\r\nHost: alias.test\r\n\r\n")
-        authed = await _ask(px, f"GET /probe HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {_auth()}\r\n\r\n".encode())
-        absolute = await _ask(px, b"GET http://alias.test/probe HTTP/1.1\r\nHost: alias.test\r\n\r\n")
+        query = await _ask(px, b"GET /probe?next=http://alias.test/ HTTP/1.1\r\nHost: x\r\n\r\n")
+        absolute = await _ask(px, b"GET http://127.0.0.1:9/probe HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     finally:
         await px.close()
-    for raw in (bare, authed):
+    for raw in (bare, query):
         assert raw.startswith(b"HTTP/1.1 400"), raw[:60]
-        assert px.auth_realm.encode() not in raw and b"proxy-authenticate" not in raw.lower()
-    # a proxy client (absolute-form) still gets the challenge it needs
-    assert absolute.startswith(b"HTTP/1.1 407") and px.auth_realm.encode() in absolute
+        assert b"proxy-authenticate" not in raw.lower()
+    # absolute-form goes through the guard/relay path (port 9 is closed: proxy-marked 502), never 407
+    assert absolute.startswith(b"HTTP/1.1 502") and b"upstream-failed" in absolute, absolute[:200]

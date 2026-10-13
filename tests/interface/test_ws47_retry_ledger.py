@@ -38,6 +38,8 @@ class Site:
     robots: bytes = ROBOTS
     robots_status: int = 200
     retry_status: int = 200
+    headless_status: int = 403
+    auth_challenge: str = ""
     body: bytes = b"Forbidden"
     cookie: str = VISITOR
     success_body: bytes = b"<!doctype html><title>Read</title>"
@@ -61,8 +63,14 @@ def visitor_site():
             state.requests.append((self.path, headers))
             if self.path == "/robots.txt":
                 data, status = state.robots, state.robots_status
+            elif self.path.startswith("/auth") and state.auth_challenge and "authorization" not in headers:
+                self.send_response_only(401)
+                self.send_header("WWW-Authenticate", state.auth_challenge)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             elif "HeadlessChrome" in headers.get("user-agent", ""):
-                data, status = state.body, 403
+                data, status = state.body, state.headless_status
             else:
                 status = state.retry_status
                 data = state.success_body if status == 200 else state.body
@@ -443,141 +451,15 @@ def test_ledger_file_never_reaches_profile_listing(_isolated_profile_root):
     assert os.path.exists(folder / "headless_retry.json")
 
 
-# -- 4. R1: proxy-auth boundary inside retry interception ---------------------
-# Only our egress proxy's own challenge (source Proxy + its origin + its Basic
-# per-instance realm) gets credentials, once per request; everything else is
-# the browser default and a repeat is cancelled (no request amplification).
+# -- 4. R3: nobody answers authentication with our credentials --------------------------
+# The browser is given no proxy credentials at all (the proxy asks for none), and
+# the retry interception does not enable auth handling. The egress proxy turns a
+# site's own 407 into a marked 502 (tests/security/test_ws47_r3_upstream_407.py),
+# so no 407 reaches the browser over the proxy connection.
 
 
-class _AuthSession:
-    def __init__(self):
-        self.handlers = {}
-        self.responses = []
-
-    def on(self, event, callback):
-        self.handlers[event] = callback
-
-    async def send(self, method, params=None):
-        if method == "Page.getFrameTree":
-            return {"frameTree": {"frame": {"id": "main"}}}
-        if method == "Fetch.continueWithAuth":
-            self.responses.append(params["authChallengeResponse"])
-        return {}
-
-    async def detach(self):
-        pass
-
-
-class _AuthContext:
-    def __init__(self, session):
-        self.session = session
-
-    async def cookies(self):
-        return []
-
-    async def new_cdp_session(self, page):
-        return self.session
-
-
-class _AuthPage:
-    def __init__(self, context):
-        self.context = context
-
-
-def _test_proxy():
-    from security import EgressGuard, EgressPolicy
-    from security.egress_proxy import EgressProxy
-
-    proxy = EgressProxy(EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True), port=19999)
-    return proxy
-
-
-async def test_auth_callback_answers_only_our_proxy_challenge_once():
-    from browser.headless_retry import HeadlessRetry
-
-    proxy = _test_proxy()
-    own, realm = proxy.server_url, proxy.auth_realm
-    session = _AuthSession()
-    cases = {
-        "own_proxy": ("Proxy", own, "basic", realm),
-        "own_proxy_trailing_slash": ("Proxy", own + "/", "Basic", realm),
-        "other_proxy": ("Proxy", "http://127.0.0.1:20000", "basic", realm),
-        "proxy_prefix": ("Proxy", own + ".evil", "basic", realm),
-        "forged_realm": ("Proxy", own, "basic", "local-synthetic"),
-        "public_realm_name": ("Proxy", own, "basic", "agent-browser"),
-        "missing_realm": ("Proxy", own, "basic", None),
-        "proxy_digest": ("Proxy", own, "digest", realm),
-        "proxy_ntlm": ("Proxy", own, "ntlm", realm),
-        "site_basic": ("Server", "http://site.test", "basic", "local-synthetic"),
-        "site_digest": ("Server", "http://site.test", "digest", "local-synthetic"),
-        "site_ntlm": ("Server", "http://site.test", "ntlm", ""),
-        "site_forged_origin_and_realm": ("Server", own, "basic", realm),
-    }
-    answers = {}
-    async with HeadlessRetry().present(_AuthPage(_AuthContext(session)), "http://site.test",
-                                       "HeadlessChrome/140.0.0.0", None, None, proxy):
-        handler = session.handlers["Fetch.authRequired"]
-        for name, (source, origin, scheme, challenge_realm) in cases.items():
-            challenge = {"source": source, "origin": origin, "scheme": scheme}
-            if challenge_realm is not None:
-                challenge["realm"] = challenge_realm
-            await handler({"requestId": name, "authChallenge": challenge})
-            answers[name] = session.responses[-1]
-        # A repeated challenge on the same request is cancelled, never re-answered.
-        for _ in range(3):
-            await handler({"requestId": "own_proxy", "authChallenge": {
-                "source": "Proxy", "origin": own, "scheme": "basic", "realm": realm}})
-            assert session.responses[-1] == {"response": "CancelAuth"}
-    creds = proxy.playwright_proxy()
-    assert answers.pop("own_proxy") == {"response": "ProvideCredentials", "username": creds["username"],
-                                        "password": creds["password"]}
-    assert answers.pop("own_proxy_trailing_slash")["response"] == "ProvideCredentials"
-    for name, answer in answers.items():
-        assert answer == {"response": "Default"}, name
-    provided = [r for r in session.responses if r["response"] == "ProvideCredentials"]
-    assert len(provided) == 2  # one per request id, never more
-
-
-async def test_auth_callback_without_token_or_proxy_never_provides():
-    from browser.headless_retry import HeadlessRetry
-
-    for proxy in (None, _test_proxy()):
-        if proxy is not None:
-            proxy.token = None
-        session = _AuthSession()
-        async with HeadlessRetry().present(_AuthPage(_AuthContext(session)), "http://site.test",
-                                           "HeadlessChrome/140.0.0.0", None, None, proxy):
-            handler = session.handlers["Fetch.authRequired"]
-            await handler({"requestId": "r", "authChallenge": {
-                "source": "Proxy", "origin": proxy.server_url if proxy else "http://127.0.0.1:1",
-                "scheme": "basic", "realm": proxy.auth_realm if proxy else "agent-browser"}})
-        assert session.responses == [{"response": "Default"}]
-
-
-async def test_egress_proxy_challenge_realm_is_per_instance():
-    """The realm we compare against is the one our proxy actually sends in its 407."""
-    import asyncio
-    import re
-
-    first, second = _test_proxy(), _test_proxy()
-    assert first.auth_realm != second.auth_realm and first.auth_realm.startswith("agent-browser-")
-    first.port = 0
-    await first.start()
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", first.port)
-        writer.write(b"GET http://127.0.0.1:9/x HTTP/1.1\r\nHost: a\r\n\r\n")
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.read(), 5)
-        writer.close()
-    finally:
-        await first.close()
-    assert raw.startswith(b"HTTP/1.1 407")
-    header = re.search(rb"(?im)^Proxy-Authenticate:\s*(.+?)\r$", raw)[1].decode()
-    assert header == f'Basic realm="{first.auth_realm}"'
-
-
-def _record_auth(server):
-    """Record our interception session's Fetch.continueWithAuth answers."""
+def _record_cdp(server):
+    """Record every CDP command our interception session sends (method, params)."""
     calls = []
     context = server._page.context
     new_session = context.new_cdp_session
@@ -587,8 +469,7 @@ def _record_auth(server):
         send = session.send
 
         async def recorder(method, params=None):
-            if method == "Fetch.continueWithAuth":
-                calls.append(dict(params["authChallengeResponse"]))
+            calls.append((method, dict(params or {})))
             return await send(method, params)
 
         session.send = recorder
@@ -598,55 +479,103 @@ def _record_auth(server):
     return calls
 
 
+def _no_auth_handling(calls):
+    methods = [m for m, _ in calls]
+    assert "Fetch.continueWithAuth" not in methods, methods
+    enables = [p for m, p in calls if m == "Fetch.enable"]
+    assert enables and all(not p.get("handleAuthRequests") for p in enables), enables
+
+
+def _no_credentials_sent(requests):
+    assert not any("authorization" in h or "proxy-authorization" in h for h in requests), requests
+
+
+@requires_chromium
+async def test_restart_first_navigate_remembered_succeeds_without_our_auth(site, _isolated_profile_root):
+    """(i) The original WS-47 symptom: a restarted server whose very first navigate
+    is a remembered retry met our proxy's 407 inside the interception (empty
+    proxy-auth cache; the challenge went to our Fetch session, not Playwright's)
+    and ended in 407. Without proxy credentials there is no challenge: it succeeds
+    and our session sends no auth answer at all."""
+    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
+        assert (await navigate(server, site.url + "/one")).data["identity"]["original_status"] == 403
+    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
+        calls = _record_cdp(server)
+        again = await navigate(server, site.url + "/two")
+    assert again.data["last_http_status"] == 200, again.data
+    assert again.data["identity"]["remembered"] is True
+    _no_auth_handling(calls)
+    assert len(site.received("/two")) == 1 and not site.headless("/two")
+    _no_credentials_sent(site.received("/two"))
+
+
+@requires_chromium
+@pytest.mark.parametrize("remembered", [False, True])
+async def test_site_407_reaches_browser_as_502_and_is_not_amplified(site, remembered):
+    """(ii) A site's 407 + Proxy-Authenticate becomes the proxy's marked 502: no
+    challenge reaches the browser, nobody answers it, the site sees one request."""
+    challenge = 'Basic realm="local-synthetic"'
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        if remembered:
+            assert (await navigate(server, site.url + "/warm")).data["identity"]["original_status"] == 403
+            site.retry_status = 407
+        site.headers = {"Proxy-Authenticate": challenge}
+        calls = _record_cdp(server)
+        seen = []
+        server._page.on("response", lambda r: seen.append((r.url, r.status, dict(r.headers))))
+        target = site.url + "/target"
+        if not remembered:
+            site.headless_status = 407  # outside any retry: the native request itself gets 407
+        result = await navigate(server, target)
+    document = [s for s in seen if s[0] == target]
+    assert document and all(status == 502 for _, status, _ in document), document
+    assert all("proxy-authenticate" not in {k.lower() for k in headers} for _, _, headers in document)
+    assert all(headers.get("x-agent-browser-egress") == "upstream-407-replaced" for _, _, headers in document)
+    assert result.data["last_http_status"] == 502
+    if remembered:
+        assert result.data["identity"]["remembered"] is True
+        _no_auth_handling(calls)
+    received = site.received("/target")
+    assert len(received) == 1, len(received)  # no replay with credentials, no amplification
+    _no_credentials_sent(received)
+
+
 @requires_chromium
 @pytest.mark.parametrize("challenge", [
     'Basic realm="local-synthetic"', 'Digest realm="local-synthetic", nonce="abc", qop="auth"', "NTLM"])
 async def test_site_401_inside_retry_gets_no_credentials(site, challenge):
+    """(v) A site's 401 inside the retry keeps the browser default: no credentials."""
     site.retry_status = 401
     site.headers = {"WWW-Authenticate": challenge}
     async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
-        calls = _record_auth(server)
+        calls = _record_cdp(server)
         result = await navigate(server, site.url + "/one")
     assert result.data["last_http_status"] == 401
-    assert all(c["response"] != "ProvideCredentials" and "password" not in c for c in calls), calls
+    _no_auth_handling(calls)
     received = site.received("/one")
     assert len(received) == 2  # native 403 + one renamed attempt, no auth replay
-    assert not any("authorization" in h or "proxy-authorization" in h for h in received)
+    _no_credentials_sent(received)
 
 
 @requires_chromium
-@pytest.mark.parametrize("forged", [False, True])
-async def test_site_407_inside_retry_is_not_amplified(site, forged):
-    """A site's own 407 surfaces to CDP as source=Proxy at our proxy origin.
-
-    The forging site only uses what a page can actually learn: it first tries the
-    DNS-alias self-connection probe to read our challenge, and replays whatever
-    realm that yielded (or the public product prefix when it yielded nothing).
-    """
-    import re
-
-    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
-        assert (await navigate(server, site.url + "/warm")).data["last_http_status"] == 200
-        realm = "local-synthetic"
-        if forged:
-            observed = await _rebind_probe(server)
-            learned = re.search(r'realm="([^"]*)"', json.dumps(observed).replace('\\"', '"'))
-            realm = learned[1] if learned else "agent-browser"
-            assert (await navigate(server, site.url + "/warm2")).data["last_http_status"] == 200
-        site.retry_status = 407
-        site.headers = {"Proxy-Authenticate": f'Basic realm="{realm}"'}
-        calls = _record_auth(server)
-        result = await navigate(server, site.url + "/target")  # remembered: inside interception
-    assert result.data["identity"]["remembered"] is True
-    assert result.data["last_http_status"] == 407
-    provided = [c for c in calls if c["response"] == "ProvideCredentials"]
-    assert provided == [], calls
-    received = site.received("/target")
-    assert 1 <= len(received) <= 2, len(received)
-    assert not any("authorization" in h or "proxy-authorization" in h for h in received)
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("challenge", ['Basic realm="local-synthetic"',
+                                       'Digest realm="local-synthetic", nonce="abc", qop="auth"'])
+async def test_site_401_never_receives_proxy_credentials(site, warm, challenge):
+    """(v) Outside any retry, with a cold or a warm proxy-auth cache, a site's 401
+    gets no Authorization header (no proxy token handed to the site)."""
+    site.auth_challenge = challenge
+    async with BrowserMCPServer(nav_settle=False, recipes=False, headless_retry=False) as server:
+        if warm:
+            assert (await navigate(server, site.url + "/warm")).data["last_http_status"] == 403
+        result = await navigate(server, site.url + "/auth")
+    assert result.data["last_http_status"] == 401
+    received = site.received("/auth")
+    assert len(received) == 1, len(received)
+    _no_credentials_sent(received)
 
 
-# -- 4b. R2: a page cannot read our challenge through a DNS alias to the proxy ---------
+# -- 4b. R2: a page cannot reach the proxy listener through a DNS alias -----------------
 
 
 async def _rebind_probe(server, *, intercepted=False):
@@ -709,12 +638,9 @@ async def _rebind_probe(server, *, intercepted=False):
 
 @requires_chromium
 @pytest.mark.parametrize("intercepted", [False, True])
-async def test_page_cannot_read_proxy_realm_through_dns_alias(intercepted):
+async def test_page_cannot_reach_proxy_listener_through_dns_alias(intercepted):
     async with BrowserMCPServer(nav_settle=False, recipes=False, headless_retry=False) as server:
         seen = await _rebind_probe(server, intercepted=intercepted)
-        realm, token = server._egress_proxy.auth_realm, server._egress_proxy.token
-    dumped = json.dumps(seen)
-    assert realm not in dumped and token not in dumped, seen
     assert "proxy-authenticate" not in seen.get("headers", {}), seen
     # the outer hop itself refused the self-connection as an egress block
     assert seen.get("status") == 403, seen
@@ -760,21 +686,3 @@ def test_non_finite_timestamp_is_corrupt(tmp_path, when):
     retry = HeadlessRetry()
     retry.load(path)
     assert retry.states == {} and retry.ledger == {} and retry.state("http://a.test") is None
-
-
-@requires_chromium
-async def test_own_proxy_challenge_inside_retry_answered_once(site, _isolated_profile_root):
-    """Our proxy's real 407 inside interception still gets its credentials (once).
-
-    A restarted server whose first navigate is remembered meets the proxy's
-    challenge inside our interception (no cached proxy auth yet).
-    """
-    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
-        assert (await navigate(server, site.url + "/one")).data["identity"]["original_status"] == 403
-    async with BrowserMCPServer(nav_settle=False, recipes=False, profile="ws47-p") as server:
-        calls = _record_auth(server)
-        again = await navigate(server, site.url + "/two")
-    assert again.data["last_http_status"] == 200 and again.data["identity"]["remembered"] is True
-    assert [c["response"] for c in calls] == ["ProvideCredentials"], calls
-    assert len(site.received("/two")) == 1
-    assert not any("authorization" in h or "proxy-authorization" in h for h in site.received("/two"))

@@ -110,7 +110,7 @@ async def test_server_start_gives_core_an_egress_runtime(monkeypatch, tmp_path, 
     assert egress is not None
     assert egress.guard.allow_private_network is True
     assert egress.guard.allow_loopback is True
-    # user-chrome 은 Chrome 명령줄로 자격증명을 못 줘 토큰 없는 프록시
+    # tokenless 는 모드 표시만(WS-47 R3 부터 모든 모드의 프록시가 자격 없음)
     assert (egress.tokenless is True) == (mode == "user-chrome")
     # 시작 실패면 프록시도 닫는다(고아 리스너 없음)
     assert egress.proxy is None
@@ -171,7 +171,8 @@ async def test_core_launch_uses_proxy_and_flags(monkeypatch):
         await rt.close()
     kw = calls[-1]
     assert kw["proxy"]["server"].startswith("http://127.0.0.1:")
-    assert kw["proxy"]["username"] and kw["proxy"]["password"]
+    # WS-47 R3: 자격 없음 — Playwright 가 launch proxy 자격을 사이트 401 에도 보내던 누출을 막는다
+    assert set(kw["proxy"]) == {"server"}, kw["proxy"]
     assert "--disable-quic" in kw["args"]
     assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in kw["args"]
 

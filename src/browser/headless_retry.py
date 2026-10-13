@@ -110,25 +110,6 @@ async def origin_cookies(context: BrowserContext, url: str) -> list[dict]:
     return found
 
 
-def proxy_challenge_credentials(challenge: dict, proxy: EgressProxy | None) -> dict | None:
-    """Our proxy's credentials only for its own challenge, else None.
-
-    CDP reports a site's own ``407 + Proxy-Authenticate`` as ``source=Proxy`` at
-    our proxy's origin too (measured), so the origin alone does not identify the
-    challenger: the scheme and per-instance realm our proxy sends must match.
-    """
-    if proxy is None:
-        return None
-    creds = proxy.playwright_proxy()
-    realm = getattr(proxy, "auth_realm", None)
-    if (challenge.get("source") == "Proxy" and creds.get("username") and realm
-            and str(challenge.get("origin") or "").rstrip("/") == creds["server"].rstrip("/")
-            and str(challenge.get("scheme") or "").lower() == "basic"
-            and challenge.get("realm") == realm):
-        return {"username": creds["username"], "password": creds["password"]}
-    return None
-
-
 LedgerEntry = dict  # {"name", "domain", "path", "value_digest"} — never the value itself
 
 
@@ -400,34 +381,11 @@ class HeadlessRetry:
                     pass
 
         session.on("Fetch.requestPaused", paused)
-
-        answered: set[str] = set()
-
-        async def auth_required(event: dict) -> None:
-            # With interception on, this session must answer auth itself. Only the
-            # pinned egress proxy's own 407 gets its credentials, once per request
-            # (a repeat is cancelled so the 407 surfaces instead of looping); any
-            # other challenge keeps the browser default (no credentials invented).
-            response: dict = {"response": "Default"}
-            creds = proxy_challenge_credentials(event.get("authChallenge") or {}, proxy)
-            if creds is not None:
-                request_id = str(event.get("requestId"))
-                if request_id in answered:
-                    response = {"response": "CancelAuth"}
-                else:
-                    answered.add(request_id)
-                    response = {"response": "ProvideCredentials", **creds}
-            try:
-                await session.send("Fetch.continueWithAuth", {"requestId": event["requestId"],
-                                                              "authChallengeResponse": response})
-            except Exception:  # noqa: BLE001 - request/session may already have closed
-                pass
-
-        session.on("Fetch.authRequired", auth_required)
         try:
             main_frame = (await session.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
-            await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}],
-                                                "handleAuthRequests": True})
+            # 인증 가로채기 옵션은 켜지 않는다(CDP 기본값): 이 세션은 어떤 인증 요청에도 답하지 않으며
+            # 프록시 자격은 Playwright 의 launch(proxy=…) 경로만 다룬다(WS-47 R3).
+            await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
             yield attempt
         finally:
             try:
