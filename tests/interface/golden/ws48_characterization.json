@@ -2658,6 +2658,45 @@
      "type": "object"
     },
     "name": "browser_recipe"
+   },
+   {
+    "description": "YouTube 영상 검색(Data API, 키 없으면 data.youtube.disabled). data.videos·data.youtube.quota. 자막은 범위 밖",
+    "inputSchema": {
+     "properties": {
+      "max_results": {
+       "default": 10,
+       "maximum": 25,
+       "minimum": 1,
+       "type": "integer"
+      },
+      "order": {
+       "enum": [
+        "relevance",
+        "date",
+        "viewCount"
+       ]
+      },
+      "published_after": {
+       "description": "YYYY-MM-DD",
+       "type": "string"
+      },
+      "query": {
+       "maxLength": 200,
+       "type": "string"
+      },
+      "region_code": {
+       "type": "string"
+      },
+      "relevance_language": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "query"
+     ],
+     "type": "object"
+    },
+    "name": "browser_youtube_search"
    }
   ],
   "build_server_tools": [
@@ -2760,6 +2799,45 @@
      "type": "object"
     },
     "name": "browser_recipe"
+   },
+   {
+    "description": "YouTube 영상 검색(Data API, 키 없으면 data.youtube.disabled). data.videos·data.youtube.quota. 자막은 범위 밖",
+    "inputSchema": {
+     "properties": {
+      "max_results": {
+       "default": 10,
+       "maximum": 25,
+       "minimum": 1,
+       "type": "integer"
+      },
+      "order": {
+       "enum": [
+        "relevance",
+        "date",
+        "viewCount"
+       ]
+      },
+      "published_after": {
+       "description": "YYYY-MM-DD",
+       "type": "string"
+      },
+      "query": {
+       "maxLength": 200,
+       "type": "string"
+      },
+      "region_code": {
+       "type": "string"
+      },
+      "relevance_language": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "query"
+     ],
+     "type": "object"
+    },
+    "name": "browser_youtube_search"
    }
   ],
   "build_server_tools_no_recipes": [
@@ -2820,6 +2898,45 @@
      "type": "object"
     },
     "name": "browser_approval_wait"
+   },
+   {
+    "description": "YouTube 영상 검색(Data API, 키 없으면 data.youtube.disabled). data.videos·data.youtube.quota. 자막은 범위 밖",
+    "inputSchema": {
+     "properties": {
+      "max_results": {
+       "default": 10,
+       "maximum": 25,
+       "minimum": 1,
+       "type": "integer"
+      },
+      "order": {
+       "enum": [
+        "relevance",
+        "date",
+        "viewCount"
+       ]
+      },
+      "published_after": {
+       "description": "YYYY-MM-DD",
+       "type": "string"
+      },
+      "query": {
+       "maxLength": 200,
+       "type": "string"
+      },
+      "region_code": {
+       "type": "string"
+      },
+      "relevance_language": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "query"
+     ],
+     "type": "object"
+    },
+    "name": "browser_youtube_search"
    }
   ],
   "list_tools": [

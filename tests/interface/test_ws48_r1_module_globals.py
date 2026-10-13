@@ -47,7 +47,7 @@ PRESERVED = (
     "ACTION_INPUT_MAP", "ActionResult", "ActionType", "AsyncExitStack", "CHALLENGE_CHECK_ACTIONS",
     "CHALLENGE_NOTE", "CHALLENGE_NOTE_HOME", "CHALLENGE_REF", "ENVELOPE_ALWAYS", "ErrorCode", "Path",
     "RECIPE_TOOL", "SERVER_TOOLS", "SITE_NAME_LABEL", "TOOL_PREFIX", "UNOBSERVED_HINT", "WAIT_DEFAULT_S",
-    "WAIT_MAX_S", "_BUTTON_INPUT_TYPES", "_DESCRIPTIONS", "_ENTER_SUBMITS_INPUT_TYPES", "_PageObservation",
+    "WAIT_MAX_S", "YOUTUBE_TOOL", "_BUTTON_INPUT_TYPES", "_DESCRIPTIONS", "_ENTER_SUBMITS_INPUT_TYPES", "_PageObservation",
     "_RELEASE_HINT", "_SCHEMA_VALUE_KEYS", "_TRUNC_HINT_EXTRACT", "_TRUNC_HINT_OBSERVE", "_TRUNC_HINT_TEXT",
     "_UNCERTAIN_CODES", "_compact_observation", "_describe", "_field_default", "_iso", "_safe_cut",
     "_signals_of", "_stderr_line", "_wait_timeout", "action_from_tool", "approve_hint_text", "asyncio",

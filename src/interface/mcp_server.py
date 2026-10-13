@@ -62,6 +62,8 @@ from interface.server_schema import (  # noqa: E402,F401
     RECIPE_TOOL,
     SERVER_TOOLS,
     TOOL_PREFIX,
+    YOUTUBE_INSTRUCTIONS,
+    YOUTUBE_TOOL,
     _DESCRIPTIONS,
     _SCHEMA_VALUE_KEYS,
     _WAIT_SCHEMA,
@@ -474,7 +476,8 @@ def _server_instructions(recipes: bool) -> str:
     from browser.headless_retry import IDENTITY_INSTRUCTIONS
 
     return ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
-            + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS)
+            + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS
+            + "\n" + YOUTUBE_INSTRUCTIONS)
 
 
 async def run_stdio(
