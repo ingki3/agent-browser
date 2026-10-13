@@ -500,7 +500,8 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
 - 입력: `query`(필수, 200자 이하), `max_results`(1~25, 기본 10), 선택 `order`(`relevance`|`date`|`viewCount`),
   `published_after`(`YYYY-MM-DD` 또는 ISO 시각), `region_code`(`KR`), `relevance_language`(`ko`).
 - 동작: `search.list`(part=snippet, type=video) 1회 → `videos.list`(part=contentDetails,statistics, id 묶음) 1회로 길이·조회수 보강.
-  보강이 실패해도 검색 결과는 돌려주고 `data.youtube.enrichment.reason`만 붙입니다.
+  응답이 요청보다 많은 항목을 돌려줘도 `max_results`개까지만 씁니다. 보강이 실패해도(보강 단계의 할당량 초과·5xx·해석 불가,
+  거대하거나 ASCII가 아닌 숫자 값 포함) 검색 결과는 `success=true`로 돌려주고 해당 필드만 `null` + `data.youtube.enrichment.reason`을 붙입니다.
 - 결과: `data.videos[] = {video_id, url, title, channel_title, channel_id, published_at, duration_s, view_count, description}`
   (`description`은 300자까지). 제목·설명·채널 이름은 업로더가 쓴 글이라 페이지 텍스트와 같게 다룹니다 — 제어·bidi 문자를
   보이는 표기로 바꾸고, 지시처럼 보이는 문구에는 `data.injection_suspected` 신호를 붙입니다(차단하지 않음).
@@ -508,11 +509,20 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
 - 네트워크: 다른 서버 요청과 같은 Egress 가드·검증 프록시를 지납니다(브라우저를 띄우지 않은 서버는 같은 운영자 정책으로
   이 호출만의 프록시를 씀, `--allow-domain`을 쓰면 `www.googleapis.com`도 허용해야 함). 대상 호스트는 `www.googleapis.com`
   고정, 리다이렉트 따르지 않음, 응답 1MB·요청 10초 상한, **재시도하지 않음**(429·5xx는 `data.youtube.reason` 신호만).
+  압축은 요청하지 않고(`Accept-Encoding: identity`) 압축 해제도 하지 않습니다 — 압축된 응답은 `invalid_response`입니다.
+  깊게 중첩된 JSON·형식이 다른 `items`도 `invalid_response`, 범위 밖 날짜·보낼 수 없는 문자(단독 surrogate)는
+  `invalid_arguments`, 그 밖의 예상하지 못한 오류는 원문 없이 `reason: "internal_error"`입니다.
   승인·레시피 대상이 아닌 읽기 전용 조회입니다.
 - 할당량: 무료 10,000단위/일(search.list 100, videos.list 1 → 검색 약 99회/일). 서버 프로세스 단위(`--profile`이면
   프로필 폴더 `youtube_quota.json`, 0600)로 오늘(태평양 시간 자정 리셋) 쓴 추정치를
   `data.youtube.quota = {used_estimate, limit, remaining_estimate, reset_at}`로 알립니다. 같은 키를 다른 곳에서도 쓰면
-  실제보다 적게 잡힙니다. API가 `quotaExceeded`/`dailyLimitExceeded`를 주면 `success=false` + `data.youtube.quota_exceeded=true`.
+  실제보다 적게 잡힙니다. 장부 파일은 링크를 따르지 않고 무작위 임시 파일로 바꿔 쓰며, 읽을 수 없으면(손상·링크·거대)
+  0부터 다시 세고 `quota.file_unreadable=true`를 붙입니다. 차감은 보수적입니다 — 요청이 API에 닿았을 수 있으면(시간 초과·
+  상류 응답 형식 불량 포함) 차감하고, Egress 차단과 검증 프록시의 업스트림 **접속** 실패(HTTP 경로)만 0입니다
+  (HTTPS에서 프록시가 접속을 거부하면 차단과 구별할 수 없어 `egress_blocked`·0으로 셉니다).
+  API가 `quotaExceeded`/`dailyLimitExceeded`를 주면 남은 추정치를 0으로 두고 `data.youtube.quota_exceeded=true`를 붙입니다 —
+  **검색 단계**에서면 `success=false`(`reason: "quota_exceeded"`), **보강 단계**에서면 검색 결과를 유지한 `success=true` +
+  `data.youtube.enrichment.reason: "quota_exceeded"`입니다.
   키 문제(`keyInvalid` 등)는 `reason: "key_invalid"` + `api_reason`(값 없음)입니다.
 - **키가 없으면** 도구는 목록에 보이고, 호출하면 `success=false` + `data.youtube.disabled=true` + 등록 방법 한 줄(`data.youtube.hint`)을 돌려줍니다.
 
@@ -526,6 +536,7 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
    `uv run keyring set agent-browser-youtube api_key`(service=`agent-browser-youtube`, account=`api_key`).
 
 키는 요청 헤더(`X-goog-api-key`)로만 보내고 URL에 싣지 않으며, 응답·오류 문구·로그에서 가립니다. 대화나 설정 파일에 키를 붙여 넣지 마십시오.
+등록된 값의 앞뒤 공백·탭은 지우지만 개행·CR이 들어 있으면(끝이라도) 지우지 않고 `reason: "key_malformed"`로 거부합니다(요청 0회).
 
 ### 동작 캐시 — 레시피 (`browser_recipe`)
 

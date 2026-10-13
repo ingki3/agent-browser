@@ -589,7 +589,7 @@ async def test_server_tool_without_browser(api, key):
     server._youtube_api_base = api.base
     try:
         out = await server.call_server_tool(TOOL, {"query": "q", "max_results": 2})
-        assert out["success"] is True and len(out["data"]["videos"]) == 3
+        assert out["success"] is True and len(out["data"]["videos"]) == 2  # max_results 로컬 상한(R1 N1)
         assert server._started is False and server._core is None  # 브라우저를 띄우지 않는다
         assert server.hub.opened is False  # 사람 인계 통로도 열지 않는다
         out2 = await server.call_server_tool(TOOL, {"query": "q"})

@@ -132,14 +132,23 @@ def _keyring_password() -> Optional[str]:
         return None
 
 
+#: 키 앞뒤에서 지우는 문자 — 공백·탭만. 개행·CR 은 지우지 않아 형식 오류(key_malformed)로 남는다.
+_KEY_TRIM = " \t"
+
+
 def resolve_api_key() -> Optional[str]:
-    """환경변수(우선) → keyring. 없으면 None. 값은 어디에도 기록하지 않는다."""
-    value = (os.environ.get(ENV_KEY) or "").strip()
-    if value:
-        return value
-    stored = _keyring_password()
-    stored = (stored or "").strip()
-    return stored or None
+    """환경변수(우선) → keyring. 없으면 None. 값은 어디에도 기록하지 않는다.
+
+    앞뒤 공백·탭만 지운다. 개행·CR 이 들어 있으면(끝이라도) 지우기 전에 거부 — 그대로 돌려줘 `_key_usable` 이
+    `key_malformed` 로 막는다(요청 0회).
+    """
+    value = os.environ.get(ENV_KEY) or ""
+    if value.strip():
+        return value if ("\n" in value or "\r" in value) else value.strip(_KEY_TRIM)
+    stored = _keyring_password() or ""
+    if not isinstance(stored, str) or not stored.strip():
+        return None
+    return stored if ("\n" in stored or "\r" in stored) else stored.strip(_KEY_TRIM)
 
 
 def _key_usable(key: str) -> bool:
@@ -390,6 +399,8 @@ class ApiReply:
     reason: str = ""  # 비어 있으면 성공(2xx + JSON 객체)
     api_reason: str = ""
     api_message: str = field(default="", repr=False)
+    #: 요청이 API 에 닿지 않았음이 확실하다(검증 프록시가 업스트림 접속 실패로 판정) — 할당량 차감 없음.
+    not_sent: bool = False
 
 
 def _check_base(api_base: str) -> str:
@@ -452,9 +463,12 @@ class YouTubeClient:
                             return ApiReply(status=status, reason="redirect_refused")
                         mark = response.headers.get(BLOCK_HEADER)
                         if mark is not None:
-                            # 검증 프록시가 직접 만든 응답(차단 403·업스트림 실패 502) — API 응답이 아니다.
-                            return ApiReply(reason="request_failed" if UPSTREAM_FAIL_MARK in mark
-                                            else "egress_blocked")
+                            # 검증 프록시가 직접 만든 응답 — API 응답이 아니다. 차단(403)·업스트림 접속 실패(502)는
+                            # 요청이 API 에 닿지 않았다(차감 0). 그 밖의 표시(상류 응답 형식 불량·상류 407)는 상류가
+                            # 이미 요청을 받았다 — 보수적으로 차감한다.
+                            if mark.startswith("blocked"):
+                                return ApiReply(reason="egress_blocked")
+                            return ApiReply(reason="request_failed", not_sent=mark.startswith(UPSTREAM_FAIL_MARK))
                         raw = await _read_capped(response)
                         if raw is None:
                             return ApiReply(status=status, reason="response_too_large")
@@ -672,11 +686,13 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
         youtube["http_status"] = reply.status
         youtube["quota"] = ledger.snapshot()
         return _fail("invalid_response", youtube)
+    # 응답이 요청보다 많이 돌려줘도(이상 응답) max_results 로 로컬 상한 — 보강 요청 id 묶음도 같다.
+    limit = int(params["maxResults"])
     ids: List[str] = []
     for item in items:
         ident = item.get("id") if isinstance(item, dict) else None
         vid = ident.get("videoId") if isinstance(ident, dict) else None
-        if isinstance(vid, str) and _VIDEO_ID_RE.match(vid) and vid not in ids:
+        if isinstance(vid, str) and _VIDEO_ID_RE.match(vid) and vid not in ids and len(ids) < limit:
             ids.append(vid)
     details: Dict[str, Dict[str, Any]] = {}
     if ids:
@@ -701,7 +717,8 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
         if not isinstance(item, dict):
             continue
         made = _video(item, details)
-        if made is not None and made[0]["video_id"] not in {v["video_id"] for v in videos}:
+        if made is not None and made[0]["video_id"] in ids \
+                and made[0]["video_id"] not in {v["video_id"] for v in videos}:
             videos.append(made[0])
             raws.append(made[1])
     invalid = sum(_invalid_enrichment(details.get(v["video_id"]), v) for v in videos)
@@ -724,7 +741,7 @@ def _charge(ledger: QuotaLedger, reply: ApiReply, units: int) -> None:
     """요청이 API 에 닿았을 수 있으면 비용을 잡는다(추정치 — 보수적으로). 할당량 초과면 오늘 0."""
     if reply.reason == "quota_exceeded":
         ledger.exhaust()
-    elif reply.reason not in ("egress_blocked", "egress_unavailable"):
+    elif reply.reason not in ("egress_blocked", "egress_unavailable") and not reply.not_sent:
         ledger.charge(units)
 
 
