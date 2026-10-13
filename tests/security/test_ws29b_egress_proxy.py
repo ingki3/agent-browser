@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from typing import List, Tuple
 
 import pytest
 
 from security import EgressGuard, EgressPolicy
-from security.egress_proxy import PROXY_USER, EgressProxy
+from security.egress_proxy import EgressProxy
 
 
 class _Upstream:
@@ -40,10 +39,6 @@ class _Upstream:
         await self.server.wait_closed()
 
 
-def _auth(token: str) -> str:
-    return "Basic " + base64.b64encode(f"{PROXY_USER}:{token}".encode()).decode()
-
-
 async def _ask(proxy: EgressProxy, raw: bytes) -> bytes:
     r, w = await asyncio.open_connection("127.0.0.1", proxy.port)
     w.write(raw)
@@ -62,29 +57,28 @@ async def test_proxy_refuses_non_loopback_bind():
         await EgressProxy(_guard(), host="0.0.0.0").start()
 
 
-async def test_proxy_requires_token_when_set():
+@pytest.mark.parametrize("auth", [None, "Basic YWdlbnQtYnJvd3Nlcjp0MGs=", "Bearer t0k"])
+async def test_proxy_asks_no_credentials(auth):
+    """WS-47 R3: 프록시는 자격을 요구하지 않는다(407 없음) — 브라우저에 자격을 주지 않으므로
+    Playwright 가 그 자격을 사이트 401 에 보내는 일도 없다. Proxy-Authorization 이 와도 넘기지 않는다."""
     up = await _Upstream().start()
-    px = await EgressProxy(_guard(), token="t0k").start()
+    px = await EgressProxy(_guard()).start()
+    extra = f"Proxy-Authorization: {auth}\r\n" if auth else ""
     try:
-        no = await _ask(px, f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n\r\n".encode())
-        bad = await _ask(px, (f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n"
-                              f"Proxy-Authorization: {_auth('nope')}\r\n\r\n").encode())
-        ok = await _ask(px, (f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n"
-                             f"Proxy-Authorization: {_auth('t0k')}\r\n\r\n").encode())
+        r = await _ask(px, f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n{extra}\r\n".encode())
     finally:
         await px.close()
         await up.close()
-    assert no.startswith(b"HTTP/1.1 407")
-    assert bad.startswith(b"HTTP/1.1 407")
-    assert ok.startswith(b"HTTP/1.1 200")
+    assert r.startswith(b"HTTP/1.1 200"), r[:40]
+    assert b"proxy-authenticate" not in r.lower()
     assert len(up.conns) == 1
-    # 프록시 자격증명은 업스트림에 넘기지 않는다
+    # 프록시 인증 머리는 업스트림에 넘기지 않는다(hop-by-hop)
     assert b"proxy-authorization" not in up.conns[0][1].lower()
 
 
 async def test_connect_to_blocked_target_never_opens_upstream():
     up = await _Upstream().start()
-    px = await EgressProxy(_guard(), token=None).start()
+    px = await EgressProxy(_guard()).start()
     try:
         r1 = await _ask(px, b"CONNECT 192.168.1.1:443 HTTP/1.1\r\nHost: x\r\n\r\n")
         r2 = await _ask(px, b"CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -98,7 +92,7 @@ async def test_connect_to_blocked_target_never_opens_upstream():
 
 
 async def test_proxy_does_not_relay_to_itself():
-    px = await EgressProxy(_guard(), token=None).start()
+    px = await EgressProxy(_guard()).start()
     try:
         r = await _ask(px, f"GET http://127.0.0.1:{px.port}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     finally:
@@ -126,7 +120,7 @@ async def test_unjudgeable_requests_are_refused(raw):
         return await orig(url)
 
     g.evaluate_async = spy  # type: ignore[method-assign]
-    px = await EgressProxy(g, token=None).start()
+    px = await EgressProxy(g).start()
     try:
         r = await _ask(px, raw)
     finally:
@@ -145,7 +139,7 @@ async def test_connects_only_to_verified_ip_not_reresolved():
         calls.append(host)
         return answers[min(len(calls) - 1, 1)]
 
-    px = await EgressProxy(_guard(resolver=resolver), token=None).start()
+    px = await EgressProxy(_guard(resolver=resolver)).start()
     try:
         r = await _ask(px, f"GET http://svc.test:{up.port}/a HTTP/1.1\r\nHost: svc.test\r\n\r\n".encode())
     finally:
@@ -161,7 +155,7 @@ async def test_resolution_failure_does_not_connect():
     async def resolver(host: str) -> List[str]:
         raise OSError("NXDOMAIN")
 
-    px = await EgressProxy(_guard(resolver=resolver), token=None).start()
+    px = await EgressProxy(_guard(resolver=resolver)).start()
     try:
         r = await _ask(px, b"CONNECT nowhere.test:443 HTTP/1.1\r\n\r\n")
     finally:
@@ -171,7 +165,7 @@ async def test_resolution_failure_does_not_connect():
 
 async def test_connect_tunnel_to_allowed_target_relays_bytes():
     up = await _Upstream().start()
-    px = await EgressProxy(_guard(), token=None).start()
+    px = await EgressProxy(_guard()).start()
     try:
         rd, wr = await asyncio.open_connection("127.0.0.1", px.port)
         wr.write(f"CONNECT 127.0.0.1:{up.port} HTTP/1.1\r\n\r\n".encode())
@@ -189,25 +183,6 @@ async def test_connect_tunnel_to_allowed_target_relays_bytes():
 
 
 # -- WS-29b R1 (NB-2: 검증자 V4·V7, NB-1: 프록시가 만든 502 표시) ----------------------
-
-
-@pytest.mark.parametrize("value", [
-    "Basic " + base64.b64encode(b"intruder:t0k").decode(),  # 다른 사용자 + 같은 토큰
-    "Basic xxxxxxxxxxxx" + _auth("t0k")[-8:],  # 접미만 같음
-    _auth("t0k") + "x",
-    "Bearer t0k",
-])
-async def test_proxy_auth_requires_exact_credentials(value):
-    up = await _Upstream().start()
-    px = await EgressProxy(_guard(), token="t0k").start()
-    try:
-        r = await _ask(px, (f"GET http://127.0.0.1:{up.port}/x HTTP/1.1\r\nHost: a\r\n"
-                            f"Proxy-Authorization: {value}\r\n\r\n").encode())
-    finally:
-        await px.close()
-        await up.close()
-    assert r.startswith(b"HTTP/1.1 407"), r[:40]
-    assert up.conns == []
 
 
 @pytest.mark.parametrize("raw", [
@@ -233,7 +208,7 @@ async def test_resolution_failure_never_opens_a_socket(monkeypatch, raw):
         raise OSError("NXDOMAIN")
 
     g = _guard(resolver=resolver)
-    px = await EgressProxy(g, token=None).start()
+    px = await EgressProxy(g).start()
     try:
         r = await _ask_raw(px.port, raw)
     finally:
@@ -255,7 +230,7 @@ async def test_connect_failure_to_allowed_target_is_marked_and_recorded():
     closed_port = probe.getsockname()[1]
     probe.close()
     g = _guard()
-    px = await EgressProxy(g, token=None).start()
+    px = await EgressProxy(g).start()
     try:
         r = await _ask(px, f"GET http://127.0.0.1:{closed_port}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     finally:
@@ -278,7 +253,7 @@ async def test_upstream_502_from_real_site_is_not_recorded():
     server = await asyncio.start_server(on, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     g = _guard()
-    px = await EgressProxy(g, token=None).start()
+    px = await EgressProxy(g).start()
     try:
         r = await _ask(px, f"GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     finally:

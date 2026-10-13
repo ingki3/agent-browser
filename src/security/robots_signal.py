@@ -23,7 +23,7 @@ from playwright.async_api import BrowserContext, Page
 
 from contracts import ActionResult
 from security.egress import EgressGuard
-from security.egress_proxy import EgressProxy, PROXY_USER
+from security.egress_proxy import EgressProxy
 
 MAX_ROBOTS_BYTES = 500 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024
@@ -344,7 +344,7 @@ class RobotsSignals:
         try:
             if proxy is None or not proxy.running:
                 return None
-            transport_proxy = httpx.Proxy(proxy.server_url, auth=(PROXY_USER, proxy.token) if proxy.token else None)
+            transport_proxy = httpx.Proxy(proxy.server_url)
             async with httpx.AsyncClient(proxy=transport_proxy, trust_env=False, follow_redirects=False,
                                          timeout=BACKGROUND_TIMEOUT_S,
                                          headers={"User-Agent": user_agent, "Accept-Encoding": "identity"}) as client:

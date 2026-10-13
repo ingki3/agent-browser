@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 #: user-chrome 시작 알림(사람이 보는 stderr 한 줄). 우리가 띄운 Chrome 에만 플래그를 줄 수 있다.
 USER_CHROME_NOTICE = (
     "agent-browser: user-chrome — Egress 프록시는 우리가 띄운 Chrome 에만 적용됩니다. "
-    "프록시 자격증명을 Chrome 명령줄로 줄 수 없어 토큰 없는 127.0.0.1 프록시를 씁니다. "
+    "프록시는 다른 모드와 같이 자격 없는 127.0.0.1 무작위 포트입니다. "
     "이미 떠 있는 Chrome 에 붙는 경로는 Egress 정책 밖입니다(README 보안 절)."
 )
 
@@ -32,7 +32,8 @@ class EgressRuntime:
     allowed_domains: Sequence[str] = ()
     allow_private_network: bool = False
     block_loopback: bool = False
-    #: user-chrome: Chrome 명령줄로 프록시 자격증명을 줄 수 없어 토큰 없이 띄운다.
+    #: user-chrome 여부 표시(호출부 호환). WS-47 R3 부터 모든 브라우저 경로의 프록시가 자격 없음 —
+    #: 동작 차이는 없다(Playwright 가 launch proxy 자격을 사이트 401 에도 보내던 누출을 없앰).
     tokenless: bool = False
 
     guard: EgressGuard = field(init=False)
@@ -47,10 +48,7 @@ class EgressRuntime:
         )
 
     async def start(self) -> "EgressRuntime":
-        proxy = EgressProxy(self.guard)
-        if self.tokenless:
-            proxy.token = None
-        self.proxy = await proxy.start()
+        self.proxy = await EgressProxy(self.guard).start()
         return self
 
     async def close(self) -> None:

@@ -109,7 +109,6 @@ async def fetch_pdf(context: BrowserContext, url: str, guard: EgressGuard | None
     never appear in results/logs and cross-origin redirects fail closed.
     """
     import httpx
-    from security.egress_proxy import PROXY_USER
 
     if not safe_url(url) or guard is None or proxy is None or not proxy.running:
         return FetchResult(url=url, reason="egress_unavailable")
@@ -119,7 +118,7 @@ async def fetch_pdf(context: BrowserContext, url: str, guard: EgressGuard | None
             ua = await robots._context_user_agent(context)
             if ua is None:
                 return FetchResult(url=url, reason="user_agent_unavailable")
-            transport = httpx.Proxy(proxy.server_url, auth=(PROXY_USER, proxy.token) if proxy.token else None)
+            transport = httpx.Proxy(proxy.server_url)
             async with httpx.AsyncClient(proxy=transport, trust_env=False, follow_redirects=False,
                                          headers={"User-Agent": ua, "Accept-Encoding": "identity"},
                                          timeout=FETCH_TIMEOUT_S) as client:

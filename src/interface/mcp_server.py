@@ -813,6 +813,11 @@ class BrowserMCPServer:
 
         # WS-32: 영속 프로필이면 먼저 잠근다 — 다른 serve 가 쓰는 중이면 아무것도 띄우지 않고 거부.
         persistent = self.acquire_profile()
+        if self.profile is not None and persistent is not None and self._headless_retry.path is None:
+            # WS-47: --profile 이면 재시도 기억·쿠키 장부도 프로필 폴더에(0600). 없으면 메모리만.
+            from browser.headless_retry import LEDGER_FILE
+
+            self._headless_retry.load(Path(persistent) / LEDGER_FILE)
         # WS-29b: 브라우저보다 검증 프록시를 먼저 띄운다 — 브라우저는 프록시로만 나간다.
         runtime = EgressRuntime(
             allowed_domains=self.allowed_domains,
@@ -2334,10 +2339,13 @@ class BrowserMCPServer:
                 and _origin(result.current_url) == remembered.origin):
             identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
                         "note": REMEMBERED_NOTE}
-            if result.data.get("last_http_status") == 403:
-                self._headless_retry.states[remembered.origin] = "failed"
+            status = result.data.get("last_http_status")
+            if status == 403:
+                self._headless_retry.mark_failed(remembered.origin or "")
                 identity["retry_failed"] = True
                 identity["note"] = FAILED_NOTE
+            elif isinstance(status, int) and 200 <= status < 300 and result.data.get("challenge") is None:
+                remembered.succeeded = True  # ledger cookies this navigate caused (on scope exit)
             result.data["identity"] = identity
         if action is ActionType.NAVIGATE and "document" not in result.data:
             retried = await self._retry_headless_navigation(name, arguments, params, result)
@@ -2363,24 +2371,23 @@ class BrowserMCPServer:
         Temporarily ineligible origins retain memory: the per-request checks
         still prevent renamed requests while cookies or REP restrictions exist.
         """
-        from browser.headless_retry import cookie_free_origin
         from security.robots_signal import _origin
 
         url = params.get("url", "") if action is ActionType.NAVIGATE else ""
         origin = _origin(url)
         page = self._recipe_page()
-        if (origin is None or self._headless_retry.states.get(origin) != "succeeded"
+        if (origin is None or self._headless_retry.state(origin) != "succeeded"
                 or self._retry_recipe_boundary.get() or not self.headless_retry
                 or not getattr(self._core, "headless", False) or page is None or self._egress is None):
             yield None
             return
         if (await self._robots.allowed(page.context, url, self._egress, self._egress_proxy) is not True
-                or not await cookie_free_origin(page.context, url)):
+                or not await self._headless_retry.cookies_cleared(page.context, url)):
             yield None
             return
         original = await self._robots._context_user_agent(page.context)
         if (original is None or "HeadlessChrome" not in original
-                or self._headless_retry.states.get(origin) != "succeeded"):
+                or self._headless_retry.state(origin) != "succeeded"):
             yield None
             return
         async with self._headless_retry.present(page, url, original, self._robots,
@@ -2390,52 +2397,78 @@ class BrowserMCPServer:
     async def _retry_headless_navigation(
         self, name: str, arguments: Dict[str, Any], params: Dict[str, Any], result: ActionResult,
     ) -> Optional[ActionResult]:
-        """WS-44: short generic 403, confirmed REP Allow, empty-cookie origin, once."""
-        from browser.headless_retry import FAILED_NOTE, SUCCESS_NOTE, cookie_free_origin
+        """WS-44: short generic 403, confirmed REP Allow, empty-cookie origin, once.
+
+        WS-47: "empty-cookie" means no cookie, or only cookies our earlier
+        successful retries caused (exact ledger match). A 403 challenge that is
+        not retried gets data.retry_skipped with a fixed reason code + note, so
+        the caller does not explain it as a temporary block.
+        """
+        from browser.headless_retry import FAILED_NOTE, SUCCESS_NOTE, skip_reason
         from security.robots_signal import _origin
 
         page = self._recipe_page()
-        if page is None:
-            return None
+        if page is None or self._egress is None or self._retry_recipe_boundary.get():
+            return None  # the nested retry call itself is reported by its caller
         status = result.data.get("last_http_status")
         challenge = result.data.get("challenge")
-        if not (isinstance(challenge, dict) and challenge.get("kind") == "blocked"
-                and challenge.get("vendor") == "generic" and status == 403
+        if (status != 403 or not isinstance(challenge, dict) or not result.success
+                or "identity" in result.data):
+            return None
+
+        def skip(code: str) -> None:
+            result.data["retry_skipped"] = skip_reason(code)
+            return None
+
+        if not getattr(self._core, "headless", False):
+            return skip("headed")
+        if not self.headless_retry:
+            return skip("disabled")
+        if not (challenge.get("kind") == "blocked" and challenge.get("vendor") == "generic"
                 and str(challenge.get("reason") or "").startswith(f"HTTP {status} + 짧은 본문")):
-            return None
-        if self._egress is None:
-            return None
+            return skip("vendor_challenge")
         if self._page_status is not None and self._page_status.confirmation_for(page):
+            return skip("vendor_challenge")
+        origin = _origin(page.url)
+        if origin is None or _origin(params.get("url", "")) != origin:
             return None
         allowed = await self._robots.allowed(page.context, page.url, self._egress, self._egress_proxy)
-        origin = _origin(page.url)
-        if (not result.success or status != 403 or not self.headless_retry
-                or not getattr(self._core, "headless", False) or allowed is not True
-                or origin is None or _origin(params.get("url", "")) != origin
-                or origin in self._headless_retry.states
-                or not await cookie_free_origin(page.context, page.url)):
-            return None
         # Also confirm the original navigate path when it redirected within this origin.
-        if await self._robots.allowed(page.context, params["url"], self._egress, self._egress_proxy) is not True:
-            return None
+        if (allowed is not True or await self._robots.allowed(
+                page.context, params["url"], self._egress, self._egress_proxy) is not True):
+            return skip("robots_not_confirmed")
+        if self._headless_retry.state(origin) == "failed":
+            return skip("already_failed")
+        if not await self._headless_retry.cookies_cleared(page.context, page.url):
+            return skip("cookies_present")
+        if self._headless_retry.state(origin) is not None:
+            return None  # remembered success that did not apply to this navigate
         original = await self._robots._context_user_agent(page.context)
         if original is None or "HeadlessChrome" not in original:
             return None
-        if origin in self._headless_retry.states:
+        if self._headless_retry.state(origin) is not None:
             return None  # another caller can reserve the origin while UA discovery awaits
-        self._headless_retry.states[origin] = "failed"  # reserve before any await/recursive navigation
+        self._headless_retry.reserve(origin)  # reserve before any await/recursive navigation
         token = self._retry_recipe_boundary.set(True)
         attempt = None
         retry_arguments = dict(arguments)
         retry_arguments["url"] = params["url"].split("#", 1)[0]
+        failed = False
         try:
             async with self._headless_retry.present(page, page.url, original, self._robots,
                                                     self._egress, self._egress_proxy) as attempt:
                 retried = await self.call_tool(name, retry_arguments)
+                retry_status = retried.data.get("last_http_status")
+                if (attempt.document_requested and "document" not in retried.data
+                        and _origin(retried.current_url) == origin):
+                    failed = (not retried.success or retried.data.get("challenge") is not None
+                              or not isinstance(retry_status, int) or not 200 <= retry_status < 300)
+                    # Success commits state + the cookies this navigate caused when present() exits.
+                    attempt.succeeded = not failed
         finally:
             self._retry_recipe_boundary.reset(token)
             if attempt is None or not attempt.document_requested:
-                self._headless_retry.states.pop(origin, None)
+                self._headless_retry.release(origin)
         if not attempt.document_requested:
             # Preserve genuine gate failures, but a same-document no-op is not a retry.
             return retried if not retried.success else None
@@ -2445,13 +2478,10 @@ class BrowserMCPServer:
             return retried
         identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "original_status": 403,
                     "note": SUCCESS_NOTE}
-        retry_status = retried.data.get("last_http_status")
-        if (not retried.success or retried.data.get("challenge") is not None
-                or not isinstance(retry_status, int) or not 200 <= retry_status < 300):
+        if failed:
+            self._headless_retry.mark_failed(origin)
             identity["retry_failed"] = True
             identity["note"] = FAILED_NOTE
-        else:
-            self._headless_retry.states[origin] = "succeeded"
         retried.data["identity"] = identity
         return retried
 
