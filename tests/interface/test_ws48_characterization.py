@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -274,22 +275,83 @@ def _env(norm: _Norm, result: Any) -> Any:
     return norm.value(json.loads(json.dumps(raw, ensure_ascii=False)))
 
 
-def _check(section: str, actual: Any) -> None:
+# --------------------------------------------------------------------------- 관측된 변형(R3)
+
+# R3(docker 리눅스, head 3/10·base 4/10): 닫힌 포트 이동은 Chrome 이 프록시가 만든 502 문서를 여느냐(A), 오류 페이지
+# (chrome-error://)를 커밋하고 goto 가 실패하느냐(B)에 따라 봉투가 갈린다 — 제품의 타이밍 경쟁이며 후속 과제다
+# (.hermes/state/ws48-r3/report.md). 일반 마스킹 대신 **이 단계만** 두 변형을 골든에 저장하고, 실제 봉투가 둘 중
+# 하나와 **정확히** 같아야 통과한다. B 는 A 에서 _VARIANT_B_FIELDS 만 다르다(골든 구조 테스트가 고정).
+# upstream_fail 은 navigation_signals 의 마지막 단계라 epoch 차이가 뒤 단계로 번지지 않는다(순서를 바꾸면 안 된다).
+_VARIANTS = "__variants__"
+_VARIANT_STEPS = {("navigation_signals", "upstream_fail")}
+_CHROME_ERROR = "chrome-error://chromewebdata/"
+_VARIANT_A, _VARIANT_B = "A_proxy_502", "B_chrome_error"
+#: B 가 A 와 다른 필드 전부: 주소 두 곳이 오류 페이지, goto 가 실패해 navigate 가 epoch 를 올리지 않음(−1).
+_VARIANT_B_FIELDS = ("current_url", "data.url", "snapshot_epoch")
+
+
+def _b_from_a(a: Dict[str, Any]) -> Dict[str, Any]:
+    b = json.loads(json.dumps(a, ensure_ascii=False))
+    b["current_url"] = b["data"]["url"] = _CHROME_ERROR
+    b["snapshot_epoch"] = a["snapshot_epoch"] - 1
+    return b
+
+
+def _variant_of(step_env: Any) -> str:
+    """B 는 오류 페이지가 커밋된 경우뿐이다. 그 밖의 주소는 A 로 분류돼 A 골든과 달라 실패한다(제3의 변형)."""
+    return _VARIANT_B if isinstance(step_env, dict) and step_env.get("current_url") == _CHROME_ERROR else _VARIANT_A
+
+
+def _resolve_variants(section: str, actual: Any, expected: Any) -> tuple:
+    """변형 단계의 골든을 실제 봉투가 분류된 변형 하나로 바꾼다 → (비교할 골든, {단계: 변형}).
+
+    허용 목록 밖 단계에 변형 표식이 있으면 그 자체로 차이가 나도록 표식을 그대로 둔다(변형이 번지지 않게).
+    """
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return expected, {}
+    resolved, chosen = dict(expected), {}
+    for step, exp in expected.items():
+        if not (isinstance(exp, dict) and _VARIANTS in exp) or (section, step) not in _VARIANT_STEPS:
+            continue
+        name = _variant_of(actual.get(step))
+        chosen[step] = name
+        resolved[step] = exp[_VARIANTS].get(name, f"<골든에 변형 없음: {name}>")
+    return resolved, chosen
+
+
+def _golden_diff(section: str, actual: Any, expected: Any) -> tuple:
+    """(차이 문자열 또는 None, {단계: 변형}) — 정확히 같을 때만 None."""
+    expected, chosen = _resolve_variants(section, actual, expected)
+    if actual == expected:
+        return None, chosen
+    a = json.dumps(actual, ensure_ascii=False, indent=1, sort_keys=True).splitlines()
+    e = json.dumps(expected, ensure_ascii=False, indent=1, sort_keys=True).splitlines()
+    import difflib
+
+    return "\n".join(list(difflib.unified_diff(e, a, "golden", "actual", lineterm=""))[:80]), chosen
+
+
+def _check(section: str, actual: Any) -> Dict[str, str]:
+    """골든과 비교하고 변형 단계가 고른 변형({단계: 변형})을 돌려준다."""
     golden: Dict[str, Any] = json.loads(GOLDEN.read_text()) if GOLDEN.exists() else {}
     if UPDATE:
-        golden[section] = actual
+        stored, chosen = actual, {}
+        old = golden.get(section)
+        if isinstance(actual, dict) and isinstance(old, dict):
+            stored = dict(actual)
+            for step, exp in old.items():
+                if isinstance(exp, dict) and _VARIANTS in exp and step in actual:
+                    chosen[step] = _variant_of(actual[step])  # 관측된 변형만 갱신, 다른 변형은 유지
+                    stored[step] = {_VARIANTS: {**exp[_VARIANTS], chosen[step]: actual[step]}}
+        golden[section] = stored
         GOLDEN.parent.mkdir(parents=True, exist_ok=True)
         GOLDEN.write_text(json.dumps(golden, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
-        return
+        return chosen
     assert section in golden, f"골든 없음: {section} (WS48_UPDATE_GOLDEN=1 로 생성)"
-    expected = golden[section]
-    if actual != expected:
-        a = json.dumps(actual, ensure_ascii=False, indent=1, sort_keys=True).splitlines()
-        e = json.dumps(expected, ensure_ascii=False, indent=1, sort_keys=True).splitlines()
-        import difflib
-
-        diff = "\n".join(list(difflib.unified_diff(e, a, "golden", "actual", lineterm=""))[:80])
-        pytest.fail(f"{section}: 응답 봉투가 골든과 다름\n{diff}")
+    diff, chosen = _golden_diff(section, actual, golden[section])
+    if diff is not None:
+        pytest.fail(f"{section}: 응답 봉투가 골든과 다름 (변형 {chosen})\n{diff}")
+    return chosen
 
 
 def _eid(obs_result: Any, name: str) -> str:
@@ -417,6 +479,90 @@ def test_layout_values_masked_after_validation_but_identity_and_order_kept():
     # 관찰 밖 경로의 같은 이름 필드는 가리지 않는다.
     other = {"data": {"ambiguous_target": {"candidates": [{"bbox": {"x": 3}, "score": 1.5}]}}}
     assert _Norm().value(other) == other
+
+
+def _upstream_variants() -> Dict[str, Any]:
+    return json.loads(GOLDEN.read_text())["navigation_signals"]["upstream_fail"][_VARIANTS]
+
+
+def test_upstream_fail_golden_holds_exactly_the_two_observed_variants():
+    """R3: 변형은 관측된 둘뿐이고, B 는 A 에서 주소 두 곳(오류 페이지)과 epoch(−1)만 다르다."""
+    v = _upstream_variants()
+    assert sorted(v) == sorted([_VARIANT_A, _VARIANT_B])
+    a, b = v[_VARIANT_A], v[_VARIANT_B]
+    assert a["current_url"] == a["data"]["url"] == "http://127.0.0.1:CLOSED/"
+    assert b == _b_from_a(a)
+    flat = lambda env, pre="": {k2: v2 for k, v in env.items()  # noqa: E731
+                                for k2, v2 in (flat(v, f"{pre}{k}.").items() if isinstance(v, dict)
+                                               else [(f"{pre}{k}", v)])}
+    fa, fb = flat(a), flat(b)
+    assert fa.keys() == fb.keys() and {k for k in fa if fa[k] != fb[k]} == set(_VARIANT_B_FIELDS)
+    assert _variant_of(a) == _VARIANT_A and _variant_of(b) == _VARIANT_B
+    # 변형 표식은 허용 목록 단계에만 있다(다른 단계로 번지지 않음).
+    golden = json.loads(GOLDEN.read_text())
+    marked = {(sec, step) for sec, body in golden.items() if isinstance(body, dict)
+              for step, env in body.items() if isinstance(env, dict) and _VARIANTS in env}
+    assert marked == _VARIANT_STEPS
+
+
+def _nav_actual(variant: str) -> Dict[str, Any]:
+    golden = json.loads(GOLDEN.read_text())["navigation_signals"]
+    actual = {k: v for k, v in golden.items() if k != "upstream_fail"}
+    actual["upstream_fail"] = json.loads(json.dumps(_upstream_variants()[variant], ensure_ascii=False))
+    return actual
+
+
+@pytest.mark.parametrize("variant", [_VARIANT_A, _VARIANT_B])
+def test_upstream_fail_either_variant_matches_exactly(variant):
+    golden = json.loads(GOLDEN.read_text())["navigation_signals"]
+    assert _golden_diff("navigation_signals", _nav_actual(variant), golden) == (None, {"upstream_fail": variant})
+
+
+def _set(env: Dict[str, Any], dotted: str, value: Any) -> None:
+    *head, last = dotted.split(".")
+    for k in head:
+        env = env[k]
+    env[last] = value
+
+
+@pytest.mark.parametrize("variant", [_VARIANT_A, _VARIANT_B])
+@pytest.mark.parametrize("field,value", [
+    ("current_url", "about:blank"),                      # 제3의 주소
+    ("data.url", "about:blank"),
+    ("snapshot_epoch", 6),                               # 다른 epoch
+    ("error_code", "E_INVALID_URL"),                     # 변형과 무관한 필드
+    ("error_message", "이동 실패: resolve_failed: 127.0.0.1"),
+    ("data.egress.code", "resolve_failed"),
+    ("data.last_http_status", None),
+    ("success", True),
+])
+def test_upstream_fail_any_other_difference_fails(variant, field, value):
+    """R3 사보타주(결정론): 변형 필드 밖 차이·제3의 주소·다른 epoch 는 두 변형 어느 쪽으로도 통과하지 못한다."""
+    golden = json.loads(GOLDEN.read_text())["navigation_signals"]
+    actual = _nav_actual(variant)
+    _set(actual["upstream_fail"], field, value)
+    diff, _ = _golden_diff("navigation_signals", actual, golden)
+    assert diff is not None
+
+
+def test_upstream_fail_mixed_variant_fails():
+    """A 의 주소에 B 의 epoch, B 의 주소에 A 의 epoch 처럼 섞이면 실패한다."""
+    golden = json.loads(GOLDEN.read_text())["navigation_signals"]
+    for variant, other in ((_VARIANT_A, _VARIANT_B), (_VARIANT_B, _VARIANT_A)):
+        actual = _nav_actual(variant)
+        actual["upstream_fail"]["snapshot_epoch"] = _upstream_variants()[other]["snapshot_epoch"]
+        assert _golden_diff("navigation_signals", actual, golden)[0] is not None
+        actual = _nav_actual(variant)
+        actual["upstream_fail"]["data"]["url"] = _upstream_variants()[other]["data"]["url"]
+        assert _golden_diff("navigation_signals", actual, golden)[0] is not None
+
+
+def test_variant_marker_outside_allowlist_is_not_resolved():
+    """허용 목록 밖 단계의 변형 표식은 풀리지 않아 그대로 차이가 된다(변형 허용이 번지지 않음)."""
+    env = {"current_url": "x"}
+    expected = {"robots_skip": {_VARIANTS: {_VARIANT_A: env}}}
+    assert _golden_diff("navigation_signals", {"robots_skip": env}, expected)[0] is not None
+    assert _golden_diff("core_actions", {"upstream_fail": env}, {"upstream_fail": {_VARIANTS: {_VARIANT_A: env}}})[0]
 
 
 # --------------------------------------------------------------------------- 정적 골든
@@ -614,10 +760,72 @@ async def test_hitl_approval_flow_golden(sites, tmp_path, monkeypatch, approval_
 
 
 @requires_chromium
-async def test_navigation_signals_golden(sites, tmp_path):
+async def test_navigation_signals_golden(sites, tmp_path, record_property):
+    chosen = _check("navigation_signals", await _navigation_signals(sites, tmp_path))
+    record_property("upstream_fail_variant", chosen.get("upstream_fail"))
+    print(f"WS48 navigation_signals/upstream_fail variant={chosen.get('upstream_fail')}")
+
+
+@requires_chromium
+async def test_navigation_upstream_fail_error_page_variant_forced(sites, tmp_path, monkeypatch, record_property):
+    """R3: 변형 B(오류 페이지 커밋)를 결정론적으로 만든다.
+
+    docker 리눅스의 B 는 Chrome 이 프록시의 502 를 받은 뒤 `chrome-error://chromewebdata/` 로 이동이 넘어가
+    goto 가 "interrupted by another navigation to chrome-error://chromewebdata/" 로 실패한 경우다(진단 로그,
+    .hermes/state/ws48-r3). Chrome 내부 경쟁 자체는 재현할 수 없어 **같은 끝 상태**를 만든다: 닫힌 포트 이동에서
+    (1) 진짜 프록시 502 를 받고(last_http_status=502) (2) 같은 주소로 다시 이동해 프록시가 기록만 하고 연결을 끊으면
+    Chrome 이 오류 페이지를 커밋하며 goto 가 실패한다(epoch 미증가). 결과 봉투가 B 골든과 정확히 같아야 한다.
+    """
+    from playwright.async_api import _generated
+
+    from security.egress_proxy import EgressProxy
+
+    real_reply = EgressProxy._reply_upstream_failure
+    real_goto = _generated.Page.goto
+    replies: List[str] = []
+    errors: List[str] = []
+
+    async def reply_then_drop(self, writer, decision, port, exc):  # noqa: ANN001,ANN202
+        if replies:  # 두 번째부터: 기록은 원래대로, 502 는 보내지 않고 끊는다
+            writer.write = lambda data: None
+        await real_reply(self, writer, decision, port, exc)
+        if replies:
+            writer.transport.abort()
+        replies.append("502" if not replies else "drop")
+
+    async def goto_twice(self, url, *args, **kwargs):  # noqa: ANN001,ANN202
+        if f"127.0.0.1:{closed}/" not in url:
+            return await real_goto(self, url, *args, **kwargs)
+        try:  # (1) 진짜 502 — 리눅스에서는 여기서 이미 B 로 끊길 수 있다. 어느 쪽이든 (2)로 B 를 강제한다
+            await real_goto(self, url, *args, **kwargs)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return await real_goto(self, url, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            for _ in range(100):  # 오류 페이지 커밋을 기다린다(최대 ~5초) — 커밋되지 않으면 아래 단정이 실패
+                if self.url == _CHROME_ERROR:
+                    break
+                await asyncio.sleep(0.05)
+            errors.append(f"{str(exc).splitlines()[0]} page.url={self.url}")
+            raise
+
+    closed = _closed_port()
+    monkeypatch.setattr(EgressProxy, "_reply_upstream_failure", reply_then_drop)
+    monkeypatch.setattr(_generated.Page, "goto", goto_twice)
+    chosen = _check("navigation_signals", await _navigation_signals(sites, tmp_path, closed=closed))
+    assert replies[:2] == ["502", "drop"], replies  # 강제 경로가 실제로 실행됐다(무의미한 통과 방지)
+    assert errors and errors[0].endswith(f"page.url={_CHROME_ERROR}"), errors
+    assert chosen == {"upstream_fail": _VARIANT_B}
+    record_property("upstream_fail_variant", chosen["upstream_fail"])
+    print(f"WS48 forced variant={chosen['upstream_fail']} goto_error={errors[0]}")
+
+
+async def _navigation_signals(sites, tmp_path, closed: int = 0) -> Dict[str, Any]:
+    """upstream_fail 은 반드시 마지막 단계 — B 의 epoch −1 이 뒤 단계로 번지지 않게 한다(R3)."""
     a, b, c = sites
     norm = _norm_for(sites, tmp_path)
-    closed = _closed_port()
+    closed = closed or _closed_port()
     norm.add(f"127.0.0.1:{closed}", "127.0.0.1:CLOSED")
     out: Dict[str, Any] = {}
     async with BrowserMCPServer(nav_settle=False, recipes=False) as s:
@@ -631,7 +839,8 @@ async def test_navigation_signals_golden(sites, tmp_path):
         out["egress_private"] = _env(norm, await s.call_tool("browser_navigate", {"url": "http://10.255.255.1/"}))
         out["upstream_fail"] = _env(norm, await s.call_tool(
             "browser_navigate", {"url": f"http://127.0.0.1:{closed}/"}))
-    _check("navigation_signals", out)
+    assert list(out)[-1] == "upstream_fail"
+    return out
 
 
 @requires_chromium

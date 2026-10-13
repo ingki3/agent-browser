@@ -1174,24 +1174,48 @@
    "tab_id": "TAB0"
   },
   "upstream_fail": {
-   "action": "navigate",
-   "current_url": "http://127.0.0.1:CLOSED/",
-   "data": {
-    "challenge": null,
-    "egress": {
-     "code": "connect_failed",
-     "host": "127.0.0.1"
+   "__variants__": {
+    "A_proxy_502": {
+     "action": "navigate",
+     "current_url": "http://127.0.0.1:CLOSED/",
+     "data": {
+      "challenge": null,
+      "egress": {
+       "code": "connect_failed",
+       "host": "127.0.0.1"
+      },
+      "last_http_status": 502,
+      "url": "http://127.0.0.1:CLOSED/"
+     },
+     "error_code": "E_NAVIGATE_TIMEOUT",
+     "error_message": "이동 실패: connect_failed: 127.0.0.1",
+     "reobserve_required": false,
+     "retry_safe": true,
+     "snapshot_epoch": 8,
+     "success": false,
+     "tab_id": "TAB0"
     },
-    "last_http_status": 502,
-    "url": "http://127.0.0.1:CLOSED/"
-   },
-   "error_code": "E_NAVIGATE_TIMEOUT",
-   "error_message": "이동 실패: connect_failed: 127.0.0.1",
-   "reobserve_required": false,
-   "retry_safe": true,
-   "snapshot_epoch": 8,
-   "success": false,
-   "tab_id": "TAB0"
+    "B_chrome_error": {
+     "action": "navigate",
+     "current_url": "chrome-error://chromewebdata/",
+     "data": {
+      "challenge": null,
+      "egress": {
+       "code": "connect_failed",
+       "host": "127.0.0.1"
+      },
+      "last_http_status": 502,
+      "url": "chrome-error://chromewebdata/"
+     },
+     "error_code": "E_NAVIGATE_TIMEOUT",
+     "error_message": "이동 실패: connect_failed: 127.0.0.1",
+     "reobserve_required": false,
+     "retry_safe": true,
+     "snapshot_epoch": 7,
+     "success": false,
+     "tab_id": "TAB0"
+    }
+   }
   }
  },
  "observation_guidance_cap": {
