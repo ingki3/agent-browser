@@ -223,14 +223,18 @@ class QuotaLedger:
     def _read(self) -> Optional[Tuple[str, int]]:
         """장부 파일을 읽는다 — 링크는 따르지 않고(O_NOFOLLOW) 일반 파일·크기 상한만. 손상이면 None(+신호).
 
-        신호(`file_unreadable`)는 그날(태평양 시간) 동안 남는다 — 다음 기록이 파일을 고쳐도 오늘 추정치는 0부터
-        다시 센 값이라서다.
+        O_NONBLOCK 으로 연다 — FIFO 는 막힘 없는 open 에서도 writer 를 기다리며 서버(이벤트 루프)를 멈춘다(WS-49
+        R2 B1). 열린 fd 를 fstat 해 일반 파일만 읽고(FIFO·소켓·장치·디렉터리는 손상 신호), 읽기 전에 막힘 모드로
+        되돌린다. 신호(`file_unreadable`)는 그날(태평양 시간) 동안 남는다 — 다음 기록이 파일을 고쳐도 오늘
+        추정치는 0부터 다시 센 값이라서다.
         """
         try:
-            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))  # type: ignore[arg-type]
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(self.path, flags)  # type: ignore[arg-type]
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise ValueError("not a regular file")
+                os.set_blocking(fd, True)
                 raw = b""
                 while chunk := os.read(fd, 64 * 1024):
                     raw += chunk
