@@ -723,3 +723,106 @@ def _kill_owned_chrome(backend: Any) -> None:
         uc.close(timeout=2.0)
     except Exception as exc:  # noqa: BLE001
         _stderr_line(f"agent-browser serve: Chrome 종료 실패: {exc!r}")
+
+
+# --------------------------------------------------------------------------- WS-48 R1: 모듈 전역 호환
+#: 책임별로 옮긴 모듈. 그 소스에 정의된 함수는 아래 `_adopt_split_globals` 로 이 모듈 네임스페이스를 전역으로 쓴다.
+_SPLIT_MODULES = (
+    "interface.server_common",
+    "interface.server_display",
+    "interface.server_envelope",
+    "interface.server_handoff",
+    "interface.server_hitl",
+    "interface.server_lifecycle",
+    "interface.server_schema",
+    "interface.server_signals",
+    "interface.server_tools",
+    "interface.server_window",
+)
+
+
+def _adopt_split_globals() -> None:
+    """옮긴 함수들이 전역 이름을 분리 전처럼 **이 모듈(interface.mcp_server)** 에서 호출 시점에 찾게 한다.
+
+    분리 전에는 서버 코드가 이 모듈 하나에 있어 `mcp_server.TOOL_PREFIX = ...`·`monkeypatch.setattr(mcp_server,
+    "_wait_timeout", ...)` 같은 재바인딩이 모든 사용처에 그대로 전달됐다. 옮긴 뒤에는 함수의 `__globals__` 가 새
+    모듈이고 `from … import` 캐시까지 생겨 그 효과가 사라졌다(WS-48 R1). 같은 코드 객체(`__code__`)로 전역만
+    이 모듈 dict 인 함수 객체를 다시 만들어 분리 모듈·믹스인 클래스·재수출 속성을 그것으로 바꾼다 — 본문·기본값·
+    클로저·annotation 은 그대로이고 호출 비용도 그대로다(조회 대상 dict 만 바뀜). annotation 문자열도 이 모듈에서
+    해석되므로 `typing.get_type_hints(BrowserMCPServer.__aenter__)` 가 분리 전처럼 성공한다.
+
+    결과: 옮긴 코드의 패치 지점은 분리 전과 같은 `interface.mcp_server.<이름>` 이다. 분리 모듈 쪽 이름
+    (`server_schema.TOOL_PREFIX` 등)을 바꿔도 옮긴 함수에는 전달되지 않는다(분리 전에 없던 지점). 모르는
+    데코레이터가 붙은 함수는 조용히 넘기지 않고 import 단계에서 실패시킨다.
+    """
+    import contextlib
+    import inspect
+    import sys
+    import types
+
+    namespace = globals()
+
+    @contextlib.asynccontextmanager
+    async def _acm_probe():  # noqa: ANN202 - asynccontextmanager 래퍼의 코드 객체 식별용
+        yield
+
+    acm_code = _acm_probe.__code__
+    swapped: Dict[int, tuple] = {}  # id(옛 함수) -> (옛 함수, 새 함수) — 옛 객체를 살려 둬 id 재사용을 막는다
+
+    def rebind(fn: Any) -> Any:
+        if id(fn) in swapped:
+            return swapped[id(fn)][1]
+        new = types.FunctionType(fn.__code__, namespace, fn.__name__, fn.__defaults__, fn.__closure__)
+        new.__kwdefaults__ = fn.__kwdefaults__
+        new.__annotations__ = dict(fn.__annotations__)
+        new.__dict__.update(fn.__dict__)
+        new.__doc__ = fn.__doc__
+        new.__qualname__ = fn.__qualname__
+        new.__module__ = fn.__module__
+        swapped[id(fn)] = (fn, new)
+        return new
+
+    def adopt(value: Any, source: str) -> Any:
+        """옮긴 소스에 정의된 함수(또는 그 래퍼)면 새 객체, 아니면 None."""
+        if isinstance(value, (staticmethod, classmethod)):
+            inner = adopt(value.__func__, source)
+            return None if inner is None else type(value)(inner)
+        if isinstance(value, property):
+            parts = [value.fget, value.fset, value.fdel]
+            new_parts = [None if p is None else (adopt(p, source) or p) for p in parts]
+            if all(a is b for a, b in zip(parts, new_parts)):
+                return None
+            return property(*new_parts, value.__doc__)
+        if not inspect.isfunction(value):
+            return None
+        if value.__code__.co_filename == source:
+            return rebind(value)
+        wrapped = getattr(value, "__wrapped__", None)
+        if inspect.isfunction(wrapped) and wrapped.__code__.co_filename == source:
+            if value.__code__ is not acm_code:
+                raise RuntimeError(f"WS-48: 전역 이전을 모르는 데코레이터 — {value.__qualname__}")
+            return contextlib.asynccontextmanager(rebind(wrapped))
+        return None
+
+    modules = [sys.modules[name] for name in _SPLIT_MODULES]
+    for mod in modules:
+        source = mod.__file__
+        for key, value in list(vars(mod).items()):
+            if inspect.isclass(value) and value.__module__ == mod.__name__:
+                for attr_name, attr in list(vars(value).items()):
+                    new_attr = adopt(attr, source)
+                    if new_attr is not None:
+                        setattr(value, attr_name, new_attr)
+            else:
+                new_value = adopt(value, source)
+                if new_value is not None:
+                    setattr(mod, key, new_value)
+    # 다른 분리 모듈의 `from … import` 캐시와 이 모듈의 재수출도 새 객체로 맞춘다.
+    for ns in [vars(mod) for mod in modules] + [namespace]:
+        for key, value in list(ns.items()):
+            pair = swapped.get(id(value))
+            if pair is not None and pair[0] is value:
+                ns[key] = pair[1]
+
+
+_adopt_split_globals()
