@@ -371,3 +371,50 @@ async def test_api_reason_echo_classified_then_redacted_in_tool_output(api, runt
     assert out["data"]["youtube"]["reason"] == "bad_request"
     assert out["data"]["youtube"]["api_reason"] == "***"
     assert ECHO not in json.dumps(out)
+
+
+# --------------------------------------------------------------------------- NB1·NB3 장부
+
+
+def test_quota_collision_does_not_unlink_unowned_temp(tmp_path, monkeypatch):
+    path = tmp_path / "youtube_quota.json"
+    token = "reviewer-collision"
+    other = path.with_name(f".{path.name}.tmp-{os.getpid()}-{token}")
+    other.write_text("UNOWNED-SENTINEL")
+    monkeypatch.setattr(yt.secrets, "token_hex", lambda n: token)
+    yt.QuotaLedger(path).charge(100)
+    assert other.read_text() == "UNOWNED-SENTINEL"
+
+
+def test_quota_own_temp_cleaned_when_replace_fails(tmp_path, monkeypatch):
+    path = tmp_path / "youtube_quota.json"
+
+    def boom(*a: Any, **k: Any) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(yt.os, "replace", boom)
+    yt.QuotaLedger(path).charge(100)
+    assert not list(tmp_path.glob(".*tmp-*"))
+
+
+def test_still_corrupt_file_signalled_on_new_day(tmp_path):
+    path = tmp_path / "youtube_quota.json"
+    path.write_text("corrupt")
+    now = [1_792_000_000.0]
+    ledger = yt.QuotaLedger(path, clock=lambda: now[0])
+    assert ledger.snapshot()["file_unreadable"]
+    now[0] += 86400
+    assert ledger.snapshot().get("file_unreadable") is True
+
+
+def test_repaired_file_signal_clears_next_day(tmp_path):
+    path = tmp_path / "youtube_quota.json"
+    path.write_text("corrupt")
+    now = [1_792_000_000.0]
+    ledger = yt.QuotaLedger(path, clock=lambda: now[0])
+    assert ledger.snapshot()["file_unreadable"]
+    ledger.charge(100)  # 기록이 파일을 고친다
+    assert ledger.snapshot()["file_unreadable"]  # 오늘은 유지
+    now[0] += 86400
+    snap = ledger.snapshot()
+    assert "file_unreadable" not in snap and snap["used_estimate"] == 0

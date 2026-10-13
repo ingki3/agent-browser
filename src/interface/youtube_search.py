@@ -211,14 +211,15 @@ class QuotaLedger:
 
     def _sync(self) -> str:
         day, _ = pacific_day(self.clock())
-        if self.path is not None:
-            stored = self._read()
-            if stored is not None and stored[0] == day:
-                self._day, self._used = day, max(self._used if self._day == day else 0, stored[1])
+        # 날 전환 초기화를 먼저 — 그 뒤의 오늘 파일 읽기가 올린 손상 신호를 지우지 않는다(WS-49 R2 NB3).
         if self._day != day:
             if self._day:
                 self.file_unreadable = False  # 새 날 — 어제 장부 손상은 오늘 추정치와 무관
             self._day, self._used = day, 0
+        if self.path is not None:
+            stored = self._read()
+            if stored is not None and stored[0] == day:
+                self._used = max(self._used, stored[1])
         return day
 
     def _read(self) -> Optional[Tuple[str, int]]:
@@ -262,8 +263,10 @@ class QuotaLedger:
             return
         tmp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
         payload = json.dumps({"day": self._day, "used": self._used}).encode("utf-8")
+        created = False  # 우리가 O_EXCL 로 만든 임시 파일만 지운다(WS-49 R2 NB1) — 같은 이름의 남의 파일은 그대로
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            created = True
             try:
                 os.write(fd, payload)
             finally:
@@ -272,10 +275,11 @@ class QuotaLedger:
             os.chmod(self.path, 0o600)
         except OSError as exc:
             logger.debug("YouTube 할당량 기록 실패 (%s)", type(exc).__name__)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            if created:
+                try:
+                    os.unlink(tmp)
+                except OSError as cleanup:
+                    logger.debug("YouTube 할당량 임시 파일 정리 실패 (%s)", type(cleanup).__name__)
 
     def charge(self, units: int) -> None:
         self._sync()
