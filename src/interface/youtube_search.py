@@ -573,17 +573,56 @@ def _apply_reply_signals(reply: ApiReply, youtube: Dict[str, Any], key: str) -> 
         youtube["quota_exceeded"] = True
 
 
-def _fit(payload: Dict[str, Any], max_chars: int) -> None:
-    videos = payload["data"].get("videos")
+_WHERE_INDEX_RE = re.compile(r"videos\[([0-9]{1,4})\]")
+
+
+def _parts_from_signal(signal: Any, count: int) -> List[Dict[str, Any]]:
+    """이미 붙은 신호를 영상별 판정으로 되돌린다(_fit 단독 호출용). 패턴은 영상별로 나눌 수 없어 그대로 둔다."""
+    parts: List[Dict[str, Any]] = [{"where": [], "patterns": [], "scanned": 0, "cut": False} for _ in range(count)]
+    if not isinstance(signal, dict) or not parts:
+        return parts
+    patterns = [p for p in signal.get("patterns") or [] if isinstance(p, str)]
+    for path in signal.get("where") or []:
+        m = _WHERE_INDEX_RE.match(path) if isinstance(path, str) else None
+        if m is not None and int(m.group(1)) < count:
+            part = parts[int(m.group(1))]
+            part["where"].append(path)
+            part["patterns"] = patterns
+    if signal.get("truncated_scan"):
+        parts[0]["cut"] = True
+        parts[0]["scanned"] = signal.get("scanned_chars") if isinstance(signal.get("scanned_chars"), int) else 0
+    return parts
+
+
+def _fit(payload: Dict[str, Any], max_chars: int, parts: Optional[List[Dict[str, Any]]] = None) -> None:
+    """응답 전체(절단 표시·개수·IPI 신호 포함)가 max_chars 안에 들 때까지 뒤 영상부터 뺀다.
+
+    개수(`youtube.returned`)·`truncated`·`injection_suspected.where` 는 남은 목록에서 다시 만든다 — 빠진 영상의
+    경로가 남거나, 크기를 맞춘 뒤에 붙인 표시가 상한을 넘기지 않는다(WS-49 R1 R4).
+    """
+    data = payload["data"]
+    videos = data.get("videos")
     if not isinstance(videos, list):
         return
-    size = lambda: len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))  # noqa: E731
-    cut = False
-    while videos and size() > max_chars:
-        videos.pop()
-        cut = True
-    if cut:
-        payload["data"]["truncated"] = True
+    full = list(videos)
+    if parts is None:
+        parts = _parts_from_signal(data.get("injection_suspected"), len(full))
+    youtube = data.get("youtube") if isinstance(data.get("youtube"), dict) else None
+    for n in range(len(full), -1, -1):
+        data["videos"] = full[:n]
+        if youtube is not None:
+            youtube["returned"] = n
+        if n < len(full):
+            data["truncated"] = True
+        else:
+            data.pop("truncated", None)
+        signal = _merge_signals(parts[:n])
+        if signal is not None:
+            data["injection_suspected"] = signal
+        else:
+            data.pop("injection_suspected", None)
+        if n == 0 or len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) <= max_chars:
+            return
 
 
 async def youtube_search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: QuotaLedger,
@@ -674,11 +713,7 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
     youtube["note"] = UNTRUSTED_NOTE
     youtube["quota"] = ledger.snapshot()
     payload: Dict[str, Any] = {"success": True, "data": {"youtube": youtube, "videos": videos}}
-    signals = _injection_parts(videos, raws, max_result_chars)
-    signal = _merge_signals(signals)
-    if signal is not None:
-        payload["data"]["injection_suspected"] = signal
-    _fit(payload, max_result_chars)
+    _fit(payload, max_result_chars, _injection_parts(videos, raws, max_result_chars))
     return payload
 
 
