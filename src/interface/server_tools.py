@@ -1,0 +1,347 @@
+"""BrowserMCPServer 의 도구 라우팅: call_tool·_call_tool·서버 도구·레시피 도구·오류 결과.
+
+WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름은 mcp_server 가 재수출한다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import AsyncExitStack
+from typing import Any, Dict, Optional
+
+from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
+from interface.server_common import _wait_timeout
+from interface.server_schema import CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, action_from_tool
+from interface.server_envelope import cap_result_size
+
+
+class ToolsMixin:
+    """BrowserMCPServer 의 도구 라우팅: call_tool·_call_tool·서버 도구·레시피 도구·오류 결과 (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
+
+    async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
+        args = dict(arguments or {})
+        if name not in SERVER_TOOLS:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": f"알 수 없는 툴: {name}"}
+        if name == RECIPE_TOOL:
+            return await self._recipe_tool(args)
+        if not self.hub.opened:
+            self.open_handoff()
+        if not self.hub.opened:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "사람 인계 통로(상태 디렉터리)를 열 수 없습니다 — 서버 stderr 참조."}
+        await self._poll_handoff()
+        short = name[len(TOOL_PREFIX):]
+        if short == "control_status":
+            data: Dict[str, Any] = {"control": self.hub.status()}
+            data["control"].pop("window", None)
+            if self.profile is not None:
+                data["profile"] = self._profile_info()
+            if self._window is not None:
+                data["window"] = self._window.info()
+            if self._tab_notice is not None:
+                data["tab_closed_by_human"] = self._tab_notice
+            return {"success": True, "data": data}
+        if short == "control_request":
+            result = await self._control_request(args)
+            result.setdefault("data", {}).setdefault("login_hint", self._login_hint())
+            return result
+        timeout = _wait_timeout(args.get("timeout_s"))
+        if short == "control_wait":
+            return await self._control_wait(timeout)
+        return await self._approval_wait(str(args.get("approval_id") or ""), timeout)
+
+    async def _recipe_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """browser_recipe(WS-38). 응답 data 도 IPI 신호 경로를 거친다(레시피 이름·중단 사유·관찰)."""
+        if self._recipes is None:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": "레시피가 꺼져 있습니다(serve --no-recipes)."}
+        payload = await self._recipes.tool(args)
+        data = payload.get("data")
+        if isinstance(data, dict) and "injection_suspected" not in data:
+            from security.injection_signal import injection_signal
+
+            signal = injection_signal(data, None, 10 * self.max_result_chars)
+            if signal is not None:
+                data["injection_suspected"] = signal
+        return payload
+
+    def _recipe_page(self) -> Any:
+        """레시피 기록·재생 대상 페이지. 프레임 안이면 None(지원하지 않음)."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        if ctx is None or getattr(ctx, "root_page", None) is not None:
+            return None
+        return getattr(ctx, "page", None)
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
+        """MCP 툴 호출을 디스패처로 라우팅한다(_call_tool). 화면 캡처는 확인 코드 표시와 직렬화한다.
+
+        WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
+        캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
+        """
+        from interface.on_demand import SWITCH_WAIT_S
+
+        capture: Dict[str, Any] = {}
+        if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
+            return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                     ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
+        if self._window is not None:
+            # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
+            blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
+            if blocked is not None:
+                return blocked
+        # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
+        self._inflight += 1
+        navigation_scope = AsyncExitStack()
+        navigation_token = self._navigation_scope.set(navigation_scope)
+        try:
+            if self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
+                result = await self._call_wait_tool(name, arguments, capture)
+            else:
+                result = await self._call_tool(name, arguments, capture)
+            if capture and capture["gen"] != self._pixel_gen:
+                return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
+            action = action_from_tool(name)
+            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+                result.data["login_hint"] = self._login_hint()
+            if action is not None:
+                await self._attach_observation_guidance(action, arguments or {}, result)
+            if action in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
+                from security.robots_signal import attach_robots_signal
+
+                ctx = getattr(self._dispatcher, "ctx", None)
+                page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+                document = result.data.get("document")
+                if isinstance(document, dict) and document.get("url") and page is not None and self._egress is not None:
+                    signal = await self._robots.signal(page.context, document["url"], self._egress, self._egress_proxy)
+                    if signal:
+                        result.data["robots"] = signal
+                else:
+                    await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+            if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
+                await self._attach_block_hint(result)
+            # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
+            # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
+            # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
+            # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
+            from security.injection_signal import attach_injection_signal
+
+            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
+            # 부분은 늘 검사 범위 안이다.
+            attach_injection_signal(result, max_scan_chars=10 * self.max_result_chars)
+            # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
+            cap_result_size(result, self.max_result_chars)
+            if self._window is not None and (self._window_unreported or self._recovered_notice):
+                self._attach_window_report(result)
+            return result
+        finally:
+            try:
+                # Same lifetime as the recursive first retry, including MCP postprocessing.
+                await navigation_scope.aclose()
+            finally:
+                self._navigation_scope.reset(navigation_token)
+                self._inflight -= 1
+                if capture:
+                    self._captures_inflight -= 1
+
+    async def _call_wait_tool(self, name: str, arguments: Dict[str, Any],
+                              capture: Dict[str, Any]) -> ActionResult:
+        """on-demand 의 wait_for — 창 전환이 시작되면 대기를 끝내고 E_TIMEOUT 으로 돌려준다(R1 NB-5).
+
+        wait_for 의 timeout_ms 는 상한이 없어 전환이 진행 중 호출을 기다리는 상한(DRAIN_TIMEOUT_S)보다 길 수
+        있다 — 긴 대기 때문에 사람 호출(control_request)이 실패하지 않게, 전환(_drain_calls)이 이 대기를
+        취소한다. 바깥 취소(클라이언트 취소·종료)는 그대로 올린다.
+        """
+        task = asyncio.get_running_loop().create_task(self._call_tool(name, arguments, capture))
+        self._wait_calls.add(task)
+        try:
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            if task.cancelled():
+                w = self._window
+                return self._error_result(
+                    ActionType.WAIT_FOR, ErrorCode.TIMEOUT,
+                    "브라우저 창 전환(사람 호출 등) 때문에 대기를 멈췄습니다 — 전환 뒤 다시 관찰하고 "
+                    "필요하면 다시 기다리세요.",
+                    data={"window": w.info() if w is not None else {}},
+                )
+            return task.result()
+        finally:
+            self._wait_calls.discard(task)
+
+    async def _call_tool(self, name: str, arguments: Dict[str, Any],
+                         capture: Dict[str, Any]) -> ActionResult:
+        """MCP 툴 호출을 디스패처로 라우팅한다.
+
+        실패는 예외가 아니라 `ActionResult`로 반환해 클라이언트가
+        구조화된 정보를 받도록 한다.
+        """
+        action = action_from_tool(name)
+        if action is None:
+            return self._error_result(
+                ActionType.OBSERVE_PAGE,
+                ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                f"알 수 없는 툴: {name}",
+            )
+
+        if not self._started:
+            await self.start()
+
+        params: Dict[str, Any] = dict(arguments or {})
+        # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
+        approval_id = params.pop("approval_id", None)
+        # WS-29: 사람이 조작권을 가진 동안(또는 비밀 입력 요청 중) 에이전트 액션 거부.
+        if self.hub.opened:
+            await self._poll_handoff()
+        control = self.hub.control_blocks(action, params)
+        if control is not None:
+            if self._recipes is not None:
+                self._recipes.reset("human_control")
+            what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
+            return self._error_result(
+                action,
+                ErrorCode.HITL_UNATTENDED_BLOCKED,
+                f"사람이 브라우저를 다루는 중이라 {what}을 거부했습니다({control['reason']}). "
+                "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
+                data={"control": control},
+            )
+        if action is ActionType.TAKE_SCREENSHOT:
+            if self._pixels_blocked():
+                # WS-29 R1: 사람용 확인 코드가 창 오버레이에 떠 있다(또는 띄울 예정). headed 창에서는
+                # 오버레이가 스크린샷에 찍히므로(실측) 그동안 화면 픽셀(일반·전체·SoM)을 주지 않는다.
+                return self._pixels_refused(action)
+            # WS-29 R2: 이 캡처를 등록한다(검사와 등록 사이에 await 없음). 코드 표시는 등록된 캡처가
+            # 끝나길 기다리고, call_tool 은 반환 직전 세대 번호로 캡처 도중 오버레이가 켜졌는지 본다.
+            self._captures_inflight += 1
+            capture["gen"] = self._pixel_gen
+
+        # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
+        model = ACTION_INPUT_MAP.get(action)
+        to_main = False
+        if action is ActionType.SWITCH_FRAME and "to_main" in params:
+            # WS-30 추가 B: 디스패처의 메인 복귀(to_main)는 계약(동결)에 없는 키라 검증에서
+            # 버려지고 '정확히 하나' 검증에 걸려 MCP 로는 복귀할 수 없었다 — 경계 특례.
+            to_main = bool(params.pop("to_main"))
+            if to_main and any(params.get(k) for k in ("frame_selector", "shadow_root_selector")):
+                return self._error_result(
+                    action,
+                    ErrorCode.FRAME_NOT_FOUND,
+                    "to_main 과 frame_selector/shadow_root_selector 는 함께 지정할 수 없습니다.",
+                )
+        if to_main:
+            params = {"to_main": True}
+        elif model is not None:
+            try:
+                validated = model(**params)
+                params = validated.model_dump(exclude_none=True)
+            except Exception as exc:  # noqa: BLE001 - Pydantic ValidationError 등
+                return self._error_result(
+                    action,
+                    ErrorCode.ELEMENT_NOT_FOUND
+                    if "element_id" in str(exc)
+                    else ErrorCode.INVALID_URL,
+                    f"입력 검증 실패: {exc}",
+                )
+        # WS-30 항목 2: 계약 키(trigger_element_id 등)를 디스패처 키로 — 게이트도 같은 키를 본다.
+        from actions.dispatcher import normalize_action_params
+
+        params = normalize_action_params(action, params)
+
+        self._observation_state()
+
+        # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
+        self._pending_gate_basis = None
+        self._used_approval = None
+        blocked = await self._check_hitl(action, params, approval_id=approval_id)
+        if blocked is not None:
+            return blocked
+
+        # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
+        retry_boundary = action is ActionType.NAVIGATE and self._retry_recipe_boundary.get()
+        recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None and not retry_boundary else None
+        # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
+        blocks_before = self._egress.blocked_total if self._egress is not None else 0
+        upstream_before = self._egress.upstream_total if self._egress is not None else 0
+        # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
+        target_href = self._handle_href(params)
+        used, self._used_approval = self._used_approval, None
+        if used is not None:
+            # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
+            self._dispatcher.heal_disabled = True
+        try:
+            scope = self._navigation_scope.get()
+            remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
+                          if scope is not None else None)
+            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                             self._egress_proxy, self._robots, self.max_result_chars)
+        except BaseException:
+            if used is not None:
+                self.hub.set_outcome(used, "outcome_unknown")
+            raise
+        finally:
+            if used is not None:
+                self._dispatcher.heal_disabled = False
+        if used is not None:
+            self._attach_approval_outcome(used, result)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
+        result = self._attach_upstream_failure(action, params, result, upstream_before)
+        if self._pending_gate_basis is not None:
+            result.data.setdefault("gate_basis", self._pending_gate_basis)
+            self._pending_gate_basis = None
+        if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
+            await self._attach_challenge(result)
+        from browser.headless_retry import FAILED_NOTE, REMEMBERED_NOTE
+        from security.robots_signal import _origin
+
+        if (remembered is not None and remembered.document_requested and "document" not in result.data
+                and _origin(result.current_url) == remembered.origin):
+            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
+                        "note": REMEMBERED_NOTE}
+            status = result.data.get("last_http_status")
+            if status == 403:
+                self._headless_retry.mark_failed(remembered.origin or "")
+                identity["retry_failed"] = True
+                identity["note"] = FAILED_NOTE
+            elif isinstance(status, int) and 200 <= status < 300 and result.data.get("challenge") is None:
+                remembered.succeeded = True  # ledger cookies this navigate caused (on scope exit)
+            result.data["identity"] = identity
+        if action is ActionType.NAVIGATE and "document" not in result.data:
+            retried = await self._retry_headless_navigation(name, arguments, params, result)
+            if retried is not None:
+                result = retried  # original pre-snapshot + final result form one recipe boundary
+        if self._recipes is not None and not retry_boundary:
+            # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
+            if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
+                self._recipes.reset("navigation_blocked")
+            else:
+                self._recipes.post(action, params, recipe_pre, result, used is not None)
+            if action is ActionType.OBSERVE_PAGE:
+                await self._recipes.observe(result)
+        # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
+        return result
+
+    def _error_result(
+        self,
+        action: ActionType,
+        code: ErrorCode,
+        message: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> ActionResult:
+        return ActionResult(
+            success=False,
+            action=action,
+            current_url=self._page.url if self._page else "",
+            snapshot_epoch=self._engine.epoch if self._engine else 0,
+            # 유일한 탭이 닫히면 활성 탭이 None 이다(R3 NB-2) — 계약은 str.
+            tab_id=(self._core.active_tab_id if self._core else "") or "",
+            healed=False,
+            reobserve_required=False,
+            retry_safe=True,
+            error_code=code,
+            error_message=message,
+            data=data or {},
+        )
