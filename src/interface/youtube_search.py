@@ -61,6 +61,7 @@ REQUEST_TIMEOUT_S = 10.0
 TITLE_LIMIT = 200
 CHANNEL_LIMIT = 100
 DESCRIPTION_LIMIT = 300
+PUBLISHED_LIMIT = 40
 API_MESSAGE_LIMIT = 160
 
 #: 할당량 장부 파일 읽기 상한(바이트)·기록값 상한 — 손상·조작된 파일은 '기억 없음'으로 시작한다.
@@ -395,6 +396,13 @@ def _text(value: Any, limit: int) -> str:
     return display_safe(value if isinstance(value, str) else "", limit)
 
 
+def _shown(value: Any, limit: int, key: Optional[str]) -> str:
+    """표시 값: 살균·절단 → 키 가림 → **다시** 상한 절단. 가림은 문자열을 키울 수 있다(`key=x` → `key=***`,
+    짧은 키 → `***`) — 가린 뒤에 자르므로 필드 상한을 넘지 않는다(WS-49 R2 B2). 가린 문자열의 앞부분이라
+    키가 되살아나지 않는다."""
+    return redact(_text(value, limit), key)[:limit]
+
+
 # --------------------------------------------------------------------------- 전송
 
 
@@ -532,8 +540,9 @@ async def _read_capped(response: Any) -> Optional[bytes]:
 # --------------------------------------------------------------------------- 검색
 
 
-def _video(item: Dict[str, Any], details: Dict[str, Dict[str, Any]]) -> Optional[Tuple[Dict[str, Any], Dict[str, str]]]:
-    """search.list 항목 → (결과 항목, IPI 검사용 원문 {필드: 원문})."""
+def _video(item: Dict[str, Any], details: Dict[str, Dict[str, Any]],
+           key: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], Dict[str, str]]]:
+    """search.list 항목 → (결과 항목, IPI 검사용 원문 {필드: 원문}). 표시 값은 키를 가린 뒤 필드 상한 안."""
     ident = item.get("id")
     video_id = ident.get("videoId") if isinstance(ident, dict) else None
     if not isinstance(video_id, str) or not _VIDEO_ID_RE.match(video_id):
@@ -549,13 +558,13 @@ def _video(item: Dict[str, Any], details: Dict[str, Dict[str, Any]]) -> Optional
     out = {
         "video_id": video_id,
         "url": f"https://www.youtube.com/watch?v={video_id}",
-        "title": _text(raw["title"], TITLE_LIMIT),
-        "channel_title": _text(raw["channelTitle"], CHANNEL_LIMIT),
+        "title": _shown(raw["title"], TITLE_LIMIT, key),
+        "channel_title": _shown(raw["channelTitle"], CHANNEL_LIMIT, key),
         "channel_id": channel_id if isinstance(channel_id, str) and _CHANNEL_ID_RE.match(channel_id) else None,
-        "published_at": _text(published, 40) if isinstance(published, str) else None,
+        "published_at": _shown(published, PUBLISHED_LIMIT, key) if isinstance(published, str) else None,
         "duration_s": parse_duration(content.get("duration")),
         "view_count": _as_int(stats.get("viewCount")),
-        "description": _text(raw["description"], DESCRIPTION_LIMIT),
+        "description": _shown(raw["description"], DESCRIPTION_LIMIT, key),
     }
     return out, {"title": raw["title"], "channel_title": raw["channelTitle"], "description": raw["description"]}
 
@@ -594,7 +603,7 @@ def _apply_reply_signals(reply: ApiReply, youtube: Dict[str, Any], key: str) -> 
     if reply.api_reason:
         youtube["api_reason"] = reply.api_reason
     if reply.api_message:
-        youtube["api_message"] = redact(_text(reply.api_message, API_MESSAGE_LIMIT), key)
+        youtube["api_message"] = _shown(reply.api_message, API_MESSAGE_LIMIT, key)
     if reply.reason == "quota_exceeded":
         youtube["quota_exceeded"] = True
 
@@ -658,28 +667,84 @@ async def youtube_search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger
     key = None
     try:
         key = key_resolver()
-        payload = await _search(args, guard=guard, proxy=proxy, ledger=ledger, key=key, api_base=api_base,
-                                max_result_chars=max_result_chars)
+        payload, parts = await _search(args, guard=guard, proxy=proxy, ledger=ledger, key=key, api_base=api_base,
+                                       max_result_chars=max_result_chars)
+        # 최종 방어: 어떤 경로로든 키가 섞였으면 가린다(응답 전체) — 그 뒤 필드 상한·전체 크기를 다시 맞춘다.
+        return _finalize(payload, key, max_result_chars, parts)
     except Exception as exc:  # noqa: BLE001 - 마지막 안전망: 예외 문구·키·외부 원문을 내보내지 않는다
         logger.warning("YouTube 검색 처리 중 예상하지 못한 오류 (%s)", type(exc).__name__)
-        payload = internal_error_result(ledger)
-    # 최종 방어: 어떤 경로로든 키가 섞였으면 가린다(응답 전체).
-    return scrub(payload, key)
+        return scrub(internal_error_result(ledger), key)
+
+
+#: 표시 필드 → 상한(호출 시점의 모듈 값). 최종 가림 뒤에도 이 길이를 넘지 않는다.
+def _field_limits() -> Tuple[Tuple[str, int], ...]:
+    return (("title", TITLE_LIMIT), ("channel_title", CHANNEL_LIMIT), ("description", DESCRIPTION_LIMIT),
+            ("published_at", PUBLISHED_LIMIT))
+
+
+#: 가림 → 필드 상한 → fit 을 되풀이하는 최대 횟수(보통 1회로 안정 — 가림이 이미 가린 값을 다시 바꾸지 않는다).
+_SETTLE_ROUNDS = 4
+
+
+def _wire_size(payload: Any) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _bound_fields(videos: List[Any]) -> None:
+    limits = _field_limits()
+    for video in videos:
+        if not isinstance(video, dict):
+            continue
+        for name, limit in limits:
+            value = video.get(name)
+            if isinstance(value, str) and len(value) > limit:
+                video[name] = value[:limit]
+
+
+def _finalize(payload: Dict[str, Any], key: Optional[str], max_chars: int,
+              parts: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """최종 응답 순서 고정(WS-49 R2 B2): **키 가림 → 필드 상한 → 전체 fit(returned·truncated·where 재계산)**.
+
+    가림은 문자열을 키운다(`key=x` → `key=***`) — 가린 뒤에 자르고 맞춘다. 맞춘 결과를 다시 가려 바뀐 것이
+    없고 직렬화 크기가 상한 안이면 끝. 안정되지 않으면(병적인 키) 영상을 모두 빼고 개수·표시를 맞춘다.
+    IPI 판정(parts)은 원문 기준으로 이미 만들어져 있어 가림·절단과 무관하다.
+    """
+    out = scrub(payload, key)
+    for _ in range(_SETTLE_ROUNDS):
+        data = out.get("data") if isinstance(out, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get("videos"), list):
+            return out  # 실패 응답 — 고정 문구·상한 있는 필드뿐
+        _bound_fields(data["videos"])
+        _fit(out, max_chars, parts)
+        again = scrub(out, key)
+        if again == out and _wire_size(out) <= max_chars:
+            return out
+        out = again
+    data = out.get("data") if isinstance(out, dict) else None
+    if isinstance(data, dict) and isinstance(data.get("videos"), list):
+        data["videos"] = []
+        data["truncated"] = True
+        data.pop("injection_suspected", None)
+        if isinstance(data.get("youtube"), dict):
+            data["youtube"]["returned"] = 0
+    return out
 
 
 async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: QuotaLedger, key: Optional[str],
-                  api_base: str, max_result_chars: int) -> Dict[str, Any]:
+                  api_base: str,
+                  max_result_chars: int) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+    """(응답, 영상별 IPI 판정 — 실패 응답이면 None). 크기 맞춤은 `_finalize`(가림 뒤)가 한다."""
     youtube: Dict[str, Any] = {"source": SOURCE}
     if not key:
         youtube.update(disabled=True, hint=DISABLED_HINT, quota=ledger.snapshot())
-        return _fail("disabled", youtube)
+        return _fail("disabled", youtube), None
     if not _key_usable(key):
         youtube["quota"] = ledger.snapshot()
-        return _fail("key_malformed", youtube)
+        return _fail("key_malformed", youtube), None
     params, why = validate_args(dict(args or {}))
     if params is None:
         youtube["quota"] = ledger.snapshot()
-        return _fail("invalid_arguments", youtube, why)
+        return _fail("invalid_arguments", youtube, why), None
     client = YouTubeClient(guard, proxy, api_base=api_base)
 
     reply = await client.get("search", params, key)
@@ -688,13 +753,13 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
         _apply_reply_signals(reply, youtube, key)
         youtube["quota"] = ledger.snapshot()
         logger.info("YouTube 검색 실패: %s (HTTP %s)", reply.reason, reply.status or "-")
-        return _fail(reply.reason, youtube)
+        return _fail(reply.reason, youtube), None
     body: Dict[str, Any] = reply.body or {}
     items = body.get("items", [])
     if not isinstance(items, list):
         youtube["http_status"] = reply.status
         youtube["quota"] = ledger.snapshot()
-        return _fail("invalid_response", youtube)
+        return _fail("invalid_response", youtube), None
     # 응답이 요청보다 많이 돌려줘도(이상 응답) max_results 로 로컬 상한 — 보강 요청 id 묶음도 같다.
     limit = int(params["maxResults"])
     ids: List[str] = []
@@ -725,7 +790,7 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
     for item in items:
         if not isinstance(item, dict):
             continue
-        made = _video(item, details)
+        made = _video(item, details, key)
         if made is not None and made[0]["video_id"] in ids \
                 and made[0]["video_id"] not in {v["video_id"] for v in videos}:
             videos.append(made[0])
@@ -742,8 +807,7 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
     youtube["note"] = UNTRUSTED_NOTE
     youtube["quota"] = ledger.snapshot()
     payload: Dict[str, Any] = {"success": True, "data": {"youtube": youtube, "videos": videos}}
-    _fit(payload, max_result_chars, _injection_parts(videos, raws, max_result_chars))
-    return payload
+    return payload, _injection_parts(videos, raws, max_result_chars)
 
 
 def _charge(ledger: QuotaLedger, reply: ApiReply, units: int) -> None:

@@ -253,3 +253,87 @@ def test_headless_retry_ledger_directory_is_corrupt(tmp_path):
     retry = HeadlessRetry()
     retry.load(path)
     assert retry.states == {} and retry.ledger == {}
+
+
+# --------------------------------------------------------------------------- B2 redaction 뒤 상한
+
+_KEY_PHRASES = {"title": "key=x " * 33, "channelTitle": "key=x " * 16, "description": "key=x " * 50}
+_LIMITS = {"title": yt.TITLE_LIMIT, "channel_title": yt.CHANNEL_LIMIT, "description": yt.DESCRIPTION_LIMIT}
+
+
+async def test_key_phrase_fields_stay_within_field_limits(api, runtime):
+    api.search = search(1, **_KEY_PHRASES)
+    out = await call(api, runtime)
+    video = out["data"]["videos"][0]
+    for name, limit in _LIMITS.items():
+        assert len(video[name]) <= limit, (name, len(video[name]))
+        assert "key=x" not in video[name]
+
+
+@pytest.mark.parametrize("budget", [2000, 3000, 4000])
+async def test_key_phrase_payload_fits_budget_with_consistent_meta(api, runtime, budget):
+    api.search = search(25, **_KEY_PHRASES)
+    out = await call(api, runtime, max_result_chars=budget)
+    assert _size(out) <= budget
+    n = len(out["data"]["videos"])
+    assert 0 < n < 25
+    assert out["data"]["youtube"]["returned"] == n and out["data"]["truncated"] is True
+    for video in out["data"]["videos"]:
+        for name, limit in _LIMITS.items():
+            assert len(video[name]) <= limit
+
+
+async def test_key_phrase_ipi_where_matches_kept_videos(api, runtime):
+    api.search = search(25, title=("key=x " * 10) + IPI, description="key=x " * 50)
+    out = await call(api, runtime, max_result_chars=3000)
+    n = len(out["data"]["videos"])
+    where = out["data"]["injection_suspected"]["where"]
+    assert _size(out) <= 3000
+    assert where and all(int(w.split("[")[1].split("]")[0]) < n for w in where)
+
+
+async def test_ipi_detected_on_raw_even_when_display_is_redacted(api, runtime):
+    """표시 값은 가려도 IPI 는 원문 기준으로 잡는다."""
+    api.search = search(1, description=("key=x " * 60) + IPI)
+    out = await call(api, runtime)
+    assert "videos[0].description" in out["data"]["injection_suspected"]["where"]
+
+
+async def test_short_key_scrub_growth_still_fits(api, runtime, monkeypatch):
+    monkeypatch.setenv(yt.ENV_KEY, "ZZ")
+    api.search = search(25, title="ZZ" * 100, description="ZZ" * 150)
+    out = await call(api, runtime, max_result_chars=3000)
+    assert _size(out) <= 3000
+    assert "ZZ" not in json.dumps(out["data"]["videos"], ensure_ascii=False)
+    assert out["data"]["youtube"]["returned"] == len(out["data"]["videos"])
+    for video in out["data"]["videos"]:
+        for name, limit in _LIMITS.items():
+            assert len(video[name]) <= limit
+
+
+def test_finalize_order_redact_then_bound_then_fit():
+    """`_finalize` 단독: 가리지 않은 채 상한까지 찬 표시 값(어느 경로로든 섞인 경우)도 가림 → 필드 상한 →
+    전체 fit 순서로 끝난다 — 마지막 직렬화가 예산·필드 상한 안이고 개수·where 가 남은 목록과 맞는다."""
+    videos = [{"video_id": f"v{i:010d}", "title": ("key=x " * 40)[:yt.TITLE_LIMIT],
+               "channel_title": ("key=x " * 20)[:yt.CHANNEL_LIMIT],
+               "description": ("key=x " * 60)[:yt.DESCRIPTION_LIMIT], "published_at": None}
+              for i in range(25)]
+    parts = [{"where": [f"videos[{i}].title"], "patterns": ["p"], "scanned": 0, "cut": False} for i in range(25)]
+    payload = {"success": True, "data": {"youtube": {"source": yt.SOURCE, "returned": 25}, "videos": videos}}
+    out = yt._finalize(payload, KEY, 3000, parts)
+    assert _size(out) <= 3000
+    n = len(out["data"]["videos"])
+    assert 0 < n < 25 and out["data"]["youtube"]["returned"] == n and out["data"]["truncated"] is True
+    assert all(int(w.split("[")[1].split("]")[0]) < n for w in out["data"]["injection_suspected"]["where"])
+    for video in out["data"]["videos"]:
+        assert "key=x" not in json.dumps(video)
+        for name, limit in _LIMITS.items():
+            assert len(video[name]) <= limit
+
+
+async def test_api_message_bounded_after_redaction(api, runtime):
+    api.code = 400
+    api.search = {"error": {"message": "key=x " * 60, "errors": [{"reason": "badRequest"}]}}
+    out = await call(api, runtime)
+    message = out["data"]["youtube"]["api_message"]
+    assert len(message) <= yt.API_MESSAGE_LIMIT and "key=x" not in message
