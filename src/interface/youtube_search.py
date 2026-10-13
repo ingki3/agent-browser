@@ -674,7 +674,8 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
     youtube["note"] = UNTRUSTED_NOTE
     youtube["quota"] = ledger.snapshot()
     payload: Dict[str, Any] = {"success": True, "data": {"youtube": youtube, "videos": videos}}
-    signal = _injection(raws, max_result_chars)
+    signals = _injection_parts(videos, raws, max_result_chars)
+    signal = _merge_signals(signals)
     if signal is not None:
         payload["data"]["injection_suspected"] = signal
     _fit(payload, max_result_chars)
@@ -689,9 +690,59 @@ def _charge(ledger: QuotaLedger, reply: ApiReply, units: int) -> None:
         ledger.charge(units)
 
 
-def _injection(raws: List[Dict[str, str]], max_result_chars: int) -> Optional[Dict[str, Any]]:
-    """외부 텍스트(잘리기 전 원문)에 IPI 신호. 경로는 결과와 같은 `videos[i].title` 꼴."""
-    from security.injection_signal import scan_texts
+#: 외부 텍스트 필드(표시 이름 순서) — IPI 경로 `videos[i].<필드>`.
+_TEXT_FIELDS = ("title", "channel_title", "description")
 
-    texts = [(f"videos[{i}].{field}", text) for i, raw in enumerate(raws) for field, text in raw.items() if text]
-    return scan_texts(texts, 10 * max_result_chars)
+
+def _injection_parts(videos: List[Dict[str, Any]], raws: List[Dict[str, str]],
+                     max_result_chars: int) -> List[Dict[str, Any]]:
+    """영상별 IPI 판정 {where, patterns, scanned, cut}. 경로는 결과와 같은 `videos[i].title` 꼴.
+
+    1) **표시되는 모든 필드**(잘리고 살균된 값)는 예산 없이 필드마다 검사한다 — 앞 영상의 큰 원문이 뒤에 실제로
+       보이는 제목의 검사를 막지 못한다(WS-49 R1 R3). 표시 값은 필드 상한(200·100·300자)이라 크기가 묶여 있다.
+    2) 잘리기 전 원문은 **별도 예산**(10 × max_result_chars)을 필드 수로 나눈 만큼씩 본다 — 설명 뒤쪽에 숨긴
+       지시를 잡되, 한 필드가 예산을 다 먹지 못한다.
+    """
+    from security.injection_signal import matching_patterns
+
+    fields = max(1, sum(1 for raw in raws for text in raw.values() if text))
+    per_field = max(DESCRIPTION_LIMIT, (10 * max_result_chars) // fields)
+    parts: List[Dict[str, Any]] = []
+    for i, (video, raw) in enumerate(zip(videos, raws)):
+        part: Dict[str, Any] = {"where": [], "patterns": [], "scanned": 0, "cut": False}
+        for field in _TEXT_FIELDS:
+            shown = video.get(field) or ""
+            original = raw.get(field) or ""
+            piece = original[:per_field]
+            part["scanned"] += len(piece)
+            part["cut"] = part["cut"] or len(original) > per_field
+            hits: List[str] = []
+            for text in (shown, piece):
+                for name in matching_patterns(text) if text else []:
+                    if name not in hits:
+                        hits.append(name)
+            if hits:
+                part["where"].append(f"videos[{i}].{field}")
+                part["patterns"].extend(h for h in hits if h not in part["patterns"])
+        parts.append(part)
+    return parts
+
+
+def _merge_signals(parts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """영상별 판정 → `data.injection_suspected`(injection_signal.scan_texts 와 같은 모양). 의심 없으면 None."""
+    from security.injection_signal import INJECTION_HINT, MAX_WHERE
+
+    patterns: List[str] = []
+    where: List[str] = []
+    for part in parts:
+        where.extend(part["where"])
+        patterns.extend(p for p in part["patterns"] if p not in patterns)
+    if not where:
+        return None
+    signal: Dict[str, Any] = {"patterns": patterns, "where": where[:MAX_WHERE], "hint": INJECTION_HINT}
+    if len(where) > MAX_WHERE:
+        signal["where_total"] = len(where)
+    if any(part["cut"] for part in parts):
+        signal["scanned_chars"] = sum(part["scanned"] for part in parts)
+        signal["truncated_scan"] = True
+    return signal
