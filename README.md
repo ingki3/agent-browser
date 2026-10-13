@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3901개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3930개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -506,6 +506,9 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
   (`description`은 300자까지). 제목·설명·채널 이름은 업로더가 쓴 글이라 페이지 텍스트와 같게 다룹니다 — 제어·bidi 문자를
   보이는 표기로 바꾸고, 지시처럼 보이는 문구에는 `data.injection_suspected` 신호를 붙입니다(차단하지 않음).
   `data.youtube = {source: "youtube_data_api_v3", returned, total_results_estimate, quota, note}` — API라 robots 신호는 없습니다.
+  표시 값은 한 방향으로 만듭니다: 표시 정규화 → 키 가림(길이가 늘지 않음: `key=x`→`key=*`, 키→`***`) → 필드 상한 절단 1회
+  (넘치면 `…`; 결합 문자·변이 선택자·피부색·ZWJ·국기 쌍은 쪼개지 않는 **근사 규칙**(stdlib `unicodedata`), 가림 표식은 통째로 뺌)
+  → 전체 크기 상한은 뒤 영상부터 영상 단위로 빼고 `returned`·`truncated`를 맞춥니다(한 영상의 필드 때문에 다른 영상이 사라지지 않음).
 - 네트워크: 다른 서버 요청과 같은 Egress 가드·검증 프록시를 지납니다(브라우저를 띄우지 않은 서버는 같은 운영자 정책으로
   이 호출만의 프록시를 씀, `--allow-domain`을 쓰면 `www.googleapis.com`도 허용해야 함). 대상 호스트는 `www.googleapis.com`
   고정, 리다이렉트 따르지 않음, 응답 1MB·요청 10초 상한, **재시도하지 않음**(429·5xx는 `data.youtube.reason` 신호만).

@@ -157,11 +157,29 @@ def _key_usable(key: str) -> bool:
     return 0 < len(key) <= 256 and all(33 <= ord(ch) <= 126 for ch in key)
 
 
+#: 가림 표식 문자 후보 — 키에 들어 있지 않은 첫 문자를 쓴다(보통 `*`). 표식 문자가 키에 없어야 가린 결과에서 키가
+#: 다시 만들어지지 않는다(멱등). 모두 단어 문자가 아니라 `key=` 앞 경계 판정을 바꾸지 않는다.
+_MARKER_CANDIDATES = "*#~\u2217\u2022\u00b7"
+
+
+def _marker_char(key: Optional[str]) -> str:
+    for ch in _MARKER_CANDIDATES:
+        if not key or ch not in key:
+            return ch
+    return next(chr(c) for c in range(0x2200, 0x2300) if chr(c) not in (key or ""))  # 병적인 키
+
+
 def redact(text: str, key: Optional[str]) -> str:
-    """문자열에서 키 값과 `key=…` 를 가린다."""
+    """문자열에서 키 값과 `key=…` 를 가린다 — **길이가 늘지 않고 멱등**(WS-49 R3).
+
+    키 → 표식 `***`(키가 3자 미만이면 키 길이만큼), `key=<값>` → `key=` + 표식 × min(len(값), 3). 결과 길이 ≤ 원문
+    길이라 가린 뒤 자른 값을 다시 가려도 늘지 않고, 표식 문자가 키에 없으므로 다시 가려도 같다.
+    """
+    mark = _marker_char(key)
     if key:
-        text = text.replace(key, _REDACTED)
-    return _KEY_PARAM_RE.sub(r"\1" + _REDACTED, text)
+        text = text.replace(key, mark * min(len(key), len(_REDACTED)))
+    return _KEY_PARAM_RE.sub(
+        lambda m: m.group(1) + mark * min(len(m.group(0)) - len(m.group(1)), len(_REDACTED)), text)
 
 
 def scrub(value: Any, key: Optional[str]) -> Any:
@@ -400,11 +418,77 @@ def _text(value: Any, limit: int) -> str:
     return display_safe(value if isinstance(value, str) else "", limit)
 
 
+#: 표시 정규화는 자르지 않는다 — 자르기는 가림 뒤 `_cut` 한 번(자른 뒤 가리면 키 일부가 남는다).
+_NO_LIMIT = 1 << 62
+_ZWJ = "\u200d"
+#: 잘린 값 끝 `key=`(+일부 표식) — 가림 표식 전체를 빼고 자른다.
+_KEY_TAIL_RE = re.compile(r"(?i)(?<![a-z0-9_])key=[^&\s\"']*\Z")
+
+
+def _is_ri(ch: str) -> bool:
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
+
+
+def _attaches(prev: str, ch: str) -> bool:
+    """ch 가 앞 문자에 붙는 묶음 구성 문자인가 — **근사 규칙**(stdlib `unicodedata`, 완전한 UAX #29 아님):
+    결합 문자(combining>0·Mn/Mc/Me), 변이 선택자(FE00-FE0F·E0100-E01EF), 피부색 수정자(1F3FB-1F3FF),
+    태그(E0020-E007F), ZWJ 와 ZWJ 바로 뒤 문자."""
+    import unicodedata
+
+    o = ord(ch)
+    return (prev == _ZWJ or ch == _ZWJ or unicodedata.combining(ch) > 0
+            or unicodedata.category(ch) in ("Mn", "Mc", "Me")
+            or 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF or 0x1F3FB <= o <= 0x1F3FF
+            or 0xE0020 <= o <= 0xE007F)
+
+
+def _cluster_floor(text: str, cut: int) -> int:
+    """cut 이하에서 묶음을 쪼개지 않는 가장 큰 절단 위치."""
+    while 0 < cut < len(text):
+        prev, ch = text[cut - 1], text[cut]
+        if _attaches(prev, ch):
+            cut -= 1
+            continue
+        if _is_ri(prev) and _is_ri(ch):
+            run = 0
+            while run < cut and _is_ri(text[cut - 1 - run]):
+                run += 1
+            if run % 2:  # 지역 표시 기호 쌍(국기) 가운데
+                cut -= 1
+                continue
+        break
+    return cut
+
+
+def _cut(text: str, limit: int, mark: str) -> str:
+    """필드 상한 절단 1회(가림 뒤). 넘치면 `…` 한 칸을 남기고 안전한 경계에서 자른다.
+
+    * 묶음(결합 문자·이모지 수정자·국기 쌍 …)은 통째로 넣거나 통째로 뺀다.
+    * 가림 표식 run 가운데서 자르지 않는다 — 표식 전체를 뺀다. 잘린 끝이 `key=`(+표식 일부)면 그 문구도 뺀다
+      (가린 결과의 앞부분은 다시 가려도 같다 — 최종 가림이 값을 바꾸지 않는다).
+    자르는 위치만 줄어드는 한 방향 계산이다(가림·절단을 되풀이하지 않는다).
+    """
+    if len(text) <= limit:
+        return text
+    if limit <= 0:
+        return ""
+    cut = limit - 1
+    while True:
+        start = cut
+        cut = _cluster_floor(text, cut)
+        while 0 < cut < len(text) and text[cut - 1] == mark and text[cut] == mark:
+            cut -= 1
+        tail = _KEY_TAIL_RE.search(text, max(0, cut - 16), cut)  # 가린 값은 표식 ≤3자 — 끝 몇 자만 본다
+        if tail is not None:
+            cut = tail.start()
+        if cut == start:
+            return text[:cut] + "…"
+
+
 def _shown(value: Any, limit: int, key: Optional[str]) -> str:
-    """표시 값: 살균·절단 → 키 가림 → **다시** 상한 절단. 가림은 문자열을 키울 수 있다(`key=x` → `key=***`,
-    짧은 키 → `***`) — 가린 뒤에 자르므로 필드 상한을 넘지 않는다(WS-49 R2 B2). 가린 문자열의 앞부분이라
-    키가 되살아나지 않는다."""
-    return redact(_text(value, limit), key)[:limit]
+    """표시 값 — 한 방향(WS-49 R3): 표시 정규화(`display_safe`, 자르지 않음) → 키 가림(길이 비증가·멱등) →
+    필드 상한 절단 1회(`_cut`, 묶음·표식 경계). 결과는 가림의 고정점이라 최종 가림이 바꾸지 않는다."""
+    return _cut(redact(_text(value, _NO_LIMIT), key), limit, _marker_char(key))
 
 
 # --------------------------------------------------------------------------- 전송
@@ -693,51 +777,33 @@ def _field_limits() -> Tuple[Tuple[str, int], ...]:
             ("published_at", PUBLISHED_LIMIT))
 
 
-#: 가림 → 필드 상한 → fit 을 되풀이하는 최대 횟수(보통 1회로 안정 — 가림이 이미 가린 값을 다시 바꾸지 않는다).
-_SETTLE_ROUNDS = 4
-
-
-def _wire_size(payload: Any) -> int:
-    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-
-
-def _bound_fields(videos: List[Any]) -> None:
+def _bound_fields(videos: List[Any], mark: str) -> None:
+    """필드 상한 절단 1회(`_cut` — 묶음·표식 경계). `_shown` 이 만든 값은 이미 상한 안이라 그대로다."""
     limits = _field_limits()
     for video in videos:
         if not isinstance(video, dict):
             continue
         for name, limit in limits:
             value = video.get(name)
-            if isinstance(value, str) and len(value) > limit:
-                video[name] = value[:limit]
+            if isinstance(value, str):
+                video[name] = _cut(value, limit, mark)
 
 
 def _finalize(payload: Dict[str, Any], key: Optional[str], max_chars: int,
               parts: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """최종 응답 순서 고정(WS-49 R2 B2): **키 가림 → 필드 상한 → 전체 fit(returned·truncated·where 재계산)**.
+    """최종 응답 — 한 방향, 각 단계 한 번(WS-49 R3): **응답 전체 가림 → 필드 상한 절단 → 전체 fit**.
 
-    가림은 문자열을 키운다(`key=x` → `key=***`) — 가린 뒤에 자르고 맞춘다. 맞춘 결과를 다시 가려 바뀐 것이
-    없고 직렬화 크기가 상한 안이면 끝. 안정되지 않으면(병적인 키) 영상을 모두 빼고 개수·표시를 맞춘다.
-    IPI 판정(parts)은 원문 기준으로 이미 만들어져 있어 가림·절단과 무관하다.
+    가림은 길이를 늘리지 않고 멱등이라(`redact`) 이미 가리고 자른 표시 값(`_shown`)은 바뀌지 않는다 — 이 가림은
+    다른 경로로 섞였을 수 있는 키를 위한 안전망이다. 절단은 가린 뒤 한 번, fit 은 뒤 영상부터 **영상 단위로**
+    빼며 개수·`truncated`·IPI `where` 를 남은 목록에서 다시 만든다. 다시 가리거나 되풀이하지 않고, 한 영상의
+    필드 문제로 다른 영상을 지우는 일도 없다. IPI 판정(parts)은 원문 기준으로 이미 만들어져 있다.
     """
     out = scrub(payload, key)
-    for _ in range(_SETTLE_ROUNDS):
-        data = out.get("data") if isinstance(out, dict) else None
-        if not isinstance(data, dict) or not isinstance(data.get("videos"), list):
-            return out  # 실패 응답 — 고정 문구·상한 있는 필드뿐
-        _bound_fields(data["videos"])
-        _fit(out, max_chars, parts)
-        again = scrub(out, key)
-        if again == out and _wire_size(out) <= max_chars:
-            return out
-        out = again
     data = out.get("data") if isinstance(out, dict) else None
-    if isinstance(data, dict) and isinstance(data.get("videos"), list):
-        data["videos"] = []
-        data["truncated"] = True
-        data.pop("injection_suspected", None)
-        if isinstance(data.get("youtube"), dict):
-            data["youtube"]["returned"] = 0
+    if not isinstance(data, dict) or not isinstance(data.get("videos"), list):
+        return out  # 실패 응답 — 고정 문구·상한 있는 필드뿐
+    _bound_fields(data["videos"], _marker_char(key))
+    _fit(out, max_chars, parts)
     return out
 
 
@@ -799,11 +865,13 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
     videos: List[Dict[str, Any]] = []
     raws: List[Dict[str, str]] = []
     for item in items:
-        if not isinstance(item, dict):
+        ident = item.get("id") if isinstance(item, dict) else None
+        vid = ident.get("videoId") if isinstance(ident, dict) else None
+        # 쓸 영상(ids, 처음 나온 것)만 변환한다 — 표시 정규화는 원문 전체를 보므로 버릴 항목에 쓰지 않는다.
+        if vid not in ids or vid in {v["video_id"] for v in videos}:
             continue
-        made = _video(item, details, key)
-        if made is not None and made[0]["video_id"] in ids \
-                and made[0]["video_id"] not in {v["video_id"] for v in videos}:
+        made = _video(item, details, key)  # type: ignore[arg-type]
+        if made is not None:
             videos.append(made[0])
             raws.append(made[1])
     invalid = sum(_invalid_enrichment(details.get(v["video_id"]), v) for v in videos)
