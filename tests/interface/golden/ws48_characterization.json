@@ -211,16 +211,16 @@
      "elements": [
       {
        "bbox": {
-        "height": 22,
-        "width": 77,
-        "x": 8,
-        "y": 8
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e1",
        "interactable": true,
        "name": "프레임 버튼",
        "role": "button",
-       "score": 8.6694,
+       "score": "<score>",
        "value": ""
       }
      ],
@@ -323,99 +323,99 @@
      "elements": [
       {
        "bbox": {
-        "height": 22,
-        "width": 39,
-        "x": 165,
-        "y": 82
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e1",
        "interactable": true,
        "name": "검색",
        "role": "button",
-       "score": 8.3655,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 62,
-        "x": 8,
-        "y": 104
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e2",
        "interactable": true,
        "name": "결제하기",
        "role": "button",
-       "score": 8.2323,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 21,
-        "width": 153,
-        "x": 8,
-        "y": 82
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e3",
        "interactable": true,
        "name": "검색어",
        "role": "textbox",
-       "score": 8.1,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 51,
-        "x": 167,
-        "y": 246
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e4",
        "interactable": true,
        "name": "더보기",
        "role": "button",
-       "score": 7.7668,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 51,
-        "x": 217,
-        "y": 246
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e5",
        "interactable": true,
        "name": "더보기",
        "role": "button",
-       "score": 7.7668,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 18,
-        "width": 84,
-        "x": 8,
-        "y": 247
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e6",
        "interactable": true,
        "name": "다음 페이지",
        "role": "link",
-       "score": 7.5504
+       "score": "<score>"
       },
       {
        "bbox": {
-        "height": 18,
-        "width": 67,
-        "x": 96,
-        "y": 247
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e7",
        "interactable": true,
        "name": "CSV 받기",
        "role": "link",
-       "score": 7.5325
+       "score": "<score>"
       }
      ],
      "snapshot_epoch": 1,
@@ -1105,16 +1105,16 @@
      "elements": [
       {
        "bbox": {
-        "height": 18,
-        "width": 16,
-        "x": 8,
-        "y": 51
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e1",
        "interactable": true,
        "name": "홈",
        "role": "link",
-       "score": 6.5642
+       "score": "<score>"
       }
      ],
      "snapshot_epoch": 1,
@@ -1336,86 +1336,86 @@
      "elements": [
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 8,
-        "y": 8
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e1",
        "interactable": true,
        "name": "항목 버튼 0000 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 8.26,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 314,
-        "y": 8
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e2",
        "interactable": true,
        "name": "항목 버튼 0001 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 8.26,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 620,
-        "y": 8
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e3",
        "interactable": true,
        "name": "항목 버튼 0002 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 7.7267,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 926,
-        "y": 8
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e4",
        "interactable": true,
        "name": "항목 버튼 0003 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 7.1933,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 8,
-        "y": 30
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e5",
        "interactable": true,
        "name": "항목 버튼 0004 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 6.55,
+       "score": "<score>",
        "value": ""
       },
       {
        "bbox": {
-        "height": 22,
-        "width": 306,
-        "x": 314,
-        "y": 30
+        "height": "<px>",
+        "width": "<px>",
+        "x": "<px>",
+        "y": "<px>"
        },
        "element_id": "@e6",
        "interactable": true,
        "name": "항목 버튼 0005 길게 늘인 이름으로 결과 크기를 키운다",
        "role": "button",
-       "score": 6.55,
+       "score": "<score>",
        "value": ""
       }
      ],

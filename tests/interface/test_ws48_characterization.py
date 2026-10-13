@@ -142,6 +142,8 @@ def _closed_port() -> int:
 # - 발급 id(승인·레시피·서버): 첫 등장 순서대로 `APPROVAL_1`·`RECIPE_1`·`SERVER_1` 로 바꿔 '같은 id 인가' 관계를
 #   보존한다. 승인 id 는 문장 속에서도 생성기 alphabet 전체(`ap_` + token_urlsafe(12) = 16자, 끝 `-`/`_` 포함)를
 #   경계로 찾는다(R3: 끝자리 `-` 가 `\b` 정규식에서 남던 flake). 형식이 다른 값(테스트가 넣은 가짜 id)은 그대로.
+# - 렌더링 값(R2): 관찰 요소의 bbox·score 는 폰트에 따라 OS 마다 달라 검증 뒤 `<px>`·`<score>` 로 가린다.
+#   요소 순서·id·이름 등은 그대로 비교한다.
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
 _APPROVAL_ID = re.compile(r"ap_[A-Za-z0-9_-]{16}")
 _APPROVAL_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_-])ap_[A-Za-z0-9_-]{16}(?![A-Za-z0-9_-])")
@@ -159,8 +161,39 @@ def _count(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
+def _px(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+
+#: 관찰 점수 허용 범위. 골든 페이지는 목표 키워드가 없어 가중치 합(역할·이름·뷰포트·크기·상단·짧은 라벨)이
+#: 이 안에 든다(실측 6.5~8.7). 범위를 벗어나면 점수 계산이 바뀐 것이므로 가리지 않고 드러낸다.
+_SCORE_RANGE = (0.0, 15.0)
+
+
+def _score(v: Any) -> bool:
+    return isinstance(v, float) and _SCORE_RANGE[0] <= v <= _SCORE_RANGE[1]
+
+
+def _order_violations(elements: List[Any]) -> List[str]:
+    """점수를 가리기 전에 관찰 요소가 점수 내림차순(프루닝 정렬 키)인지 확인한다 — 어긋나면 표식을 덧붙인다."""
+    scores = [e.get("score") if isinstance(e, dict) else None for e in elements]
+    return [f"<INVALID order elements[{i}].score={b!r} > elements[{i - 1}].score={a!r}>"
+            for i, (a, b) in enumerate(zip(scores, scores[1:]), start=1)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b > a]
+
+
+#: R2(CI ubuntu): 요소 크기·위치는 폰트·렌더링에 따라 OS 마다 다르다(22→24px 등) — 코드 동작이 아니다.
+#: 점수도 크기·상단 근접에서 파생되므로 함께 가린다. 요소 순서·element_id·name·role·interactable·value 는
+#: 그대로 비교하고, 가리기 전에 '점수 내림차순' 관계를 검증해 정렬이 깨지면 드러낸다(_ELEMENTS 참고).
+_ELEMENTS = ("data", "observation", "elements")
+_LAYOUT_RULES: Dict[tuple, str] = {
+    **{_ELEMENTS + ("*", "bbox", k): "px" for k in ("x", "y", "width", "height")},
+    _ELEMENTS + ("*", "score"): "score",
+}
+
 #: 봉투 루트 기준 경로(리스트 원소는 "*") → 종류. 이 경로 밖은 정규화하지 않는다.
 _PATH_RULES: Dict[tuple, str] = {
+    **_LAYOUT_RULES,
     ("data", "latency_ms"): "ms",
     ("data", "approval", "approval_id"): "approval",
     ("data", "approval", "rejected", "approval_id"): "approval",
@@ -205,6 +238,10 @@ class _Norm:
             return "<ms>" if _ms(v) else f"<INVALID ms {where}={v!r}>"
         if kind == "count":
             return "<count>" if _count(v) else f"<INVALID count {where}={v!r}>"
+        if kind == "px":
+            return "<px>" if _px(v) else f"<INVALID px {where}={v!r}>"
+        if kind == "score":
+            return "<score>" if _score(v) else f"<INVALID score {where}={v!r}>"
         if kind == "iso":
             return "<iso>" if isinstance(v, str) and _ISO.fullmatch(v) else f"<INVALID iso {where}={v!r}>"
         pattern = {"approval": _APPROVAL_ID, "recipe": _RECIPE_ID, "server": _SERVER_ID}[kind]
@@ -223,7 +260,10 @@ class _Norm:
         if isinstance(v, dict):
             return {k: self.value(x, k, path + (k,)) for k, x in v.items()}
         if isinstance(v, list):
-            return [self.value(x, key, path + ("*",)) for x in v]
+            out = [self.value(x, key, path + ("*",)) for x in v]
+            if path == _ELEMENTS:
+                out.extend(_order_violations(v))
+            return out
         if isinstance(v, str):
             return self.text(v)
         return v
@@ -350,6 +390,33 @@ def test_volatile_keys_outside_allowlist_are_not_hidden():
     """허용 목록 밖 경로는 그대로 — 새 휘발성 필드가 골든 차이로 드러난다."""
     env = {"latency_ms": 5, "data": {"other": {"latency_ms": 7, "id": "r_0000beef", "expires_at": "x"}}}
     assert _Norm().value(env) == env
+
+
+def test_layout_values_masked_after_validation_but_identity_and_order_kept():
+    """R2: bbox·score 는 타입·부호·범위 검증 뒤에만 가린다. 이름·순서·id 는 그대로, 점수 정렬이 깨지면 드러낸다."""
+    def env(*els):
+        return {"data": {"observation": {"elements": [
+            {"element_id": f"@e{i}", "name": n, "score": s, "bbox": {"x": x, "y": 8, "width": 30, "height": 22}}
+            for i, (n, s, x) in enumerate(els, start=1)]}}}
+
+    linux = _Norm().value(env(("가", 8.68, 343), ("나", 6.5447, 8)))
+    mac = _Norm().value(env(("가", 8.6694, 314), ("나", 6.5642, 8)))
+    assert linux == mac  # 렌더링 차이만 있으면 같다
+    assert linux["data"]["observation"]["elements"][0] == {
+        "element_id": "@e1", "name": "가", "score": "<score>",
+        "bbox": {"x": "<px>", "y": "<px>", "width": "<px>", "height": "<px>"}}
+    assert _Norm().value(env(("나", 8.68, 343), ("가", 6.5, 8))) != mac  # 순서·이름 차이는 남는다
+    assert _Norm().value(env(("가", 8.68, 343))) != mac  # 요소 누락도 남는다
+    els = _Norm().value(env(("가", 6.5, 8), ("나", 8.68, 343)))["data"]["observation"]["elements"]
+    assert els[-1] == "<INVALID order elements[1].score=8.68 > elements[0].score=6.5>"
+    bad = _Norm().value(env(("가", 99.0, -1), ("나", 7, True)))["data"]["observation"]["elements"]
+    assert bad[0]["score"] == "<INVALID score data/observation/elements/*/score=99.0>"
+    assert bad[0]["bbox"]["x"] == "<INVALID px data/observation/elements/*/bbox/x=-1>"
+    assert bad[1]["score"] == "<INVALID score data/observation/elements/*/score=7>"  # 정수는 계약(float)과 다르다
+    assert bad[1]["bbox"]["x"] == "<INVALID px data/observation/elements/*/bbox/x=True>"
+    # 관찰 밖 경로의 같은 이름 필드는 가리지 않는다.
+    other = {"data": {"ambiguous_target": {"candidates": [{"bbox": {"x": 3}, "score": 1.5}]}}}
+    assert _Norm().value(other) == other
 
 
 # --------------------------------------------------------------------------- 정적 골든
