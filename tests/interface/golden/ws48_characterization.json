@@ -134,7 +134,7 @@
     "challenge": null,
     "element_id": "@e6",
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "signals": [
      "url_changed: http://SITE_A/ -> http://SITE_A/next",
      "dom_delta: 16 -> 7",
@@ -153,7 +153,7 @@
    "current_url": "http://SITE_A/",
    "data": {
     "element_id": "@e7",
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "signals": [
      "file_saved: TMP/file.csv"
     ]
@@ -172,7 +172,7 @@
     "items": {
      "text": "특성화 홈"
     },
-    "latency_ms": "<masked>"
+    "latency_ms": "<ms>"
    },
    "reobserve_required": false,
    "retry_safe": true,
@@ -190,7 +190,7 @@
      "http://SITE_A/frame"
     ],
     "frame_url": "http://SITE_A/frame",
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "resolved_from": "current_frame"
    },
    "reobserve_required": false,
@@ -205,7 +205,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "observation": {
      "axtree_summary": "@e1 button \"프레임 버튼\"",
      "elements": [
@@ -257,7 +257,7 @@
     "frame_depth": 0,
     "frame_path": [],
     "frame_url": "http://SITE_A/",
-    "latency_ms": "<masked>"
+    "latency_ms": "<ms>"
    },
    "reobserve_required": false,
    "retry_safe": true,
@@ -271,7 +271,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "url": "http://SITE_A/"
    },
    "reobserve_required": false,
@@ -284,7 +284,7 @@
    "action": "hover",
    "current_url": "http://SITE_A/",
    "data": {
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "retried": true,
     "signals": []
    },
@@ -302,7 +302,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "url": "http://SITE_A/"
    },
    "reobserve_required": false,
@@ -317,7 +317,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "observation": {
      "axtree_summary": "@e1 button \"검색\"\n@e2 button \"결제하기\"\n@e3 textbox \"검색어\"\n@e4 button \"더보기\"\n@e5 button \"더보기\"\n@e6 link \"다음 페이지\"\n@e7 link \"CSV 받기\"",
      "elements": [
@@ -437,7 +437,7 @@
     "challenge": null,
     "key": "Tab",
     "last_http_status": 200,
-    "latency_ms": "<masked>"
+    "latency_ms": "<ms>"
    },
    "reobserve_required": false,
    "retry_safe": false,
@@ -451,7 +451,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "url": "http://SITE_A/"
    },
    "reobserve_required": false,
@@ -469,7 +469,7 @@
    "current_url": "http://SITE_A/",
    "data": {
     "hint": "스크롤 위치가 바뀌지 않았습니다(이미 끝이거나 이 페이지는 창 스크롤이 없음). 새 항목이 필요하면 '더 보기' 버튼 등을 observe_page 로 찾으세요.",
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "no_effect": true,
     "scrolled": 500,
     "scrolled_px": 0
@@ -486,7 +486,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "tab_id": "TAB1",
     "url": "http://SITE_A/next"
    },
@@ -504,7 +504,7 @@
     "challenge": null,
     "count": 2,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "tabs": [
      {
       "tab_id": "TAB0",
@@ -529,7 +529,7 @@
     "challenge": null,
     "element_id": "@e3",
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "signals": [
      "value_applied: '사과'"
     ]
@@ -547,7 +547,7 @@
     "challenge": null,
     "condition": "selector",
     "last_http_status": 200,
-    "latency_ms": "<masked>"
+    "latency_ms": "<ms>"
    },
    "reobserve_required": false,
    "retry_safe": true,
@@ -621,11 +621,11 @@
    "current_url": "http://SITE_A/",
    "data": {
     "approval": {
-     "approval_id": "<masked>",
-     "expires_at": "<masked>",
-     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "approval_id": "APPROVAL_1",
+     "expires_at": "<iso>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL_1 (브라우저 창에 뜨는 확인 코드 입력)",
      "rejected": {
-      "approval_id": "<masked>",
+      "approval_id": "ap-bogus000",
       "reason": "알 수 없는 승인 id(이 서버가 발급하지 않았거나 서버가 재시작됨)",
       "reason_code": "unknown"
      }
@@ -642,7 +642,7 @@
     "risk": "high"
    },
    "error_code": "E_HITL_UNATTENDED_BLOCKED",
-   "error_message": "승인 증표 거부: 알 수 없는 승인 id(이 서버가 발급하지 않았거나 서버가 재시작됨). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "error_message": "승인 증표 거부: 알 수 없는 승인 id(이 서버가 발급하지 않았거나 서버가 재시작됨). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL_1` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
    "reobserve_required": false,
    "retry_safe": true,
    "snapshot_epoch": 1,
@@ -654,9 +654,9 @@
    "current_url": "http://SITE_A/",
    "data": {
     "approval": {
-     "approval_id": "<masked>",
-     "expires_at": "<masked>",
-     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)"
+     "approval_id": "APPROVAL_1",
+     "expires_at": "<iso>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL_1 (브라우저 창에 뜨는 확인 코드 입력)"
     },
     "dialog": null,
     "gate_basis": {
@@ -670,7 +670,7 @@
     "risk": "high"
    },
    "error_code": "E_HITL_UNATTENDED_BLOCKED",
-   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL_1` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
    "reobserve_required": false,
    "retry_safe": true,
    "snapshot_epoch": 1,
@@ -682,11 +682,11 @@
    "current_url": "http://SITE_A/",
    "data": {
     "approval": {
-     "approval_id": "<masked>",
-     "expires_at": "<masked>",
-     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "approval_id": "APPROVAL_2",
+     "expires_at": "<iso>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL_2 (브라우저 창에 뜨는 확인 코드 입력)",
      "rejected": {
-      "approval_id": "<masked>",
+      "approval_id": "APPROVAL_1",
       "reason": "이미 사용한 승인 증표(1회용)",
       "reason_code": "used"
      }
@@ -703,7 +703,7 @@
     "risk": "high"
    },
    "error_code": "E_HITL_UNATTENDED_BLOCKED",
-   "error_message": "승인 증표 거부: 이미 사용한 승인 증표(1회용). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "error_message": "승인 증표 거부: 이미 사용한 승인 증표(1회용). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL_2` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
    "reobserve_required": false,
    "retry_safe": true,
    "snapshot_epoch": 1,
@@ -715,11 +715,11 @@
    "current_url": "http://SITE_A/",
    "data": {
     "approval": {
-     "approval_id": "<masked>",
-     "expires_at": "<masked>",
-     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "approval_id": "APPROVAL_1",
+     "expires_at": "<iso>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL_1 (브라우저 창에 뜨는 확인 코드 입력)",
      "rejected": {
-      "approval_id": "<masked>",
+      "approval_id": "APPROVAL_1",
       "reason": "아직 사람이 승인하지 않음(`agent-browser approve` 필요)",
       "reason_code": "not_approved"
      }
@@ -736,7 +736,7 @@
     "risk": "high"
    },
    "error_code": "E_HITL_UNATTENDED_BLOCKED",
-   "error_message": "승인 증표 거부: 아직 사람이 승인하지 않음(`agent-browser approve` 필요). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "error_message": "승인 증표 거부: 아직 사람이 승인하지 않음(`agent-browser approve` 필요). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL_1` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
    "reobserve_required": false,
    "retry_safe": true,
    "snapshot_epoch": 1,
@@ -748,14 +748,14 @@
    "current_url": "http://SITE_A/",
    "data": {
     "approval": {
-     "approval_id": "<masked>",
+     "approval_id": "APPROVAL_1",
      "outcome": "succeeded",
      "status": "used"
     },
     "challenge": null,
     "element_id": "@e2",
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "signals": [
      "text_changed",
      "focus_moved: BODY# -> BUTTON#pay"
@@ -770,8 +770,8 @@
   "approval_wait_approved": {
    "data": {
     "approval": {
-     "approval_id": "<masked>",
-     "expires_at": "<masked>",
+     "approval_id": "APPROVAL_1",
+     "expires_at": "<iso>",
      "next": "같은 툴을 같은 인자 + approval_id 로 다시 호출하세요(1회용).",
      "outcome": null,
      "status": "approved"
@@ -800,7 +800,7 @@
   "approval_wait_unknown": {
    "data": {
     "approval": {
-     "approval_id": "<masked>",
+     "approval_id": "nope",
      "status": "unknown"
     }
    },
@@ -838,8 +838,8 @@
      "request_id": null,
      "requested": false,
      "secret_wanted": false,
-     "server_id": "<masked>",
-     "since": "<masked>"
+     "server_id": "SERVER_1",
+     "since": "<iso>"
     },
     "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
    },
@@ -855,8 +855,8 @@
      "request_id": null,
      "requested": false,
      "secret_wanted": false,
-     "server_id": "<masked>",
-     "since": "<masked>"
+     "server_id": "SERVER_1",
+     "since": "<iso>"
     }
    },
    "success": true
@@ -968,7 +968,7 @@
      "vendor": "cloudflare"
     },
     "last_http_status": 403,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "retry_skipped": {
      "note": "보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다",
      "reason": "vendor_challenge",
@@ -1016,7 +1016,7 @@
     },
     "hint": "속도 제한 — 잠시 뒤에 다시 요청하세요. Retry-After: 120",
     "last_http_status": 429,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "retry_after": "120",
     "url": "http://SITE_B/slow429"
    },
@@ -1038,7 +1038,7 @@
      "remembered": true
     },
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "url": "http://SITE_A/read2"
    },
    "reobserve_required": false,
@@ -1059,7 +1059,7 @@
      "reason": "headless_ua_blocked"
     },
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "url": "http://SITE_A/read"
    },
    "reobserve_required": false,
@@ -1074,7 +1074,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "robots": {
      "ai_agents_disallowed": [],
      "content_signal": "",
@@ -1099,7 +1099,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "observation": {
      "axtree_summary": "@e1 link \"홈\"",
      "elements": [
@@ -1149,7 +1149,7 @@
      "vendor": "generic"
     },
     "last_http_status": 403,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "retry_skipped": {
      "note": "robots.txt 가 일반 접근 허용을 확정해 주지 않아 이름을 바꾸지 않았습니다",
      "reason": "robots_not_confirmed",
@@ -1309,12 +1309,12 @@
       "text": "항목 버튼 0035 길게 늘인 이름으로 결과 크기를 키운다"
      }
     ],
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "truncated": {
      "hint": "결과가 2000자 상한을 넘어 앞쪽 항목만 담았습니다. 더 보려면 selector 를 좁히세요(예: 목록 안 특정 구역, :nth-child(-n+50)).",
-     "returned_chars": "<masked>",
+     "returned_chars": "<count>",
      "returned_items": 36,
-     "total_chars": "<masked>",
+     "total_chars": "<count>",
      "total_items": 300
     }
    },
@@ -1330,7 +1330,7 @@
    "data": {
     "challenge": null,
     "last_http_status": 200,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "observation": {
      "axtree_summary": "@e1 button \"항목 버튼 0000 길게 늘인 이름으로 결과 크기를 키운다\"\n@e2 button \"항목 버튼 0001 길게 늘인 이름으로 결과 크기를 키운다\"\n@e3 button \"항목 버튼 0002 길게 늘인 이름으로 결과 크기를 키운다\"\n@e4 button \"항목 버튼 0003 길게 늘인 이름으로 결과 크기를 키운다\"\n@e5 button \"항목 버튼 0004 길게 늘인 이름으로 결과 크기를 키운다\"\n@e6 button \"항목 버튼 0005 길게 늘인 이름으로 결과 크기를 키운다\"",
      "elements": [
@@ -1426,9 +1426,9 @@
     },
     "truncated": {
      "hint": "결과가 2000자 상한을 넘어 점수 순 앞쪽 요소만 담았습니다. 더 보려면 force_full_tree 없이 prune_top_n 을 줄여 부르거나, extract 의 selector 를 좁혀 필요한 부분만 읽으세요.",
-     "returned_chars": "<masked>",
+     "returned_chars": "<count>",
      "returned_items": 6,
-     "total_chars": "<masked>",
+     "total_chars": "<count>",
      "total_items": 20
     }
    },
@@ -1474,7 +1474,7 @@
       "text": ""
      }
     ],
-    "latency_ms": "<masked>"
+    "latency_ms": "<ms>"
    },
    "reobserve_required": false,
    "retry_safe": true,
@@ -1495,7 +1495,7 @@
      {
       "auto": true,
       "disabled": false,
-      "id": "<masked>",
+      "id": "RECIPE_1",
       "name": "자동: / 검색어 입력→클릭",
       "ok": 0,
       "origin": "http://SITE_A",
@@ -1526,7 +1526,7 @@
     },
     "hint": "robots 때문이 아님 — 사이트 서버가 이 브라우저를 막음(헤드리스 이름 차단 가능)",
     "last_http_status": 403,
-    "latency_ms": "<masked>",
+    "latency_ms": "<ms>",
     "retry_skipped": {
      "note": "헤드리스 이름 재시도가 꺼져 있어(--no-headless-retry) 다시 시도하지 않았습니다",
      "reason": "disabled",

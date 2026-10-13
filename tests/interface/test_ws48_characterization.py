@@ -135,22 +135,58 @@ def _closed_port() -> int:
 
 # --------------------------------------------------------------------------- 정규화
 
-_MASK_KEYS = {"approval_id", "expires_at", "latency_ms", "elapsed_ms", "duration_ms", "server_id",
-              "created_at", "updated_at", "at", "ts", "last_used", "id", "since",
-              # 브라우저 결과의 글자 수는 latency_ms 자릿수에 따라 ±1 흔들린다 — 정확한 값은 정적 cap 골든이 고정.
-              "returned_chars", "total_chars"}
-_APPROVAL_RE = re.compile(r"\bap[-_][0-9A-Za-z_-]{6,}\b")
+# 정규화 원칙(WS-48 R1·NB-2): **필드 경로별 허용 목록**에 있는 값만 바꾼다. 목록 밖 경로의 시각·id 는 그대로
+# 남아 골든과 달라지므로(숨기지 않고 드러남) 새 휘발성 필드가 생기면 의식적으로 여기에 추가해야 한다.
+# - 시간·글자 수: 타입과 범위를 먼저 검증한 뒤에만 자리표시자로 바꾼다. 0 도 같은 자리표시자다(0 만 남기면
+#   빠른 실행에서 골든이 흔들린다). 잘못된 타입·형식은 가리지 않고 `<INVALID ...>` 로 드러낸다. None 은 그대로.
+# - 발급 id(승인·레시피·서버): 첫 등장 순서대로 `APPROVAL_1`·`RECIPE_1`·`SERVER_1` 로 바꿔 '같은 id 인가' 관계를
+#   보존한다. 승인 id 는 문장 속에서도 생성기 alphabet 전체(`ap_` + token_urlsafe(12) = 16자, 끝 `-`/`_` 포함)를
+#   경계로 찾는다(R3: 끝자리 `-` 가 `\b` 정규식에서 남던 flake). 형식이 다른 값(테스트가 넣은 가짜 id)은 그대로.
+_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
+_APPROVAL_ID = re.compile(r"ap_[A-Za-z0-9_-]{16}")
+_APPROVAL_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_-])ap_[A-Za-z0-9_-]{16}(?![A-Za-z0-9_-])")
+_RECIPE_ID = re.compile(r"r_[0-9a-f]{8}")
+_SERVER_ID = re.compile(r"\d+-[0-9a-f]{6}")
 _TAB_RE = re.compile(r"\btab-[0-9a-f]{6,}\b")
+_TAB_KEYS = ("tab_id", "popup_tab_id", "active_tab_id")
+
+
+def _ms(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+
+def _count(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+#: 봉투 루트 기준 경로(리스트 원소는 "*") → 종류. 이 경로 밖은 정규화하지 않는다.
+_PATH_RULES: Dict[tuple, str] = {
+    ("data", "latency_ms"): "ms",
+    ("data", "approval", "approval_id"): "approval",
+    ("data", "approval", "rejected", "approval_id"): "approval",
+    ("data", "approval", "expires_at"): "iso",
+    ("data", "control", "server_id"): "server",
+    ("data", "control", "since"): "iso",
+    # 브라우저 결과의 글자 수는 latency_ms 자릿수에 따라 ±1 흔들린다 — 정확한 값은 정적 cap 골든이 고정.
+    ("data", "truncated", "returned_chars"): "count",
+    ("data", "truncated", "total_chars"): "count",
+    ("data", "recipes", "*", "id"): "recipe",
+}
 
 
 class _Norm:
     def __init__(self) -> None:
         self.subs: List[tuple] = []
         self.tabs: Dict[str, str] = {}
+        self.aliases: Dict[str, Dict[str, str]] = {"APPROVAL": {}, "RECIPE": {}, "SERVER": {}}
 
     def add(self, real: str, alias: str) -> None:
         if real:
             self.subs.append((real, alias))
+
+    def alias(self, kind: str, real: str) -> str:
+        table = self.aliases[kind]
+        return table.setdefault(real, f"{kind}_{len(table) + 1}")
 
     def _tab(self, m: "re.Match[str]") -> str:
         return self.tabs.setdefault(m.group(0), f"TAB{len(self.tabs)}")
@@ -158,18 +194,36 @@ class _Norm:
     def text(self, s: str) -> str:
         for real, alias in sorted(self.subs, key=lambda x: -len(x[0])):
             s = s.replace(real, alias)
-        s = _APPROVAL_RE.sub("APPROVAL", s)
+        s = _APPROVAL_IN_TEXT.sub(lambda m: self.alias("APPROVAL", m.group(0)), s)
         return _TAB_RE.sub(self._tab, s)
 
-    def value(self, v: Any, key: str = "") -> Any:
-        if key in _MASK_KEYS and v not in (None, "", 0, False):
-            return "<masked>"
-        if key in ("tab_id", "popup_tab_id", "active_tab_id") and isinstance(v, str) and v:
+    def _rule(self, kind: str, v: Any, path: tuple) -> Any:
+        if v is None:
+            return None
+        where = "/".join(path)
+        if kind == "ms":
+            return "<ms>" if _ms(v) else f"<INVALID ms {where}={v!r}>"
+        if kind == "count":
+            return "<count>" if _count(v) else f"<INVALID count {where}={v!r}>"
+        if kind == "iso":
+            return "<iso>" if isinstance(v, str) and _ISO.fullmatch(v) else f"<INVALID iso {where}={v!r}>"
+        pattern = {"approval": _APPROVAL_ID, "recipe": _RECIPE_ID, "server": _SERVER_ID}[kind]
+        if isinstance(v, str) and pattern.fullmatch(v):
+            return self.alias(kind.upper(), v)
+        if kind == "approval" and isinstance(v, str):
+            return self.text(v)  # 테스트가 넣은 가짜 id 등 — 결정적이므로 그대로(문장 규칙만)
+        return f"<INVALID {kind} {where}={v!r}>"
+
+    def value(self, v: Any, key: str = "", path: tuple = ()) -> Any:
+        rule = _PATH_RULES.get(path)
+        if rule is not None:
+            return self._rule(rule, v, path)
+        if key in _TAB_KEYS and isinstance(v, str) and v:
             return self.tabs.setdefault(v, f"TAB{len(self.tabs)}")
         if isinstance(v, dict):
-            return {k: self.value(x, k) for k, x in v.items()}
+            return {k: self.value(x, k, path + (k,)) for k, x in v.items()}
         if isinstance(v, list):
-            return [self.value(x, key) for x in v]
+            return [self.value(x, key, path + ("*",)) for x in v]
         if isinstance(v, str):
             return self.text(v)
         return v
@@ -224,6 +278,78 @@ def _norm_for(sites, tmp_path: Path) -> _Norm:
         n.add(site.url.split("://", 1)[1], alias)
     n.add(str(tmp_path), "TMP")
     return n
+
+
+# --------------------------------------------------------------------------- 정규화 자체(결정론)
+
+
+_TOKEN_TAILS = ["a" * 16, "a" * 15 + "-", "a" * 14 + "--", "a" * 15 + "_", "-" + "a" * 14 + "-", "_" * 16, "-" * 16]
+
+
+@pytest.mark.parametrize("tail", _TOKEN_TAILS)
+def test_approval_alias_covers_whole_token_alphabet(tail):
+    """R3: 끝자리 `-`·`_`·복수 dash 를 포함한 유효한 승인 id 가 문장·필드 모두에서 같은 alias 가 된다."""
+    real = "ap_" + tail
+    assert re.fullmatch(r"ap_[A-Za-z0-9_-]{16}", real)
+    n = _Norm()
+    assert n.text(f"agent-browser approve {real} (브라우저 창)") == "agent-browser approve APPROVAL_1 (브라우저 창)"
+    assert n.text(f"승인 id `{real}` 를 넘기세요") == "승인 id `APPROVAL_1` 를 넘기세요"
+    env = {"data": {"approval": {"approval_id": real, "how_to_approve": f"agent-browser approve {real}"}}}
+    assert n.value(env) == {"data": {"approval": {"approval_id": "APPROVAL_1",
+                                                  "how_to_approve": "agent-browser approve APPROVAL_1"}}}
+
+
+def test_approval_alias_preserves_identity_relation():
+    n = _Norm()
+    one, two = "ap_" + "a" * 15 + "-", "ap_" + "b" * 14 + "--"
+    assert n.text(f"{one} {two} {one}") == "APPROVAL_1 APPROVAL_2 APPROVAL_1"
+    assert n.value({"data": {"approval": {"approval_id": two}}})["data"]["approval"]["approval_id"] == "APPROVAL_2"
+    # 형식이 아닌 값(테스트가 넣은 가짜 id·17자)은 바꾸지 않는다 — 결정적이고 관계가 섞이지 않는다.
+    assert n.text("ap-bogus000") == "ap-bogus000"
+    assert n.text("ap_" + "c" * 17) == "ap_" + "c" * 17
+
+
+@pytest.mark.parametrize("value,expected", [
+    (0, "<ms>"), (0.0, "<ms>"), (37, "<ms>"), (12.5, "<ms>"), (None, None),
+    ("12", "<INVALID ms data/latency_ms='12'>"), (True, "<INVALID ms data/latency_ms=True>"),
+    (-1, "<INVALID ms data/latency_ms=-1>"),
+])
+def test_latency_masking_checks_type_and_treats_zero_alike(value, expected):
+    """NB-2: 0 도 같은 자리표시자, 잘못된 타입은 가리지 않고 드러낸다, 없음(None)은 그대로."""
+    assert _Norm().value({"data": {"latency_ms": value}}) == {"data": {"latency_ms": expected}}
+
+
+@pytest.mark.parametrize("path,value,expected", [
+    (("data", "approval", "expires_at"), "2026-10-13T01:02:03+00:00", "<iso>"),
+    (("data", "approval", "expires_at"), 1760000000.0, "<INVALID iso data/approval/expires_at=1760000000.0>"),
+    (("data", "control", "since"), "어제", "<INVALID iso data/control/since='어제'>"),
+    (("data", "control", "server_id"), "1234-abcdef", "SERVER_1"),
+    (("data", "control", "server_id"), 1234, "<INVALID server data/control/server_id=1234>"),
+    (("data", "truncated", "returned_chars"), 0, "<count>"),
+    (("data", "truncated", "total_chars"), "9", "<INVALID count data/truncated/total_chars='9'>"),
+])
+def test_allowlisted_paths_validate_before_masking(path, value, expected):
+    env: Dict[str, Any] = {}
+    cur = env
+    for part in path[:-1]:
+        cur = cur.setdefault(part, {})
+    cur[path[-1]] = value
+    out = _Norm().value(env)
+    for part in path:
+        out = out[part]
+    assert out == expected
+
+
+def test_recipe_ids_alias_by_first_appearance():
+    n = _Norm()
+    env = {"data": {"recipes": [{"id": "r_0000beef"}, {"id": "r_0000cafe"}, {"id": "r_0000beef"}]}}
+    assert [r["id"] for r in n.value(env)["data"]["recipes"]] == ["RECIPE_1", "RECIPE_2", "RECIPE_1"]
+
+
+def test_volatile_keys_outside_allowlist_are_not_hidden():
+    """허용 목록 밖 경로는 그대로 — 새 휘발성 필드가 골든 차이로 드러난다."""
+    env = {"latency_ms": 5, "data": {"other": {"latency_ms": 7, "id": "r_0000beef", "expires_at": "x"}}}
+    assert _Norm().value(env) == env
 
 
 # --------------------------------------------------------------------------- 정적 골든
@@ -366,8 +492,26 @@ def _visible(s: BrowserMCPServer) -> List[Any]:
     return seen
 
 
+#: R3: 승인 id 끝자리를 생성기 alphabet 의 경계 문자로 강제한다(검증자 forced_flake 방식 — 유효한 token_urlsafe 값).
+_FORCED_SUFFIX = {"random": "", "trailing_dash": "-", "trailing_underscore": "_", "double_dash": "--"}
+
+
+@pytest.fixture(params=sorted(_FORCED_SUFFIX))
+def approval_token_shape(request, monkeypatch):
+    suffix = _FORCED_SUFFIX[request.param]
+    if suffix:
+        real = handoff.secrets.token_urlsafe
+
+        def forced(nbytes=None):  # noqa: ANN001,ANN202
+            value = real(nbytes)
+            return value[: -len(suffix)] + suffix if nbytes == 12 else value
+
+        monkeypatch.setattr(handoff.secrets, "token_urlsafe", forced)
+    return suffix
+
+
 @requires_chromium
-async def test_hitl_approval_flow_golden(sites, tmp_path, monkeypatch):
+async def test_hitl_approval_flow_golden(sites, tmp_path, monkeypatch, approval_token_shape):
     a, _, _ = sites
     monkeypatch.setattr(handoff, "_stdin_is_tty", lambda: False)
     norm = _norm_for(sites, tmp_path)
@@ -379,8 +523,9 @@ async def test_hitl_approval_flow_golden(sites, tmp_path, monkeypatch):
         obs = await s.call_tool("browser_observe_page", {})
         args = {"element_id": _eid(obs, "결제하기"), "epoch": _epoch(obs)}
         first = await s.call_tool("browser_click", args)
-        out["approval_required"] = _env(norm, first)
         aid = first.data["approval"]["approval_id"]
+        assert aid.endswith(approval_token_shape)  # 강제한 모양이 실제로 발급됐다(무의미한 통과 방지)
+        out["approval_required"] = _env(norm, first)
         out["approval_bogus_id"] = _env(norm, await s.call_tool("browser_click", dict(args, approval_id="ap-bogus000")))
         out["approval_unapproved"] = _env(norm, await s.call_tool("browser_click", dict(args, approval_id=aid)))
         # 사람: 코드 표시 요청 → 창에서 코드 읽기 → 승인.
