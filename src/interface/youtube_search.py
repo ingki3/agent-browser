@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import stat
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -60,6 +62,10 @@ TITLE_LIMIT = 200
 CHANNEL_LIMIT = 100
 DESCRIPTION_LIMIT = 300
 API_MESSAGE_LIMIT = 160
+
+#: 할당량 장부 파일 읽기 상한(바이트)·기록값 상한 — 손상·조작된 파일은 '기억 없음'으로 시작한다.
+MAX_QUOTA_FILE_BYTES = 4096
+MAX_QUOTA_USED = 10 ** 9
 
 #: 키가 없을 때의 고정 안내(값 없음).
 DISABLED_HINT = (
@@ -184,6 +190,8 @@ class QuotaLedger:
         self.limit = limit
         self._day = ""
         self._used = 0
+        #: 마지막 읽기에서 장부 파일이 손상(깊은 JSON·링크·거대·형식 이상)이었는가 — snapshot 신호.
+        self.file_unreadable = False
 
     def _sync(self) -> str:
         day, _ = pacific_day(self.clock())
@@ -196,27 +204,53 @@ class QuotaLedger:
         return day
 
     def _read(self) -> Optional[Tuple[str, int]]:
+        """장부 파일을 읽는다 — 링크는 따르지 않고(O_NOFOLLOW) 일반 파일·크기 상한만. 손상이면 None(+신호)."""
+        self.file_unreadable = False
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))  # type: ignore[union-attr]
-            day, used = raw.get("day"), raw.get("used")
-            if isinstance(day, str) and isinstance(used, int) and used >= 0:
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))  # type: ignore[arg-type]
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ValueError("not a regular file")
+                raw = b""
+                while chunk := os.read(fd, 64 * 1024):
+                    raw += chunk
+                    if len(raw) > MAX_QUOTA_FILE_BYTES:
+                        raise ValueError("quota file too large")
+            finally:
+                os.close(fd)
+            data = json.loads(raw.decode("utf-8"))
+            day, used = data.get("day"), data.get("used")
+            if isinstance(day, str) and isinstance(used, int) and not isinstance(used, bool) \
+                    and 0 <= used <= MAX_QUOTA_USED:
                 return day, used
-        except (OSError, ValueError, AttributeError):
-            pass
+            raise ValueError("unexpected quota file shape")
+        except FileNotFoundError:
+            return None
+        except Exception as exc:  # noqa: BLE001 - 손상(깊은 JSON·링크·거대 파일 등): 기억 없음으로 시작 + 신호
+            self.file_unreadable = True
+            logger.debug("YouTube 할당량 장부를 읽지 못함 (%s)", type(exc).__name__)
         return None
 
     def _write(self) -> None:
+        """무작위 임시 이름 + O_EXCL(+O_NOFOLLOW) 로 만들고 바꿔 넣는다 — 미리 놓인 링크를 따라 쓰지 않는다."""
         if self.path is None:
             return
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+        payload = json.dumps({"day": self._day, "used": self._used}).encode("utf-8")
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"day": self._day, "used": self._used}, fh)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
             os.replace(tmp, self.path)
             os.chmod(self.path, 0o600)
         except OSError as exc:
             logger.debug("YouTube 할당량 기록 실패 (%s)", type(exc).__name__)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def charge(self, units: int) -> None:
         self._sync()
@@ -232,8 +266,11 @@ class QuotaLedger:
     def snapshot(self) -> Dict[str, Any]:
         self._sync()
         _, reset = pacific_day(self.clock())
-        return {"used_estimate": self._used, "limit": self.limit,
-                "remaining_estimate": max(self.limit - self._used, 0), "reset_at": reset}
+        snap: Dict[str, Any] = {"used_estimate": self._used, "limit": self.limit,
+                                "remaining_estimate": max(self.limit - self._used, 0), "reset_at": reset}
+        if self.file_unreadable:
+            snap["file_unreadable"] = True
+        return snap
 
 
 # --------------------------------------------------------------------------- 입력·변환
