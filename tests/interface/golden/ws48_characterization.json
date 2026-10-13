@@ -1,0 +1,3299 @@
+{
+ "cap_result_size": {
+  "2000": {
+   "action": "extract",
+   "current_url": "http://x/",
+   "data": {
+    "items": [
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가0"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가1"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가2"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가3"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가4"
+     }
+    ],
+    "truncated": {
+     "hint": "결과가 2000자 상한을 넘어 앞쪽 항목만 담았습니다. 더 보려면 selector 를 좁히세요(예: 목록 안 특정 구역, :nth-child(-n+50)).",
+     "returned_chars": 1911,
+     "returned_items": 5,
+     "total_chars": 12707,
+     "total_items": 40
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "t"
+  },
+  "5000": {
+   "action": "extract",
+   "current_url": "http://x/",
+   "data": {
+    "items": [
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가0"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가1"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가2"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가3"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가4"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가5"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가6"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가7"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가8"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가9"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가10"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가11"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가12"
+     },
+     {
+      "text": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가13"
+     }
+    ],
+    "truncated": {
+     "hint": "결과가 5000자 상한을 넘어 앞쪽 항목만 담았습니다. 더 보려면 selector 를 좁히세요(예: 목록 안 특정 구역, :nth-child(-n+50)).",
+     "returned_chars": 4733,
+     "returned_items": 14,
+     "total_chars": 12707,
+     "total_items": 40
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "t"
+  }
+ },
+ "core_actions": {
+  "ambiguous_selector": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "ambiguous_target": {
+     "candidates": [
+      {
+       "name": "더보기",
+       "role": "button",
+       "visible": true
+      },
+      {
+       "name": "더보기",
+       "role": "button",
+       "visible": true
+      }
+     ],
+     "count": 2
+    }
+   },
+   "error_code": "E_ELEMENT_NOT_FOUND",
+   "error_message": "selector 가 2개 요소에 맞습니다 — browser_observe_page 로 관찰한 뒤 element_id 로 다시 고르세요",
+   "reobserve_required": true,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "click_link": {
+   "action": "click",
+   "current_url": "http://SITE_A/next",
+   "data": {
+    "challenge": null,
+    "element_id": "@e6",
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "signals": [
+     "url_changed: http://SITE_A/ -> http://SITE_A/next",
+     "dom_delta: 16 -> 7",
+     "text_changed",
+     "focus_moved: A#dl -> BODY#"
+    ]
+   },
+   "reobserve_required": false,
+   "retry_safe": false,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "download": {
+   "action": "download_file",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "element_id": "@e7",
+    "latency_ms": "<masked>",
+    "signals": [
+     "file_saved: TMP/file.csv"
+    ]
+   },
+   "downloaded_path": "TMP/file.csv",
+   "reobserve_required": false,
+   "retry_safe": false,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "extract_h1": {
+   "action": "extract",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "items": {
+     "text": "특성화 홈"
+    },
+    "latency_ms": "<masked>"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "frame_in": {
+   "action": "switch_frame",
+   "current_url": "http://SITE_A/frame",
+   "data": {
+    "child_frames": [],
+    "frame_depth": 1,
+    "frame_path": [
+     "http://SITE_A/frame"
+    ],
+    "frame_url": "http://SITE_A/frame",
+    "latency_ms": "<masked>",
+    "resolved_from": "current_frame"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 4,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "frame_observe": {
+   "action": "observe_page",
+   "current_url": "http://SITE_A/frame",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "observation": {
+     "axtree_summary": "@e1 button \"프레임 버튼\"",
+     "elements": [
+      {
+       "bbox": {
+        "height": 22,
+        "width": 77,
+        "x": 8,
+        "y": 8
+       },
+       "element_id": "@e1",
+       "interactable": true,
+       "name": "프레임 버튼",
+       "role": "button",
+       "score": 8.6694,
+       "value": ""
+      }
+     ],
+     "snapshot_epoch": 4,
+     "title": "프레임",
+     "token_count": 13,
+     "url": "http://SITE_A/frame"
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 4,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "frame_out": {
+   "action": "switch_frame",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "child_frames": [
+     {
+      "selector_hint": "",
+      "url": "http://SITE_A/frame"
+     },
+     {
+      "selector_hint": "",
+      "url": "http://SITE_A/frame"
+     },
+     {
+      "selector_hint": "#fr",
+      "url": "http://SITE_A/frame"
+     }
+    ],
+    "frame_depth": 0,
+    "frame_path": [],
+    "frame_url": "http://SITE_A/",
+    "latency_ms": "<masked>"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 5,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "go_back": {
+   "action": "go_back",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "url": "http://SITE_A/"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 2,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "hover": {
+   "action": "hover",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "latency_ms": "<masked>",
+    "retried": true,
+    "signals": []
+   },
+   "error_code": "E_TIMEOUT",
+   "error_message": "재시도 후에도 미충족(URL/DOM/텍스트/속성/값/탭 어디에도 변화가 없음 (Silent Failure 의심))",
+   "reobserve_required": true,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "navigate": {
+   "action": "navigate",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "url": "http://SITE_A/"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "observe": {
+   "action": "observe_page",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "observation": {
+     "axtree_summary": "@e1 button \"검색\"\n@e2 button \"결제하기\"\n@e3 textbox \"검색어\"\n@e4 button \"더보기\"\n@e5 button \"더보기\"\n@e6 link \"다음 페이지\"\n@e7 link \"CSV 받기\"",
+     "elements": [
+      {
+       "bbox": {
+        "height": 22,
+        "width": 39,
+        "x": 165,
+        "y": 82
+       },
+       "element_id": "@e1",
+       "interactable": true,
+       "name": "검색",
+       "role": "button",
+       "score": 8.3655,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 62,
+        "x": 8,
+        "y": 104
+       },
+       "element_id": "@e2",
+       "interactable": true,
+       "name": "결제하기",
+       "role": "button",
+       "score": 8.2323,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 21,
+        "width": 153,
+        "x": 8,
+        "y": 82
+       },
+       "element_id": "@e3",
+       "interactable": true,
+       "name": "검색어",
+       "role": "textbox",
+       "score": 8.1,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 51,
+        "x": 167,
+        "y": 246
+       },
+       "element_id": "@e4",
+       "interactable": true,
+       "name": "더보기",
+       "role": "button",
+       "score": 7.7668,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 51,
+        "x": 217,
+        "y": 246
+       },
+       "element_id": "@e5",
+       "interactable": true,
+       "name": "더보기",
+       "role": "button",
+       "score": 7.7668,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 18,
+        "width": 84,
+        "x": 8,
+        "y": 247
+       },
+       "element_id": "@e6",
+       "interactable": true,
+       "name": "다음 페이지",
+       "role": "link",
+       "score": 7.5504
+      },
+      {
+       "bbox": {
+        "height": 18,
+        "width": 67,
+        "x": 96,
+        "y": 247
+       },
+       "element_id": "@e7",
+       "interactable": true,
+       "name": "CSV 받기",
+       "role": "link",
+       "score": 7.5325
+      }
+     ],
+     "snapshot_epoch": 1,
+     "title": "WS48 홈",
+     "token_count": 66,
+     "url": "http://SITE_A/"
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "press_tab": {
+   "action": "press_key",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "key": "Tab",
+    "last_http_status": 200,
+    "latency_ms": "<masked>"
+   },
+   "reobserve_required": false,
+   "retry_safe": false,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "reload": {
+   "action": "reload",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "url": "http://SITE_A/"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 3,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "screenshot_keys": [
+   "bytes",
+   "latency_ms"
+  ],
+  "scroll": {
+   "action": "scroll",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "hint": "스크롤 위치가 바뀌지 않았습니다(이미 끝이거나 이 페이지는 창 스크롤이 없음). 새 항목이 필요하면 '더 보기' 버튼 등을 observe_page 로 찾으세요.",
+    "latency_ms": "<masked>",
+    "no_effect": true,
+    "scrolled": 500,
+    "scrolled_px": 0
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "tab_create": {
+   "action": "tab_control",
+   "current_url": "http://SITE_A/next",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "tab_id": "TAB1",
+    "url": "http://SITE_A/next"
+   },
+   "reobserve_required": true,
+   "retry_safe": false,
+   "snapshot_epoch": 6,
+   "success": true,
+   "tab_id": "TAB1"
+  },
+  "tab_list": {
+   "action": "tab_control",
+   "current_url": "http://SITE_A/next",
+   "data": {
+    "active": "tab-2",
+    "challenge": null,
+    "count": 2,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "tabs": [
+     {
+      "tab_id": "TAB0",
+      "url": "http://SITE_A/"
+     },
+     {
+      "tab_id": "TAB1",
+      "url": "http://SITE_A/next"
+     }
+    ]
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 6,
+   "success": true,
+   "tab_id": "TAB1"
+  },
+  "type": {
+   "action": "type_text",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "element_id": "@e3",
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "signals": [
+     "value_applied: '사과'"
+    ]
+   },
+   "reobserve_required": false,
+   "retry_safe": false,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "wait_selector": {
+   "action": "wait_for",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "challenge": null,
+    "condition": "selector",
+    "last_http_status": 200,
+    "latency_ms": "<masked>"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 3,
+   "success": true,
+   "tab_id": "TAB0"
+  }
+ },
+ "error_results": {
+  "bad_click": {
+   "action": "click",
+   "current_url": "about:blank",
+   "error_code": "E_INVALID_URL",
+   "error_message": "입력 검증 실패: 1 validation error for ClickInput\nepoch\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='x', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.13/v/int_parsing",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 0,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "bad_navigate": {
+   "action": "navigate",
+   "current_url": "about:blank",
+   "error_code": "E_INVALID_URL",
+   "error_message": "입력 검증 실패: 1 validation error for NavigateInput\nurl\n  Field required [type=missing, input_value={}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 0,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "frame_to_main_conflict": {
+   "action": "switch_frame",
+   "current_url": "about:blank",
+   "data": {
+    "hint": "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
+   },
+   "error_code": "E_FRAME_NOT_FOUND",
+   "error_message": "to_main 과 frame_selector/shadow_root_selector 는 함께 지정할 수 없습니다.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 0,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "recipe_disabled": {
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "레시피가 꺼져 있습니다(serve --no-recipes).",
+   "success": false
+  },
+  "unknown_server_tool": {
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "알 수 없는 툴: browser_nope",
+   "success": false
+  },
+  "unknown_tool": {
+   "action": "observe_page",
+   "current_url": "about:blank",
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "알 수 없는 툴: browser_nope",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 0,
+   "success": false,
+   "tab_id": "TAB0"
+  }
+ },
+ "hitl_approval_flow": {
+  "approval_bogus_id": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "expires_at": "<masked>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "rejected": {
+      "approval_id": "<masked>",
+      "reason": "알 수 없는 승인 id(이 서버가 발급하지 않았거나 서버가 재시작됨)",
+      "reason_code": "unknown"
+     }
+    },
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "승인 증표 거부: 알 수 없는 승인 id(이 서버가 발급하지 않았거나 서버가 재시작됨). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "approval_required": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "expires_at": "<masked>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)"
+    },
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "approval_reuse": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "expires_at": "<masked>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "rejected": {
+      "approval_id": "<masked>",
+      "reason": "이미 사용한 승인 증표(1회용)",
+      "reason_code": "used"
+     }
+    },
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "승인 증표 거부: 이미 사용한 승인 증표(1회용). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "approval_unapproved": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "expires_at": "<masked>",
+     "how_to_approve": "사람이 터미널에서: agent-browser approve APPROVAL (브라우저 창에 뜨는 확인 코드 입력)",
+     "rejected": {
+      "approval_id": "<masked>",
+      "reason": "아직 사람이 승인하지 않음(`agent-browser approve` 필요)",
+      "reason_code": "not_approved"
+     }
+    },
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "승인 증표 거부: 아직 사람이 승인하지 않음(`agent-browser approve` 필요). 무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 사람에게 `agent-browser approve APPROVAL` 실행을 요청하세요(승인 뒤 같은 인자에 approval_id 를 더해 다시 호출, browser_approval_wait 로 대기) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "approval_used": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "outcome": "succeeded",
+     "status": "used"
+    },
+    "challenge": null,
+    "element_id": "@e2",
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "signals": [
+     "text_changed",
+     "focus_moved: BODY# -> BUTTON#pay"
+    ]
+   },
+   "reobserve_required": false,
+   "retry_safe": false,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "approval_wait_approved": {
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "expires_at": "<masked>",
+     "next": "같은 툴을 같은 인자 + approval_id 로 다시 호출하세요(1회용).",
+     "outcome": null,
+     "status": "approved"
+    }
+   },
+   "success": true
+  },
+  "page_out": "결제됨",
+  "screenshot_while_code": {
+   "action": "take_screenshot",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "blocked_by": "approval_code_displayed",
+    "retry_after_s": 120
+   },
+   "error_code": "E_SCREENSHOT_FAILED",
+   "error_message": "사람이 승인 확인 중이라(창에 확인 코드 표시) 잠시 화면 캡처를 할 수 없습니다. observe_page·extract 는 쓸 수 있습니다. 잠시 뒤 다시 시도하세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  }
+ },
+ "hitl_unattended": {
+  "approval_wait_unknown": {
+   "data": {
+    "approval": {
+     "approval_id": "<masked>",
+     "status": "unknown"
+    }
+   },
+   "success": false
+  },
+  "click_pay_blocked": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "control_request_headless": {
+   "data": {
+    "browser_mode": "headless",
+    "control": {
+     "holder": "agent",
+     "reason": "",
+     "request_id": null,
+     "requested": false,
+     "secret_wanted": false,
+     "server_id": "<masked>",
+     "since": "<masked>"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
+   },
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "headless 서버라 사람이 볼 창이 없습니다. 운영자에게 `agent-browser serve --browser on-demand`(필요할 때만 창) · `--browser human` · `--browser user-chrome` 중 하나로 다시 띄우도록 요청하세요.",
+   "success": false
+  },
+  "control_status": {
+   "data": {
+    "control": {
+     "holder": "agent",
+     "reason": "",
+     "request_id": null,
+     "requested": false,
+     "secret_wanted": false,
+     "server_id": "<masked>",
+     "since": "<masked>"
+    }
+   },
+   "success": true
+  },
+  "coordinate_click": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "coordinate_target": "non_interactive",
+     "matched_keyword": "결제",
+     "name": "특성화 홈\n 검색\n결제하기\n\n대기\n\n다음 페이지 CSV 받기 더보기더보기",
+     "source": "name",
+     "tag": "HTML"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:특성화 홈\n 검색\n결제하기\n\n대기\n\n다음 페이지 CSV 받기 더보기더보기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:특성화 홈\n 검색\n결제하기\n\n대기\n\n다음 페이지 CSV 받기 더보기더보기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "page_out": "대기",
+  "press_enter_blocked": {
+   "action": "press_key",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": null,
+     "name": "",
+     "source": "form_submit"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "press_key:*",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (폼 제출 액션) — 이 액션을 허용하려면 서버를 `--pre-approve \"press_key:*\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "selector_pay_blocked": {
+   "action": "click",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": "결제",
+     "name": "결제하기",
+     "source": "name"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:결제하기",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (고위험 키워드 '결제' 탐지(출처 name)) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:결제하기\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "type_enter_blocked": {
+   "action": "type_text",
+   "current_url": "http://SITE_A/",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": null,
+     "name": "검색어",
+     "source": "form_submit"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "type_text:검색어",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (폼 제출 액션) — 이 액션을 허용하려면 서버를 `--pre-approve \"type_text:검색어\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  }
+ },
+ "navigation_signals": {
+  "cloudflare_skip": {
+   "action": "navigate",
+   "current_url": "http://SITE_B/cf",
+   "data": {
+    "challenge": {
+     "kind": "captcha",
+     "reason": "Cloudflare 브라우저 확인 화면",
+     "vendor": "cloudflare"
+    },
+    "last_http_status": 403,
+    "latency_ms": "<masked>",
+    "retry_skipped": {
+     "note": "보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다",
+     "reason": "vendor_challenge",
+     "retried": false
+    },
+    "url": "http://SITE_B/cf"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 5,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "egress_private": {
+   "action": "navigate",
+   "current_url": "http://SITE_C/blocked",
+   "data": {
+    "challenge": null,
+    "egress": {
+     "category": "private",
+     "code": "egress_blocked",
+     "host": "10.255.255.1",
+     "open_with": "serve --allow-private-network",
+     "reason": "private_network"
+    },
+    "last_http_status": 403,
+    "url": "http://SITE_C/blocked"
+   },
+   "error_code": "E_INVALID_URL",
+   "error_message": "egress_blocked: 10.255.255.1 (private)",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 7,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "rate_limited": {
+   "action": "navigate",
+   "current_url": "http://SITE_B/slow429",
+   "data": {
+    "challenge": {
+     "kind": "blocked",
+     "reason": "HTTP 429 + 짧은 본문(8자)",
+     "vendor": "generic"
+    },
+    "hint": "속도 제한 — 잠시 뒤에 다시 요청하세요. Retry-After: 120",
+    "last_http_status": 429,
+    "latency_ms": "<masked>",
+    "retry_after": "120",
+    "url": "http://SITE_B/slow429"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 6,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "remembered": {
+   "action": "navigate",
+   "current_url": "http://SITE_A/read2",
+   "data": {
+    "challenge": null,
+    "identity": {
+     "note": "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다",
+     "presented_as": "chrome",
+     "reason": "headless_ua_blocked",
+     "remembered": true
+    },
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "url": "http://SITE_A/read2"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 4,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "retry_success": {
+   "action": "navigate",
+   "current_url": "http://SITE_A/read",
+   "data": {
+    "challenge": null,
+    "identity": {
+     "note": "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)",
+     "original_status": 403,
+     "presented_as": "chrome",
+     "reason": "headless_ua_blocked"
+    },
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "url": "http://SITE_A/read"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 3,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "robots_disallowed": {
+   "action": "navigate",
+   "current_url": "http://SITE_A/private",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "robots": {
+     "ai_agents_disallowed": [],
+     "content_signal": "",
+     "disallowed": true,
+     "note": "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다.",
+     "robots_url": "http://SITE_A/robots.txt",
+     "rule": "Disallow: /private",
+     "scope": "all_bots",
+     "user_fetch_agents_allowed": []
+    },
+    "url": "http://SITE_A/private"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "robots_observe": {
+   "action": "observe_page",
+   "current_url": "http://SITE_A/private",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "observation": {
+     "axtree_summary": "@e1 link \"홈\"",
+     "elements": [
+      {
+       "bbox": {
+        "height": 18,
+        "width": 16,
+        "x": 8,
+        "y": 51
+       },
+       "element_id": "@e1",
+       "interactable": true,
+       "name": "홈",
+       "role": "link",
+       "score": 6.5642
+      }
+     ],
+     "snapshot_epoch": 1,
+     "title": "다음",
+     "token_count": 8,
+     "url": "http://SITE_A/private"
+    },
+    "robots": {
+     "ai_agents_disallowed": [],
+     "content_signal": "",
+     "disallowed": true,
+     "note": "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다.",
+     "robots_url": "http://SITE_A/robots.txt",
+     "rule": "Disallow: /private",
+     "scope": "all_bots",
+     "user_fetch_agents_allowed": []
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "robots_skip": {
+   "action": "navigate",
+   "current_url": "http://SITE_C/blocked",
+   "data": {
+    "challenge": {
+     "kind": "blocked",
+     "reason": "HTTP 403 + 짧은 본문(9자)",
+     "vendor": "generic"
+    },
+    "last_http_status": 403,
+    "latency_ms": "<masked>",
+    "retry_skipped": {
+     "note": "robots.txt 가 일반 접근 허용을 확정해 주지 않아 이름을 바꾸지 않았습니다",
+     "reason": "robots_not_confirmed",
+     "retried": false
+    },
+    "robots": {
+     "ai_agents_disallowed": [],
+     "content_signal": "",
+     "disallowed": true,
+     "note": "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다.",
+     "robots_url": "http://SITE_C/robots.txt",
+     "rule": "Disallow: /blocked",
+     "scope": "all_bots",
+     "user_fetch_agents_allowed": []
+    },
+    "url": "http://SITE_C/blocked"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 7,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "upstream_fail": {
+   "action": "navigate",
+   "current_url": "http://127.0.0.1:CLOSED/",
+   "data": {
+    "challenge": null,
+    "egress": {
+     "code": "connect_failed",
+     "host": "127.0.0.1"
+    },
+    "last_http_status": 502,
+    "url": "http://127.0.0.1:CLOSED/"
+   },
+   "error_code": "E_NAVIGATE_TIMEOUT",
+   "error_message": "이동 실패: connect_failed: 127.0.0.1",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 8,
+   "success": false,
+   "tab_id": "TAB0"
+  }
+ },
+ "observation_guidance_cap": {
+  "big_extract_capped": {
+   "action": "extract",
+   "current_url": "http://SITE_A/big",
+   "data": {
+    "items": [
+     {
+      "text": "항목 버튼 0000 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0001 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0002 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0003 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0004 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0005 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0006 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0007 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0008 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0009 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0010 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0011 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0012 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0013 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0014 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0015 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0016 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0017 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0018 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0019 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0020 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0021 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0022 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0023 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0024 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0025 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0026 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0027 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0028 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0029 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0030 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0031 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0032 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0033 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0034 길게 늘인 이름으로 결과 크기를 키운다"
+     },
+     {
+      "text": "항목 버튼 0035 길게 늘인 이름으로 결과 크기를 키운다"
+     }
+    ],
+    "latency_ms": "<masked>",
+    "truncated": {
+     "hint": "결과가 2000자 상한을 넘어 앞쪽 항목만 담았습니다. 더 보려면 selector 를 좁히세요(예: 목록 안 특정 구역, :nth-child(-n+50)).",
+     "returned_chars": "<masked>",
+     "returned_items": 36,
+     "total_chars": "<masked>",
+     "total_items": 300
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 2,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "big_observe_capped": {
+   "action": "observe_page",
+   "current_url": "http://SITE_A/big",
+   "data": {
+    "challenge": null,
+    "last_http_status": 200,
+    "latency_ms": "<masked>",
+    "observation": {
+     "axtree_summary": "@e1 button \"항목 버튼 0000 길게 늘인 이름으로 결과 크기를 키운다\"\n@e2 button \"항목 버튼 0001 길게 늘인 이름으로 결과 크기를 키운다\"\n@e3 button \"항목 버튼 0002 길게 늘인 이름으로 결과 크기를 키운다\"\n@e4 button \"항목 버튼 0003 길게 늘인 이름으로 결과 크기를 키운다\"\n@e5 button \"항목 버튼 0004 길게 늘인 이름으로 결과 크기를 키운다\"\n@e6 button \"항목 버튼 0005 길게 늘인 이름으로 결과 크기를 키운다\"",
+     "elements": [
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 8,
+        "y": 8
+       },
+       "element_id": "@e1",
+       "interactable": true,
+       "name": "항목 버튼 0000 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 8.26,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 314,
+        "y": 8
+       },
+       "element_id": "@e2",
+       "interactable": true,
+       "name": "항목 버튼 0001 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 8.26,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 620,
+        "y": 8
+       },
+       "element_id": "@e3",
+       "interactable": true,
+       "name": "항목 버튼 0002 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 7.7267,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 926,
+        "y": 8
+       },
+       "element_id": "@e4",
+       "interactable": true,
+       "name": "항목 버튼 0003 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 7.1933,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 8,
+        "y": 30
+       },
+       "element_id": "@e5",
+       "interactable": true,
+       "name": "항목 버튼 0004 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 6.55,
+       "value": ""
+      },
+      {
+       "bbox": {
+        "height": 22,
+        "width": 306,
+        "x": 314,
+        "y": 30
+       },
+       "element_id": "@e6",
+       "interactable": true,
+       "name": "항목 버튼 0005 길게 늘인 이름으로 결과 크기를 키운다",
+       "role": "button",
+       "score": 6.55,
+       "value": ""
+      }
+     ],
+     "snapshot_epoch": 2,
+     "title": "큰 페이지",
+     "token_count": 192,
+     "url": "http://SITE_A/big"
+    },
+    "truncated": {
+     "hint": "결과가 2000자 상한을 넘어 점수 순 앞쪽 요소만 담았습니다. 더 보려면 force_full_tree 없이 prune_top_n 을 줄여 부르거나, extract 의 selector 를 좁혀 필요한 부분만 읽으세요.",
+     "returned_chars": "<masked>",
+     "returned_items": 6,
+     "total_chars": "<masked>",
+     "total_items": 20
+    }
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 2,
+   "success": true,
+   "tab_id": "TAB0"
+  },
+  "missing_selector_hint": {
+   "action": "click",
+   "current_url": "http://SITE_A/sparse",
+   "data": {
+    "dialog": null,
+    "gate_basis": {
+     "matched_keyword": null,
+     "name": "",
+     "source": "unresolved"
+    },
+    "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름).",
+    "pre_approve_hint": "click:*",
+    "requires_confirmation": false,
+    "risk": "high"
+   },
+   "error_code": "E_HITL_UNATTENDED_BLOCKED",
+   "error_message": "무인 모드에서 사전 승인되지 않은 고위험 액션 (대상 판정 불가(selector 가 0개 요소에 맞음) — 안전하게 차단) — 이 액션을 허용하려면 서버를 `--pre-approve \"click:*\"` 으로 다시 띄우거나 `--mode interactive` 를 쓰세요. 사용자에게 이 안내를 전하고 멈추세요.",
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": false,
+   "tab_id": "TAB0"
+  },
+  "sparse_extract_hint": {
+   "action": "extract",
+   "current_url": "http://SITE_A/sparse",
+   "data": {
+    "hint": "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요",
+    "items": [
+     {
+      "text": ""
+     },
+     {
+      "text": ""
+     }
+    ],
+    "latency_ms": "<masked>"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  }
+ },
+ "retry_disabled_recipe": {
+  "recipe_bad_op": {
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "op 는 save|run|list|delete 중 하나입니다.",
+   "success": false
+  },
+  "recipe_list": {
+   "data": {
+    "recipes": [
+     {
+      "auto": true,
+      "disabled": false,
+      "id": "<masked>",
+      "name": "자동: / 검색어 입력→클릭",
+      "ok": 0,
+      "origin": "http://SITE_A",
+      "params": [
+       "검색어"
+      ],
+      "runs": 0,
+      "steps": 3
+     }
+    ],
+    "storage": "memory"
+   },
+   "success": true
+  },
+  "recipe_run_missing": {
+   "error_code": "E_FEATURE_NOT_IMPLEMENTED",
+   "error_message": "레시피 'missing' 가 없습니다(browser_recipe list).",
+   "success": false
+  },
+  "retry_disabled": {
+   "action": "navigate",
+   "current_url": "http://SITE_A/read",
+   "data": {
+    "challenge": {
+     "kind": "blocked",
+     "reason": "HTTP 403 + 짧은 본문(9자)",
+     "vendor": "generic"
+    },
+    "hint": "robots 때문이 아님 — 사이트 서버가 이 브라우저를 막음(헤드리스 이름 차단 가능)",
+    "last_http_status": 403,
+    "latency_ms": "<masked>",
+    "retry_skipped": {
+     "note": "헤드리스 이름 재시도가 꺼져 있어(--no-headless-retry) 다시 시도하지 않았습니다",
+     "reason": "disabled",
+     "retried": false
+    },
+    "url": "http://SITE_A/read"
+   },
+   "reobserve_required": false,
+   "retry_safe": true,
+   "snapshot_epoch": 1,
+   "success": true,
+   "tab_id": "TAB0"
+  }
+ },
+ "tool_schemas": {
+  "build_all_tools": [
+   {
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "force_full_tree": {
+       "default": false,
+       "type": "boolean"
+      },
+      "prune_top_n": {
+       "default": 20,
+       "type": "integer"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_observe_page"
+   },
+   {
+    "description": "현재 페이지의 스크린샷을 캡처합니다.",
+    "inputSchema": {
+     "properties": {
+      "annotate_som": {
+       "default": false,
+       "type": "boolean"
+      },
+      "full_page": {
+       "default": false,
+       "type": "boolean"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_take_screenshot"
+   },
+   {
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 15000,
+       "type": "integer"
+      },
+      "url": {
+       "type": "string"
+      },
+      "wait_until": {
+       "default": "domcontentloaded",
+       "enum": [
+        "domcontentloaded",
+        "load",
+        "networkidle",
+        "commit"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "url"
+     ],
+     "type": "object"
+    },
+    "name": "browser_navigate"
+   },
+   {
+    "description": "브라우저 히스토리에서 이전 페이지로 이동합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_go_back"
+   },
+   {
+    "description": "현재 페이지를 새로고침합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "ignore_cache": {
+       "default": false,
+       "type": "boolean"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_reload"
+   },
+   {
+    "description": "지정한 요소를 클릭합니다. 실행 전 요소 유효성을 검증합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "button": {
+       "default": "left",
+       "enum": [
+        "left",
+        "right",
+        "middle"
+       ],
+       "type": "string"
+      },
+      "element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "epoch": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "expected_name": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "expected_role": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "x": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "y": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_click"
+   },
+   {
+    "description": "입력 필드에 텍스트를 입력합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "clear_before": {
+       "default": true,
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "press_enter": {
+       "default": false,
+       "type": "boolean"
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "text"
+     ],
+     "type": "object"
+    },
+    "name": "browser_type_text"
+   },
+   {
+    "description": "드롭다운에서 옵션을 선택합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "index": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_select_option"
+   },
+   {
+    "description": "체크박스나 라디오 버튼을 토글합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "checked": {
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "checked"
+     ],
+     "type": "object"
+    },
+    "name": "browser_check_box"
+   },
+   {
+    "description": "뷰포트를 스크롤합니다. 동적 로딩 시 재관찰이 필요할 수 있습니다.",
+    "inputSchema": {
+     "properties": {
+      "direction": {
+       "enum": [
+        "up",
+        "down"
+       ],
+       "type": "string"
+      },
+      "distance": {
+       "default": 500,
+       "type": "integer"
+      },
+      "target_element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "direction"
+     ],
+     "type": "object"
+    },
+    "name": "browser_scroll"
+   },
+   {
+    "description": "요소 위에 마우스를 올려 툴팁이나 서브메뉴를 노출시킵니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_hover"
+   },
+   {
+    "description": "키보드 이벤트를 발생시킵니다 (Enter, Tab, Escape 등). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "key": {
+       "examples": [
+        "Enter",
+        "Tab",
+        "Escape"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "key"
+     ],
+     "type": "object"
+    },
+    "name": "browser_press_key"
+   },
+   {
+    "description": "지정한 조건이 만족될 때까지 대기합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "condition": {
+       "enum": [
+        "selector",
+        "network_idle",
+        "spa_route",
+        "stabilize"
+       ],
+       "type": "string"
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "required": [
+      "condition"
+     ],
+     "type": "object"
+    },
+    "name": "browser_wait_for"
+   },
+   {
+    "description": "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
+    "inputSchema": {
+     "properties": {
+      "attributes": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "extract_all": {
+       "default": false,
+       "type": "boolean"
+      },
+      "selector": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "selector"
+     ],
+     "type": "object"
+    },
+    "name": "browser_extract"
+   },
+   {
+    "description": "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 먼저, 없으면 최상위 문서 기준으로 찾습니다(이때 더 얕은 프레임으로 돌아갈 수 있음 — data.resolved_from(current_frame|root)·frame_depth 로 확인). 중첩 프레임은 바깥부터 한 단계씩(data.child_frames 의 selector_hint 가 다음 후보). 최상위 문서 복귀는 {\"to_main\": true} 만 보내십시오.",
+    "inputSchema": {
+     "properties": {
+      "frame_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "shadow_root_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_switch_frame"
+   },
+   {
+    "description": "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
+    "inputSchema": {
+     "properties": {
+      "accept": {
+       "default": true,
+       "type": "boolean"
+      },
+      "prompt_text": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_handle_dialog"
+   },
+   {
+    "description": "파일 입력 필드에 파일을 바인딩합니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "file_paths": {
+       "items": {
+        "type": "string"
+       },
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "file_paths"
+     ],
+     "type": "object"
+    },
+    "name": "browser_upload_file"
+   },
+   {
+    "description": "다운로드를 트리거하고 파일을 저장합니다. save_dir 는 절대 경로(상대 경로 거부, `..` 정규화).",
+    "inputSchema": {
+     "properties": {
+      "epoch": {
+       "type": "integer"
+      },
+      "save_dir": {
+       "type": "string"
+      },
+      "trigger_element_id": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "trigger_element_id",
+      "save_dir",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_download_file"
+   },
+   {
+    "description": "탭을 생성/전환/종료하거나 목록을 조회합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "command": {
+       "enum": [
+        "create",
+        "switch",
+        "close",
+        "list"
+       ],
+       "type": "string"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "url": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "command"
+     ],
+     "type": "object"
+    },
+    "name": "browser_tab_control"
+   }
+  ],
+  "build_listed_tools": [
+   {
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "force_full_tree": {
+       "default": false,
+       "type": "boolean"
+      },
+      "prune_top_n": {
+       "default": 20,
+       "type": "integer"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_observe_page"
+   },
+   {
+    "description": "현재 페이지의 스크린샷을 캡처합니다.",
+    "inputSchema": {
+     "properties": {
+      "annotate_som": {
+       "default": false,
+       "type": "boolean"
+      },
+      "full_page": {
+       "default": false,
+       "type": "boolean"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_take_screenshot"
+   },
+   {
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 15000,
+       "type": "integer"
+      },
+      "url": {
+       "type": "string"
+      },
+      "wait_until": {
+       "default": "domcontentloaded",
+       "enum": [
+        "domcontentloaded",
+        "load",
+        "networkidle",
+        "commit"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "url"
+     ],
+     "type": "object"
+    },
+    "name": "browser_navigate"
+   },
+   {
+    "description": "브라우저 히스토리에서 이전 페이지로 이동합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_go_back"
+   },
+   {
+    "description": "현재 페이지를 새로고침합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "ignore_cache": {
+       "default": false,
+       "type": "boolean"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_reload"
+   },
+   {
+    "description": "지정한 요소를 클릭합니다. 실행 전 요소 유효성을 검증합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "button": {
+       "default": "left",
+       "enum": [
+        "left",
+        "right",
+        "middle"
+       ],
+       "type": "string"
+      },
+      "element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "epoch": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "expected_name": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "expected_role": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "x": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "y": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_click"
+   },
+   {
+    "description": "입력 필드에 텍스트를 입력합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "clear_before": {
+       "default": true,
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "press_enter": {
+       "default": false,
+       "type": "boolean"
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "text"
+     ],
+     "type": "object"
+    },
+    "name": "browser_type_text"
+   },
+   {
+    "description": "드롭다운에서 옵션을 선택합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "index": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_select_option"
+   },
+   {
+    "description": "체크박스나 라디오 버튼을 토글합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "checked": {
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "checked"
+     ],
+     "type": "object"
+    },
+    "name": "browser_check_box"
+   },
+   {
+    "description": "뷰포트를 스크롤합니다. 동적 로딩 시 재관찰이 필요할 수 있습니다.",
+    "inputSchema": {
+     "properties": {
+      "direction": {
+       "enum": [
+        "up",
+        "down"
+       ],
+       "type": "string"
+      },
+      "distance": {
+       "default": 500,
+       "type": "integer"
+      },
+      "target_element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "direction"
+     ],
+     "type": "object"
+    },
+    "name": "browser_scroll"
+   },
+   {
+    "description": "요소 위에 마우스를 올려 툴팁이나 서브메뉴를 노출시킵니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_hover"
+   },
+   {
+    "description": "키보드 이벤트를 발생시킵니다 (Enter, Tab, Escape 등). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "key": {
+       "examples": [
+        "Enter",
+        "Tab",
+        "Escape"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "key"
+     ],
+     "type": "object"
+    },
+    "name": "browser_press_key"
+   },
+   {
+    "description": "지정한 조건이 만족될 때까지 대기합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "condition": {
+       "enum": [
+        "selector",
+        "network_idle",
+        "spa_route",
+        "stabilize"
+       ],
+       "type": "string"
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "required": [
+      "condition"
+     ],
+     "type": "object"
+    },
+    "name": "browser_wait_for"
+   },
+   {
+    "description": "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
+    "inputSchema": {
+     "properties": {
+      "attributes": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "extract_all": {
+       "default": false,
+       "type": "boolean"
+      },
+      "selector": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "selector"
+     ],
+     "type": "object"
+    },
+    "name": "browser_extract"
+   },
+   {
+    "description": "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 먼저, 없으면 최상위 문서 기준으로 찾습니다(이때 더 얕은 프레임으로 돌아갈 수 있음 — data.resolved_from(current_frame|root)·frame_depth 로 확인). 중첩 프레임은 바깥부터 한 단계씩(data.child_frames 의 selector_hint 가 다음 후보). 최상위 문서 복귀는 {\"to_main\": true} 만 보내십시오.",
+    "inputSchema": {
+     "properties": {
+      "frame_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "shadow_root_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_switch_frame"
+   },
+   {
+    "description": "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
+    "inputSchema": {
+     "properties": {
+      "accept": {
+       "default": true,
+       "type": "boolean"
+      },
+      "prompt_text": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_handle_dialog"
+   },
+   {
+    "description": "파일 입력 필드에 파일을 바인딩합니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "file_paths": {
+       "items": {
+        "type": "string"
+       },
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "file_paths"
+     ],
+     "type": "object"
+    },
+    "name": "browser_upload_file"
+   },
+   {
+    "description": "다운로드를 트리거하고 파일을 저장합니다. save_dir 는 절대 경로(상대 경로 거부, `..` 정규화).",
+    "inputSchema": {
+     "properties": {
+      "epoch": {
+       "type": "integer"
+      },
+      "save_dir": {
+       "type": "string"
+      },
+      "trigger_element_id": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "trigger_element_id",
+      "save_dir",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_download_file"
+   },
+   {
+    "description": "탭을 생성/전환/종료하거나 목록을 조회합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "command": {
+       "enum": [
+        "create",
+        "switch",
+        "close",
+        "list"
+       ],
+       "type": "string"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "url": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "command"
+     ],
+     "type": "object"
+    },
+    "name": "browser_tab_control"
+   },
+   {
+    "description": "사람에게 조작권 요청(캡차·로그인). 창 serve(human·on-demand) 만. secret_wanted=true 면 관찰도 막힘. 다음: control_wait",
+    "inputSchema": {
+     "properties": {
+      "reason": {
+       "type": "string"
+      },
+      "secret_wanted": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "reason"
+     ],
+     "type": "object"
+    },
+    "name": "browser_control_request"
+   },
+   {
+    "description": "조작권 상태(holder agent|human)",
+    "inputSchema": {
+     "properties": {},
+     "type": "object"
+    },
+    "name": "browser_control_status"
+   },
+   {
+    "description": "사람의 take/release 까지 대기(초, 기본 60)",
+    "inputSchema": {
+     "properties": {
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_control_wait"
+   },
+   {
+    "description": "data.approval 을 사람이 승인/거절할 때까지 대기",
+    "inputSchema": {
+     "properties": {
+      "approval_id": {
+       "type": "string"
+      },
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "required": [
+      "approval_id"
+     ],
+     "type": "object"
+    },
+    "name": "browser_approval_wait"
+   },
+   {
+    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete",
+    "inputSchema": {
+     "properties": {
+      "id": {
+       "description": "run·delete 대상 레시피 id",
+       "type": "string"
+      },
+      "last_n": {
+       "description": "save: 최근 통과 단계 수",
+       "maximum": 20,
+       "minimum": 1,
+       "type": "integer"
+      },
+      "name": {
+       "description": "save 할 이름",
+       "type": "string"
+      },
+      "op": {
+       "enum": [
+        "save",
+        "run",
+        "list",
+        "delete"
+       ]
+      },
+      "params": {
+       "description": "{이름: 값} — save 는 입력한 글자, run 은 새 값",
+       "type": "object"
+      },
+      "pins": {
+       "description": "save: {\"단계번호\": \"identity\"} (slot|ui|identity)",
+       "type": "object"
+      }
+     },
+     "required": [
+      "op"
+     ],
+     "type": "object"
+    },
+    "name": "browser_recipe"
+   }
+  ],
+  "build_server_tools": [
+   {
+    "description": "사람에게 조작권 요청(캡차·로그인). 창 serve(human·on-demand) 만. secret_wanted=true 면 관찰도 막힘. 다음: control_wait",
+    "inputSchema": {
+     "properties": {
+      "reason": {
+       "type": "string"
+      },
+      "secret_wanted": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "reason"
+     ],
+     "type": "object"
+    },
+    "name": "browser_control_request"
+   },
+   {
+    "description": "조작권 상태(holder agent|human)",
+    "inputSchema": {
+     "properties": {},
+     "type": "object"
+    },
+    "name": "browser_control_status"
+   },
+   {
+    "description": "사람의 take/release 까지 대기(초, 기본 60)",
+    "inputSchema": {
+     "properties": {
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_control_wait"
+   },
+   {
+    "description": "data.approval 을 사람이 승인/거절할 때까지 대기",
+    "inputSchema": {
+     "properties": {
+      "approval_id": {
+       "type": "string"
+      },
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "required": [
+      "approval_id"
+     ],
+     "type": "object"
+    },
+    "name": "browser_approval_wait"
+   },
+   {
+    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete",
+    "inputSchema": {
+     "properties": {
+      "id": {
+       "description": "run·delete 대상 레시피 id",
+       "type": "string"
+      },
+      "last_n": {
+       "description": "save: 최근 통과 단계 수",
+       "maximum": 20,
+       "minimum": 1,
+       "type": "integer"
+      },
+      "name": {
+       "description": "save 할 이름",
+       "type": "string"
+      },
+      "op": {
+       "enum": [
+        "save",
+        "run",
+        "list",
+        "delete"
+       ]
+      },
+      "params": {
+       "description": "{이름: 값} — save 는 입력한 글자, run 은 새 값",
+       "type": "object"
+      },
+      "pins": {
+       "description": "save: {\"단계번호\": \"identity\"} (slot|ui|identity)",
+       "type": "object"
+      }
+     },
+     "required": [
+      "op"
+     ],
+     "type": "object"
+    },
+    "name": "browser_recipe"
+   }
+  ],
+  "build_server_tools_no_recipes": [
+   {
+    "description": "사람에게 조작권 요청(캡차·로그인). 창 serve(human·on-demand) 만. secret_wanted=true 면 관찰도 막힘. 다음: control_wait",
+    "inputSchema": {
+     "properties": {
+      "reason": {
+       "type": "string"
+      },
+      "secret_wanted": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "reason"
+     ],
+     "type": "object"
+    },
+    "name": "browser_control_request"
+   },
+   {
+    "description": "조작권 상태(holder agent|human)",
+    "inputSchema": {
+     "properties": {},
+     "type": "object"
+    },
+    "name": "browser_control_status"
+   },
+   {
+    "description": "사람의 take/release 까지 대기(초, 기본 60)",
+    "inputSchema": {
+     "properties": {
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_control_wait"
+   },
+   {
+    "description": "data.approval 을 사람이 승인/거절할 때까지 대기",
+    "inputSchema": {
+     "properties": {
+      "approval_id": {
+       "type": "string"
+      },
+      "timeout_s": {
+       "maximum": 120,
+       "type": "number"
+      }
+     },
+     "required": [
+      "approval_id"
+     ],
+     "type": "object"
+    },
+    "name": "browser_approval_wait"
+   }
+  ],
+  "list_tools": [
+   {
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "force_full_tree": {
+       "default": false,
+       "type": "boolean"
+      },
+      "prune_top_n": {
+       "default": 20,
+       "type": "integer"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_observe_page"
+   },
+   {
+    "description": "현재 페이지의 스크린샷을 캡처합니다.",
+    "inputSchema": {
+     "properties": {
+      "annotate_som": {
+       "default": false,
+       "type": "boolean"
+      },
+      "full_page": {
+       "default": false,
+       "type": "boolean"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_take_screenshot"
+   },
+   {
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 15000,
+       "type": "integer"
+      },
+      "url": {
+       "type": "string"
+      },
+      "wait_until": {
+       "default": "domcontentloaded",
+       "enum": [
+        "domcontentloaded",
+        "load",
+        "networkidle",
+        "commit"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "url"
+     ],
+     "type": "object"
+    },
+    "name": "browser_navigate"
+   },
+   {
+    "description": "브라우저 히스토리에서 이전 페이지로 이동합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_go_back"
+   },
+   {
+    "description": "현재 페이지를 새로고침합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "ignore_cache": {
+       "default": false,
+       "type": "boolean"
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_reload"
+   },
+   {
+    "description": "지정한 요소를 클릭합니다. 실행 전 요소 유효성을 검증합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "button": {
+       "default": "left",
+       "enum": [
+        "left",
+        "right",
+        "middle"
+       ],
+       "type": "string"
+      },
+      "element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "epoch": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "expected_name": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "expected_role": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "x": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "y": {
+       "minimum": 0,
+       "type": [
+        "integer",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_click"
+   },
+   {
+    "description": "입력 필드에 텍스트를 입력합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "clear_before": {
+       "default": true,
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "press_enter": {
+       "default": false,
+       "type": "boolean"
+      },
+      "text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "text"
+     ],
+     "type": "object"
+    },
+    "name": "browser_type_text"
+   },
+   {
+    "description": "드롭다운에서 옵션을 선택합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "index": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_select_option"
+   },
+   {
+    "description": "체크박스나 라디오 버튼을 토글합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "checked": {
+       "type": "boolean"
+      },
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "checked"
+     ],
+     "type": "object"
+    },
+    "name": "browser_check_box"
+   },
+   {
+    "description": "뷰포트를 스크롤합니다. 동적 로딩 시 재관찰이 필요할 수 있습니다.",
+    "inputSchema": {
+     "properties": {
+      "direction": {
+       "enum": [
+        "up",
+        "down"
+       ],
+       "type": "string"
+      },
+      "distance": {
+       "default": 500,
+       "type": "integer"
+      },
+      "target_element_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "direction"
+     ],
+     "type": "object"
+    },
+    "name": "browser_scroll"
+   },
+   {
+    "description": "요소 위에 마우스를 올려 툴팁이나 서브메뉴를 노출시킵니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_hover"
+   },
+   {
+    "description": "키보드 이벤트를 발생시킵니다 (Enter, Tab, Escape 등). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "key": {
+       "examples": [
+        "Enter",
+        "Tab",
+        "Escape"
+       ],
+       "type": "string"
+      }
+     },
+     "required": [
+      "key"
+     ],
+     "type": "object"
+    },
+    "name": "browser_press_key"
+   },
+   {
+    "description": "지정한 조건이 만족될 때까지 대기합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "condition": {
+       "enum": [
+        "selector",
+        "network_idle",
+        "spa_route",
+        "stabilize"
+       ],
+       "type": "string"
+      },
+      "selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "timeout_ms": {
+       "default": 10000,
+       "type": "integer"
+      }
+     },
+     "required": [
+      "condition"
+     ],
+     "type": "object"
+    },
+    "name": "browser_wait_for"
+   },
+   {
+    "description": "CSS 셀렉터로 텍스트와 속성을 추출합니다.",
+    "inputSchema": {
+     "properties": {
+      "attributes": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "extract_all": {
+       "default": false,
+       "type": "boolean"
+      },
+      "selector": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "selector"
+     ],
+     "type": "object"
+    },
+    "name": "browser_extract"
+   },
+   {
+    "description": "iframe 또는 Shadow DOM 컨텍스트로 전환합니다. frame_selector 는 현재 프레임 기준으로 먼저, 없으면 최상위 문서 기준으로 찾습니다(이때 더 얕은 프레임으로 돌아갈 수 있음 — data.resolved_from(current_frame|root)·frame_depth 로 확인). 중첩 프레임은 바깥부터 한 단계씩(data.child_frames 의 selector_hint 가 다음 후보). 최상위 문서 복귀는 {\"to_main\": true} 만 보내십시오.",
+    "inputSchema": {
+     "properties": {
+      "frame_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "shadow_root_selector": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_switch_frame"
+   },
+   {
+    "description": "Alert/Confirm/Prompt 다이얼로그를 처리합니다.",
+    "inputSchema": {
+     "properties": {
+      "accept": {
+       "default": true,
+       "type": "boolean"
+      },
+      "prompt_text": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": "object"
+    },
+    "name": "browser_handle_dialog"
+   },
+   {
+    "description": "파일 입력 필드에 파일을 바인딩합니다.",
+    "inputSchema": {
+     "properties": {
+      "element_id": {
+       "type": "string"
+      },
+      "epoch": {
+       "type": "integer"
+      },
+      "file_paths": {
+       "items": {
+        "type": "string"
+       },
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "element_id",
+      "epoch",
+      "file_paths"
+     ],
+     "type": "object"
+    },
+    "name": "browser_upload_file"
+   },
+   {
+    "description": "다운로드를 트리거하고 파일을 저장합니다. save_dir 는 절대 경로(상대 경로 거부, `..` 정규화).",
+    "inputSchema": {
+     "properties": {
+      "epoch": {
+       "type": "integer"
+      },
+      "save_dir": {
+       "type": "string"
+      },
+      "trigger_element_id": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "trigger_element_id",
+      "save_dir",
+      "epoch"
+     ],
+     "type": "object"
+    },
+    "name": "browser_download_file"
+   },
+   {
+    "description": "탭을 생성/전환/종료하거나 목록을 조회합니다. data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "inputSchema": {
+     "properties": {
+      "command": {
+       "enum": [
+        "create",
+        "switch",
+        "close",
+        "list"
+       ],
+       "type": "string"
+      },
+      "tab_id": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "url": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "command"
+     ],
+     "type": "object"
+    },
+    "name": "browser_tab_control"
+   }
+  ]
+ }
+}
