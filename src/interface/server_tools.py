@@ -108,17 +108,7 @@ class ToolsMixin:
             if action is not None:
                 await self._attach_observation_guidance(action, arguments or {}, result)
             if action in {ActionType.NAVIGATE, ActionType.OBSERVE_PAGE}:
-                from security.robots_signal import attach_robots_signal
-
-                ctx = getattr(self._dispatcher, "ctx", None)
-                page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
-                document = result.data.get("document")
-                if isinstance(document, dict) and document.get("url") and page is not None and self._egress is not None:
-                    signal = await self._robots.signal(page.context, document["url"], self._egress, self._egress_proxy)
-                    if signal:
-                        result.data["robots"] = signal
-                else:
-                    await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+                await self._attach_robots(result)
             if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
                 await self._attach_block_hint(result)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
@@ -194,6 +184,27 @@ class ToolsMixin:
         params: Dict[str, Any] = dict(arguments or {})
         # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
         approval_id = params.pop("approval_id", None)
+        refused = await self._refuse_before_validation(action, params, capture)
+        if refused is not None:
+            return refused
+        checked = self._validated_params(action, params)
+        if isinstance(checked, ActionResult):
+            return checked
+        params = checked
+
+        self._observation_state()
+
+        # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
+        self._pending_gate_basis = None
+        self._used_approval = None
+        blocked = await self._check_hitl(action, params, approval_id=approval_id)
+        if blocked is not None:
+            return blocked
+        return await self._run_gated_action(name, arguments, action, params)
+
+    async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
+                                        capture: Dict[str, Any]) -> Optional[ActionResult]:
+        """조작권(사람)·확인 코드 표시 중 화면 캡처 거부. 통과한 스크린샷은 캡처로 등록한다."""
         # WS-29: 사람이 조작권을 가진 동안(또는 비밀 입력 요청 중) 에이전트 액션 거부.
         if self.hub.opened:
             await self._poll_handoff()
@@ -218,7 +229,10 @@ class ToolsMixin:
             # 끝나길 기다리고, call_tool 은 반환 직전 세대 번호로 캡처 도중 오버레이가 켜졌는지 본다.
             self._captures_inflight += 1
             capture["gen"] = self._pixel_gen
+        return None
 
+    def _validated_params(self, action: ActionType, params: Dict[str, Any]) -> Any:
+        """계약 입력 검증 + 디스패처 키 정규화. 반환: 검증된 params(dict) 또는 실패 ActionResult."""
         # 입력 검증: 계약 모델로 파싱해 잘못된 인자를 조기 차단한다.
         model = ACTION_INPUT_MAP.get(action)
         to_main = False
@@ -249,17 +263,11 @@ class ToolsMixin:
         # WS-30 항목 2: 계약 키(trigger_element_id 등)를 디스패처 키로 — 게이트도 같은 키를 본다.
         from actions.dispatcher import normalize_action_params
 
-        params = normalize_action_params(action, params)
+        return normalize_action_params(action, params)
 
-        self._observation_state()
-
-        # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
-        self._pending_gate_basis = None
-        self._used_approval = None
-        blocked = await self._check_hitl(action, params, approval_id=approval_id)
-        if blocked is not None:
-            return blocked
-
+    async def _run_gated_action(self, name: str, arguments: Dict[str, Any], action: ActionType,
+                                params: Dict[str, Any]) -> ActionResult:
+        """게이트를 통과한 액션 실행 → 신호 부착 → 헤드리스 재시도 → 레시피 기록."""
         # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
         retry_boundary = action is ActionType.NAVIGATE and self._retry_recipe_boundary.get()
         recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None and not retry_boundary else None
@@ -269,6 +277,35 @@ class ToolsMixin:
         # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
         target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
+        result, remembered = await self._dispatch_with_approval(action, params, used)
+        if used is not None:
+            self._attach_approval_outcome(used, result)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
+        result = self._attach_upstream_failure(action, params, result, upstream_before)
+        if self._pending_gate_basis is not None:
+            result.data.setdefault("gate_basis", self._pending_gate_basis)
+            self._pending_gate_basis = None
+        if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
+            await self._attach_challenge(result)
+        self._attach_remembered_identity(remembered, result)
+        if action is ActionType.NAVIGATE and "document" not in result.data:
+            retried = await self._retry_headless_navigation(name, arguments, params, result)
+            if retried is not None:
+                result = retried  # original pre-snapshot + final result form one recipe boundary
+        if self._recipes is not None and not retry_boundary:
+            # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
+            if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
+                self._recipes.reset("navigation_blocked")
+            else:
+                self._recipes.post(action, params, recipe_pre, result, used is not None)
+            if action is ActionType.OBSERVE_PAGE:
+                await self._recipes.observe(result)
+        # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
+        return result
+
+    async def _dispatch_with_approval(self, action: ActionType, params: Dict[str, Any],
+                                      used: Optional[str]) -> tuple:
+        """디스패처 실행(승인 증표 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
         if used is not None:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
@@ -285,44 +322,7 @@ class ToolsMixin:
         finally:
             if used is not None:
                 self._dispatcher.heal_disabled = False
-        if used is not None:
-            self._attach_approval_outcome(used, result)
-        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
-        result = self._attach_upstream_failure(action, params, result, upstream_before)
-        if self._pending_gate_basis is not None:
-            result.data.setdefault("gate_basis", self._pending_gate_basis)
-            self._pending_gate_basis = None
-        if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
-            await self._attach_challenge(result)
-        from browser.headless_retry import FAILED_NOTE, REMEMBERED_NOTE
-        from security.robots_signal import _origin
-
-        if (remembered is not None and remembered.document_requested and "document" not in result.data
-                and _origin(result.current_url) == remembered.origin):
-            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
-                        "note": REMEMBERED_NOTE}
-            status = result.data.get("last_http_status")
-            if status == 403:
-                self._headless_retry.mark_failed(remembered.origin or "")
-                identity["retry_failed"] = True
-                identity["note"] = FAILED_NOTE
-            elif isinstance(status, int) and 200 <= status < 300 and result.data.get("challenge") is None:
-                remembered.succeeded = True  # ledger cookies this navigate caused (on scope exit)
-            result.data["identity"] = identity
-        if action is ActionType.NAVIGATE and "document" not in result.data:
-            retried = await self._retry_headless_navigation(name, arguments, params, result)
-            if retried is not None:
-                result = retried  # original pre-snapshot + final result form one recipe boundary
-        if self._recipes is not None and not retry_boundary:
-            # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
-            if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
-                self._recipes.reset("navigation_blocked")
-            else:
-                self._recipes.post(action, params, recipe_pre, result, used is not None)
-            if action is ActionType.OBSERVE_PAGE:
-                await self._recipes.observe(result)
-        # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
-        return result
+        return result, remembered
 
     def _error_result(
         self,

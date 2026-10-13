@@ -166,8 +166,6 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
         recipes: bool = True,
         headless_retry: bool = True,
     ) -> None:
-        from interface.handoff import HandoffHub, state_root
-
         #: 이름 붙인 영속 프로필(WS-32, serve --profile). None 이면 기존 동작(빈 컨텍스트).
         if profile is not None:
             from browser import serve_profile
@@ -188,6 +186,41 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
             from recipes.service import RecipeService
 
             self._recipes = RecipeService(self)
+        self._init_window_fields(browser_mode)
+        self._init_handoff_fields(browser_mode, profile, handoff_root, approval_ttl_s)
+        #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
+        self.allow_private_network = allow_private_network
+        self.block_loopback = block_loopback
+        #: 이동 대기 스위치 (WS-28). DispatchContext.nav_settle 로 전달된다.
+        self.nav_settle = nav_settle
+        #: observe_page·extract 응답 봉투 크기 상한(글자, WS-30b). cap_result_size 참조.
+        self.max_result_chars = max_result_chars
+        #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
+        #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
+        self.secrets = secrets
+        #: Tier-2 SoM 게이트 (PRD §8-2). 기본 OFF — 레거시 클라이언트는
+        #: annotate_som=True에 E_FEATURE_NOT_IMPLEMENTED를 그대로 받는다.
+        self.som_enabled = som_enabled
+        self.mode = mode
+        self.allowed_domains = allowed_domains
+        self.pre_approved_actions = pre_approved_actions
+        self.headless = headless
+        self.headless_retry = bool(headless_retry)
+        from browser.headless_retry import HeadlessRetry
+
+        self._headless_retry = HeadlessRetry()
+        self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
+        self._navigation_scope: ContextVar[AsyncExitStack | None] = ContextVar("headless_navigation_scope", default=None)
+        #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
+        #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
+        self.browser_mode = browser_mode
+        self.chrome_profile = chrome_profile
+        self.keep_open = keep_open
+
+        self._init_session_fields()
+
+    def _init_window_fields(self, browser_mode: str) -> None:
+        """__init__ 1부(WS-48 분해): on-demand 창·전환 관문·확인 코드 창 상태."""
         #: WS-34 on-demand 창 상태(다른 방식이면 None — 기존 동작 그대로).
         from interface.on_demand import ON_DEMAND, WindowState
 
@@ -221,6 +254,11 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
         self._wait_calls: "set[asyncio.Task]" = set()
         self._code_where: Optional[str] = None
 
+    def _init_handoff_fields(self, browser_mode: str, profile: Optional[str], handoff_root: Any,
+                             approval_ttl_s: float) -> None:
+        """__init__ 2부(WS-48 분해): 사람 인계 통로·안내 띠·승인 증표·화면 캡처 차단 상태."""
+        from interface.handoff import HandoffHub, state_root
+
         #: 사람 인계 통로(조작권·승인 증표, WS-29). 디스크 상태는 open_handoff() 에서 만든다.
         self.hub = HandoffHub(
             root=handoff_root if handoff_root is not None else state_root(),
@@ -246,35 +284,9 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
         #: WS-37: 진행 중인 닫힌 탭 복구(반납 처리). 감시 태스크가 반납을 먼저 집어 복구하는 동안
         #: 다른 호출(control_wait 등)이 복구가 끝나기 전에 '반납됨' 을 알리지 않도록 기다리는 데 쓴다.
         self._release_recovery: Optional["asyncio.Future[None]"] = None
-        #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
-        self.allow_private_network = allow_private_network
-        self.block_loopback = block_loopback
-        #: 이동 대기 스위치 (WS-28). DispatchContext.nav_settle 로 전달된다.
-        self.nav_settle = nav_settle
-        #: observe_page·extract 응답 봉투 크기 상한(글자, WS-30b). cap_result_size 참조.
-        self.max_result_chars = max_result_chars
-        #: 자격증명 플레이스홀더 해석기 (PRD 5.3). 디스패처에 주입되어
-        #: type_text의 키를 실제 값으로 바꾼다. LLM에는 키만 노출된다.
-        self.secrets = secrets
-        #: Tier-2 SoM 게이트 (PRD §8-2). 기본 OFF — 레거시 클라이언트는
-        #: annotate_som=True에 E_FEATURE_NOT_IMPLEMENTED를 그대로 받는다.
-        self.som_enabled = som_enabled
-        self.mode = mode
-        self.allowed_domains = allowed_domains
-        self.pre_approved_actions = pre_approved_actions
-        self.headless = headless
-        self.headless_retry = bool(headless_retry)
-        from browser.headless_retry import HeadlessRetry
 
-        self._headless_retry = HeadlessRetry()
-        self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
-        self._navigation_scope: ContextVar[AsyncExitStack | None] = ContextVar("headless_navigation_scope", default=None)
-        #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
-        #: 방식과 무관하게 같다 — 브라우저를 여는 방법만 다르다.
-        self.browser_mode = browser_mode
-        self.chrome_profile = chrome_profile
-        self.keep_open = keep_open
-
+    def _init_session_fields(self) -> None:
+        """__init__ 3부(WS-48 분해): 브라우저 세션 핸들·문서 상태·신호 캐시(start() 가 채운다)."""
         self._core: Any = None
         self._engine: Any = None
         self._dispatcher: Any = None
@@ -381,13 +393,7 @@ def create_server(
         recipes=recipes,
         headless_retry=headless_retry,
     )
-    #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
-    from security.robots_signal import ROBOTS_INSTRUCTIONS
-    from actions.pdf_document import PDF_INSTRUCTIONS
-    from browser.headless_retry import IDENTITY_INSTRUCTIONS
-
-    instructions = ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
-                    + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS)
+    instructions = _server_instructions(recipes)
 
     def _build_tools() -> List[Tool]:
         """툴 정의를 SDK 타입으로 변환한다.
@@ -460,6 +466,17 @@ def create_server(
     return server, backend
 
 
+def _server_instructions(recipes: bool) -> str:
+    """MCP initialize 의 서버 instructions(create_server 에서 분리, WS-48)."""
+    #: Independent instruction fragments: recipes optional, observation (WS-40) and robots (WS-41) always present.
+    from security.robots_signal import ROBOTS_INSTRUCTIONS
+    from actions.pdf_document import PDF_INSTRUCTIONS
+    from browser.headless_retry import IDENTITY_INSTRUCTIONS
+
+    return ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
+            + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS)
+
+
 async def run_stdio(
     *,
     mode: ExecutionMode = ExecutionMode.UNATTENDED,
@@ -485,8 +502,6 @@ async def run_stdio(
     profile(WS-32): 영속 프로필 이름. MCP 를 열기 전에 잠근다 — 다른 serve 가 쓰는 중이면
     serve_profile.ProfileInUseError 를 올린다(CLI 가 stderr 한 줄 + exit 2).
     """
-    import sys
-
     from mcp.server.stdio import stdio_server
 
     secrets = None
@@ -524,6 +539,24 @@ async def run_stdio(
             if hasattr(backend, "hub"):
                 backend.hub.close()
             raise
+    _announce_serve(mode, browser_mode, chrome_profile, keep_open, profile, recipes,
+                    allow_private_network, block_loopback, server_id)
+
+    async def _serve() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream, write_stream, server.create_initialization_options()
+            )
+
+    await _serve_until_stop(_serve, backend)
+
+
+def _announce_serve(mode: ExecutionMode, browser_mode: str, chrome_profile: Any, keep_open: bool,
+                    profile: Optional[str], recipes: bool, allow_private_network: bool,
+                    block_loopback: bool, server_id: Optional[str]) -> None:
+    """serve 시작 로그(stderr, run_stdio 에서 분리 — WS-48). stdout 은 MCP 전용."""
+    import sys
+
     extra = ""
     if browser_mode == "user-chrome":
         extra = f" chrome_profile={chrome_profile or '(기본)'} keep_open={bool(keep_open)}"
@@ -554,12 +587,10 @@ async def run_stdio(
             file=sys.stderr,
             flush=True,
         )
-    async def _serve() -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream, server.create_initialization_options()
-            )
 
+
+async def _serve_until_stop(_serve: Any, backend: Any) -> None:
+    """서버를 돌리고 종료 신호·정상 종료를 처리한다(run_stdio 에서 분리 — WS-48)."""
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     received: List[int] = []

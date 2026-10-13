@@ -149,6 +149,46 @@ class HitlMixin:
         """고위험 액션 승인 게이트. 차단 시 ActionResult를 반환한다."""
         from security import ActionContext
 
+        target = await self._gate_target(action, params)
+        if isinstance(target, ActionResult):
+            return target
+        element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis = target
+
+        decision = self._hitl.evaluate(
+            ActionContext(
+                action=action,
+                element_name=element_name,
+                selector=selector,
+                domain=self._current_domain(),
+                submits_form=submits_form,
+                unresolved_target=unresolved,
+                signals=signals,
+                basis_extra=basis_extra,
+            )
+        )
+        if decision.allowed:
+            if report_basis:
+                self._pending_gate_basis = dict(decision.basis)
+            return None
+
+        # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve` + 창의 확인 코드)에서 승인한
+        # 바로 그 행동만 통과. R1: 사람이 볼 창이 없으면(headless) 증표를 발급하지 않는다 —
+        # 확인 코드를 띄울 곳이 없어 사람만 승인할 수 있다는 보장이 없다.
+        ap: Any = None
+        approval: Optional[Dict[str, Any]] = None
+        if self._human_can_see():
+            issued = await self._approval_or_pass(action, params, approval_id, decision, report_basis,
+                                                  element_name, selector)
+            if issued is None or isinstance(issued, ActionResult):
+                return issued
+            ap, approval, rejected = issued
+        else:
+            rejected = None
+        return self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected)
+
+    async def _gate_target(self, action: ActionType, params: Dict[str, Any]) -> Any:
+        """게이트가 판정할 대상 해석. 반환: (이름, selector, 폼 제출, 판정 불가 사유, 문맥 신호,
+        근거 부가정보, 통과해도 근거를 싣는가) 튜플 또는 모호한 selector 거부 ActionResult(WS-39)."""
         element_name = ""
         element_id = params.get("element_id")
         if element_id and self._engine is not None:
@@ -190,71 +230,68 @@ class HitlMixin:
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
             report_basis = True
         elif action is ActionType.TYPE_TEXT and not submits_form:
-            text = str(params.get("text") or "")
-            if "\n" in text or "\r" in text:
-                # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
-                info = await dispatcher.describe_element(element_id) if dispatcher else None
-                if info is None:
-                    unresolved = "입력 대상을 읽을 수 없음"
-                elif info.get("tag") == "INPUT" and info.get("in_form"):
-                    submits_form = True
+            submits_form, unresolved = await self._newline_submit_target(
+                params, element_id, submits_form, unresolved)
         elif action is ActionType.PRESS_KEY:
             submits_form, name, unresolved, signals = await self._press_key_target(params)
             element_name = name or element_name
+        return element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis
 
-        decision = self._hitl.evaluate(
-            ActionContext(
-                action=action,
-                element_name=element_name,
-                selector=selector,
-                domain=self._current_domain(),
-                submits_form=submits_form,
-                unresolved_target=unresolved,
-                signals=signals,
-                basis_extra=basis_extra,
-            )
-        )
-        if decision.allowed:
-            if report_basis:
-                self._pending_gate_basis = dict(decision.basis)
-            return None
+    async def _newline_submit_target(self, params: Dict[str, Any], element_id: Any, submits_form: bool,
+                                     unresolved: str) -> tuple:
+        """type_text 의 줄바꿈 입력이 폼 제출인지 대상 요소로 판정한다. 반환: (폼 제출, 판정 불가 사유)."""
+        dispatcher = self._dispatcher
+        text = str(params.get("text") or "")
+        if "\n" in text or "\r" in text:
+            # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
+            info = await dispatcher.describe_element(element_id) if dispatcher else None
+            if info is None:
+                unresolved = "입력 대상을 읽을 수 없음"
+            elif info.get("tag") == "INPUT" and info.get("in_form"):
+                submits_form = True
+        return submits_form, unresolved
 
-        # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve` + 창의 확인 코드)에서 승인한
-        # 바로 그 행동만 통과. R1: 사람이 볼 창이 없으면(headless) 증표를 발급하지 않는다 —
-        # 확인 코드를 띄울 곳이 없어 사람만 승인할 수 있다는 보장이 없다.
-        ap: Any = None
-        approval: Optional[Dict[str, Any]] = None
-        if self._human_can_see():
-            components = self._approval_components(action, params, dict(decision.basis))
-            rejected: Optional[Dict[str, Any]] = None
-            if approval_id:
-                passed = await self._use_approval(str(approval_id), action, params, components)
-                if passed is True:
-                    if report_basis:
-                        self._pending_gate_basis = dict(decision.basis)
-                    return None
-                if isinstance(passed, ActionResult):
-                    return passed
-                rejected = passed
-            ap = self.hub.issue_approval(components, {
-                "target": element_name or selector,
-                "reason": decision.reason,
-                "domain": self._current_domain(),
-            })
-            # NB-7: action_digest 는 싣지 않는다 — 사람 CLI 가 상태 파일에서 읽는다.
-            approval = {
-                "approval_id": ap.approval_id,
-                "expires_at": _iso(ap.expires),
-                "how_to_approve": (f"사람이 터미널에서: agent-browser approve {ap.approval_id} "
-                                   "(브라우저 창에 뜨는 확인 코드 입력)"),
-            }
-            if rejected is not None:
-                approval["rejected"] = rejected
-                if rejected.get("reason_code") == "target_changed":
-                    approval["reason"] = "target_changed"
-        else:
-            rejected = None
+    async def _approval_or_pass(self, action: ActionType, params: Dict[str, Any], approval_id: Any,
+                                decision: Any, report_basis: bool, element_name: str,
+                                selector: str) -> Any:
+        """승인 증표 사용 또는 새 증표 발급(사람이 볼 창이 있을 때만).
 
+        반환: None = 증표로 통과, ActionResult = 대상이 승인 때와 달라 거부,
+        (발급한 증표, data.approval, 거부된 증표 사유 또는 None) = 차단 결과에 싣는다.
+        """
+        components = self._approval_components(action, params, dict(decision.basis))
+        rejected: Optional[Dict[str, Any]] = None
+        if approval_id:
+            passed = await self._use_approval(str(approval_id), action, params, components)
+            if passed is True:
+                if report_basis:
+                    self._pending_gate_basis = dict(decision.basis)
+                return None
+            if isinstance(passed, ActionResult):
+                return passed
+            rejected = passed
+        ap = self.hub.issue_approval(components, {
+            "target": element_name or selector,
+            "reason": decision.reason,
+            "domain": self._current_domain(),
+        })
+        # NB-7: action_digest 는 싣지 않는다 — 사람 CLI 가 상태 파일에서 읽는다.
+        approval = {
+            "approval_id": ap.approval_id,
+            "expires_at": _iso(ap.expires),
+            "how_to_approve": (f"사람이 터미널에서: agent-browser approve {ap.approval_id} "
+                               "(브라우저 창에 뜨는 확인 코드 입력)"),
+        }
+        if rejected is not None:
+            approval["rejected"] = rejected
+            if rejected.get("reason_code") == "target_changed":
+                approval["reason"] = "target_changed"
+        return ap, approval, rejected
+
+    def _hitl_blocked_result(self, action: ActionType, decision: Any, element_name: str, ap: Any,
+                             approval: Optional[Dict[str, Any]],
+                             rejected: Optional[Dict[str, Any]]) -> ActionResult:
+        """게이트 차단 결과(메시지·gate_basis·승인 증표·사람용 해결 경로)."""
         message = decision.reason
         if decision.requires_confirmation and decision.dialog is not None:
             # 대화형 모드: 클라이언트가 렌더링할 정형 모달을 함께 전달한다.

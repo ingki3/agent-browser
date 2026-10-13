@@ -147,6 +147,38 @@ class SignalsMixin:
                                                 self._egress, self._egress_proxy) as attempt:
             yield attempt
 
+    async def _attach_robots(self, result: ActionResult) -> None:
+        """navigate·observe_page 결과에 robots.txt 의사 표시 신호(data.robots, WS-41)를 싣는다."""
+        from security.robots_signal import attach_robots_signal
+
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+        document = result.data.get("document")
+        if isinstance(document, dict) and document.get("url") and page is not None and self._egress is not None:
+            signal = await self._robots.signal(page.context, document["url"], self._egress, self._egress_proxy)
+            if signal:
+                result.data["robots"] = signal
+        else:
+            await attach_robots_signal(self._robots, result, page, self._egress, self._egress_proxy)
+
+    def _attach_remembered_identity(self, remembered: Any, result: ActionResult) -> None:
+        """기억된 성공으로 처음부터 일반 Chrome 이름으로 연 navigate 결과에 data.identity 를 싣는다."""
+        from browser.headless_retry import FAILED_NOTE, REMEMBERED_NOTE
+        from security.robots_signal import _origin
+
+        if (remembered is not None and remembered.document_requested and "document" not in result.data
+                and _origin(result.current_url) == remembered.origin):
+            identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
+                        "note": REMEMBERED_NOTE}
+            status = result.data.get("last_http_status")
+            if status == 403:
+                self._headless_retry.mark_failed(remembered.origin or "")
+                identity["retry_failed"] = True
+                identity["note"] = FAILED_NOTE
+            elif isinstance(status, int) and 200 <= status < 300 and result.data.get("challenge") is None:
+                remembered.succeeded = True  # ledger cookies this navigate caused (on scope exit)
+            result.data["identity"] = identity
+
     async def _retry_headless_navigation(
         self, name: str, arguments: Dict[str, Any], params: Dict[str, Any], result: ActionResult,
     ) -> Optional[ActionResult]:
