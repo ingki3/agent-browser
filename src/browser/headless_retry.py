@@ -384,7 +384,7 @@ class HeadlessRetry:
         try:
             main_frame = (await session.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
             # 인증 가로채기 옵션은 켜지 않는다(CDP 기본값): 이 세션은 어떤 인증 요청에도 답하지 않으며
-            # 프록시 자격은 Playwright 의 launch(proxy=…) 경로만 다룬다(WS-47 R3).
+            # 프록시 자격은 어느 경로에도 주지 않는다(egress 프록시는 무자격, WS-47 R3).
             await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
             yield attempt
         finally:
