@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import time
 from typing import AsyncIterator, Callable, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -220,8 +221,14 @@ class HeadlessRetry:
         """Adopt the profile file; any unreadable/corrupt file means 'no memory'."""
         self.path = Path(path)
         try:
-            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            # O_NONBLOCK: a FIFO in the ledger's place would otherwise block open() waiting for a writer
+            # (and with it the server). Only a regular file is read; anything else is a corrupt ledger.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(self.path, flags)
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ValueError("ledger is not a regular file")
+                os.set_blocking(fd, True)
                 raw = b""
                 while chunk := os.read(fd, 1 << 20):
                     raw += chunk

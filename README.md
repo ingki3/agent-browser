@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3760개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3930개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -165,7 +165,7 @@ uv run python -m harness.agent_eval --report artifacts/agent_eval.json
 
 ## MCP 클라이언트 연동
 
-19종 툴(과 사람 인계·레시피용 서버 도구)을 stdio로 노출합니다. Claude Desktop 설정 예시입니다.
+19종 툴(과 사람 인계·레시피·YouTube 검색용 서버 도구)을 stdio로 노출합니다. Claude Desktop 설정 예시입니다.
 
 ```json
 {
@@ -492,6 +492,55 @@ PDF navigate 1회는 서버 GET 2회(브라우저 시작 + 재요청)와 robots.
 PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 표시되지 않습니다. 스캔 PDF의
 스크린샷은 PDF를 표시하는 사람의 브라우저에서 확인해야 합니다.
 
+### YouTube 영상 검색 (`browser_youtube_search`)
+
+`youtube.com/results`는 robots `User-agent: *` 금지라 부르는 에이전트가 열지 않습니다. 영상 정보는 영상 페이지를 열면 되고
+자막은 이 도구의 **범위 밖**(부르는 에이전트의 별도 스킬)입니다. 비어 있던 **검색**만 공식 YouTube Data API v3로 채웁니다.
+
+- 입력: `query`(필수, 200자 이하), `max_results`(1~25, 기본 10), 선택 `order`(`relevance`|`date`|`viewCount`),
+  `published_after`(`YYYY-MM-DD` 또는 ISO 시각), `region_code`(`KR`), `relevance_language`(`ko`).
+- 동작: `search.list`(part=snippet, type=video) 1회 → `videos.list`(part=contentDetails,statistics, id 묶음) 1회로 길이·조회수 보강.
+  응답이 요청보다 많은 항목을 돌려줘도 `max_results`개까지만 씁니다. 보강이 실패해도(보강 단계의 할당량 초과·5xx·해석 불가,
+  거대하거나 ASCII가 아닌 숫자 값 포함) 검색 결과는 `success=true`로 돌려주고 해당 필드만 `null` + `data.youtube.enrichment.reason`을 붙입니다.
+- 결과: `data.videos[] = {video_id, url, title, channel_title, channel_id, published_at, duration_s, view_count, description}`
+  (`description`은 300자까지). 제목·설명·채널 이름은 업로더가 쓴 글이라 페이지 텍스트와 같게 다룹니다 — 제어·bidi 문자를
+  보이는 표기로 바꾸고, 지시처럼 보이는 문구에는 `data.injection_suspected` 신호를 붙입니다(차단하지 않음).
+  `data.youtube = {source: "youtube_data_api_v3", returned, total_results_estimate, quota, note}` — API라 robots 신호는 없습니다.
+  표시 값은 한 방향으로 만듭니다: 표시 정규화 → 키 가림(길이가 늘지 않음: `key=x`→`key=*`, 키→`***`) → 필드 상한 절단 1회
+  (넘치면 `…`; 결합 문자·변이 선택자·피부색·ZWJ·국기 쌍은 쪼개지 않는 **근사 규칙**(stdlib `unicodedata`), 가림 표식은 통째로 뺌)
+  → 전체 크기 상한은 뒤 영상부터 영상 단위로 빼고 `returned`·`truncated`를 맞춥니다(한 영상의 필드 때문에 다른 영상이 사라지지 않음).
+- 네트워크: 다른 서버 요청과 같은 Egress 가드·검증 프록시를 지납니다(브라우저를 띄우지 않은 서버는 같은 운영자 정책으로
+  이 호출만의 프록시를 씀, `--allow-domain`을 쓰면 `www.googleapis.com`도 허용해야 함). 대상 호스트는 `www.googleapis.com`
+  고정, 리다이렉트 따르지 않음, 응답 1MB·요청 10초 상한, **재시도하지 않음**(429·5xx는 `data.youtube.reason` 신호만).
+  압축은 요청하지 않고(`Accept-Encoding: identity`) 압축 해제도 하지 않습니다 — 압축된 응답은 `invalid_response`입니다.
+  깊게 중첩된 JSON·형식이 다른 `items`도 `invalid_response`, 범위 밖 날짜·보낼 수 없는 문자(단독 surrogate)는
+  `invalid_arguments`, 그 밖의 예상하지 못한 오류는 원문 없이 `reason: "internal_error"`입니다.
+  승인·레시피 대상이 아닌 읽기 전용 조회입니다.
+- 할당량: 무료 10,000단위/일(search.list 100, videos.list 1 → 검색 약 99회/일). 서버 프로세스 단위(`--profile`이면
+  프로필 폴더 `youtube_quota.json`, 0600)로 오늘(태평양 시간 자정 리셋) 쓴 추정치를
+  `data.youtube.quota = {used_estimate, limit, remaining_estimate, reset_at}`로 알립니다. 같은 키를 다른 곳에서도 쓰면
+  실제보다 적게 잡힙니다. 장부 파일은 링크를 따르지 않고 무작위 임시 파일로 바꿔 쓰며, 읽을 수 없으면(손상·링크·거대)
+  0부터 다시 세고 `quota.file_unreadable=true`를 붙입니다. 차감은 보수적입니다 — 요청이 API에 닿았을 수 있으면(시간 초과·
+  상류 응답 형식 불량 포함) 차감하고, Egress 차단과 검증 프록시의 업스트림 **접속** 실패(HTTP 경로)만 0입니다
+  (HTTPS에서 프록시가 접속을 거부하면 차단과 구별할 수 없어 `egress_blocked`·0으로 셉니다).
+  API가 `quotaExceeded`/`dailyLimitExceeded`를 주면 남은 추정치를 0으로 두고 `data.youtube.quota_exceeded=true`를 붙입니다 —
+  **검색 단계**에서면 `success=false`(`reason: "quota_exceeded"`), **보강 단계**에서면 검색 결과를 유지한 `success=true` +
+  `data.youtube.enrichment.reason: "quota_exceeded"`입니다.
+  키 문제(`keyInvalid` 등)는 `reason: "key_invalid"` + `api_reason`(값 없음)입니다.
+- **키가 없으면** 도구는 목록에 보이고, 호출하면 `success=false` + `data.youtube.disabled=true` + 등록 방법 한 줄(`data.youtube.hint`)을 돌려줍니다.
+
+키 발급(무료, 약 5분):
+
+1. [Google Cloud 콘솔](https://console.cloud.google.com/)에서 프로젝트를 만들거나 고릅니다.
+2. "API 및 서비스 → 라이브러리"에서 **YouTube Data API v3**를 사용 설정합니다.
+3. "사용자 인증 정보 → 사용자 인증 정보 만들기 → API 키"로 키를 만듭니다.
+4. 키 제한: "API 제한사항 → 키 제한 → YouTube Data API v3"만 고릅니다.
+5. serve 를 띄우는 환경에 등록합니다 — 환경변수 `AGENT_BROWSER_YOUTUBE_API_KEY`(우선) 또는 OS 키체인
+   `uv run keyring set agent-browser-youtube api_key`(service=`agent-browser-youtube`, account=`api_key`).
+
+키는 요청 헤더(`X-goog-api-key`)로만 보내고 URL에 싣지 않으며, 응답·오류 문구·로그에서 가립니다. 대화나 설정 파일에 키를 붙여 넣지 마십시오.
+등록된 값의 앞뒤 공백·탭은 지우지만 개행·CR이 들어 있으면(끝이라도) 지우지 않고 `reason: "key_malformed"`로 거부합니다(요청 0회).
+
 ### 동작 캐시 — 레시피 (`browser_recipe`)
 
 같은 사이트에서 같은 일을 다시 할 때, 부르는 에이전트가 단계마다 관찰→판단(LLM 약 4.5초/단계)을 하지 않고 **검증된 동작 묶음을 도구 호출 한 번으로 재생**합니다. 페이지 구조가 바뀔 수 있다는 전제로, 어긋나면 **누르지 않고 멈춥니다**. 기본으로 켜져 있고 `serve --no-recipes`로 끕니다(끄면 기록·도구·관찰 후보·안내가 모두 없음).
@@ -568,7 +617,7 @@ headless 전용 서버나 화면 없는 환경에서는 실패합니다. 맥 앞
 
 ### 사람 인계 — 조작권과 승인 (MCP)
 
-액션 툴 19종 외에 계약 밖 **사람 인계 서버 도구 4개**(`browser_control_request`·`browser_control_status`·`browser_control_wait`·`browser_approval_wait`)가 tools/list 에 함께 실립니다(레시피 도구 `browser_recipe` 는 [동작 캐시](#동작-캐시--레시피-browser_recipe) 참조). 사람은 같은 컴퓨터의 터미널에서 `agent-browser control …`·`agent-browser approve …`로 답합니다. `serve`는 시작할 때 stderr 에 `server_id=<id>`를 한 줄 씁니다. 서버별 상태는 `~/.agent-browser/servers/<server_id>/`(0700, 파일 0600)에 있고 서버가 끝나면 지웁니다(프로세스가 없는 옛 디렉터리는 다음 서버가 시작할 때 청소). 서버가 하나만 떠 있으면 `--server`를 생략할 수 있고, 둘 이상이면 목록을 보여 주고 거부합니다.
+액션 툴 19종 외에 계약 밖 **사람 인계 서버 도구 4개**(`browser_control_request`·`browser_control_status`·`browser_control_wait`·`browser_approval_wait`)가 tools/list 에 함께 실립니다(레시피 도구 `browser_recipe` 는 [동작 캐시](#동작-캐시--레시피-browser_recipe), 영상 검색 도구 `browser_youtube_search` 는 [YouTube 영상 검색](#youtube-영상-검색-browser_youtube_search) 참조). 사람은 같은 컴퓨터의 터미널에서 `agent-browser control …`·`agent-browser approve …`로 답합니다. `serve`는 시작할 때 stderr 에 `server_id=<id>`를 한 줄 씁니다. 서버별 상태는 `~/.agent-browser/servers/<server_id>/`(0700, 파일 0600)에 있고 서버가 끝나면 지웁니다(프로세스가 없는 옛 디렉터리는 다음 서버가 시작할 때 청소). 서버가 하나만 떠 있으면 `--server`를 생략할 수 있고, 둘 이상이면 목록을 보여 주고 거부합니다.
 
 **캡차 예시(조작권).** 창이 보이는 서버(`serve --browser human` 또는 `--browser user-chrome`)와 필요할 때 창을 여는 `--browser on-demand` 서버에서 됩니다 — headless 서버의 `browser_control_request`는 사람이 볼 창이 없어 거부하고 이 옵션들을 안내합니다.
 

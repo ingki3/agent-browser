@@ -159,11 +159,38 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
             "required": ["op"],
         },
     },
+    # WS-49 YouTube 영상 검색(공식 Data API v3, 읽기 전용 — 승인·레시피 대상 아님). 키가 없어도 목록에 보이고
+    # 호출하면 data.youtube.disabled 로 알린다(interface.youtube_search). 상한은 그 모듈 상수와 같다(테스트로 고정).
+    f"{TOOL_PREFIX}youtube_search": {
+        "description": (
+            "YouTube 영상 검색(Data API, 키 없으면 data.youtube.disabled). data.videos·data.youtube.quota. 자막은 범위 밖"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "maxLength": 200},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                "order": {"enum": ["relevance", "date", "viewCount"]},
+                "published_after": {"type": "string", "description": "YYYY-MM-DD"},
+                "region_code": {"type": "string"},
+                "relevance_language": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
 }
 
 
 #: 레시피 서버 도구 이름(WS-38).
 RECIPE_TOOL = f"{TOOL_PREFIX}recipe"
+
+#: YouTube 영상 검색 서버 도구 이름(WS-49).
+YOUTUBE_TOOL = f"{TOOL_PREFIX}youtube_search"
+
+#: MCP initialize 의 서버 instructions 한 줄(WS-49) — 레시피 여부와 무관하게 보낸다.
+YOUTUBE_INSTRUCTIONS = (
+    f"영상 찾기는 {YOUTUBE_TOOL}(YouTube Data API — youtube.com/results 를 열지 않음). 자막은 이 도구 범위 밖입니다."
+)
 
 
 OBSERVE_INSTRUCTIONS = (

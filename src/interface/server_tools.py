@@ -6,17 +6,26 @@ WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름�
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from typing import Any, Dict, Optional
 
 from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
 from interface.server_common import _wait_timeout
-from interface.server_schema import CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, action_from_tool
+from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
+                                      action_from_tool)
 from interface.server_envelope import cap_result_size
+
+logger = logging.getLogger("interface.mcp_server")
 
 
 class ToolsMixin:
     """BrowserMCPServer 의 도구 라우팅: call_tool·_call_tool·서버 도구·레시피 도구·오류 결과 (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
+
+    #: WS-49 YouTube 검색 — 할당량 추정 장부(첫 호출 때 만듦)와 **테스트 전용** API 주소(루프백 Mock).
+    #: 운영에서는 None → interface.youtube_search.API_BASE(www.googleapis.com 고정). 환경변수·CLI 로 바꾸는 길은 없다.
+    _youtube_ledger: Any = None
+    _youtube_api_base: Optional[str] = None
 
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
@@ -26,6 +35,8 @@ class ToolsMixin:
                     "error_message": f"알 수 없는 툴: {name}"}
         if name == RECIPE_TOOL:
             return await self._recipe_tool(args)
+        if name == YOUTUBE_TOOL:
+            return await self._youtube_tool(args)
         if not self.hub.opened:
             self.open_handoff()
         if not self.hub.opened:
@@ -66,6 +77,51 @@ class ToolsMixin:
             if signal is not None:
                 data["injection_suspected"] = signal
         return payload
+
+    async def _youtube_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """browser_youtube_search(WS-49). 브라우저·사람 인계 통로 없이 동작한다.
+
+        Egress: 서버가 이미 시작했으면 그 가드·검증 프록시를, 아니면 같은 운영자 정책(allowlist·사설망·루프백)
+        으로 이 호출만의 프록시를 띄워 지난다(robots 조회와 같은 방식). 할당량 장부는 서버 프로세스 단위이고
+        `--profile` 로 프로필을 잡은 뒤에는 그 폴더 파일(0600)에도 남는다.
+        """
+        from interface import youtube_search as yt
+
+        try:
+            return await self._youtube_call(args, yt)
+        except Exception as exc:  # noqa: BLE001 - 서버 도구 경계의 마지막 안전망(예외 문구는 키·외부 원문을 담을 수 있다)
+            logger.warning("browser_youtube_search 처리 중 예상하지 못한 오류 (%s)", type(exc).__name__)
+            return yt.internal_error_result(self._youtube_ledger)
+
+    async def _youtube_call(self, args: Dict[str, Any], yt: Any) -> Dict[str, Any]:
+        from pathlib import Path
+
+        QuotaLedger, youtube_search, API_BASE = yt.QuotaLedger, yt.youtube_search, yt.API_BASE
+        lock = getattr(self, "_profile_lock", None)
+        path = (Path(lock.path) / "youtube_quota.json"
+                if self.profile is not None and lock is not None and getattr(lock, "held", False) else None)
+        if self._youtube_ledger is None:
+            self._youtube_ledger = QuotaLedger(path=path)
+        elif path is not None and self._youtube_ledger.path != path:
+            self._youtube_ledger.path = path  # 메모리 추정치와 파일 기록 중 큰 쪽을 이어 간다
+        runtime = None
+        guard, proxy = self._egress, self._egress_proxy
+        if guard is None or proxy is None or not getattr(proxy, "running", False):
+            from security.egress_runtime import EgressRuntime
+
+            runtime = await EgressRuntime(
+                allowed_domains=self.allowed_domains,
+                allow_private_network=self.allow_private_network,
+                block_loopback=self.block_loopback,
+            ).start()
+            guard, proxy = runtime.guard, runtime.proxy
+        try:
+            return await youtube_search(args, guard=guard, proxy=proxy, ledger=self._youtube_ledger,
+                                        api_base=self._youtube_api_base or API_BASE,
+                                        max_result_chars=self.max_result_chars)
+        finally:
+            if runtime is not None:
+                await runtime.close()
 
     def _recipe_page(self) -> Any:
         """레시피 기록·재생 대상 페이지. 프레임 안이면 None(지원하지 않음)."""
