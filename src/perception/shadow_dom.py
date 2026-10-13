@@ -233,6 +233,7 @@ async def _extract_properties(cdp: Any, backend_node_id: int) -> Optional[Dict[s
         try:
             await cdp.send("Runtime.releaseObject", {"objectId": object_id})
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): CDP 객체 해제 실패는 무해하다(세션·문서가 이미 바뀜).
             pass
 
     return (response.get("result") or {}).get("value")

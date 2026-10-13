@@ -88,6 +88,7 @@ class ApprovalCodeWindow:
         try:
             return bool(self._browser.is_connected()) and not self.page.is_closed()
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 연결·탭 상태를 못 읽으면 닫힌 것으로 본다.
             return False
 
     @property
@@ -126,6 +127,7 @@ class ApprovalCodeWindow:
             try:
                 await self.page.bring_to_front()
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 창을 앞으로 가져오기는 편의 기능 — 실패해도 코드 표시는 유지된다.
                 pass
             self._shown = True
             return True

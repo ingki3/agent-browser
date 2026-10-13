@@ -7,7 +7,10 @@ run(`interface/run_cli.py`)과 MCP 서버(`interface/mcp_server.py`)가 같은 �
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def track_main_document_status(target: Any, record: Dict[str, Any]) -> Any:
@@ -28,6 +31,7 @@ def track_main_document_status(target: Any, record: Dict[str, Any]) -> Any:
             if is_main_document_response(response):
                 record["last_http_status"] = response.status
         except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
+            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             pass
 
     on("response", _on_response)
@@ -75,6 +79,7 @@ class PageDocumentStatus:
             try:
                 page.on("close", self.forget)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): close 리스너를 못 달면(가짜 페이지 등) 기록 정리가 늦을 뿐이다.
                 pass
 
         on("page", _on_page)
@@ -93,6 +98,7 @@ class PageDocumentStatus:
             self._store(page, self._seq, response.url, response.status,
                         getattr(response, "headers", {}))
         except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
+            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             pass
 
     def record(self, page: Any, url: str, status: int) -> None:
@@ -129,6 +135,7 @@ class PageDocumentStatus:
                 self._store(page, seq, response.url, response.status,
                             getattr(response, "headers", {}))
             except Exception:  # noqa: BLE001
+                logger.debug("보류 응답 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
                 pass
         self._pending = still
 
@@ -163,6 +170,7 @@ class PageDocumentStatus:
         try:
             current = page.url
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): URL 을 못 읽으면 판정용 상태 없음(None).
             return None
         if _strip_fragment(current) != _strip_fragment(entry[1]):
             return None

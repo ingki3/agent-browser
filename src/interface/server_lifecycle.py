@@ -159,6 +159,7 @@ class LifecycleMixin:
         try:
             alive = alive and not page.is_closed()
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 닫힘 여부를 못 읽으면 코어의 탭 기록만 믿는다.
             pass
         if alive:
             return

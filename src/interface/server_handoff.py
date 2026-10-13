@@ -259,6 +259,7 @@ class HandoffMixin:
         try:
             await page.bring_to_front()
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 창을 앞으로 가져오기는 편의 기능 — 실패해도 조작권 요청은 유지된다.
             pass
         from interface.handoff import display_safe
 

@@ -183,6 +183,7 @@ class _NavWatch:
             status = response.status
             disposition = (response.headers or {}).get("content-disposition", "")
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 응답 객체를 읽지 못하면(닫힌 요청 등) 이 응답은 무시한다 — 이동 감시는 다른 신호·상한으로 끝난다.
             return
         if status in _NO_DOCUMENT_STATUS:
             self.aborted = f"status_{status}"
@@ -273,6 +274,7 @@ class _NavWatch:
             try:
                 self.page.remove_listener(name, fn)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 이미 닫힌 페이지에서 리스너 떼기 실패는 무해하다.
                 pass
         self._handlers = []
         self.active = False
@@ -977,6 +979,7 @@ class ActionDispatcher:
                 path.append(cur.url)
                 cur = cur.parent_frame
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 분리된 프레임이면 지금까지 모은 경로만 보고한다(진단 정보).
             pass
         path.reverse()
         return len(path), path
@@ -995,6 +998,7 @@ class ActionDispatcher:
                 element = await child.frame_element()
                 hint = await element.evaluate(_FRAME_HINT_JS)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 선택자 힌트는 보조 정보 — 못 읽으면 빈 힌트로 둔다.
                 pass
             out.append({"selector_hint": hint, "url": child.url})
         return out
@@ -1050,6 +1054,7 @@ class ActionDispatcher:
         try:
             return await self._locator_for(handle).evaluate(_TARGET_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 읽기 실패 = 대상 판정 불가(None) — 게이트가 판정 불가로 막는다(fail-closed).
             return None
 
     async def approval_target_check(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1158,6 +1163,7 @@ class ActionDispatcher:
                 try:
                     await cdp.send("Runtime.releaseObject", {"objectId": object_id})
                 except Exception:  # noqa: BLE001
+                    # 의도된 fail-safe(WS-48 점검): CDP 객체 해제 실패는 무해하다(세션·문서가 이미 바뀜).
                     pass
             if called.get("exceptionDetails"):
                 return {"unresolved": "좌표 대상 읽기 예외"}
@@ -1184,6 +1190,7 @@ class ActionDispatcher:
         try:
             info = await top.evaluate(_FOCUS_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
         if isinstance(info, dict) and info.get("opaque"):
             deeper = await self._focus_in_focused_frame(top)
@@ -1219,6 +1226,7 @@ class ActionDispatcher:
         try:
             info = await deepest.evaluate(_FOCUS_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
         if not isinstance(info, dict) or info.get("opaque"):
             return None
@@ -1252,6 +1260,7 @@ class ActionDispatcher:
         try:
             return self.ctx.page.url or ""
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 닫힌·가짜 페이지는 빈 URL 로 본다.
             return ""
 
     def _result(
@@ -1367,6 +1376,7 @@ class ActionDispatcher:
         try:
             url = self.ctx.page.url
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): URL 을 못 읽으면 비밀 치환을 허용하지 않는다(fail-closed).
             return False
         return bool(check(url))
 
@@ -1663,6 +1673,7 @@ class ActionDispatcher:
         try:
             state = await capture_state(root)
         except Exception:  # noqa: BLE001 — 문서 교체 중 등
+            logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             return None
         if mark_start:
             self._top_start = None
@@ -1674,6 +1685,7 @@ class ActionDispatcher:
                     await root.evaluate(_TOP_RECORDER_ARM_JS)
                 self._top_start = started
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 기록기 장착 실패 = 기준선 없이 사후 창만으로 판정한다(위 주석과 같은 경로).
                 pass
         return state
 
@@ -1742,6 +1754,7 @@ class ActionDispatcher:
                 await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
                 read = await root.evaluate(_TOP_RECORDER_READ_JS, args)
         except Exception:  # noqa: BLE001
+            logger.debug("최상위 변화 귀속 판정 실패 — 귀속 안 됨(False)으로 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             return False
         self._top_attribution = read if isinstance(read, dict) else None
         if not isinstance(read, dict) or read.get("overflow"):
@@ -2169,6 +2182,7 @@ class ActionDispatcher:
                     loc = page.get_by_text(handle.name, exact=True)
                 return loc.first
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): role/text 로케이터를 못 만들면 아래 CSS 경로로 내려간다.
                 pass
 
         return page.locator(selector).first

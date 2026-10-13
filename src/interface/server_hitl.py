@@ -447,4 +447,5 @@ class HitlMixin:
 
             return urlparse(self._page.url).hostname or ""
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): URL 을 못 읽으면 빈 도메인으로 본다.
             return ""

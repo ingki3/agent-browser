@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import time
@@ -39,6 +40,8 @@ from browser.login_flow import (
     read_login_state,
 )
 from security.credentials import Credential, _host, _matches
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PROFILE_ROOT = Path.home() / ".agent-browser" / "profiles"
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -107,6 +110,7 @@ async def install_navigation_guard(context: Any, allowed_domains: Sequence[str])
                                 await page.goto(back, wait_until="domcontentloaded")
                                 return
                         except Exception:  # noqa: BLE001
+                            # 의도된 fail-safe(WS-48 점검): 복구는 최선 노력 — 탭이 닫혔거나 이동 중이면 그만둔다.
                             return
                 asyncio.get_running_loop().create_task(restore())
             return
@@ -181,6 +185,7 @@ class LoginTracer:
         try:
             self.sink(ev)
         except Exception:  # noqa: BLE001 - 기록 실패가 로그인을 막으면 안 된다
+            logger.debug("로그인 감시 이벤트 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             pass
 
     def _tab(self, page: Any) -> int:
@@ -215,6 +220,7 @@ class LoginTracer:
             try:
                 self.context.remove_listener("page", h)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 이미 닫힌 컨텍스트에서 리스너 떼기 실패는 무해하다.
                 pass
         self._handlers.clear()
 
@@ -231,6 +237,7 @@ class LoginTracer:
         try:
             rep = await auth_cookie_report(self.context, self.domain, self.cookie_names)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 쿠키 조회 실패는 이번 폴링만 건너뛴다(다음 폴링에서 다시 본다).
             return
         for name, r in rep.items():
             cur = None if r is None else (r["persistent"], None if r["days_left"] is None
@@ -440,6 +447,7 @@ async def ensure_logged_in(
                 try:
                     await page.goto(check_url, wait_until="domcontentloaded")
                 except Exception:  # noqa: BLE001
+                    # 의도된 fail-safe(WS-48 점검): 이동 실패는 아래 wait_settled·로그인 판정이 그대로 가린다.
                     pass
             st = await wait_settled(page, stable_ms=min(stable_ms, 1500))
             if tracer is not None:

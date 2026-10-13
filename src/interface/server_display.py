@@ -147,6 +147,7 @@ class DisplayMixin:
         try:
             return bool(page.is_closed())
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 확인 불가 = 오버레이가 남았다고 본다(docstring 의 fail-closed).
             return False
 
     async def _set_banner(self, text: Optional[str]) -> bool:

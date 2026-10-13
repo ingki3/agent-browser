@@ -269,6 +269,7 @@ class RecipeService:
         try:
             skel = (await keys.snapshot(page, None))["skel"]
         except Exception:  # noqa: BLE001
+            logger.debug("레시피 후보 골격 계산 실패 — 후보 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
             return
         out: List[Dict[str, Any]] = []
         for rec in cands:
