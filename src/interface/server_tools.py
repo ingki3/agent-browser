@@ -6,6 +6,7 @@ WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름�
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,8 @@ from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
 from interface.server_envelope import cap_result_size
+
+logger = logging.getLogger("interface.mcp_server")
 
 
 class ToolsMixin:
@@ -82,10 +85,18 @@ class ToolsMixin:
         으로 이 호출만의 프록시를 띄워 지난다(robots 조회와 같은 방식). 할당량 장부는 서버 프로세스 단위이고
         `--profile` 로 프로필을 잡은 뒤에는 그 폴더 파일(0600)에도 남는다.
         """
+        from interface import youtube_search as yt
+
+        try:
+            return await self._youtube_call(args, yt)
+        except Exception as exc:  # noqa: BLE001 - 서버 도구 경계의 마지막 안전망(예외 문구는 키·외부 원문을 담을 수 있다)
+            logger.warning("browser_youtube_search 처리 중 예상하지 못한 오류 (%s)", type(exc).__name__)
+            return yt.internal_error_result(self._youtube_ledger)
+
+    async def _youtube_call(self, args: Dict[str, Any], yt: Any) -> Dict[str, Any]:
         from pathlib import Path
 
-        from interface.youtube_search import API_BASE, QuotaLedger, youtube_search
-
+        QuotaLedger, youtube_search, API_BASE = yt.QuotaLedger, yt.youtube_search, yt.API_BASE
         lock = getattr(self, "_profile_lock", None)
         path = (Path(lock.path) / "youtube_quota.json"
                 if self.profile is not None and lock is not None and getattr(lock, "held", False) else None)

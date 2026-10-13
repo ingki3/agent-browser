@@ -93,6 +93,7 @@ _REASONS: Dict[str, Tuple[str, str]] = {
     "egress_blocked": ("E_DOWNLOAD_FAILED", "Egress 정책이 YouTube API 호스트를 막았습니다."),
     "egress_unavailable": ("E_DOWNLOAD_FAILED", "Egress 검증 프록시가 없어 요청하지 않았습니다."),
     "request_failed": ("E_DOWNLOAD_FAILED", "YouTube API 요청이 실패했습니다."),
+    "internal_error": ("E_DOWNLOAD_FAILED", "YouTube 검색 처리 중 예상하지 못한 오류가 났습니다(원문은 표시하지 않음)."),
 }
 
 _QUOTA_API_REASONS = frozenset({"quotaExceeded", "dailyLimitExceeded"})
@@ -106,9 +107,14 @@ _VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}\Z")
 _CHANNEL_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _REGION_RE = re.compile(r"[A-Za-z]{2}\Z")
 _LANG_RE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?\Z")
-_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+#: 숫자는 ASCII 0-9 만, 자릿수 상한 — `\d` 는 유니코드 숫자(아랍·윗첨자 등)도 받고 int() 자릿수 제한(4300)에
+#: 걸리는 거대 숫자는 예외가 된다. 전역 int 자릿수 제한은 건드리지 않는다.
 _DURATION_RE = re.compile(
-    r"P(?:(?P<w>\d+)W)?(?:(?P<d>\d+)D)?(?:T(?:(?P<h>\d+)H)?(?:(?P<m>\d+)M)?(?:(?P<s>\d+)S)?)?\Z")
+    r"P(?:(?P<w>[0-9]{1,6})W)?(?:(?P<d>[0-9]{1,7})D)?"
+    r"(?:T(?:(?P<h>[0-9]{1,9})H)?(?:(?P<m>[0-9]{1,10})M)?(?:(?P<s>[0-9]{1,12})S)?)?\Z")
+_UINT_RE = re.compile(r"[0-9]{1,18}\Z")
+MAX_UINT = 10 ** 18
 _KEY_PARAM_RE = re.compile(r"(?i)(?<![a-z0-9_])(key=)[^&\s\"']+")
 _REDACTED = "***"
 
@@ -289,17 +295,32 @@ def parse_duration(value: Any) -> Optional[int]:
 
 
 def _as_int(value: Any) -> Optional[int]:
+    """음이 아닌 정수(또는 ASCII 숫자 문자열, 18자리 이하) → int. 그 밖은 None — 예외를 던지지 않는다."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and value.isdigit():
+        return value if 0 <= value <= MAX_UINT else None
+    if isinstance(value, str) and _UINT_RE.match(value):
         return int(value)
     return None
 
 
+def _encodable(value: Any) -> bool:
+    """UTF-8 로 보낼 수 있는 문자열인가(단독 surrogate 는 URL 인코딩에서 예외가 된다)."""
+    if not isinstance(value, str):
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def validate_args(args: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], str]:
     """도구 인자 → search.list 매개변수. 실패면 (None, 이유)."""
+    for name, value in args.items():
+        if not _encodable(value):
+            return None, f"{name if _encodable(name) else '인자'} 에 보낼 수 없는 문자(단독 surrogate)가 있습니다."
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return None, "query 는 비어 있지 않은 문자열이어야 합니다."
@@ -342,11 +363,12 @@ def _rfc3339(value: Any) -> Optional[str]:
             day = date.fromisoformat(value)
             return f"{day.isoformat()}T00:00:00Z"
         stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        # 극단 날짜(0001-01-01T00:00+14:00 등)는 UTC 로 옮길 때 OverflowError — 입력 문제로 돌려준다.
+        return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError):
         return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _text(value: Any, limit: int) -> str:
@@ -443,8 +465,8 @@ class YouTubeClient:
             return ApiReply(reason="egress_blocked" if isinstance(exc, httpx.ProxyError) else "request_failed")
         try:
             body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            body = None
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            body = None  # 깊은 중첩(1MB 안에서도 RecursionError)·깨진 JSON → 해석 불가
         if 200 <= status < 300:
             if not isinstance(body, dict):
                 return ApiReply(status=status, reason="invalid_response")
@@ -512,6 +534,27 @@ def _video(item: Dict[str, Any], details: Dict[str, Dict[str, Any]]) -> Optional
     return out, {"title": raw["title"], "channel_title": raw["channelTitle"], "description": raw["description"]}
 
 
+def _invalid_enrichment(detail: Any, video: Dict[str, Any]) -> int:
+    """보강 응답에 값이 있었는데 해석하지 못한 필드 수."""
+    if not isinstance(detail, dict):
+        return 0
+    content = detail.get("contentDetails") if isinstance(detail.get("contentDetails"), dict) else {}
+    stats = detail.get("statistics") if isinstance(detail.get("statistics"), dict) else {}
+    return (int(content.get("duration") is not None and video["duration_s"] is None)
+            + int(stats.get("viewCount") is not None and video["view_count"] is None))
+
+
+def internal_error_result(ledger: Any = None) -> Dict[str, Any]:
+    """예상하지 못한 예외의 고정 응답 — 예외 문구(키·외부 원문이 섞일 수 있음)는 싣지 않는다."""
+    youtube: Dict[str, Any] = {"source": SOURCE}
+    if ledger is not None:
+        try:
+            youtube["quota"] = ledger.snapshot()
+        except Exception as exc:  # noqa: BLE001 - 장부도 실패하면 할당량 없이
+            logger.debug("YouTube 할당량 스냅샷 실패 (%s)", type(exc).__name__)
+    return _fail("internal_error", youtube)
+
+
 def _fail(reason: str, youtube: Dict[str, Any], detail: str = "") -> Dict[str, Any]:
     code, message = _REASONS[reason]
     youtube["reason"] = reason
@@ -547,9 +590,14 @@ async def youtube_search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger
                          key_resolver: Callable[[], Optional[str]] = resolve_api_key,
                          api_base: str = API_BASE, max_result_chars: int = 20_000) -> Dict[str, Any]:
     """`browser_youtube_search` 본체. 반환: 서버 도구 응답 dict(success·data·error_code·error_message)."""
-    key = key_resolver()
-    payload = await _search(args, guard=guard, proxy=proxy, ledger=ledger, key=key, api_base=api_base,
-                            max_result_chars=max_result_chars)
+    key = None
+    try:
+        key = key_resolver()
+        payload = await _search(args, guard=guard, proxy=proxy, ledger=ledger, key=key, api_base=api_base,
+                                max_result_chars=max_result_chars)
+    except Exception as exc:  # noqa: BLE001 - 마지막 안전망: 예외 문구·키·외부 원문을 내보내지 않는다
+        logger.warning("YouTube 검색 처리 중 예상하지 못한 오류 (%s)", type(exc).__name__)
+        payload = internal_error_result(ledger)
     # 최종 방어: 어떤 경로로든 키가 섞였으면 가린다(응답 전체).
     return scrub(payload, key)
 
@@ -577,7 +625,11 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
         logger.info("YouTube 검색 실패: %s (HTTP %s)", reply.reason, reply.status or "-")
         return _fail(reply.reason, youtube)
     body: Dict[str, Any] = reply.body or {}
-    items = body.get("items") if isinstance(body.get("items"), list) else []
+    items = body.get("items", [])
+    if not isinstance(items, list):
+        youtube["http_status"] = reply.status
+        youtube["quota"] = ledger.snapshot()
+        return _fail("invalid_response", youtube)
     ids: List[str] = []
     for item in items:
         ident = item.get("id") if isinstance(item, dict) else None
@@ -594,7 +646,11 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
             if more.reason == "quota_exceeded":
                 youtube["quota_exceeded"] = True
         else:
-            for d in (more.body or {}).get("items") or []:
+            found = (more.body or {}).get("items", [])
+            if not isinstance(found, list):
+                youtube["enrichment"] = {"reason": "invalid_response", "http_status": more.status}
+                found = []
+            for d in found:
                 if isinstance(d, dict) and isinstance(d.get("id"), str):
                     details[d["id"]] = d
     videos: List[Dict[str, Any]] = []
@@ -606,6 +662,10 @@ async def _search(args: Dict[str, Any], *, guard: Any, proxy: Any, ledger: Quota
         if made is not None and made[0]["video_id"] not in {v["video_id"] for v in videos}:
             videos.append(made[0])
             raws.append(made[1])
+    invalid = sum(_invalid_enrichment(details.get(v["video_id"]), v) for v in videos)
+    if invalid and "enrichment" not in youtube:
+        # 보강 값이 해석 불가(거대·비 ASCII 숫자 등) — 그 필드만 null, 검색 결과는 그대로.
+        youtube["enrichment"] = {"reason": "invalid_response", "invalid_values": invalid}
     page = body.get("pageInfo") if isinstance(body.get("pageInfo"), dict) else {}
     total = _as_int(page.get("totalResults"))
     if total is not None:
