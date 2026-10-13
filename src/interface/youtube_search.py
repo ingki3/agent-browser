@@ -408,8 +408,14 @@ def _shown(value: Any, limit: int, key: Optional[str]) -> str:
 
 @dataclass
 class ApiReply:
-    """API 응답의 중간 표현. 본문·API 문구는 키를 되돌려 줄 수 있어 repr 에서 뺀다(WS-49 R1 R5) —
-    api_message 는 받는 즉시 키를 가린 값만 담는다."""
+    """API 응답의 중간 표현. 외부(API)가 채우는 문자열 필드는 키를 되돌려 줄 수 있다(WS-49 R1 R5·R2 B3).
+
+    | 필드 | 출처 | 처리 |
+    | body | 응답 JSON 전체 | repr 제외(성공 본문 — 변환은 표시 단계에서 가림) |
+    | api_reason | error.errors[0].reason·details[].reason·status | 분류는 원래 값으로, 보관은 키를 가린 값 |
+    | api_message | error.message | 보관은 키를 가린 값 + repr 제외 |
+    status·reason·not_sent 는 이 모듈이 정한 값(외부 문자열 아님).
+    """
 
     status: int = 0
     body: Any = field(default=None, repr=False)
@@ -518,7 +524,8 @@ class YouTubeClient:
             reason = "upstream_error"
         else:
             reason = "http_error"
-        return ApiReply(status=status, reason=reason, api_reason=api_reason, api_message=redact(api_message, key))
+        return ApiReply(status=status, reason=reason, api_reason=redact(api_reason, key),
+                        api_message=redact(api_message, key))
 
 
 async def _read_capped(response: Any) -> Optional[bytes]:

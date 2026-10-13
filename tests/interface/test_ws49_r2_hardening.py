@@ -337,3 +337,37 @@ async def test_api_message_bounded_after_redaction(api, runtime):
     out = await call(api, runtime)
     message = out["data"]["youtube"]["api_message"]
     assert len(message) <= yt.API_MESSAGE_LIMIT and "key=x" not in message
+
+
+# --------------------------------------------------------------------------- B3 외부 문자열 필드 repr
+
+ECHO = "AIza" + "A" * 35  # 39자, _key_usable 통과·_API_REASON_RE 모양(영문자)
+
+
+@pytest.mark.parametrize("where", ["errors_reason", "details_reason", "status", "message", "success_body"])
+async def test_api_reply_external_fields_never_hold_key_in_repr(api, runtime, where):
+    assert yt._key_usable(ECHO)
+    bodies = {
+        "errors_reason": (400, {"error": {"message": "m", "errors": [{"reason": ECHO}]}}),
+        "details_reason": (400, {"error": {"message": "m", "details": [{"reason": ECHO}]}}),
+        "status": (400, {"error": {"message": "m", "status": ECHO}}),
+        "message": (403, {"error": {"message": f"bad {ECHO} key={ECHO}", "errors": [{"reason": "keyInvalid"}]}}),
+        "success_body": (200, search(1, description=ECHO)),
+    }
+    api.code, api.search = bodies[where]
+    reply = await yt.YouTubeClient(runtime.guard, runtime.proxy, api_base=api.base).get("search", {}, ECHO)
+    exc = RuntimeError(reply)
+    for text in (repr(reply), str(reply), repr(exc), str(exc), repr(exc.args)):
+        assert ECHO not in text, (where, text)
+    if where != "success_body":
+        assert ECHO not in reply.api_reason and ECHO not in reply.api_message
+
+
+async def test_api_reason_echo_classified_then_redacted_in_tool_output(api, runtime, monkeypatch):
+    monkeypatch.setenv(yt.ENV_KEY, ECHO)
+    api.code = 400
+    api.search = {"error": {"message": "m", "errors": [{"reason": ECHO}]}}
+    out = await call(api, runtime)
+    assert out["data"]["youtube"]["reason"] == "bad_request"
+    assert out["data"]["youtube"]["api_reason"] == "***"
+    assert ECHO not in json.dumps(out)
