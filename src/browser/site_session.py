@@ -184,8 +184,8 @@ class LoginTracer:
               "kind": kind, **kw}
         try:
             self.sink(ev)
-        except Exception:  # noqa: BLE001 - 기록 실패가 로그인을 막으면 안 된다
-            logger.debug("로그인 감시 이벤트 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+        except Exception as exc:  # noqa: BLE001 - 기록 실패가 로그인을 막으면 안 된다
+            logger.debug("로그인 감시 이벤트 기록 실패 — 기록 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             pass
 
     def _tab(self, page: Any) -> int:

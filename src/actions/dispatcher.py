@@ -1672,8 +1672,8 @@ class ActionDispatcher:
             return None
         try:
             state = await capture_state(root)
-        except Exception:  # noqa: BLE001 — 문서 교체 중 등
-            logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+        except Exception as exc:  # noqa: BLE001 — 문서 교체 중 등
+            logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return None
         if mark_start:
             self._top_start = None
@@ -1753,8 +1753,8 @@ class ActionDispatcher:
                 # 시간) 그 안에 한 번도 안 바뀐 노드는 주기 ≤ 창인 자발 변화가 아니다 — 대기 없음.
                 await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
                 read = await root.evaluate(_TOP_RECORDER_READ_JS, args)
-        except Exception:  # noqa: BLE001
-            logger.debug("최상위 변화 귀속 판정 실패 — 귀속 안 됨(False)으로 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("최상위 변화 귀속 판정 실패 — 귀속 안 됨(False)으로 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return False
         self._top_attribution = read if isinstance(read, dict) else None
         if not isinstance(read, dict) or read.get("overflow"):

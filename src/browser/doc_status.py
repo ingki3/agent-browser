@@ -30,8 +30,8 @@ def track_main_document_status(target: Any, record: Dict[str, Any]) -> Any:
         try:
             if is_main_document_response(response):
                 record["last_http_status"] = response.status
-        except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
-            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+        except Exception as exc:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
+            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             pass
 
     on("response", _on_response)
@@ -97,8 +97,8 @@ class PageDocumentStatus:
                 return
             self._store(page, self._seq, response.url, response.status,
                         getattr(response, "headers", {}))
-        except Exception:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
-            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+        except Exception as exc:  # noqa: BLE001 - 상태 기록 실패로 실행을 막지 않는다
+            logger.debug("메인 문서 상태 기록 실패 — 기록 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             pass
 
     def record(self, page: Any, url: str, status: int) -> None:
@@ -134,8 +134,8 @@ class PageDocumentStatus:
             try:
                 self._store(page, seq, response.url, response.status,
                             getattr(response, "headers", {}))
-            except Exception:  # noqa: BLE001
-                logger.debug("보류 응답 상태 기록 실패 — 기록 없이 진행", exc_info=True)  # WS-48: 흐름 불변, 진단용
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("보류 응답 상태 기록 실패 — 기록 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
                 pass
         self._pending = still
 
