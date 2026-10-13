@@ -25,7 +25,7 @@ import re
 import secrets
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -382,11 +382,14 @@ def _text(value: Any, limit: int) -> str:
 
 @dataclass
 class ApiReply:
+    """API 응답의 중간 표현. 본문·API 문구는 키를 되돌려 줄 수 있어 repr 에서 뺀다(WS-49 R1 R5) —
+    api_message 는 받는 즉시 키를 가린 값만 담는다."""
+
     status: int = 0
-    body: Any = None
+    body: Any = field(default=None, repr=False)
     reason: str = ""  # 비어 있으면 성공(2xx + JSON 객체)
     api_reason: str = ""
-    api_message: str = ""
+    api_message: str = field(default="", repr=False)
 
 
 def _check_base(api_base: str) -> str:
@@ -484,7 +487,7 @@ class YouTubeClient:
             reason = "upstream_error"
         else:
             reason = "http_error"
-        return ApiReply(status=status, reason=reason, api_reason=api_reason, api_message=api_message)
+        return ApiReply(status=status, reason=reason, api_reason=api_reason, api_message=redact(api_message, key))
 
 
 async def _read_capped(response: Any) -> Optional[bytes]:
@@ -745,9 +748,9 @@ def _injection_parts(videos: List[Dict[str, Any]], raws: List[Dict[str, str]],
     parts: List[Dict[str, Any]] = []
     for i, (video, raw) in enumerate(zip(videos, raws)):
         part: Dict[str, Any] = {"where": [], "patterns": [], "scanned": 0, "cut": False}
-        for field in _TEXT_FIELDS:
-            shown = video.get(field) or ""
-            original = raw.get(field) or ""
+        for fname in _TEXT_FIELDS:
+            shown = video.get(fname) or ""
+            original = raw.get(fname) or ""
             piece = original[:per_field]
             part["scanned"] += len(piece)
             part["cut"] = part["cut"] or len(original) > per_field
@@ -757,7 +760,7 @@ def _injection_parts(videos: List[Dict[str, Any]], raws: List[Dict[str, str]],
                     if name not in hits:
                         hits.append(name)
             if hits:
-                part["where"].append(f"videos[{i}].{field}")
+                part["where"].append(f"videos[{i}].{fname}")
                 part["patterns"].extend(h for h in hits if h not in part["patterns"])
         parts.append(part)
     return parts
