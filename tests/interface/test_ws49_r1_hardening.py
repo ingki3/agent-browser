@@ -234,6 +234,17 @@ def test_corrupt_deep_quota_file_is_ignored(tmp_path):
     assert snap["used_estimate"] == 0 and snap["file_unreadable"] is True
 
 
+async def test_corrupt_quota_signal_reaches_tool_response(api, runtime, tmp_path):
+    quota = tmp_path / "youtube_quota.json"
+    quota.write_text('{"used":' + "[" * 1200 + "0" + "]" * 1200 + "}")
+    ledger = yt.QuotaLedger(quota)
+    out = await call(api, runtime, ledger=ledger)
+    assert out["success"] is True
+    assert out["data"]["youtube"]["quota"]["file_unreadable"] is True
+    assert out["data"]["youtube"]["quota"]["used_estimate"] == 101
+    assert json.loads(quota.read_text())["used"] == 101  # 다음 기록이 손상 파일을 정상 장부로 바꾼다
+
+
 async def test_unexpected_exception_is_fixed_signal_without_key(api, runtime, monkeypatch, caplog):
     async def explode(*a, **k):
         raise RuntimeError(f"boom {KEY}")

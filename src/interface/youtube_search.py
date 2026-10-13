@@ -215,12 +215,17 @@ class QuotaLedger:
             if stored is not None and stored[0] == day:
                 self._day, self._used = day, max(self._used if self._day == day else 0, stored[1])
         if self._day != day:
+            if self._day:
+                self.file_unreadable = False  # 새 날 — 어제 장부 손상은 오늘 추정치와 무관
             self._day, self._used = day, 0
         return day
 
     def _read(self) -> Optional[Tuple[str, int]]:
-        """장부 파일을 읽는다 — 링크는 따르지 않고(O_NOFOLLOW) 일반 파일·크기 상한만. 손상이면 None(+신호)."""
-        self.file_unreadable = False
+        """장부 파일을 읽는다 — 링크는 따르지 않고(O_NOFOLLOW) 일반 파일·크기 상한만. 손상이면 None(+신호).
+
+        신호(`file_unreadable`)는 그날(태평양 시간) 동안 남는다 — 다음 기록이 파일을 고쳐도 오늘 추정치는 0부터
+        다시 센 값이라서다.
+        """
         try:
             fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))  # type: ignore[arg-type]
             try:
