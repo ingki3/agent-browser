@@ -9,6 +9,7 @@ sharing the Playwright command pipe or browser cookies/authentication.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import unicodedata
@@ -24,6 +25,8 @@ from playwright.async_api import BrowserContext, Page
 from contracts import ActionResult
 from security.egress import EgressGuard
 from security.egress_proxy import EgressProxy
+
+logger = logging.getLogger(__name__)
 
 MAX_ROBOTS_BYTES = 500 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024
@@ -319,7 +322,8 @@ class RobotsSignals:
         rules: Optional[RobotsRules] = None
         try:
             rules = await asyncio.wait_for(self._fetch(context, origin, guard, proxy), timeout=BACKGROUND_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 - diagnostic failures never change the action result
+        except Exception as exc:  # noqa: BLE001 - diagnostic failures never change the action result
+            logger.debug("robots.txt 백그라운드 조회 실패 — 판정 불가로 캐시 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             pass
         finally:
             self._pending.pop(origin, None)
@@ -450,5 +454,6 @@ async def attach_robots_signal(service: RobotsSignals, result: ActionResult,
         signal = await service.signal(page.context, page.url, guard, proxy)
         if signal is not None:
             result.data["robots"] = signal
-    except Exception:  # noqa: BLE001 - a diagnostic must not fail navigation/observation
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail navigation/observation
+        logger.debug("robots 신호 부착 실패 — 신호 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
         pass

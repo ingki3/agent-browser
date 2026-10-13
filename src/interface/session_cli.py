@@ -528,7 +528,8 @@ def _run_remove(profile: str, *, auth_dir: Optional[str], force: bool) -> int:
                 f"  참고: 키체인에 패스프레이즈가 남아 있습니다 "
                 f"(service={KEYRING_SERVICE}, account={profile})."
             )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("키체인 패스프레이즈 잔존 확인 실패 — 안내 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
         pass
     return 0
 
