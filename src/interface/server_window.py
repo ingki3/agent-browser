@@ -20,6 +20,20 @@ logger = logging.getLogger("interface.mcp_server")
 class WindowMixin:
     """BrowserMCPServer 의 필요할 때만 창(WS-34): 전환 관문·창 전환·on-demand 진입 (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
 
+    #: WS-50: 꺼진 브라우저 복구 알림 — reason 과 안내(클래스 속성: 믹스인 모듈에 새 모듈 수준 이름을 두지 않는다).
+    _BROWSER_RECOVERED = "browser_recovered"
+    _BROWSER_RECOVERED_HINT = ("브라우저가 꺼져 있어 headless 로 다시 열고 마지막 탭을 복원했습니다 — 다시 관찰하세요. "
+                               "이전 element_id·tab_id 는 무효.")
+
+    def _mark_browser_recovered(self, result: ActionResult) -> None:
+        """도구 결과에 꺼진 브라우저 복구 사실을 1회 싣는다(epoch 은 전환이 이미 올렸다 → 재관찰 요구)."""
+        window = result.data.get("window")
+        window = dict(window) if isinstance(window, dict) else {}
+        notice = {"reason": self._BROWSER_RECOVERED, "hint": self._BROWSER_RECOVERED_HINT}
+        window.update(recovered=True, notice=notice, hint=self._BROWSER_RECOVERED_HINT)
+        result.data["window"] = window
+        result.reobserve_required = True
+
     def _sync_window(self) -> None:
         """창 상태를 사람용 상태 파일(control.json — `agent-browser control status`)에도 싣는다."""
         if self._window is not None:
@@ -86,6 +100,22 @@ class WindowMixin:
             return
         self._window_tasks.add(task)
         task.add_done_callback(self._window_tasks.discard)
+
+    def _browser_dead(self) -> bool:
+        """WS-50: 영속 컨텍스트(브라우저)가 꺼졌거나 관리 탭이 0개인가 — 이대로는 어떤 도구도 실행되지 않는다."""
+        core = self._core
+        if core is None:
+            return False
+        if self._ctx_closed or getattr(core, "persistent_closed", False):
+            return True
+        return not core.tabs()
+
+    def _note_tabs(self) -> None:
+        """WS-50: 살아 있는 탭 URL·활성 탭을 기록한다(headless 에서도) — 브라우저가 꺼지면 이것으로 복원한다."""
+        w = self._window
+        if w is None or w.state not in ("headless", "headed") or self._browser_dead():
+            return
+        w.last_tabs = self._tab_snapshot()
 
     def _tab_snapshot(self) -> List[Dict[str, Any]]:
         core = self._core
@@ -204,6 +234,10 @@ class WindowMixin:
             # R1 NB-5: 이미 시작한 전환(태스크가 아직 첫 틱 전)이 있다 — 다시 판정·spawn 하지 않는다.
             return
         tabs = self._core.tabs()
+        if not tabs and getattr(self._core, "tabs_emptied_by_close_tab", False):
+            # WS-50: 에이전트가 tab_control close 로 마지막 탭을 닫았다(코어의 결정적 표시) — 사람이 창을 닫은
+            # 것이 아니다. 조작권·창 상태는 그대로 두고, 다음 도구 호출 입구(_on_demand_enter)가 복구한다.
+            return
         if tabs and not self._ctx_closed:
             active = self._core.active_tab_id
             w.last_tabs = [{"tab_id": t.tab_id, "url": str(getattr(t.page, "url", "") or ""),
@@ -261,4 +295,25 @@ class WindowMixin:
                     data={"window": w.info()},
                 )
             self._recovered_notice = True
+        elif self._started and w.state in ("headless", "headed") and self._browser_dead():
+            # WS-50: 브라우저가 꺼졌다(마지막 탭 닫힘·컨텍스트/프로세스 종료) — 같은 전환 경로로 headless 로
+            # 다시 열고 마지막 탭을 복원한 뒤 이 호출을 실행한다. 사람이 조작권을 가진 동안에는 창을 바꾸지
+            # 않는다(그 사이 호출은 기존 관문이 거부·실패시킨다). 실패하면 state=failed — 다음 호출이 기존
+            # failed 규칙대로 한 번 더 시도한다(호출당 1회, 루프 없음).
+            from interface.handoff import HOLDER_HUMAN
+
+            if self.hub.holder == HOLDER_HUMAN:
+                return None
+            _stderr_line("agent-browser serve: 브라우저가 꺼져 있음 — headless 로 다시 엽니다")
+            out = await self._switch_window(False, "browser_recovered", force=True)
+            if not out.get("ok"):
+                return self._error_result(
+                    action, ErrorCode.PAGE_CRASHED,
+                    "브라우저를 다시 열지 못했습니다(" + str(out.get("error") or "") + ") — "
+                    "운영자에게 serve 재시작을 요청하세요.",
+                    data={"window": w.info()},
+                )
+            self._recovered_notice = self._BROWSER_RECOVERED
+        else:
+            self._note_tabs()
         return None

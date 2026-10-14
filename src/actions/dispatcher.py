@@ -101,6 +101,17 @@ SCROLL_NO_EFFECT_HINT = (
     "스크롤 위치가 바뀌지 않았습니다(이미 끝이거나 이 페이지는 창 스크롤이 없음). "
     "새 항목이 필요하면 '더 보기' 버튼 등을 observe_page 로 찾으세요."
 )
+#: WS-50: 마지막 탭을 닫으면 브라우저가 꺼지므로 빈 탭으로 바꿔 둔다 — 그 사실을 알리는 한 줄.
+LAST_TAB_REPLACED_HINT = (
+    "마지막 탭이라 빈 탭(about:blank)을 먼저 열고 닫았습니다(브라우저 유지) — 다음은 navigate 로 이동하세요."
+)
+#: WS-50: Playwright 가 닫힌 페이지·컨텍스트·브라우저에 대해 내는 오류 문구(TargetClosedError).
+_TARGET_CLOSED = "has been closed"
+
+
+def _is_target_closed(exc: BaseException) -> bool:
+    """닫힌 페이지·컨텍스트·브라우저로 인한 실패인가(TargetClosedError 또는 같은 문구)."""
+    return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 #: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
 #: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
@@ -2322,6 +2333,8 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=True,
                 error_code=(ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
+                            # WS-50: 닫힌 페이지·컨텍스트·브라우저는 이동 시간 초과가 아니다.
+                            else ErrorCode.PAGE_CRASHED if _is_target_closed(exc)
                             else ErrorCode.NAVIGATE_TIMEOUT),
                 error_message=str(exc),
             )
@@ -2638,18 +2651,31 @@ class ActionDispatcher:
                         error_code=ErrorCode.TAB_NOT_FOUND,
                         error_message=f"탭을 찾을 수 없습니다: {tab_id}",
                     )
+                closing = core.get_tab(tab_id)
+                replaced = False
+                if len(core.tabs()) == 1:
+                    # WS-50: 마지막 탭을 닫으면 브라우저(영속 컨텍스트)가 함께 꺼진다 — 빈 탭을 먼저 만들어
+                    # 활성으로 두고 닫는다(거부하지 않음: 습관적으로 닫는 에이전트가 실패 루프에 빠지지 않게).
+                    blank = await core.new_tab(closing.profile_name)
+                    core.set_active_tab(blank.tab_id)
+                    self._set_active_page(blank.page, blank.tab_id)
+                    replaced = True
                 await core.close_tab(tab_id)
                 remaining = core.tabs()
                 if remaining:
                     core.set_active_tab(remaining[0].tab_id)
                     self._set_active_page(remaining[0].page, remaining[0].tab_id)
                 self.ctx.engine.bump_epoch("tab_close")
+                data: Dict[str, Any] = {"closed": tab_id, "remaining": len(remaining)}
+                if replaced:
+                    data["replaced_with_blank"] = True
+                    data["hint"] = LAST_TAB_REPLACED_HINT
                 return self._result(
                     success=True,
                     action=action,
                     retry_safe=False,
                     reobserve_required=True,
-                    data={"closed": tab_id, "remaining": len(remaining)},
+                    data=data,
                 )
         except Exception as exc:  # noqa: BLE001
             return self._result(

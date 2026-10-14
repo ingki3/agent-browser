@@ -182,6 +182,11 @@ class BrowserCore:
         self._adoptable_page: Any = None
         #: 영속 프로필 모드(WS-32): launch_persistent_context 가 돌려준 컨텍스트
         self._persistent: Any = None
+        #: WS-50: 열어 둔 영속 컨텍스트가 밖에서 닫혔다(브라우저 종료·마지막 탭 닫힘·프로세스 죽음).
+        self._persistent_closed = False
+        #: WS-50: 관리 탭이 0개가 된 마지막 원인이 close_tab(=부르는 쪽, 에이전트)이었다. 다른 경로로
+        #: 탭이 사라지거나(사람·사이트 JS) 새 탭이 등록되면 False — 시간 창이 아닌 결정적 표시.
+        self._emptied_by_close_tab = False
 
     @property
     def is_user_chrome(self) -> bool:
@@ -240,7 +245,7 @@ class BrowserCore:
         kw = self._launch_kwargs()
         kw.update(self._context_options())
         try:
-            self._persistent = await self._playwright.chromium.launch_persistent_context(
+            ctx = await self._playwright.chromium.launch_persistent_context(
                 str(self.persistent_profile), **kw
             )
         except Exception as exc:  # noqa: BLE001
@@ -252,7 +257,27 @@ class BrowserCore:
                 ErrorCode.PAGE_CRASHED,
                 f"영속 프로필 브라우저를 열지 못했습니다: {safe_reason(exc)}",
             ) from None
+        self._persistent = ctx
+        self._persistent_closed = False
+        self._emptied_by_close_tab = False
+        on = getattr(ctx, "on", None)
+        if callable(on):
+            def _closed(*_a: Any) -> None:
+                if self._persistent is ctx:
+                    self._persistent_closed = True
+
+            on("close", _closed)
         return self._persistent
+
+    @property
+    def persistent_closed(self) -> bool:
+        """WS-50: 열어 둔 영속 컨텍스트가 밖에서 닫혔는가(close_persistent 로 닫은 것은 아님)."""
+        return self._persistent is not None and self._persistent_closed
+
+    @property
+    def tabs_emptied_by_close_tab(self) -> bool:
+        """WS-50: 지금 관리 탭이 0개이고, 그렇게 만든 마지막 제거가 close_tab 이었는가."""
+        return self._emptied_by_close_tab and not self._tab_index
 
     async def close_persistent(self) -> None:
         """영속 컨텍스트(=브라우저)를 닫는다. 쿠키를 디스크에 남기려면 닫아야 한다.
@@ -260,6 +285,8 @@ class BrowserCore:
         탭·컨텍스트 기록을 비운다. playwright 는 그대로 둔다(open_persistent 로 다시 열 수 있게).
         """
         ctx, self._persistent = self._persistent, None
+        self._persistent_closed = False
+        self._emptied_by_close_tab = False
         self._contexts.clear()
         self._tab_index.clear()
         self._active_tab_id = None
@@ -541,6 +568,7 @@ class BrowserCore:
                 f"세션 탭 상한({self.max_tabs})을 초과했습니다.",
             )
 
+        self._emptied_by_close_tab = False
         self._tab_counter += 1
         tab_id = f"tab-{self._tab_counter}"
         tab = ManagedTab(tab_id=tab_id, page=page, profile_name=profile_name)
@@ -566,9 +594,17 @@ class BrowserCore:
 
     def _on_page_closed(self, tab_id: str) -> None:
         """페이지가 (사이트 JS·사용자·close_tab 등으로) 닫히면 탭 목록에서 뺀다."""
-        self._forget_tab(tab_id)
+        if self._forget_tab(tab_id) is not None:
+            # close_tab 이 아닌 경로(사람·사이트 JS)로 탭이 사라졌다 — 에이전트 닫기 표시를 지운다.
+            self._emptied_by_close_tab = False
 
     async def new_tab(self, profile_name: str, url: Optional[str] = None) -> ManagedTab:
+        if self.persistent_closed:
+            # WS-50: 죽은 영속 컨텍스트가 _contexts 에 남아 '컨텍스트를 1개만' 으로 오해되던 오류 대신.
+            raise BrowserCoreError(
+                ErrorCode.PAGE_CRASHED,
+                "브라우저(영속 컨텍스트)가 닫혔습니다 — 브라우저를 다시 열어야 합니다.",
+            )
         managed = self._contexts.get(profile_name)
         if managed is None:
             await self.new_context(profile_name)
@@ -613,6 +649,8 @@ class BrowserCore:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}"
             )
+        # WS-50: 부르는 쪽(에이전트)이 마지막 탭을 닫았다는 결정적 표시 — 창 감시가 사람의 창 닫기로 오판하지 않게.
+        self._emptied_by_close_tab = not self._tab_index
         await tab.page.close()
 
     def switch_tab(self, tab_id: str) -> None:
