@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-3930개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+3954개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -317,7 +317,7 @@ click         ->  element_id="@e3", epoch=0
 
 한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.
 
-탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다.
+탭: `tab_control`의 `command`는 `create`(새 탭을 열고 활성으로)·`switch`·`close`·`list`입니다. 링크(`target=_blank`)나 `window.open`으로 열린 새 창도 탭 목록에 올라가지만 활성 탭은 바뀌지 않습니다 — 그 창을 보려면 `switch`로 옮기십시오. 새 창을 연 `click` 결과의 `data.opened_tab_ids`에 새 탭 id가 실립니다. 탭 상한을 넘은 새 창은 목록에 올리지 않고, 닫힌 창은 목록에서 빠집니다. 마지막 남은 탭을 `close` 하면 브라우저가 꺼지지 않게 빈 탭(`about:blank`)을 먼저 열고 닫습니다(성공, `data.remaining=1`, `data.replaced_with_blank=true`, `data.hint`).
 
 agent-browser는 **캡차 자동 풀이·Cloudflare/Akamai 등의 확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
 
@@ -693,10 +693,11 @@ agent-browser serve --browser on-demand --profile work  # 이름 붙인 영속 �
 Chromium 은 같은 브라우저를 headless ↔ 창 있음으로 바꿀 수 없습니다. 그래서 **같은 프로필 폴더를 닫고 창 있음/없음으로 다시 엽니다**(`--profile`이 없으면 서버 전용 임시 프로필 `~/.agent-browser/profiles/ondemand-<server_id>/`, 0700, 서버 종료 때 삭제 — 비정상 종료로 남은 것은 다음 on-demand 서버가 시작할 때 잠금이 풀린 것만 지움, `profile list`에는 안 보임). 다시 연 브라우저에는 처음 시작과 **같은 경로**로 검증 프록시(실행 인자)·route 가드·문서 상태 추적·탭·CDP·디스패처를 다시 달고, 열려 있던 탭 URL 을 복원합니다(활성 탭 먼저, `about:blank`·`chrome://` 등 http(s) 가 아닌 탭은 건너뜀). 전환 동안 프로필 잠금은 그대로 쥡니다.
 
 1. **창 열기** — `browser_control_request` 가 오면(또는 사람이 요청 없이 `control take`) 진행 중인 도구 호출이 끝나길 기다렸다가 창을 엽니다. 전환 중 들어온 도구 호출은 끝날 때까지(최대 30초) 기다리고, 넘으면 `E_TIMEOUT` + `data.window`로 알립니다. 결과 `data.window = {mode: "on-demand", state: "headed", reopened: true, tabs: [{tab_id, was, url, active, restored, http_status?, error?}], skipped, switch_ms, snapshot_epoch, hint}`.
-2. **창 닫기** — 사람이 `control release` 하면 마지막으로 보던 탭 URL 로 headless 를 다시 열고 `browser_control_wait`(또는 그다음 도구 결과)의 `data.window = {state: "headless", reopened: true, …, hint: "… 다시 관찰하세요"}`로 알립니다. 사람이 take 하지 않은 채 요청이 10분 지나면 요청을 거두고 창도 닫습니다. 사람이 창을 직접 닫으면(X) 조작권을 에이전트에게 돌리고 headless 로 다시 열어 `data.window.notice = {reason: "window_closed"}`로 알립니다.
+2. **창 닫기** — 사람이 `control release` 하면 마지막으로 보던 탭 URL 로 headless 를 다시 열고 `browser_control_wait`(또는 그다음 도구 결과)의 `data.window = {state: "headless", reopened: true, …, hint: "… 다시 관찰하세요"}`로 알립니다. 사람이 take 하지 않은 채 요청이 10분 지나면 요청을 거두고 창도 닫습니다. 사람이 창을 직접 닫으면(X) 조작권을 에이전트에게 돌리고 headless 로 다시 열어 `data.window.notice = {reason: "window_closed"}`로 알립니다. 에이전트가 `tab_control close` 로 탭을 닫은 것은 사람의 창 닫기로 보지 않습니다.
 3. **sticky** — headless 로 돌아온 뒤, 창에서 해결했던 사이트(등록 가능 도메인 — `shop.example.com` 과 `www.example.com` 은 같은 사이트)에서 차단/캡차(`data.challenge`)가 다시 보이면 그 결과에 `data.window.sticky_pending = {domain, kind, detected_at}`와 "사람을 다시 부르라"는 안내가 붙습니다. 다음 `browser_control_request` 때 창을 열고 **그 서버 수명 동안 창을 유지**합니다(`window.sticky: true, sticky_reason`). 서버를 다시 시작하면 초기화됩니다. 사람은 `agent-browser control status`에서 `window=… sticky=…`로 봅니다.
 4. **승인 코드 창** — headless 상태에서 `agent-browser approve`로 코드가 필요하면, 페이지는 headless 그대로 두고 **별도의 작은 창**(별도 Chromium 프로세스 — 에이전트 탭 목록·영속 프로필에 없음, 스크립트 끔, 네트워크 전부 차단, 로컬 내용만)에 승인 내용(액션·대상·문서 출처·승인 만료)과 6자리 코드를 띄웁니다. 페이지를 다시 열지 않으므로 승인 뒤 같은 인자 + `approval_id` 재호출이 **문서 해시 일치로 그대로 실행**됩니다. 코드를 입력·거절·만료하면 창을 닫습니다. 창을 띄우지 못하면 코드를 무효로 하고 승인할 수 없다고 알립니다(fail-closed). 이미 창이 열린 상태(인계 중·sticky)면 기존처럼 그 창 오버레이에 띄웁니다. 코드가 떠 있는 동안 화면 캡처 거부는 그대로입니다(방어 겹침).
 5. **실패하면 닫는다** — 검증 프록시가 실행 중이 아니거나, 다시 열기·route 재설치가 실패하거나 전환 중 서버가 신호로 끝나면, 보호가 덜 걸렸을 수 있는 브라우저를 남기지 않고 닫습니다(`data.window.state: "failed"`). 다음 도구 호출이 headless 로 다시 열고 결과에 `data.window.recovered: true`를 붙입니다. 탭 하나의 복원 실패는 그 탭만 `restored: false`(이유)로 알립니다.
+6. **꺼진 브라우저 복구** — 브라우저(영속 컨텍스트)가 꺼졌거나 관리 탭이 0개이면 다음 도구 호출 입구에서 같은 전환 경로로 headless 를 다시 열고 마지막 탭 URL 을 복원한 뒤 그 호출을 실행합니다(`data.window.notice = {reason: "browser_recovered", hint}`, 1회, `reobserve_required=true`). 사람이 조작권을 가진 동안에는 하지 않고, 다시 열지 못하면 `E_PAGE_CRASHED`(serve 재시작 안내)이며 호출당 1회만 시도합니다.
 
 **무엇이 유지되고 사라지나**(로컬 Mock 실측, `.hermes/state/ws34/probe_perf.py`):
 

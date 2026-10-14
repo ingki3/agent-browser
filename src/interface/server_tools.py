@@ -179,7 +179,15 @@ class ToolsMixin:
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
             cap_result_size(result, self.max_result_chars)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
+                # WS-50: 꺼진 브라우저 복구는 '창 전환 실패 뒤 복구' 와 다른 알림(browser_recovered)으로 싣는다.
+                browser_recovered = self._recovered_notice == self._BROWSER_RECOVERED
+                if browser_recovered:
+                    self._recovered_notice = False
                 self._attach_window_report(result)
+                if browser_recovered:
+                    self._mark_browser_recovered(result)
+            if self._window is not None:
+                self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result
         finally:
             try:
