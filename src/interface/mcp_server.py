@@ -572,18 +572,35 @@ def install_public_log_filter() -> Callable[[], None]:
     if getattr(previous, "_ws51_public", False):
         return lambda: None
 
-    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-        record = previous(*args, **kwargs)
+    def _mask(record: logging.LogRecord) -> None:
         try:
             message = record.getMessage()
-        except Exception:  # noqa: BLE001 - 형식이 깨진 레코드는 logging 이 원래대로 보고한다
-            return record
+            failed = False
+        except Exception as exc:  # noqa: BLE001 - 형식이 깨진 호출(`'bad %d' % url`)
+            # R1 B4: 원 record 를 그대로 두면 handler 의 'Logging error … Arguments: (…)' 진단이 원문 args 를
+            # stderr 로 낸다. 형식 실패 사실은 남기고(조용히 버리지 않는다) msg·args 를 가린 문자열로 바꾼다.
+            try:
+                args_text = repr(record.args)
+            except Exception:  # noqa: BLE001
+                args_text = "<args repr 실패>"
+            message = f"[로그 형식 오류 {type(exc).__name__}: {exc}] msg={record.msg!r} args={args_text}"
+            failed = True
         masked = public_text(message)
-        if masked != message:
+        if failed or masked != message:
             record.msg, record.args = masked, None
         if record.exc_info and record.exc_info[0] is not None and not record.exc_text:
             text = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
             record.exc_text = public_text(text)  # Formatter 는 exc_text 가 있으면 다시 만들지 않는다
+        if record.stack_info:
+            record.stack_info = public_text(record.stack_info)
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        try:
+            _mask(record)
+        except Exception as exc:  # noqa: BLE001 - 가림이 실패해도 로그는 남기되 원문은 내보내지 않는다
+            record.msg = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략] logger={record.name}"
+            record.args, record.exc_info, record.exc_text, record.stack_info = None, None, None, None
         return record
 
     factory._ws51_public = True  # type: ignore[attr-defined]

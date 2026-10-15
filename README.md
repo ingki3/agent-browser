@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-4113개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+4214개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -754,7 +754,7 @@ IPv4-mapped IPv6(`[::ffff:192.168.1.1]`)·정수(`3232235777`)·16진(`0xc0.0xa8
 
 **프롬프트 주입 신호** — `run`(내장 LLM 루프)은 웹 텍스트를 신뢰 경계 블록에 넣어 지시로 읽지 않게 합니다. `serve`(MCP)는 결과의 웹 유래 텍스트에 지시형 문구가 있으면 `data.injection_suspected` 신호를 붙입니다 — 차단이 아니라 신호이며 정규식 기반이라 우회될 수 있습니다([프롬프트 주입 신호](#프롬프트-주입-신호-datainjection_suspected)). 제품 경로(MCP 결과) 측정 탐지율 1.0, 오탐률 0.0(Mock 표본 기준).
 
-**응답 주소의 비밀 값 가리기** — `serve`(MCP)가 돌려주는 페이지·탭 주소(`current_url`·`data.url`·`observation.url`·`data.window.tabs[].url`·오류 문구 안의 주소, 서버 stderr·로그 줄)는 쿼리·조각의 비밀 값을 `[REDACTED]` 로 가립니다 — 키 이름이 비밀 계열(token·session·code·sig·key 등, 낱말 단위 판정)이거나 값이 JWT·24자 이상 무작위 문자열일 때만, 사용자정보(`user:pass@`)는 뺍니다. 검색어·날짜·쪽 번호 같은 값은 그대로이고, 페이지 **내용**인 `extract` 항목(href 등)·관찰 요소는 원문입니다. 서버 안(탭 복원·창 전환·레시피 재생)은 원문 주소를 쓰고, 가린 주소를 `navigate`·`tab_control create` 에 넘기면 이동하지 않고 `E_INVALID_URL` 입니다(reload·go_back·탭 전환이나 링크 재추출 안내).
+**응답 주소의 비밀 값 가리기** — `serve`(MCP)가 돌려주는 주소 칸(`current_url`·`url`·`*_url`·`data.window.tabs[].url` — 스킴과 무관, `about:blank#…`·상대 주소 포함)과 자유 문장(오류 문구·robots 규칙·서버 stderr·로그 줄) 안의 주소는 쿼리·조각의 비밀 값을 `[REDACTED]` 로 가립니다 — 키 이름이 비밀 계열(token·session·code·sig·key 등, 대소문자·퍼센트 인코딩 무시, 짧은 낱말은 낱말 단위 판정)이거나 값이 JWT·24자 이상 무작위 문자열일 때만, 파라미터 구분자는 `&`·`;`, 사용자정보(`user:pass@`)는 뺍니다. 검색어·날짜·쪽 번호 같은 값은 그대로이고, 페이지 **내용**인 `extract` 항목(`data.items`)·관찰 요소(`data.observation.elements`·`axtree_summary`)는 원문입니다. 규칙 기반이라 이 규칙에 맞지 않는 비밀(평범한 키 이름의 짧은 값 등)은 가려지지 않습니다. 처리는 입력 길이에 선형입니다(1MiB 제목 observe 실측 0.08초). 서버 안(탭 복원·창 전환·레시피 재생)은 원문 주소를 쓰고, 가린 주소를 `navigate`·`tab_control create` 에 넘기면 이동하지 않고 `E_INVALID_URL` 입니다(reload·go_back·탭 전환이나 링크 재추출 안내).
 
 **세션 암호화** — 쿠키와 로컬스토리지를 AES-256-GCM + Argon2id로 암호화해 `0600` 권한으로 저장합니다.
 

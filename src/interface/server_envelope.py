@@ -74,7 +74,7 @@ def envelope_dict(result: ActionResult) -> Dict[str, Any]:
     if isinstance(data, dict) and "observation" in data:
         out["data"] = dict(data, observation=_compact_observation(data["observation"]))
     # WS-51: 에이전트에게 나가는 모든 주소(current_url·data.url·observation.url·window.tabs[].url·오류 문구 안의
-    # 주소 …)의 비밀 값을 가린다. 관찰 요소·extract 항목(페이지 내용)은 원문 — public_url.CONTENT_KEYS.
+    # 주소 …)의 비밀 값을 가린다. 관찰 요소·extract 항목(페이지 내용)은 원문 — public_url.CONTENT_PATHS(경로 기준).
     from security.public_url import public_payload
 
     return public_payload(out)
