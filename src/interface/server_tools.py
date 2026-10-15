@@ -28,7 +28,17 @@ class ToolsMixin:
     _youtube_api_base: Optional[str] = None
 
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
+        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답).
+
+        WS-51: 응답의 페이지/탭 주소(window.tabs[].url·탭 알림·레시피 단계 결과 …)는 비밀 값을 가린 새 dict 로
+        돌려준다(security.public_url). 서버 내부 상태(last_tabs 등)는 원문 그대로 둔다.
+        """
+        from security.public_url import public_payload
+
+        return public_payload(await self._server_tool_payload(name, arguments))
+
+    async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """call_server_tool 본문(가리기 전 원문 응답)."""
         args = dict(arguments or {})
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,

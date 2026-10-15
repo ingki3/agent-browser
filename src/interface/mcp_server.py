@@ -29,7 +29,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from weakref import WeakSet
 
 from playwright.async_api import Frame
@@ -551,7 +551,49 @@ async def run_stdio(
                 read_stream, write_stream, server.create_initialization_options()
             )
 
-    await _serve_until_stop(_serve, backend)
+    restore_log = install_public_log_filter()  # WS-51: 로그 줄의 페이지 주소 비밀 값 가리기
+    try:
+        await _serve_until_stop(_serve, backend)
+    finally:
+        restore_log()
+
+
+def install_public_log_filter() -> Callable[[], None]:
+    """이 프로세스의 모든 로그 레코드(메시지·예외 traceback)에서 주소의 비밀 값을 가린다(WS-51).
+
+    로거마다 필터를 다는 방식은 자식 로거 레코드에 걸리지 않아 레코드 팩토리를 감싼다. 이미 설치돼
+    있으면 아무것도 하지 않는다. 반환: 원래 팩토리로 돌리는 함수(serve 종료 때 부른다).
+    """
+    import traceback
+
+    from security.public_url import public_text
+
+    previous = logging.getLogRecordFactory()
+    if getattr(previous, "_ws51_public", False):
+        return lambda: None
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - 형식이 깨진 레코드는 logging 이 원래대로 보고한다
+            return record
+        masked = public_text(message)
+        if masked != message:
+            record.msg, record.args = masked, None
+        if record.exc_info and record.exc_info[0] is not None and not record.exc_text:
+            text = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
+            record.exc_text = public_text(text)  # Formatter 는 exc_text 가 있으면 다시 만들지 않는다
+        return record
+
+    factory._ws51_public = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+
+    def restore() -> None:
+        if logging.getLogRecordFactory() is factory:
+            logging.setLogRecordFactory(previous)
+
+    return restore
 
 
 def _announce_serve(mode: ExecutionMode, browser_mode: str, chrome_profile: Any, keep_open: bool,
