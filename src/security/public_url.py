@@ -11,14 +11,16 @@
   `data:`·`blob:`, 스킴 없는 상대 주소(`/p?x=1`, `?x=1`, `#x=1`)도 같은 규칙(R1 B3).
 * 쿼리와 조각(`#a=b&c=d` 꼴)의 **값**을 다음이면 `[REDACTED]` 로 바꾼다(키 이름은 남긴다). 파라미터
   구분자는 `&` 와 `;` 둘 다이고, 구분자와 순서는 그대로 둔다. 인코딩된 `%26`·`%3B` 는 값 내용이다(R1 B2).
-  (a) 키 이름이 비밀 계열(`_secret_key`, 대소문자 무시 — R1 B1). 키는 퍼센트 인코딩을 (최대 3겹) 풀고:
-      ① **소문자 전체 키**에 긴 낱말(token·session·secret·password·passwd·signature·ticket·credential·
+  (a) 키 이름이 비밀 계열(`_secret_key`, 대소문자 무시 — R1 B1). 키는 퍼센트 인코딩을 (최대 3겹) 풀고
+      Unicode NFKC + casefold 로 정규화한다(R2 B7 — 전각 `ｔｏｋｅｎ`, long-s `ſeſſion`. 터키어 `ı`·`İ` 는
+      ASCII 의 casefold 동치가 아니라 범위 밖):
+      ① **정규화한 전체 키**에 긴 낱말(token·session·secret·password·passwd·signature·ticket·credential·
          assertion·nonce·authorization)이 들어 있거나(`gatetoken`·`GaTeToKeN`·`JSESSIONID`),
-      ② 소문자 키를 영문/숫자 덩어리로 쪼갠 낱말이 짧은 낱말(key·sid·sig·otp·pwd·jwt·code·auth·sess·saml)
+      ② 정규화한 키를 영문/숫자 덩어리로 쪼갠 낱말이 짧은 낱말(key·sid·sig·otp·pwd·jwt·code·auth·sess·saml)
          이나 붙여 쓴 흔한 이름(apikey·phpsessid·passcode …) 과 **통째로** 같거나(`sId`·`API_KEY`),
       ③ 원래 키의 camelCase 낱말이 그렇다(`sortKey`·`promoCode` — 기존 낱말 분해 규칙).
       짧은 낱말을 부분 일치로 보지 않아 `keyword`·`monkey`·`codec`·`zipcode`·`author` 는 남는다.
-      ①② 는 소문자만 보므로 어떤 대소문자 조합도 같은 판정이다. ③ 은 그 위에 더하는 규칙이다.
+      ①② 는 casefold 만 보므로 어떤 대소문자 조합도 같은 판정이다. ③ 은 그 위에 더하는 규칙이다.
   (b) 값 자체가 비밀처럼 보임(`_secret_value`): JWT(`eyJ….….…`), 또는 길이 ≥ 24 의 base64/hex/url-safe
       문자열 중 ① 16진수만 ② 대문자·소문자·숫자가 모두 섞임 ③ 구분자 없는 24자 이상 덩어리에 글자와
       숫자가 섞임. 하이픈으로 이은 슬러그·UUID·날짜·검색어·짧은 id 는 남는다.
@@ -29,6 +31,12 @@
 **시간**: 모든 탐색은 입력 길이에 선형이다(R1 B5 — 64KiB 제목 하나로 observe 16초였다). 자유 문장의 주소
 후보는 공백·따옴표·꺾쇠로 나눈 덩어리의 **시작에서만** 찾고, 스킴 후보는 64자 상한으로 찾는다(상한이 없으면
 긴 글자 덩어리에서 시작점마다 다시 훑는 이차시간). JWT 는 정규식 대신 덩어리 단위로 한 번씩 훑는다.
+
+**자유 문장의 값 경계**(R2 B6): 주소 덩어리가 비밀 키 값으로 끝났는데 문장이 이어지면 — 값이 비었고 바로
+따옴표면(`token="X"`) 짝 따옴표까지(없으면 줄 끝), 값 뒤가 공백이면(`token=prefix X`) 같은 값일 수 있어 다음
+구분 기호(`&`·`;`·`#`·줄바꿈·닫는 괄호·따옴표·꺾쇠)까지 안전 쪽으로 가린다(한 번에 MAX_VALUE_TAIL_CHARS, 상한이
+단어 안에 걸리면 그 단어 끝까지 — 다음 주소 덩어리 한가운데서 끊지 않는다). 대가: `?token=X 다음 말` 의
+'다음 말' 도 가려진다. 주소 칸(url·*_url)은 주소 전체를 하나로 보므로 이 규칙이 필요 없다.
 
 **경계**: 페이지 *내용* 으로서의 주소는 가리지 않는다 — 에이전트가 링크를 따라가려면 원문이 필요하다
 (`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`. **경로**로
@@ -42,6 +50,7 @@ from __future__ import annotations
 
 import functools
 import re
+import unicodedata
 from typing import Any, FrozenSet, List, Optional, Tuple
 from urllib.parse import quote, unquote, unquote_plus, urlsplit
 
@@ -70,6 +79,11 @@ MAX_PAYLOAD_DEPTH = 64
 _CACHE_MIN_CHARS = 16 * 1024
 #: 키 이름의 퍼센트 인코딩을 푸는 최대 겹 수(`%2574oken` → `%74oken` → `token`).
 _MAX_KEY_UNQUOTE = 3
+#: 자유 문장에서 비밀 키 값이 공백·따옴표 뒤로 이어질 때 한 번에 더 가리는 최대 글자 수(R2 B6).
+MAX_VALUE_TAIL_CHARS = 1024
+#: 줄바꿈 글자(str.splitlines 기준) — 공백 연장·짝 없는 따옴표 연장은 줄을 넘지 않는다.
+_LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+_QUOTES = "\"'"
 
 #: 낱말 안 부분 일치로 비밀 키를 판정하는 긴 낱말(소문자 전체 키에 대해).
 _LONG_WORDS = (
@@ -98,6 +112,15 @@ _CANDIDATE = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>]*?(?:://|[?#])[^\s\"'<>]*")
 #: 덩어리 안 절대 주소의 시작(스킴). 스킴 길이 상한이 이차시간을 막는다.
 _SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,%d}://" % (MAX_SCHEME_CHARS - 1))
 _MARK = re.compile(r"\[REDACTED|%5BREDACTED", re.IGNORECASE)
+#: 공백 뒤 이어지는 비밀 값 묶음의 끝: 파라미터·조각 구분자, 줄바꿈, 닫는 괄호, 따옴표·꺾쇠(R2 B6).
+#: `]` 는 넣지 않는다 — 가림 표지 `[REDACTED]` 안에서 끊기면 멱등이 깨진다.
+_TAIL_END = re.compile("[&;#)}\"'<>" + _LINE_BREAKS + "]")
+#: 따옴표로 시작한 값의 끝: 짝 따옴표 또는 줄바꿈.
+_QUOTE_STOP = {q: re.compile("[" + re.escape(q) + _LINE_BREAKS + "]") for q in _QUOTES}
+#: 상한에 걸린 연장을 끝낼 자리(공백·구분 기호·닫는 괄호·따옴표·꺾쇠).
+_WORD_END = re.compile(r"[\s&;#)}\"'<>]")
+#: 연장이 구분 기호에서 멈춘 뒤 이어지는 덩어리(공백·따옴표·꺾쇠 전까지).
+_RUN = re.compile(r"[^\s\"'<>]*")
 
 #: 응답 구조에서 페이지 '내용' 으로 보고 가리지 않는 **경로**(최상위 응답 기준): extract 항목, 관찰 요소·요약.
 CONTENT_PATHS: FrozenSet[Tuple[str, ...]] = frozenset({
@@ -114,21 +137,25 @@ _MAX_CONTENT_PATH = max(len(p) for p in CONTENT_PATHS)
 
 
 def _secret_key(raw_key: str) -> bool:
-    """키 이름이 비밀 계열인가(대소문자 무시 — 모듈 설명 (a))."""
+    """키 이름이 비밀 계열인가(대소문자 무시 — 모듈 설명 (a)).
+
+    판정 정규형(R2 B7): 퍼센트 디코딩 → NFKC(전각 `ｔｏｋｅｎ` → token) → casefold(long-s `ſeſſion` → session).
+    """
     key = raw_key
     for _ in range(_MAX_KEY_UNQUOTE):
         decoded = unquote_plus(key)
         if decoded == key:
             break
         key = decoded
-    low = key.lower()
+    key = unicodedata.normalize("NFKC", key)
+    low = key.casefold()
     if any(word in low for word in _LONG_WORDS):
         return True
     for seg in _KEY_SEGMENT.findall(low):
         if seg in _SHORT_WORDS or seg in _COMPOUNDS:
             return True
     for word in _KEY_WORD.findall(key):
-        w = word.lower()
+        w = word.casefold()
         if w in _SHORT_WORDS or w in _COMPOUNDS:
             return True
     return False
@@ -284,8 +311,7 @@ def public_url(url: str) -> str:
 # ------------------------------------------------------------------ 자유 문장·응답 구조
 
 
-def _public_chunk(match: "re.Match[str]") -> str:
-    chunk = match.group(0)
+def _public_chunk(chunk: str) -> str:
     scheme_at = chunk.find("://")
     marks = [i for i in (chunk.find("?"), chunk.find("#")) if i >= 0]
     first_mark = min(marks) if marks else -1
@@ -301,9 +327,106 @@ def _public_chunk(match: "re.Match[str]") -> str:
     return chunk
 
 
+def _secret_tail_value(chunk: str) -> Optional[str]:
+    """덩어리의 마지막 쿼리/조각 파라미터가 비밀 키면 그 (원문) 값, 아니면 None."""
+    marks = [i for i in (chunk.find("?"), chunk.find("#")) if i >= 0]
+    if not marks:
+        return None
+    cut = max(chunk.rfind(c) for c in "?#&;")
+    if cut < min(marks):
+        return None
+    key, eq, value = chunk[cut + 1:].partition("=")
+    if not eq or not _secret_key(key):
+        return None
+    return value
+
+
+def _public_run(run: str) -> str:
+    """연장이 구분 기호에서 멈춘 뒤 이어지는 같은 주소의 나머지(`&b=1&sid=…`·`#…`·`)?…`)."""
+    if run[0] in "&;":
+        masked = public_url("?" + run)
+        return masked if masked == URL_MASK else masked[1:]
+    if run[0] == "#":
+        return public_url(run)
+    return _public_chunk(run)
+
+
+def _word_end(text: str, pos: int) -> int:
+    """상한에 걸린 연장을 그 자리 단어(덩어리) 끝까지 늘린다 — 주소 덩어리 한가운데서 끊기면 남은 꼬리가 덩어리
+    시작이 아니라 다음 탐색에서 빠지고 원문이 남는다(1MiB 반복 주소 표본)."""
+    end = _WORD_END.search(text, pos)
+    return end.start() if end is not None else len(text)
+
+
+def _extend_secret_value(text: str, pos: int, chunk: str, out: List[str]) -> int:
+    """덩어리가 비밀 키 값으로 끝났는데 문장이 공백·따옴표로 이어지면 그 값의 경계를 안전 쪽으로 정한다(R2 B6).
+
+    * 값이 비었고 바로 따옴표가 오면(`token="X"`) 짝 따옴표까지(없으면 줄 끝·상한까지) 가린다.
+    * 값 뒤가 가로 공백이면(`token=prefix X`) 같은 단어 묶음으로 보고 다음 구분 기호(`&`·`;`·`#`·줄바꿈·
+      닫는 괄호·따옴표·꺾쇠) 또는 MAX_VALUE_TAIL_CHARS 까지 가린다(공백은 남긴다).
+    * 연장이 `&`·`;`·`#`·닫는 괄호에서 멈추면 이어지는 덩어리도 같은 주소의 나머지로 가리고, 그 끝이 다시 비밀
+      키 값이면 반복한다. 매 단계가 글자를 소비하므로 전체 선형.
+    반환: 다음 탐색 위치. 가린 조각은 out 에 붙인다.
+    """
+    n = len(text)
+    while pos < n:
+        value = _secret_tail_value(chunk)
+        if value is None:
+            return pos
+        ch = text[pos]
+        if ch in _QUOTES and value == "":
+            limit = min(n, pos + 1 + MAX_VALUE_TAIL_CHARS)
+            end = _QUOTE_STOP[ch].search(text, pos + 1, limit)
+            stop = end.start() if end is not None else _word_end(text, limit)
+            inner = MASK if stop > pos + 1 else ""
+            if end is None or text[stop] != ch:  # 짝 없음 — 줄 끝·상한까지
+                out.append(ch + inner)
+                return stop
+            out.append(ch + inner + ch)
+            pos = stop + 1
+        elif ch.isspace() and ch not in _LINE_BREAKS:
+            limit = min(n, pos + MAX_VALUE_TAIL_CHARS)
+            end = _TAIL_END.search(text, pos, limit)
+            stop = end.start() if end is not None else _word_end(text, limit)
+            seg = text[pos:stop]
+            body = seg.strip()
+            if body:
+                out.append(seg[:len(seg) - len(seg.lstrip())] + MASK + seg[len(seg.rstrip()):])
+            else:
+                out.append(seg)
+                if stop < n and text[stop] in _QUOTES:  # `token= "X"` — 빈 값 뒤 공백 다음 따옴표
+                    pos = stop
+                    continue
+            pos = stop
+        else:
+            return pos
+        if pos >= n or text[pos] not in "&;#)}":
+            return pos
+        run = _RUN.match(text, pos).group(0)  # type: ignore[union-attr]  # 빈 일치 가능 패턴
+        out.append(_public_run(run))
+        chunk = "?" + run if run[0] in "&;" else run
+        pos += len(run)
+    return pos
+
+
+def _public_urls_in_text(text: str) -> str:
+    out: List[str] = []
+    pos = 0
+    while True:
+        m = _CANDIDATE.search(text, pos)
+        if m is None:
+            break
+        out.append(text[pos:m.start()])
+        chunk = m.group(0)
+        out.append(_public_chunk(chunk))
+        pos = _extend_secret_value(text, m.end(), chunk, out)
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _public_text(text: str) -> str:
     if "://" in text or "?" in text or "#" in text:
-        text = _CANDIDATE.sub(_public_chunk, text)
+        text = _public_urls_in_text(text)
     return _mask_jwts(text)
 
 

@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
 import unicodedata
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -558,18 +559,49 @@ async def run_stdio(
         restore_log()
 
 
-def install_public_log_filter() -> Callable[[], None]:
-    """이 프로세스의 모든 로그 레코드(메시지·예외 traceback)에서 주소의 비밀 값을 가린다(WS-51).
+#: install_public_log_filter 의 겹친 설치 수(R2 NB-5c) — 마지막 설치가 끝날 때만 원래대로 돌린다.
+_PUBLIC_LOG_STATE: Dict[str, Any] = {"count": 0, "uninstall": None}
+_PUBLIC_LOG_LOCK = threading.Lock()
 
-    로거마다 필터를 다는 방식은 자식 로거 레코드에 걸리지 않아 레코드 팩토리를 감싼다. 이미 설치돼
-    있으면 아무것도 하지 않는다. 반환: 원래 팩토리로 돌리는 함수(serve 종료 때 부른다).
+
+def install_public_log_filter() -> Callable[[], None]:
+    """이 프로세스의 모든 로그 레코드(메시지·예외 traceback·stack·extra 문자열)에서 주소의 비밀 값을 가린다(WS-51).
+
+    로거마다 필터를 다는 방식은 자식 로거 레코드에 걸리지 않아 레코드 팩토리를 감싼다. `extra=` 속성은 팩토리
+    **뒤에** 붙으므로(Logger.makeRecord) makeRecord 도 감싸 문자열 값을 가린다(formatter 의 `%(url)s`). 앞선
+    팩토리가 이미 채운 exc_text 도 가린다. 겹쳐 설치하면 횟수를 세어 마지막 restore 때만 원래대로 돌린다 —
+    먼저 끝난 쪽이 남은 설치의 가림을 벗기지 않는다. 반환: 이 설치를 끝내는 함수(두 번 불러도 한 번만 센다).
     """
+    with _PUBLIC_LOG_LOCK:
+        if _PUBLIC_LOG_STATE["count"] == 0:
+            _PUBLIC_LOG_STATE["uninstall"] = _install_public_log_hooks()
+        _PUBLIC_LOG_STATE["count"] += 1
+    done = [False]
+
+    def restore() -> None:
+        with _PUBLIC_LOG_LOCK:
+            if done[0]:
+                return
+            done[0] = True
+            _PUBLIC_LOG_STATE["count"] -= 1
+            if _PUBLIC_LOG_STATE["count"] == 0:
+                uninstall = _PUBLIC_LOG_STATE["uninstall"]
+                _PUBLIC_LOG_STATE["uninstall"] = None
+                if uninstall is not None:
+                    uninstall()
+
+    return restore
+
+
+def _install_public_log_hooks() -> Callable[[], None]:
+    """레코드 팩토리·Logger.makeRecord 를 감싸고, 둘을 원래대로 돌리는 함수를 돌려준다(refcount 는 호출자)."""
     import traceback
 
     from security.public_url import public_text
 
     previous = logging.getLogRecordFactory()
-    if getattr(previous, "_ws51_public", False):
+    original_make = logging.Logger.makeRecord
+    if getattr(previous, "_ws51_public", False):  # 다른 경로(모듈 재적재 등)로 이미 감싸져 있다
         return lambda: None
 
     def _mask(record: logging.LogRecord) -> None:
@@ -588,7 +620,9 @@ def install_public_log_filter() -> Callable[[], None]:
         masked = public_text(message)
         if failed or masked != message:
             record.msg, record.args = masked, None
-        if record.exc_info and record.exc_info[0] is not None and not record.exc_text:
+        if record.exc_text:  # R2 NB-5a: 앞선 팩토리가 이미 채운 traceback 문자열
+            record.exc_text = public_text(record.exc_text)
+        elif record.exc_info and record.exc_info[0] is not None:
             text = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
             record.exc_text = public_text(text)  # Formatter 는 exc_text 가 있으면 다시 만들지 않는다
         if record.stack_info:
@@ -603,14 +637,31 @@ def install_public_log_filter() -> Callable[[], None]:
             record.args, record.exc_info, record.exc_text, record.stack_info = None, None, None, None
         return record
 
-    factory._ws51_public = True  # type: ignore[attr-defined]
-    logging.setLogRecordFactory(factory)
+    def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = original_make(self, *args, **kwargs)
+        extra = kwargs.get("extra", args[8] if len(args) > 8 else None)
+        if extra:
+            for key in extra:  # R2 NB-5b: extra 문자열 속성(formatter 가 `%(url)s` 로 쓴다)
+                value = record.__dict__.get(key)
+                if isinstance(value, str):
+                    try:
+                        record.__dict__[key] = public_text(value)
+                    except Exception as exc:  # noqa: BLE001 - 속성은 남기되 원문은 내보내지 않는다
+                        record.__dict__[key] = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략]"
+        return record
 
-    def restore() -> None:
+    factory._ws51_public = True  # type: ignore[attr-defined]
+    make_record._ws51_public = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+    logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
+
+    def uninstall() -> None:
         if logging.getLogRecordFactory() is factory:
             logging.setLogRecordFactory(previous)
+        if logging.Logger.makeRecord is make_record:
+            logging.Logger.makeRecord = original_make  # type: ignore[method-assign]
 
-    return restore
+    return uninstall
 
 
 def _announce_serve(mode: ExecutionMode, browser_mode: str, chrome_profile: Any, keep_open: bool,
