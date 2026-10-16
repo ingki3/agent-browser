@@ -2243,6 +2243,10 @@ class ActionDispatcher:
             ) as dl:
                 await target.click(timeout=5000)
             download = await dl.value
+            # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
+            from security.secret_registry import register_url
+
+            register_url(getattr(download, "url", ""))
             # save_dir 는 _dispatch_inner 에서 절대 경로로 정규화됐다(R1 NB-5).
             save_path = os.path.join(params["save_dir"], download.suggested_filename)
             await download.save_as(save_path)
