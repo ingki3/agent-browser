@@ -340,7 +340,7 @@ def test_control_fields_keep_original_values(value):
                  "approval": {"approval_id": "ap_AbCdEf123456_-xy", "status": "approved", "outcome": "succeeded",
                               "expires_at": "2026-10-16T12:00:00Z"},
                  "control": {"holder": "agent", "request_id": "rq_AbCdEf123456", "server_id": "123-abcdef",
-                             "since": "2026-10-16T12:00:00Z", "reason": "approved"},
+                             "since": "2026-10-16T12:00:00Z", "reason": "request_expired"},  # R5: reason 은 어휘만
                  "element_id": "@e1"},
     }
     out = public_payload(payload)
@@ -365,7 +365,7 @@ def test_control_key_inventory_is_fixed():
     assert pu.CONTROL_TIME_KEYS == {"since", "expires_at", "started_at", "created_at", "detected_at", "reset_at"}
     assert pu._CONTROL_ID_KEYS == {"tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id",
                                    "server_id": "server_id", "element_id": "element_id",
-                                   "trigger_element_id": "element_id"}
+                                   "trigger_element_id": "element_id", "id": "recipe_id"}  # R5 B4: 레시피 id
     assert pu.control_value("popup_tab_id", "tab-3") and pu.control_value("closed_tab_id", "tab-9")
     assert not pu.control_value("tab_id", "tab-1x") and not pu.control_value("status", "Approved!")
 

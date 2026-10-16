@@ -8,7 +8,8 @@
 
 * 등록 판정은 public_url 과 **같은 함수**(`security.public_url.secret_values`)라 주소 칸과 갈라지지 않는다.
 * 보호 대상(§1.1): 값(원문·unquote·unquote_plus 각각) 길이 ≥ 8, 또는 4~7 이고 순수 알파벳이 아님. 제외: 도구 어휘
-  (ActionType·ErrorCode 값)와 도구가 만든 식별자 형식(`tab-N`·승인 id·요청 id·요소 id·서버 id·도구 이름) — 이런
+  (ActionType·ErrorCode 값)와 도구가 만든 식별자 형식(`tab-N`·승인 id·요청 id·요소 id(`@eN`·`@rN`)·서버 id·레시피 id·
+  도구 이름) — 이런
   값을 가리면 응답의 제어 필드·탭 전환이 깨진다(R3-B7).
 * 표현 집합(§1.3)은 `representations(v)` 한 곳에서 만든다(검증자도 이 함수를 import 한다).
 * 일치(§2 P4): ≥ 8 값은 표현을 길이 내림차순 `str.replace` 로 본문에 없는 사설 영역 센티널로 바꾸고, 연속 센티널을
@@ -17,8 +18,9 @@
   §1.4 의 NB 다(전체 표현은 남지 않는다).
 * 긴 값(원문 ≥ 256자)은 128자 정렬 블록 색인으로 **잘리거나 일부가 바뀐 꼴**에서도 원문 연속 256자 이상이 남지 않게
   가린다(본문 위치마다 사전 조회 — 값 수와 무관한 선형 시간).
-* 상한(§2 P5): 값 256개 + 표현·블록 글자 합 16Mi 자, 넘으면 오래된 값부터 잊는다(LRU — 다시 본 값은 뒤로). 긴 값도
-  원문 그대로 보관한다(지문·절단 없음).
+* 상한(§2 P5): 값 256개 + 표현·블록 글자 합 16Mi 자, 넘으면 오래된 값부터 **값 단위로** 잊는다(LRU — 다시 본 값은
+  뒤로). 살아 있는 값은 언제나 모든 표현을 갖는다(R5 B2 — 표현 일부만 버리지 않는다). 값 하나의 전 표현이 예산을
+  넘으면 그 값만 혼자 남는다(메모리 상한 ≈ 그 값 하나의 표현 합). 긴 값도 원문 그대로 보관한다(지문·절단 없음).
 * 프로세스 메모리 전용: 디스크·로그·응답에 쓰지 않는다. repr·str 은 개수만 보이고, pickle·copy 는 거부한다.
 * 스레드 안전: 등록은 Lock 안에서 새 스냅샷을 만들고, 조회는 스냅샷을 한 번 읽는다(잠금 없음).
 * 등록은 예외를 내지 않는다 — 등록 실패가 도구 동작을 막지 않는다.
@@ -60,7 +62,8 @@ TOOL_ID_FORMATS: Dict[str, "re.Pattern[str]"] = {
     "tab_id": re.compile(r"tab-\d+"),                       # browser.core: f"tab-{n}"
     "approval_id": re.compile(r"ap_[A-Za-z0-9_-]{1,64}"),    # handoff: f"ap_{token_urlsafe(12)}"
     "request_id": re.compile(r"rq_[A-Za-z0-9_-]{1,64}"),     # handoff: f"rq_{token_urlsafe(9)}"
-    "element_id": re.compile(r"@e\d+"),                      # perception.engine: f"@e{idx}"
+    "element_id": re.compile(r"@[er]\d+"),                   # perception.engine: f"@e{idx}" · recipes.service: f"@r{seq}"
+    "recipe_id": re.compile(r"r_[0-9a-f]{8}"),                # recipes.store: "r_" + token_hex(4)
     "server_id": re.compile(r"\d+-[0-9a-f]{6}|login-[0-9a-f]{8}"),  # handoff: f"{pid}-{hex(3)}" · login_cli
     "tool_name": re.compile(r"browser_[a-z_]{1,48}"),       # MCP 도구 이름
 }
@@ -141,7 +144,7 @@ def _html(value: str) -> List[str]:
 
 
 def _tagged(value: str) -> "OrderedDict[str, bool]":
-    """표현 → 주소 칸 계열(R1·R2·R2∘R2) 여부. 순서는 결정적(우선순위 순 — 예산이 모자라면 뒤부터 버린다).
+    """표현 → 주소 칸 계열(R1·R2·R2∘R2) 여부. 순서는 결정적(우선순위 순).
     같은 입력의 퍼센트 꼴은 한 번만 만든다(JSON·HTML 꼴이 원문과 같은 흔한 경우 — 긴 값의 등록 비용)."""
     memo: Dict[str, List[str]] = {}
 
@@ -217,8 +220,9 @@ class _Part(NamedTuple):
 
 
 def _parts(raw: str) -> Tuple[_Part, ...]:
+    """값 하나의 기저별 표현 전부(R5 B2: 값 단위 원자적 — 표현 일부만 예산에서 버리지 않는다. 글자 예산은 값 단위
+    LRU 퇴출로만 지킨다, `SecretRegistry.add_values`)."""
     parts: List[_Part] = []
-    budget = MAX_CHARS
     bases = _bases(raw)
     if any(is_tool_token(base) for base in bases):
         return ()  # `%40e3`(= `@e3`) 처럼 인코딩된 도구 식별자도 통째로 제외
@@ -243,15 +247,12 @@ def _parts(raw: str) -> Tuple[_Part, ...]:
         for form, url in _tagged(base).items():
             if not _registrable(form):
                 continue
-            if forms and chars + len(form) > budget:
-                continue  # 예산 초과 — 원문은 늘 남기고 덜 중요한 표현부터 버린다
             forms.append(form)
             chars += len(form)
             if url:
                 url_forms.append(form)
         if not forms:
             continue
-        budget -= chars
         parts.append(_Part(base, long, anchor if len(anchor) >= _ANCHOR_MIN else "", tuple(forms),
                            tuple(url_forms), tuple(blocks), chars))
     return tuple(parts)
@@ -463,7 +464,9 @@ class SecretRegistry:
                 self._order[value] = parts
                 self._chars += sum(p.chars for p in parts)
                 changed = True
-            while self._order and (len(self._order) > self._cap or self._chars > self._max_chars):
+            # 값 단위 LRU(R5 B2): 오래된 값부터 통째로 잊는다. 가장 최근 값은 남긴다 — 값 하나의 전 표현이 글자 예산을
+            # 넘으면 그 값만 혼자 남는다(표현 일부를 버려 살아 있는 값이 새는 일이 없다).
+            while len(self._order) > 1 and (len(self._order) > self._cap or self._chars > self._max_chars):
                 _, parts = self._order.popitem(last=False)
                 self._chars -= sum(p.chars for p in parts)
                 changed = True

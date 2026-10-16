@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import numbers
 import os
+import re
 import signal
 import threading
 import time
@@ -626,8 +628,9 @@ LOG_MAX_DEPTH = 8
 
 
 class _LogSafe:
-    """로그 인자 자리의 비문자열 객체 — str·repr 이 각각 public_text(원 str·repr)(R4 P1). 숫자 변환은 원 객체에 맡긴다
-    (`%d` 등). 원 str/repr 이 실패하면 그 예외를 그대로 낸다(logging 의 형식 오류 경로 — 원문 없이 진단)."""
+    """로그 인자 자리의 비문자열 객체 — str·repr 이 각각 public_text(원 str·repr)(R4 P1). 숫자 변환(`%d` 등)은 원
+    객체에 맡기되, str·repr 이 가려지는 객체면 숫자로 바꾸지 않는다(R5 B1 — 원 숫자가 `%x`·`%05d` 꼴로 새지 않게).
+    원 str/repr 이 실패하면 그 예외를 그대로 낸다(logging 의 형식 오류 경로 — 원문 없이 진단)."""
 
     __slots__ = ("_obj",)
 
@@ -643,14 +646,27 @@ class _LogSafe:
     def __format__(self, spec: str) -> str:
         return format(str(self), spec)
 
+    def masked(self) -> bool:
+        """원 str·repr 중 하나라도 가려지는가(실패하면 False — 형식 오류 경로에 맡긴다)."""
+        try:
+            text, rep = str(self._obj), repr(self._obj)
+        except Exception:  # noqa: BLE001
+            return False
+        return _log_text(text) != text or _log_text(rep) != rep
+
+    def _number_source(self) -> Any:
+        if self.masked():
+            raise TypeError("가린 로그 값은 숫자로 바꾸지 않습니다")
+        return self._obj
+
     def __int__(self) -> int:
-        return int(self._obj)
+        return int(self._number_source())
 
     def __float__(self) -> float:
-        return float(self._obj)
+        return float(self._number_source())
 
     def __index__(self) -> int:
-        return self._obj.__index__()
+        return self._number_source().__index__()
 
 
 def _log_text(text: str) -> str:
@@ -661,19 +677,42 @@ def _log_text(text: str) -> str:
     return public_text(text)
 
 
+def _masked_number(obj: Any) -> Optional[str]:
+    """숫자(int·float·complex·Decimal·Fraction·IntEnum …)의 str·repr 이 가려지면 가린 문자열, 아니면 None(R5 B1).
+
+    가려지지 않은 숫자는 원 객체 그대로 둔다 — `%d`·`%5.2f`·`%x` 출력이 훅이 없을 때와 같다. 가려진 숫자는 숫자가
+    아니라 표지 문자열이 된다(원 숫자를 다른 진법·자릿수로 찍어 새는 길이 없다). str/repr 이 실패하면(자릿수 상한을
+    넘는 거대 정수 등) None — 원 객체의 형식 오류 경로에 맡긴다."""
+    try:
+        text, rep = str(obj), repr(obj)
+    except Exception:  # noqa: BLE001
+        return None
+    safe = _log_text(text)
+    if safe != text:
+        return safe
+    safe_rep = _log_text(rep)
+    return safe_rep if safe_rep != rep else None
+
+
 def log_safe_value(obj: Any, depth: int = 0) -> Any:
-    """로그 인자·extra 값 하나를 같은 모양으로 정제한다(바뀐 것이 없으면 같은 객체). R4 P1."""
-    if obj is None or isinstance(obj, (bool, int, float, complex)):
+    """로그 인자·extra 값 하나를 같은 모양으로 정제한다(바뀐 것이 없으면 같은 객체). R4 P1 · R5 B1.
+
+    비문자열 리프 전 유형: None·bool 은 그대로, 숫자는 가려질 때만 표지 문자열(아니면 같은 객체), 그 밖의 객체
+    (bytes·datetime·UUID·Enum·사용자 객체 …)는 _LogSafe(str·repr·format 이 가린 값)."""
+    if obj is None or isinstance(obj, bool):
         return obj
     if isinstance(obj, str):
         out = _log_text(obj)
         return obj if out == obj else out
+    if isinstance(obj, numbers.Number):
+        masked = _masked_number(obj)
+        return obj if masked is None else masked
     if depth >= LOG_MAX_DEPTH:
         return "[REDACTED-DEPTH]"
     if isinstance(obj, dict):
         if len(obj) > LOG_MAX_ITEMS:
             return f"[로그 값 생략: 원소 {len(obj)}개 — 상한 {LOG_MAX_ITEMS}]"
-        pairs = [(log_safe_value(k, depth + 1), log_safe_value(v, depth + 1)) for k, v in list(obj.items())]
+        pairs = [(_log_safe_key(k, depth + 1), log_safe_value(v, depth + 1)) for k, v in list(obj.items())]
         if all(a is k and b is v for (a, b), (k, v) in zip(pairs, obj.items())):
             return obj
         return OrderedDict(pairs) if isinstance(obj, OrderedDict) else dict(pairs)
@@ -696,6 +735,66 @@ def log_safe_value(obj: Any, depth: int = 0) -> Any:
     return _LogSafe(obj)
 
 
+def _log_safe_key(key: Any, depth: int) -> Any:
+    """dict 키 — 값과 같은 규칙(숫자 키가 가려지면 표지 문자열 키 — JSON 직렬화도 된다)."""
+    return log_safe_value(key, depth)
+
+
+#: printf 형식 지정자(logging 의 `%` 스타일). `%%` 는 인자를 쓰지 않는다.
+_PCT_SPEC = re.compile(r"%(?:\((?P<key>[^)]*)\))?(?P<flags>[#0\- +]*)(?P<width>\*|\d+)?"
+                       r"(?:\.(?P<prec>\*|\d+))?[hlL]?(?P<conv>[diouxXeEfFgGcrsa%])")
+_NUMERIC_CONV = frozenset("diouxXeEfFgGc")
+
+
+def _was_masked(original: Any, safe: Any) -> bool:
+    """인자 하나가 숫자 형식으로 찍힐 수 없게 가려졌는가(가린 숫자 → 표지 문자열, 가린 _LogSafe)."""
+    if isinstance(safe, str) and not isinstance(original, str):
+        return True
+    return isinstance(safe, _LogSafe) and safe.masked()
+
+
+def _neutralize_masked_specs(msg: str, original: Any, safe: Any) -> Optional[str]:
+    """가린 인자 자리의 숫자 형식 지정자(`%d`·`%5.2f`·`%x` …)를 `%s` 로 바꾼 형식 문자열(R5 B1 — 형식 오류 없이
+    표지). 가려지지 않은 인자 자리는 그대로(원래 출력과 같다). 바꿀 자리가 없으면 msg, 다룰 수 없으면 None."""
+    mapping = isinstance(safe, dict)
+    if not mapping and not isinstance(safe, tuple):
+        return msg
+    out: List[str] = []
+    prev = 0
+    index = 0
+    changed = False
+    for m in _PCT_SPEC.finditer(msg):
+        conv = m.group("conv")
+        if conv == "%":
+            continue
+        if not mapping:
+            stars = (m.group("width") == "*") + (m.group("prec") == "*")
+            index += stars
+            if index >= len(safe):
+                return None
+            hit = _was_masked(original[index], safe[index])
+            index += 1
+        else:
+            key = m.group("key")
+            if key is None or key not in safe:
+                return None
+            hit = _was_masked(original.get(key), safe[key])
+        if not hit or conv not in _NUMERIC_CONV:
+            continue
+        if m.group("prec") == "*":
+            return None  # `%.*d` 의 정밀도 인자를 버리면 인자 수가 어긋난다 — 형식 오류 경로(원문 없음)
+        key_part = f"({m.group('key')})" if mapping else ""
+        flags = "-" if "-" in m.group("flags") else ""
+        out.append(msg[prev:m.start()])
+        out.append(f"%{key_part}{flags}{m.group('width') or ''}s")
+        prev = m.end()
+        changed = True
+    if not changed:
+        return msg
+    out.append(msg[prev:])
+    return "".join(out)
+
+
 def _install_public_log_hooks() -> Callable[[], None]:
     """레코드 팩토리·Logger.makeRecord·sys/threading excepthook 을 감싸고, 원래대로 돌리는 함수를 돌려준다
     (refcount 는 호출자)."""
@@ -713,7 +812,14 @@ def _install_public_log_hooks() -> Callable[[], None]:
         original_msg, original_args = record.msg, record.args
         safe_args = log_safe_value(original_args) if original_args else original_args
         safe_msg = original_msg if isinstance(original_msg, str) else log_safe_value(original_msg)
-        record.msg, record.args = safe_msg, safe_args
+        format_msg = safe_msg
+        if isinstance(safe_msg, str) and safe_args and safe_args is not original_args:
+            format_msg = _neutralize_masked_specs(safe_msg, original_args, safe_args)
+            if format_msg is None:
+                format_msg = safe_msg
+            elif format_msg is not safe_msg:
+                safe_msg = format_msg  # 아래 '바뀜' 판정 — 완성 문장으로 바꿔 둔다
+        record.msg, record.args = format_msg, safe_args
         try:
             message = record.getMessage()
             failed = False
@@ -752,13 +858,22 @@ def _install_public_log_hooks() -> Callable[[], None]:
         record = original_make(self, *args, **kwargs)
         extra = kwargs.get("extra", args[8] if len(args) > 8 else None)
         if extra:
-            for key in extra:  # R2 NB-5b · R4 P1: extra 속성(문자열·dict·list·중첩·dict 키·객체)
+            for key in list(extra):  # R2 NB-5b · R4 P1 · R5 B1: extra 속성(값의 모든 리프 + 속성 이름)
                 if key not in record.__dict__:
                     continue
                 try:
-                    record.__dict__[key] = log_safe_value(record.__dict__[key])
+                    value = log_safe_value(record.__dict__[key])
                 except Exception as exc:  # noqa: BLE001 - 속성은 남기되 원문은 내보내지 않는다
-                    record.__dict__[key] = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략]"
+                    value = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략]"
+                safe_key = _log_text(key) if isinstance(key, str) else key
+                if safe_key == key:
+                    record.__dict__[key] = value
+                    continue
+                del record.__dict__[key]  # 속성 이름 자체가 등록 값 — 가린 이름으로 옮긴다(Formatter 가 키를 찍는 경로)
+                name, n = safe_key, 2
+                while name in record.__dict__:
+                    name, n = f"{safe_key}#{n}", n + 1
+                record.__dict__[name] = value
         return record
 
     def _write_exception(header: str, exc_type: Any, exc: Any, tb: Any) -> None:

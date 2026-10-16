@@ -49,10 +49,13 @@
 이어지면(`/a?token=prefix X`) X 는 '페이지가 쓴 내용' 으로 남는다(본문 elements 와 같은 취급). 4~7자 등록 값은 앞뒤가
 영숫자가 아닐 때만 가리고 주소 칸에는 쓰지 않는다. 레지스트리 상한(값 256개·글자 16Mi)을 넘어 잊힌 옛 값은 URL 문법
 계층만 적용된다. 표현 범위는 `secret_registry.representations` (대소문자 섞인 16진·base64·NFC/NFD·말줄임은 범위 밖).
+호스트 라벨은 라벨 전체가 등록 값일 때만 가린다(`xx<V>yy.도메인` 은 남는다 — 정상 도메인 보호, 2026-10-17 결정).
+페이지 내용 subtree(아래 '경계')는 범위 밖(원문 보존 계약, 2026-10-17 결정).
 
 **주소 칸**(url·*_url): public_url → 레지스트리(≥ 8 값의 R1·R2 표현·긴 원문 조각, 호스트는 라벨 단위 casefold) → JWT
-(R4 P3). 제어 필드(action·error_code·*tab_id·approval_id·status … — `control_value`)는 값이 도구 어휘·식별자 형식이면
-그대로 둔다(R4 P2).
+(R4 P3). 제어 필드(action·error_code·*tab_id·approval_id·레시피 id·status … — `control_value`)는 값이 그 키의 실제
+열거 어휘(`CONTROL_VOCABULARY`, 코드 상수에서 도출) 또는 도구 식별자 형식이면 그대로 둔다(R4 P2 · R5 B3·B4 — 낱말 모양
+일반 면제는 없다, 자유 문장 칸은 정제).
 
 **경계**: 페이지 *내용* 으로서의 주소는 가리지 않는다 — 에이전트가 링크를 따라가려면 원문이 필요하다
 (`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`. **경로**로
@@ -550,12 +553,60 @@ def _public_url_field(value: str) -> str:
 # ------------------------------------------------------------------ 제어 필드(§1.5, R4 P2 — R3-B7)
 
 _ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
-_ENUM_WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
-#: 값이 도구 열거 어휘(소문자 snake 낱말)인 제어 키.
-CONTROL_ENUM_KEYS: FrozenSet[str] = frozenset({
-    "status", "state", "holder", "reason", "reason_code", "kind", "mode", "browser_mode", "outcome", "op", "risk",
-    "presented_as", "sticky_reason", "changed",
-})
+#: 제어 키 → 그 키에 실리는 **도구 열거 어휘**(R5 B3 — 낱말 모양 일반 면제를 폐지하고 코드 상수에서 도출한 실제 값만).
+#: 출처(생산 코드)는 각 줄 주석, 전수 조사는 tests/security/test_ws51_r5_census.py(AST — src/ 전체의 리터럴·상수·str Enum
+#: 생산자가 이 표 안에 있는지, 동적 생산자는 분류됐는지) 가 고정한다. 자유 문장 칸(handoff 요청 사유·hitl 사유·challenge
+#: 사유·sticky_reason 등)은 이 어휘에 없는 값이면 정제한다.
+_APPROVAL_STATUS = ("pending", "approved", "used", "denied", "revoked", "expired", "unknown")  # handoff.Approval·_FINISHED
+_REPLAY_STOP = ("page_changed", "not_ready", "target_not_found", "target_ambiguous", "approval_required",
+                "action_failed", "expect_mismatch")  # recipes.replay._Stop · recipes.keys found.reason
+_PDF_REASONS = ("egress_unavailable", "user_agent_unavailable", "egress_blocked", "redirect_origin", "redirect_limit",
+                "content_encoding", "file_size_limit", "invalid_length", "not_pdf", "fetch_timeout", "fetch_failed",
+                "encrypted", "page_range", "chars_limit", "pages_limit", "resource_limit", "parse_error",
+                "parse_timeout", "no_pages", "no_text_layer")  # actions.pdf_document FetchResult·doc.update
+_YOUTUBE_REASONS = ("egress_unavailable", "egress_blocked", "redirect_refused", "request_failed", "response_too_large",
+                    "timeout", "invalid_response", "quota_exceeded", "key_invalid", "rate_limited", "bad_request",
+                    "upstream_error", "http_error")  # interface.youtube_search ApiReply.reason
+CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
+    "status": frozenset(_APPROVAL_STATUS + ("opening", "ready")),  # + server_handoff LoginJob.status
+    "state": frozenset({"headless", "headed", "switching", "failed",  # on_demand.WindowState·server_window
+                        "logged_in", "login_form", "captcha",  # browser.login_flow.LoginState
+                        "succeeded"}),  # browser.headless_retry states
+    "holder": frozenset({"agent", "human"}),  # handoff.HOLDER_AGENT·HOLDER_HUMAN
+    "reason": frozenset(_REPLAY_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
+        "headless_ua_blocked",  # server_signals identity
+        "cookies_present", "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
+        "browser_recovered", "request_expired", "window_closed",  # server_window notice
+        "capture_busy", "target_changed",  # server_display·server_hitl
+        "not_in_allowlist", "private_network", "unsupported_scheme", "malformed_url",  # security.egress.BlockReason
+        "fresh", "epoch_mismatch", "node_detached", "role_changed", "name_changed",  # actions.verification.StalenessReason
+        "sabotage",  # harness.tier2_som(사보타주 표지)
+    )),
+    "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
+                              "mismatch"}),  # handoff.check_approval 사유 코드
+    "kind": frozenset({"none", "captcha", "blocked",  # browser.challenge.ChallengeKind
+                       "slot", "ui", "identity",  # recipes.keys 대상 종류
+                       "pdf", "positive", "negative"}),  # actions.pdf_document·browser.site_session
+    "mode": frozenset({"interactive", "unattended",  # contracts.ExecutionMode
+                       "on-demand",  # interface.on_demand.ON_DEMAND
+                       "offline", "live", "after", "json"}),  # harness 보고 모드
+    "browser_mode": frozenset({"headless", "human", "user-chrome", "on-demand"}),  # interface.cli --browser choices
+    "outcome": frozenset({"succeeded", "failed", "outcome_unknown",  # server_hitl._attach_approval_outcome
+                          "unresolved", "resolved", "force"}),  # agent.loop.HandoffOutcome
+    "op": frozenset({"save", "run", "list", "delete",  # browser_recipe op
+                     "take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish",
+                     "cookie_sites", "status"}),  # handoff._OPS · cli status
+    "risk": frozenset({"low", "medium", "high"}),  # security.hitl.RiskLevel
+    "presented_as": frozenset({"chrome"}),  # server_signals identity
+    "sticky_reason": frozenset(),  # 자유 문장(on_demand — 도메인·사유 문장) — 늘 정제
+    "changed": frozenset({"none_pending", "released", "taken", "timeout"}),  # server_handoff._control_wait
+}
+#: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).
+CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
+    "reason": re.compile(r"http_\d{3}"),  # actions.pdf_document f"http_{status_code}"
+}
+#: 값이 도구 열거 어휘인 제어 키(호환 이름 — 판정은 CONTROL_VOCABULARY).
+CONTROL_ENUM_KEYS: FrozenSet[str] = frozenset(CONTROL_VOCABULARY)
 #: 값이 도구가 찍은 시각(ISO 8601)인 제어 키.
 CONTROL_TIME_KEYS: FrozenSet[str] = frozenset({
     "since", "expires_at", "started_at", "created_at", "detected_at", "reset_at",
@@ -564,6 +615,7 @@ CONTROL_TIME_KEYS: FrozenSet[str] = frozenset({
 _CONTROL_ID_KEYS: Dict[str, str] = {
     "tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id", "server_id": "server_id",
     "element_id": "element_id", "trigger_element_id": "element_id",
+    "id": "recipe_id",  # recipes.service list·save·run 의 레시피 id(R5 B4)
 }
 _ACTION_VALUES: FrozenSet[str] = frozenset(a.value for a in ActionType)
 _ERROR_VALUES: FrozenSet[str] = frozenset(e.value for e in ErrorCode)
@@ -581,8 +633,12 @@ def control_value(key: Any, value: str) -> bool:
     fmt = _CONTROL_ID_KEYS.get(key) or ("tab_id" if key.endswith("_tab_id") else None)
     if fmt is not None:
         return secret_registry.TOOL_ID_FORMATS[fmt].fullmatch(value) is not None
-    if key in CONTROL_ENUM_KEYS:
-        return _ENUM_WORD.fullmatch(value) is not None
+    vocabulary = CONTROL_VOCABULARY.get(key)
+    if vocabulary is not None:
+        if value in vocabulary:
+            return True
+        pattern = CONTROL_PATTERNS.get(key)
+        return pattern is not None and pattern.fullmatch(value) is not None
     if key in CONTROL_TIME_KEYS:
         return _ISO_TIME.fullmatch(value) is not None
     return False
