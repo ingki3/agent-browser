@@ -270,7 +270,8 @@ def test_registered_variants_cover_encodings():
 
 
 def test_lru_cap_and_thread_safety():
-    reg = secret_registry.SecretRegistry(cap=secret_registry.MAX_VARIANTS)
+    # R4 §5: 상한 단위는 변형이 아니라 값(MAX_VALUES) + 글자 예산(MAX_CHARS).
+    reg = secret_registry.SecretRegistry(cap=secret_registry.MAX_VALUES)
     errors = []
 
     def worker(k):
@@ -287,18 +288,23 @@ def test_lru_cap_and_thread_safety():
     for t in threads:
         t.join()
     assert not errors
-    assert len(reg) == secret_registry.MAX_VARIANTS
+    assert len(reg) == secret_registry.MAX_VALUES
+    assert 0 < reg.chars <= secret_registry.MAX_CHARS
     reg.add_value("SYNTHnewest0001")
     assert reg.mask("SYNTHnewest0001") == R
     assert reg.mask("SYNTHthread00x00000") == "SYNTHthread00x00000"  # 가장 오래된 값은 잊었다
 
 
 def test_overlapping_and_periodic_values():
+    """R4 §5(의도적 변경): 겹침은 §1.4 정의로 — 어느 등록 값의 전체 표현도 남지 않는다. 서로 다른 등록 값이 겹쳐
+    남는 일부 조각(`ab`·`SYNTHoverlap`)은 NB(긴 것부터 str.replace — P4)."""
     secret_registry.REGISTRY.add_value("abababab")
-    assert public_text("xx ababababab yy") == f"xx {R} yy"   # 겹친 출현은 하나로
+    out = public_text("xx ababababab yy")
+    assert "abababab" not in out and out.startswith(f"xx {R}") and out.endswith(" yy")
     secret_registry.REGISTRY.add_value("SYNTHoverlapAAAA")
     secret_registry.REGISTRY.add_value("AAAAtailSYNTH999")
-    assert public_text("SYNTHoverlapAAAAtailSYNTH999!") == R + "!"
+    out = public_text("SYNTHoverlapAAAAtailSYNTH999!")
+    assert "SYNTHoverlapAAAA" not in out and "AAAAtailSYNTH999" not in out and R in out and out.endswith("!")
 
 
 def test_registry_never_serializes_values():
@@ -452,7 +458,7 @@ def _run_perf(shape: str, nvals: int) -> dict:
 def test_performance_linear_and_under_a_second(shape, nvals):
     rows = _run_perf(shape, nvals)
     if nvals:
-        assert rows["variants"] == secret_registry.MAX_VARIANTS  # 레지스트리를 상한까지 채운 조건 성립
+        assert rows["variants"] == secret_registry.MAX_VALUES  # 레지스트리를 값 상한까지 채운 조건 성립(R4 §5)
     times = {int(k): v for k, v in rows["times"].items()}
     assert times[1 << 20] < 1.0, (shape, times)
     # 2배 입력 → 시간 ≤ 2.5배 (잡음이 큰 아주 짧은 측정은 바닥 5ms 로 본다)
