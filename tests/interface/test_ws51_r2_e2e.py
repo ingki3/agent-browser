@@ -5,6 +5,9 @@
 * B7: 전각 `ｔｏｋｅｎ`·long-s `ſeſſion` 키(Chromium 이 퍼센트 인코딩)로 이동한 navigate/observe 응답.
 
 값은 짧은 합성 값. 공개 사이트 없음.
+
+R3: 공백 표본(`/a?token=prefix X`)은 도구가 그 값을 주소에서 본 경우로 고쳤다 — 실제로 `?token=X` 주소로 이동한 뒤
+제목을 바꾼다(레지스트리 등록 경로 b·c). 본 적 없는 값의 제목 전용 공백 꼬리는 문서화된 한계(r3 테스트).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import pytest
 
 from contracts import ActionResult, ActionType, ErrorCode
 from interface.mcp_server import BrowserMCPServer, envelope_json, tool_name
+from security import secret_registry
 
 from test_run_cli import requires_chromium
 
@@ -25,6 +29,13 @@ PAGE = b"<!doctype html><meta charset=utf-8><title>clean</title><button>Go</butt
 
 B6_TITLES = [f'/a?token="{SHORT}"', f"/a?token='{SHORT}'", f"/a?token=prefix {SHORT}",
              f'goto failed: http://127.0.0.1:1/a?token="{SHORT}"']
+
+
+@pytest.fixture(autouse=True)
+def _fresh_registry():
+    secret_registry.clear()
+    yield
+    secret_registry.clear()
 
 
 @pytest.fixture
@@ -52,6 +63,8 @@ def lab():
 @requires_chromium
 async def test_b6_observe_title_masks_quoted_and_spaced_values(lab):
     async with BrowserMCPServer(headless=True, nav_settle=False) as s:
+        # 도구가 SHORT 가 든 주소를 실제로 본 뒤(공백 표본 — R3) 깨끗한 페이지로
+        assert (await s.call_tool(tool_name(ActionType.NAVIGATE), {"url": f"{lab}/seen?token={SHORT}"})).success
         assert (await s.call_tool(tool_name(ActionType.NAVIGATE), {"url": f"{lab}/clean"})).success
         for title in B6_TITLES:
             await s._page.evaluate("(t) => { document.title = t; }", title)
@@ -65,6 +78,7 @@ async def test_b6_observe_title_masks_quoted_and_spaced_values(lab):
 
 @pytest.mark.parametrize("message", B6_TITLES)
 def test_b6_error_envelope_masks(message):
+    secret_registry.register_url(f"http://127.0.0.1:1/seen?token={SHORT}")  # R3: 도구가 본 값
     r = ActionResult(action=ActionType.NAVIGATE, success=False, snapshot_epoch=1,
                      current_url="http://127.0.0.1:1/", tab_id="t", retry_safe=True,
                      error_code=ErrorCode.TIMEOUT, error_message=message)

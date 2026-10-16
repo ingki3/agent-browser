@@ -8,6 +8,10 @@
 * NB-5: 로그 — 이미 채워진 exc_text·extra 문자열 속성·겹친 설치 refcount.
 
 값은 일부러 짧은 합성 값(값 규칙이 키 규칙의 구멍을 덮지 않게). 공개 사이트 없음.
+
+R3(설계 전환 — 비밀 값 레지스트리): 공백 연장·1024자 상한은 없앴다. 공백으로 이어지는 표본(`token=prefix X`)은
+**도구가 그 값을 주소에서 본 경우**(레지스트리 등록)로 고쳐 같은 기대를 유지한다 — 본 적 없는 값의 제목 전용 공백
+꼬리는 문서화된 한계(test_ws51_r3_secret_registry). 따옴표 표본은 등록 없이도 그대로 가려진다(인용 값 소비).
 """
 
 from __future__ import annotations
@@ -24,10 +28,26 @@ from urllib.parse import quote
 
 import pytest
 
+from security import secret_registry
 from security.public_url import public_payload, public_text, public_url
 
 R = "[REDACTED]"
 SHORT = "SYNTHr2X"
+#: 도구가 본 주소(이동 대상·탭 주소) — 이 값이 레지스트리에 등록된 상태(R3).
+SEEN_URL = f"http://127.0.0.1:1/seen?token={SHORT}"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_registry():
+    secret_registry.clear()
+    yield
+    secret_registry.clear()
+
+
+@pytest.fixture
+def seen():
+    """R3: 도구가 SHORT 가 든 주소를 본 상태(navigate·리다이렉트·탭 주소와 같은 등록)."""
+    secret_registry.register_url(SEEN_URL)
 
 # ------------------------------------------------------------------ B6 자유 문장 값 경계
 
@@ -71,7 +91,7 @@ def _log_once(text: str) -> str:
 
 
 @pytest.mark.parametrize("text", B6_SAMPLES)
-def test_b6_url_field_and_free_text_both_mask(text):
+def test_b6_url_field_and_free_text_both_mask(text, seen):
     """같은 표본을 주소 칸(url·*_url)과 자유 문장(error_message·안내) 양쪽에 넣는다."""
     out = public_payload({"current_url": text, "error_message": text,
                           "data": {"sample_url": text, "hint": f"다시 시도: {text}", "title": text}})
@@ -82,7 +102,7 @@ def test_b6_url_field_and_free_text_both_mask(text):
 
 
 @pytest.mark.parametrize("text", B6_SAMPLES)
-def test_b6_stderr_real_fd2_masks(text, capfd):
+def test_b6_stderr_real_fd2_masks(text, capfd, seen):
     from interface.server_common import _stderr_line
 
     _stderr_line(text)
@@ -92,25 +112,18 @@ def test_b6_stderr_real_fd2_masks(text, capfd):
 
 
 @pytest.mark.parametrize("text", B6_SAMPLES)
-def test_b6_logging_masks(text):
+def test_b6_logging_masks(text, seen):
     out = _log_once(text)
     assert out.count("\n") == 2, out  # 로그는 남는다
     assert SHORT not in out, out
 
 
 @pytest.mark.parametrize("text,expected", [
-    # 따옴표로 시작하는 값 → 짝 따옴표까지, 그 뒤 문장은 남는다
+    # 따옴표로 시작하는 값 → 짝 따옴표까지, 그 뒤 문장은 남는다(등록 없이 — URL 문법 계층)
     (f'제목 /a?token="{SHORT}" 끝', f'제목 /a?token="{R}" 끝'),
     (f"/a?token='{SHORT}' 그리고 'x'", f"/a?token='{R}' 그리고 'x'"),
     (f'/a?token="{SHORT}\n다음 줄', f'/a?token="{R}\n다음 줄'),          # 짝이 없으면 줄 끝까지
     ('/a?token="" 빈 값', '/a?token="" 빈 값'),
-    # 공백 뒤 같은 단어 묶음 → 다음 구분 기호(& ; # 줄바꿈 닫는 괄호 따옴표)까지
-    (f"/a?token=prefix {SHORT}&page=2", f"/a?token={R} {R}&page=2"),
-    (f"/a?token=prefix {SHORT};page=2", f"/a?token={R} {R};page=2"),
-    (f"/a?token=prefix {SHORT}#top", f"/a?token={R} {R}#top"),
-    (f"(see /a?token=prefix {SHORT}) 다음", f"(see /a?token={R} {R}) 다음"),
-    (f"/a?token=prefix {SHORT}\n다음 줄", f"/a?token={R} {R}\n다음 줄"),
-    (f'"/a?token=prefix {SHORT}" 끝', f'"/a?token={R} {R}" 끝'),
     # 주소를 감싼 따옴표(값이 비지 않음)는 닫는 따옴표 — 뒤 문장을 먹지 않는다
     (f'"/a?token={SHORT}" and "other"', f'"/a?token={R}" and "other"'),
     (f"'/a?token={SHORT}' 끝", f"'/a?token={R}' 끝"),
@@ -125,6 +138,22 @@ def test_b6_boundary_rules(text, expected):
     assert public_text(out) == out
 
 
+@pytest.mark.parametrize("text,expected", [
+    # R3: 공백 뒤 값은 경계를 추측하지 않는다 — 도구가 본 값(SHORT)은 레지스트리로, 덩어리 끝 값은 URL 문법으로.
+    (f"/a?token=prefix {SHORT}&page=2", f"/a?token={R} {R}&page=2"),
+    (f"/a?token=prefix {SHORT};page=2", f"/a?token={R} {R};page=2"),
+    (f"/a?token=prefix {SHORT}#top", f"/a?token={R} {R}#top"),
+    (f"(see /a?token=prefix {SHORT}) 다음", f"(see /a?token={R} {R}) 다음"),
+    (f"/a?token=prefix {SHORT}\n다음 줄", f"/a?token={R} {R}\n다음 줄"),
+    (f'"/a?token=prefix {SHORT}" 끝', f'"/a?token={R} {R}" 끝'),
+    (f"/a?token=prefix {SHORT} 다음 말", f"/a?token={R} {R} 다음 말"),  # 뒤 문장은 남는다(R3 — 의미 보존)
+])
+def test_b6_space_values_masked_when_seen(text, expected, seen):
+    out = public_text(text)
+    assert out == expected
+    assert public_text(out) == out
+
+
 @pytest.mark.parametrize("text", [
     f"/a?token=x y&sid={SHORT}",            # 연장이 & 에서 멈춘 뒤 이어지는 쿼리도 같은 규칙
     f"/a?token=x y;code={SHORT}",
@@ -132,28 +161,23 @@ def test_b6_boundary_rules(text, expected):
     f'/a?token="x"&sid={SHORT}',
     f"/a?token=x y#access_token={SHORT}",
 ])
-def test_b6_query_resumes_after_extension(text):
+def test_b6_query_resumes_after_extension(text, seen):
     out = public_text(text)
     assert SHORT not in out, out
     assert public_text(out) == out
 
 
-def test_b6_extension_is_capped():
-    from security.public_url import MAX_VALUE_TAIL_CHARS
-
-    tail = "w" * (MAX_VALUE_TAIL_CHARS * 3) + " " + "z" * (MAX_VALUE_TAIL_CHARS * 2)
+def test_b6_no_space_extension_in_r3():
+    """R3: 공백 연장·1024자 상한은 없다 — 공백 뒤 문장은 (등록 값이 아니면) 그대로 남는다(B10 의미 보존)."""
+    tail = "w" * 3072 + " " + "z" * 2048
     out = public_text(f"/a?token=prefix {tail}")
-    assert out.startswith(f"/a?token={R} {R}")
-    assert out.endswith("z" * (MAX_VALUE_TAIL_CHARS * 2))  # 상한 뒤 다음 단어부터는 문장 그대로
-    assert len(out) < len(tail)
+    assert out == f"/a?token={R} {tail}"
 
 
 def test_b6_cap_never_cuts_inside_a_following_url():
-    """상한이 다음 주소 덩어리 한가운데에 걸려도 그 덩어리 꼬리(`…ken=X`)가 원문으로 남지 않는다."""
-    from security.public_url import MAX_VALUE_TAIL_CHARS
-
+    """긴 문장 뒤의 다음 주소 덩어리(`…ken=X`)도 덩어리 시작에서 다시 찾아 가린다(R2 상한 표본 유지)."""
     for shift in range(0, 40):
-        text = "/a?token=x " + "w" * (MAX_VALUE_TAIL_CHARS - 20 + shift) + f" http://h.test/?token={SHORT} 끝"
+        text = "/a?token=x " + "w" * (1024 - 20 + shift) + f" http://h.test/?token={SHORT} 끝"
         assert SHORT not in public_text(text), shift
     many = f"http://h.test/?token={SHORT} " * 400
     assert SHORT not in public_text(many)
@@ -305,6 +329,7 @@ PERF_CASES = {
 
 
 def _perf_child(case: str, n: int) -> None:
+    secret_registry.register_url(SEEN_URL)  # R3: 공백 표본의 SHORT 는 도구가 본 값
     text = PERF_CASES[case](n)
     t = time.perf_counter()
     out = public_payload({"message": text, "url": text})

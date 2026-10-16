@@ -214,6 +214,11 @@ class LifecycleMixin:
         # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
         self._page_status = PageDocumentStatus()
         self._page_status.attach(context)
+        # WS-51 R3 등록 지점 (c): main-frame 이동·문서 요청 리다이렉트 체인의 비밀 값을 레지스트리에(첫 탭 전에 —
+        # 새 탭·팝업도 context 의 page 이벤트로 잡는다). 등록 실패는 조용히 끝난다.
+        from security.secret_registry import watch_browser_context
+
+        watch_browser_context(context)
         tab = await self._core.new_tab("mcp-session")
         self._page = tab.page
         self._cdp = await self._core.new_cdp_session(tab.tab_id)
@@ -253,7 +258,10 @@ class LifecycleMixin:
         from interface import on_demand
         from urllib.parse import urlsplit
 
+        from security.secret_registry import register_urls
+
         order = sorted(snapshot, key=lambda t: not t.get("active"))
+        register_urls(str(item.get("url") or "") for item in order)  # WS-51 R3 (d): 보관한 탭 원문 주소
         tabs_info: List[Dict[str, Any]] = []
         skipped = 0
         for item in order:

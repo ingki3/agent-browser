@@ -2355,6 +2355,11 @@ class ActionDispatcher:
         from security.public_url import REDACTED_NAVIGATE_HINT, has_redaction_mark
 
         if not has_redaction_mark(url):
+            # WS-51 R3 등록 지점 (b): 이동 대상(navigate·tab create)의 비밀 값을 goto 전에 레지스트리에 — 이동이
+            # 실패해 오류 문구(`Page.goto: … navigating to "URL"`)에 실려도 그 값은 가려진다. 예외를 내지 않는다.
+            from security.secret_registry import register_url
+
+            register_url(url)
             return None
         return self._result(
             success=False,

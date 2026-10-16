@@ -32,11 +32,23 @@
 후보는 공백·따옴표·꺾쇠로 나눈 덩어리의 **시작에서만** 찾고, 스킴 후보는 64자 상한으로 찾는다(상한이 없으면
 긴 글자 덩어리에서 시작점마다 다시 훑는 이차시간). JWT 는 정규식 대신 덩어리 단위로 한 번씩 훑는다.
 
-**자유 문장의 값 경계**(R2 B6): 주소 덩어리가 비밀 키 값으로 끝났는데 문장이 이어지면 — 값이 비었고 바로
-따옴표면(`token="X"`) 짝 따옴표까지(없으면 줄 끝), 값 뒤가 공백이면(`token=prefix X`) 같은 값일 수 있어 다음
-구분 기호(`&`·`;`·`#`·줄바꿈·닫는 괄호·따옴표·꺾쇠)까지 안전 쪽으로 가린다(한 번에 MAX_VALUE_TAIL_CHARS, 상한이
-단어 안에 걸리면 그 단어 끝까지 — 다음 주소 덩어리 한가운데서 끊지 않는다). 대가: `?token=X 다음 말` 의
-'다음 말' 도 가려진다. 주소 칸(url·*_url)은 주소 전체를 하나로 보므로 이 규칙이 필요 없다.
+**자유 문장**(R3 — 설계 전환, 사용자 결정 2026-10-16 A). public_text 는 세 계층이다:
+
+1. **도구가 본 주소의 비밀 값은 어디서든 가린다** — `security.secret_registry`. 이동 대상·리다이렉트 체인·main-frame
+   이동·탭 주소·같은 응답의 주소 칸에서 이 모듈이 `[REDACTED]` 로 바꾸는 바로 그 값(`secret_values` — 같은 판정
+   함수)과 인코딩 변형을 정확 일치로 가린다. 값이 문장에서 공백·따옴표·이스케이프로 어떻게 둘러싸여 있든 같다.
+2. **출처 모를 문장은 URL 문법 경계만** — 공백·따옴표·꺾쇠로 나뉜 주소 덩어리에 public_url 을 적용한다. 공백은
+   주소의 끝이다(R2 의 공백 연장·1024자 상한은 없앴다 — 문장만 보고는 `Request /a?token=abc HTTP 401` 과
+   `/a?token=prefix SECRET` 을 가를 수 없다, 설계 리뷰 §1). 단 비밀 키 값이 비었거나 `\\` 뿐인데 바로 따옴표가
+   오면(`token="X"`·`token=\\"X\\"`·JSON 문자열 안 주소) 이스케이프되지 않은 짝 따옴표나 줄 끝까지 상한 없이
+   가린다(이스케이프 열림 `\\"` 은 `\\"` 로 닫히고, 그 전에 맨 따옴표가 오면 거기서 끝 — 바깥 문자열의 끝). 인용 뒤
+   `&`·`;`·`#` 로 이어지는 같은 주소의 나머지도 같은 규칙.
+3. JWT 모양 덩어리.
+
+**한계(문서화)**: 도구가 어떤 주소에서도 본 적 없는 비밀이 페이지 제목 같은 출처 모를 문장에만 공백 뒤로 이어지면
+(`/a?token=prefix X`) X 는 '페이지가 쓴 내용' 으로 남는다(본문 elements 와 같은 취급). 4~7자 등록 값은 앞뒤가
+영숫자가 아닐 때만 가린다. 레지스트리 상한(256 변형)을 넘어 잊힌 옛 값은 URL 문법 계층만 적용된다. 주소 칸
+(url·*_url)은 주소 전체를 하나로 보므로 이 계층들과 무관하게 public_url 이다.
 
 **경계**: 페이지 *내용* 으로서의 주소는 가리지 않는다 — 에이전트가 링크를 따라가려면 원문이 필요하다
 (`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`. **경로**로
@@ -54,6 +66,7 @@ import unicodedata
 from typing import Any, FrozenSet, List, Optional, Tuple
 from urllib.parse import quote, unquote, unquote_plus, urlsplit
 
+from security import secret_registry
 from security.masking import MASK
 
 #: 파싱하지 못한(또는 너무 긴) 주소 대신 쓰는 표지(원문을 남기지 않는다).
@@ -79,9 +92,7 @@ MAX_PAYLOAD_DEPTH = 64
 _CACHE_MIN_CHARS = 16 * 1024
 #: 키 이름의 퍼센트 인코딩을 푸는 최대 겹 수(`%2574oken` → `%74oken` → `token`).
 _MAX_KEY_UNQUOTE = 3
-#: 자유 문장에서 비밀 키 값이 공백·따옴표 뒤로 이어질 때 한 번에 더 가리는 최대 글자 수(R2 B6).
-MAX_VALUE_TAIL_CHARS = 1024
-#: 줄바꿈 글자(str.splitlines 기준) — 공백 연장·짝 없는 따옴표 연장은 줄을 넘지 않는다.
+#: 줄바꿈 글자(str.splitlines 기준) — 짝 없는 따옴표 값은 줄을 넘지 않는다.
 _LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 _QUOTES = "\"'"
 
@@ -112,14 +123,9 @@ _CANDIDATE = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>]*?(?:://|[?#])[^\s\"'<>]*")
 #: 덩어리 안 절대 주소의 시작(스킴). 스킴 길이 상한이 이차시간을 막는다.
 _SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,%d}://" % (MAX_SCHEME_CHARS - 1))
 _MARK = re.compile(r"\[REDACTED|%5BREDACTED", re.IGNORECASE)
-#: 공백 뒤 이어지는 비밀 값 묶음의 끝: 파라미터·조각 구분자, 줄바꿈, 닫는 괄호, 따옴표·꺾쇠(R2 B6).
-#: `]` 는 넣지 않는다 — 가림 표지 `[REDACTED]` 안에서 끊기면 멱등이 깨진다.
-_TAIL_END = re.compile("[&;#)}\"'<>" + _LINE_BREAKS + "]")
-#: 따옴표로 시작한 값의 끝: 짝 따옴표 또는 줄바꿈.
-_QUOTE_STOP = {q: re.compile("[" + re.escape(q) + _LINE_BREAKS + "]") for q in _QUOTES}
-#: 상한에 걸린 연장을 끝낼 자리(공백·구분 기호·닫는 괄호·따옴표·꺾쇠).
-_WORD_END = re.compile(r"[\s&;#)}\"'<>]")
-#: 연장이 구분 기호에서 멈춘 뒤 이어지는 덩어리(공백·따옴표·꺾쇠 전까지).
+#: 인용 값 안에서 다음으로 볼 글자: 같은 따옴표·백슬래시·줄바꿈(소비형 — 지난 글자를 다시 훑지 않는다).
+_QUOTE_STOP = {q: re.compile("[" + re.escape(q) + "\\\\" + _LINE_BREAKS + "]") for q in _QUOTES}
+#: 인용 값 뒤 구분 기호에서 이어지는 같은 주소의 나머지(공백·따옴표·꺾쇠 전까지).
 _RUN = re.compile(r"[^\s\"'<>]*")
 
 #: 응답 구조에서 페이지 '내용' 으로 보고 가리지 않는 **경로**(최상위 응답 기준): extract 항목, 관찰 요소·요약.
@@ -234,50 +240,64 @@ def _secret_value(raw_value: str) -> bool:
 # ------------------------------------------------------------------ 주소
 
 
-def _public_value(raw_value: str, depth: int) -> str:
+#: 가린 원 값을 모으는 자리(secret_values) — None 이면 모으지 않는다.
+_Sink = Optional[List[str]]
+
+
+def _public_value(raw_value: str, depth: int, sink: _Sink = None) -> str:
     """비밀이 아닌 값 — 값이 절대 주소면 그 주소도 가린다(바뀐 경우에만 다시 인코딩)."""
     decoded = unquote(raw_value)
     if "://" not in decoded:
         return raw_value
     if depth >= MAX_URL_DEPTH:
+        if sink is not None:
+            sink.append(raw_value)
         return MASK  # 너무 깊은 중첩 주소 — 더 풀지 않고 값 전체를 가린다
-    inner = _public_url(decoded, depth + 1)
+    inner = _public_url(decoded, depth + 1, sink)
     if inner == decoded:
         return raw_value
     return quote(inner, safe="/:[]")
 
 
-def _public_param(part: str, depth: int) -> str:
+def _public_param(part: str, depth: int, sink: _Sink = None) -> str:
     if "=" in part:
         key, value = part.split("=", 1)
         if value and (_secret_key(key) or _secret_value(value)):
+            if sink is not None:
+                sink.append(value)
             value = MASK
         else:
-            value = _public_value(value, depth)
+            value = _public_value(value, depth, sink)
         return f"{key}={value}"
     if part and _secret_value(part):
+        if sink is not None:
+            sink.append(part)
         return MASK
     return part
 
 
-def _public_query(query: str, depth: int) -> str:
+def _public_query(query: str, depth: int, sink: _Sink = None) -> str:
     """`&`·`;` 로 나눈 각 파라미터의 값을 가린다. 구분자·순서는 그대로(짝수 칸 = 파라미터, 홀수 칸 = 구분자)."""
     pieces = _PARAM_SEP.split(query)
     for i in range(0, len(pieces), 2):
-        pieces[i] = _public_param(pieces[i], depth)
+        pieces[i] = _public_param(pieces[i], depth, sink)
     return "".join(pieces)
 
 
-def _public_fragment(fragment: str, depth: int) -> str:
+def _public_fragment(fragment: str, depth: int, sink: _Sink = None) -> str:
     if "=" in fragment:
         if "?" in fragment:  # SPA 경로 `#/route?code=…`
             route, query = fragment.split("?", 1)
-            return route + "?" + _public_query(query, depth)
-        return _public_query(fragment, depth)
-    return MASK if fragment and _secret_value(fragment) else fragment
+            return route + "?" + _public_query(query, depth, sink)
+        return _public_query(fragment, depth, sink)
+    if fragment and _secret_value(fragment):
+        if sink is not None:
+            sink.append(fragment)
+        return MASK
+    return fragment
 
 
-def _public_url(url: str, depth: int) -> str:
+def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
     if len(url) > MAX_URL_CHARS:
         return URL_MASK
     try:
@@ -289,12 +309,16 @@ def _public_url(url: str, depth: int) -> str:
     prefix, has_query, query = rest.partition("?")
     netloc = parts.netloc
     if "@" in netloc:
+        if sink is not None:
+            # 사용자정보는 통째로 뺀다 — 비밀번호(없으면 사용자 자리에 쓴 토큰)를 등록 대상으로.
+            user, _, password = netloc.rsplit("@", 1)[0].partition(":")
+            sink.append(password or user)
         prefix = prefix.replace("//" + netloc, "//" + netloc.rsplit("@", 1)[1], 1)
     out = prefix
     if has_query:
-        out += "?" + _public_query(query, depth)
+        out += "?" + _public_query(query, depth, sink)
     if has_frag:
-        out += "#" + _public_fragment(fragment, depth)
+        out += "#" + _public_fragment(fragment, depth, sink)
     return out
 
 
@@ -306,6 +330,16 @@ def public_url(url: str) -> str:
     if not isinstance(url, str) or not url:
         return url
     return _public_url(url, 0)
+
+
+def secret_values(url: str) -> List[str]:
+    """public_url(url) 이 `[REDACTED]` 로 바꾸는(또는 사용자정보로 빼는) 원 값들 — 비밀 값 레지스트리의 등록
+    판정이다(같은 함수라 주소 칸 판정과 갈라지지 않는다). 중첩 주소(`next=`)의 값은 디코드된 원 값."""
+    if not isinstance(url, str) or not url:
+        return []
+    sink: List[str] = []
+    _public_url(url, 0, sink)
+    return [v for v in sink if v]
 
 
 # ------------------------------------------------------------------ 자유 문장·응답 구조
@@ -342,110 +376,109 @@ def _secret_tail_value(chunk: str) -> Optional[str]:
 
 
 def _public_run(run: str) -> str:
-    """연장이 구분 기호에서 멈춘 뒤 이어지는 같은 주소의 나머지(`&b=1&sid=…`·`#…`·`)?…`)."""
+    """인용 값 뒤 구분 기호에서 이어지는 같은 주소의 나머지(`&b=1&sid=…`·`;…`·`#…`)."""
     if run[0] in "&;":
         masked = public_url("?" + run)
         return masked if masked == URL_MASK else masked[1:]
-    if run[0] == "#":
-        return public_url(run)
-    return _public_chunk(run)
+    return public_url(run)
 
 
-def _word_end(text: str, pos: int) -> int:
-    """상한에 걸린 연장을 그 자리 단어(덩어리) 끝까지 늘린다 — 주소 덩어리 한가운데서 끊기면 남은 꼬리가 덩어리
-    시작이 아니라 다음 탐색에서 빠지고 원문이 남는다(1MiB 반복 주소 표본)."""
-    end = _WORD_END.search(text, pos)
-    return end.start() if end is not None else len(text)
+def _quoted_end(text: str, pos: int, escaped_open: bool) -> Tuple[int, int]:
+    """pos 의 따옴표로 시작한 인용 값의 (안쪽 끝, 소비 끝).
 
-
-def _extend_secret_value(text: str, pos: int, chunk: str, out: List[str]) -> int:
-    """덩어리가 비밀 키 값으로 끝났는데 문장이 공백·따옴표로 이어지면 그 값의 경계를 안전 쪽으로 정한다(R2 B6).
-
-    * 값이 비었고 바로 따옴표가 오면(`token="X"`) 짝 따옴표까지(없으면 줄 끝·상한까지) 가린다.
-    * 값 뒤가 가로 공백이면(`token=prefix X`) 같은 단어 묶음으로 보고 다음 구분 기호(`&`·`;`·`#`·줄바꿈·
-      닫는 괄호·따옴표·꺾쇠) 또는 MAX_VALUE_TAIL_CHARS 까지 가린다(공백은 남긴다).
-    * 연장이 `&`·`;`·`#`·닫는 괄호에서 멈추면 이어지는 덩어리도 같은 주소의 나머지로 가리고, 그 끝이 다시 비밀
-      키 값이면 반복한다. 매 단계가 글자를 소비하므로 전체 선형.
-    반환: 다음 탐색 위치. 가린 조각은 out 에 붙인다.
+    * 열림이 맨 따옴표면: `\\x` 는 값 내용(이스케이프), 짝 따옴표에서 닫는다(따옴표 소비).
+    * 열림이 `\\"` 면(JSON·repr 안 주소): `\\"` 에서 닫는다. 그 전에 맨 따옴표가 오면 바깥 문자열의 끝이라 거기서
+      멈추고 소비하지 않는다.
+    * 줄바꿈·문장 끝에서 멈춘다(상한 없음). 정규식은 매번 직전 위치부터 다음 멈춤 글자만 찾는다 — 선형.
     """
+    q = text[pos]
+    stop = _QUOTE_STOP[q]
+    i = pos + 1
     n = len(text)
-    while pos < n:
-        value = _secret_tail_value(chunk)
-        if value is None:
-            return pos
-        ch = text[pos]
-        if ch in _QUOTES and value == "":
-            limit = min(n, pos + 1 + MAX_VALUE_TAIL_CHARS)
-            end = _QUOTE_STOP[ch].search(text, pos + 1, limit)
-            stop = end.start() if end is not None else _word_end(text, limit)
-            inner = MASK if stop > pos + 1 else ""
-            if end is None or text[stop] != ch:  # 짝 없음 — 줄 끝·상한까지
-                out.append(ch + inner)
-                return stop
-            out.append(ch + inner + ch)
-            pos = stop + 1
-        elif ch.isspace() and ch not in _LINE_BREAKS:
-            limit = min(n, pos + MAX_VALUE_TAIL_CHARS)
-            end = _TAIL_END.search(text, pos, limit)
-            stop = end.start() if end is not None else _word_end(text, limit)
-            seg = text[pos:stop]
-            body = seg.strip()
-            if body:
-                out.append(seg[:len(seg) - len(seg.lstrip())] + MASK + seg[len(seg.rstrip()):])
-            else:
-                out.append(seg)
-                if stop < n and text[stop] in _QUOTES:  # `token= "X"` — 빈 값 뒤 공백 다음 따옴표
-                    pos = stop
-                    continue
-            pos = stop
-        else:
-            return pos
-        if pos >= n or text[pos] not in "&;#)}":
-            return pos
-        run = _RUN.match(text, pos).group(0)  # type: ignore[union-attr]  # 빈 일치 가능 패턴
-        out.append(_public_run(run))
-        chunk = "?" + run if run[0] in "&;" else run
-        pos += len(run)
-    return pos
+    while True:
+        m = stop.search(text, i)
+        if m is None:
+            return n, n
+        j = m.start()
+        c = text[j]
+        if c == "\\":
+            if escaped_open and text[j + 1:j + 2] == q:
+                return j, j + 2
+            i = j + 2
+            continue
+        if c == q:
+            return (j, j) if escaped_open else (j, j + 1)
+        return j, j  # 줄바꿈
+
+
+def _quoted_secret(chunk: str, text: str, pos: int) -> Optional[str]:
+    """덩어리가 비밀 키의 빈 값(또는 `\\` 뿐인 값)으로 끝나고 바로 따옴표가 오면 그 값(백슬래시들), 아니면 None."""
+    if pos >= len(text) or text[pos] not in _QUOTES:
+        return None
+    value = _secret_tail_value(chunk)
+    if value is None or value.strip("\\"):
+        return None
+    return value
 
 
 def _public_urls_in_text(text: str) -> str:
     out: List[str] = []
     pos = 0
+    n = len(text)
     while True:
         m = _CANDIDATE.search(text, pos)
         if m is None:
             break
         out.append(text[pos:m.start()])
-        chunk = m.group(0)
-        out.append(_public_chunk(chunk))
-        pos = _extend_secret_value(text, m.end(), chunk, out)
+        piece = m.group(0)  # 입력에 실제로 있는 조각
+        mask_piece = _public_chunk
+        pos = m.end()
+        # 비밀 키의 빈 값 + 따옴표: 인용 값(짝 따옴표·줄 끝까지) — 매 단계가 글자를 소비하므로 전체 선형.
+        while True:
+            # 인용 뒤 이어지는 나머지(`&sid=`)는 쿼리로 판정한다(앞에 `?` 를 붙여 본다).
+            probe = "?" + piece if mask_piece is _public_run and piece[0] in "&;" else piece
+            slashes = _quoted_secret(probe, text, pos)
+            if slashes is None:
+                out.append(mask_piece(piece))
+                break
+            head = piece[:len(piece) - len(slashes)]
+            out.append(mask_piece(head) + slashes + text[pos])
+            inner_end, end = _quoted_end(text, pos, len(slashes) % 2 == 1)
+            out.append((MASK if inner_end > pos + 1 else "") + text[inner_end:end])
+            pos = end
+            if pos >= n or text[pos] not in "&;#":
+                break
+            piece = _RUN.match(text, pos).group(0)  # type: ignore[union-attr]  # 빈 일치 가능 패턴
+            mask_piece = _public_run
+            pos += len(piece)
     out.append(text[pos:])
     return "".join(out)
 
 
 def _public_text(text: str) -> str:
+    text = secret_registry.mask_registered(text)
     if "://" in text or "?" in text or "#" in text:
         text = _public_urls_in_text(text)
     return _mask_jwts(text)
 
 
 @functools.lru_cache(maxsize=8)
-def _public_text_long(text: str) -> str:
+def _public_text_long(text: str, registry_version: int) -> str:
     return _public_text(text)
 
 
 def public_text(text: str) -> str:
-    """자유 문장(오류 문구·안내·로그 줄·robots 규칙) 안의 주소에 public_url 을 적용하고 JWT 를 가린다.
+    """자유 문장(오류 문구·안내·로그 줄·robots 규칙·제목)을 가린다 — 도구가 본 비밀 값(레지스트리) → 주소 덩어리의
+    public_url(+인용 값) → JWT (모듈 설명 '자유 문장').
 
     절대 주소뿐 아니라 `://` 없는 상대 주소 조각(`/p?token=…`, `?token=…`, `#token=…`)도 같은 규칙. 선형 시간.
-    긴 문자열(_CACHE_MIN_CHARS 이상)은 최근 8개 결과를 기억한다 — 크기 상한(cap_result_size)이 같은 결과를 여러 번
-    직렬화하며 같은 긴 제목을 다시 가리지 않게.
+    긴 문자열(_CACHE_MIN_CHARS 이상)은 최근 8개 결과를 레지스트리 버전과 함께 기억한다 — 크기 상한(cap_result_size)이
+    같은 결과를 여러 번 직렬화하며 같은 긴 제목을 다시 가리지 않게(새 값이 등록되면 다시 계산).
     """
     if not isinstance(text, str) or not text:
         return text
     if len(text) >= _CACHE_MIN_CHARS:
-        return _public_text_long(text)
+        return _public_text_long(text, secret_registry.version())
     return _public_text(text)
 
 
@@ -499,8 +532,32 @@ def public_payload(obj: Any, *, content_paths: FrozenSet[Tuple[str, ...]] = CONT
       입력과 같은 객체다(복사하지 않음 — 두 소비자 envelope_dict·call_server_tool 은 새로 만든 dict 를 넘기고
       결과를 바로 직렬화한다).
     * 깊이 MAX_PAYLOAD_DEPTH 를 넘는 자리는 DEPTH_MASK — 예외를 내지 않는다.
+    * 가리기 전에 같은 응답의 주소 칸 원문(내용 경로 밖)을 비밀 값 레지스트리에 등록한다(R3 등록 지점 a) — 제목이
+      주소 칸보다 먼저 나와도 그 주소의 비밀 값은 제목에서 가려진다.
     """
+    try:
+        _register_url_fields(obj, (), 0, content_paths, False)
+    except Exception:  # noqa: BLE001 - 등록 실패가 응답을 막지 않는다(URL 문법 계층은 그대로)
+        pass
     return _payload(obj, (), 0, content_paths, False)
+
+
+def _register_url_fields(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
+                         paths: FrozenSet[Tuple[str, ...]], url_field: bool) -> None:
+    if isinstance(obj, str):
+        if url_field:
+            secret_registry.register_url(obj)
+        return
+    if depth >= MAX_PAYLOAD_DEPTH:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            sub = path + (k,) if path is not None and len(path) < _MAX_CONTENT_PATH else None
+            if sub is None or sub not in paths:
+                _register_url_fields(v, sub, depth + 1, paths, _is_url_key(k))
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _register_url_fields(v, None, depth + 1, paths, url_field)
 
 
 def has_redaction_mark(url: Any) -> bool:

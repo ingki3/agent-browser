@@ -153,8 +153,8 @@ def test_url_field_is_one_address_even_with_spaces_or_quotes(value):
 
 @pytest.mark.parametrize("text,expected", [
     (f"Disallow: /guard?gateToken={SHORT}", f"Disallow: /guard?gateToken={R}"),
-    # R2 B6: 비밀 키 값 뒤 공백으로 이어지는 단어 묶음은 같은 값일 수 있어(`token=prefix X`) 안전 쪽으로 가린다
-    (f"상대 주소 ?token={SHORT} 끝", f"상대 주소 ?token={R} {R}"),
+    # R3: 공백은 주소의 끝 — R2 의 공백 연장(뒤 낱말까지 가림)을 되돌렸다(B10 의미 보존, 비밀 값 레지스트리로 대체)
+    (f"상대 주소 ?token={SHORT} 끝", f"상대 주소 ?token={R} 끝"),
     (f"조각 #access_token={SHORT}&x=1", f"조각 #access_token={R}&x=1"),
     (f"/login?next=https://h.test/p?token={SHORT}", None),  # 안쪽 절대 주소도
     # 자유 문장의 물음표·해시·등호는 그대로
