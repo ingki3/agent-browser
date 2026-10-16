@@ -63,9 +63,10 @@ from __future__ import annotations
 import functools
 import re
 import unicodedata
-from typing import Any, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 from urllib.parse import quote, unquote, unquote_plus, urlsplit
 
+from contracts import ActionType, ErrorCode
 from security import secret_registry
 from security.masking import MASK
 
@@ -127,6 +128,7 @@ _MARK = re.compile(r"\[REDACTED|%5BREDACTED", re.IGNORECASE)
 _QUOTE_STOP = {q: re.compile("[" + re.escape(q) + "\\\\" + _LINE_BREAKS + "]") for q in _QUOTES}
 #: 인용 값 뒤 구분 기호에서 이어지는 같은 주소의 나머지(공백·따옴표·꺾쇠 전까지).
 _RUN = re.compile(r"[^\s\"'<>]*")
+_BACKSLASHES = re.compile(r"\\+")
 
 #: 응답 구조에서 페이지 '내용' 으로 보고 가리지 않는 **경로**(최상위 응답 기준): extract 항목, 관찰 요소·요약.
 CONTENT_PATHS: FrozenSet[Tuple[str, ...]] = frozenset({
@@ -383,12 +385,16 @@ def _public_run(run: str) -> str:
     return public_url(run)
 
 
-def _quoted_end(text: str, pos: int, escaped_open: bool) -> Tuple[int, int]:
-    """pos 의 따옴표로 시작한 인용 값의 (안쪽 끝, 소비 끝).
+def _quoted_end(text: str, pos: int, depth: int) -> Tuple[int, int]:
+    """pos 의 따옴표(바로 앞 백슬래시 depth 개로 열림)로 시작한 인용 값의 (안쪽 끝, 소비 끝).
 
-    * 열림이 맨 따옴표면: `\\x` 는 값 내용(이스케이프), 짝 따옴표에서 닫는다(따옴표 소비).
-    * 열림이 `\\"` 면(JSON·repr 안 주소): `\\"` 에서 닫는다. 그 전에 맨 따옴표가 오면 바깥 문자열의 끝이라 거기서
-      멈추고 소비하지 않는다.
+    임의 깊이 이스케이프(R4 P1 — repr·JSON 을 몇 겹 거친 로그 문장): 같은 따옴표 앞 백슬래시 덩어리의 길이를 연 쪽과
+    비교한다. 이스케이프는 겹마다 백슬래시를 늘리므로(0 → 1·2 → 3·5 …) 값 **안** 의 따옴표는 연 쪽보다 길다.
+
+    * 같은 길이 → 닫는 따옴표(소비).
+    * 더 긴 덩어리 → 한 겹 더 이스케이프된 따옴표 — 값 내용.
+    * 더 짧은 덩어리(맨 따옴표 포함) → 바깥 문자열의 끝 — 거기서 멈추고 소비하지 않는다(맨 따옴표로 연 값에는
+      더 짧은 것이 없다).
     * 줄바꿈·문장 끝에서 멈춘다(상한 없음). 정규식은 매번 직전 위치부터 다음 멈춤 글자만 찾는다 — 선형.
     """
     q = text[pos]
@@ -402,12 +408,17 @@ def _quoted_end(text: str, pos: int, escaped_open: bool) -> Tuple[int, int]:
         j = m.start()
         c = text[j]
         if c == "\\":
-            if escaped_open and text[j + 1:j + 2] == q:
-                return j, j + 2
-            i = j + 2
+            r = _BACKSLASHES.match(text, j).end()  # type: ignore[union-attr]  # j 가 백슬래시
+            if r < n and text[r] == q:
+                run = r - j
+                if run == depth:
+                    return j, r + 1
+                if run < depth:
+                    return j, j
+            i = r + 1 if r < n and text[r] == q else r
             continue
         if c == q:
-            return (j, j) if escaped_open else (j, j + 1)
+            return (j, j + 1) if depth == 0 else (j, j)
         return j, j  # 줄바꿈
 
 
@@ -443,7 +454,7 @@ def _public_urls_in_text(text: str) -> str:
                 break
             head = piece[:len(piece) - len(slashes)]
             out.append(mask_piece(head) + slashes + text[pos])
-            inner_end, end = _quoted_end(text, pos, len(slashes) % 2 == 1)
+            inner_end, end = _quoted_end(text, pos, len(slashes))
             out.append((MASK if inner_end > pos + 1 else "") + text[inner_end:end])
             pos = end
             if pos >= n or text[pos] not in "&;#":
@@ -487,24 +498,107 @@ def _is_url_key(key: Any) -> bool:
     return isinstance(key, str) and (key in ("url", "urls") or key.endswith("_url") or key.endswith("_urls"))
 
 
+def _registered_in_url(url: str) -> str:
+    """주소 칸(public_url 뒤)의 등록 값(R4 P3 — R3-B1): 호스트 뒤(경로·쿼리·조각)는 ≥ 8 값의 R1·R2 표현과 긴 원문
+    조각을, 호스트는 라벨 단위로 등록 원문과 casefold 비교해 같은 라벨만 가린다(Chromium 은 호스트를 소문자로
+    바꾼다). 4~7자 값은 쓰지 않는다 — `?code=2026` 을 본 뒤 `/archive/2026/` 같은 정상 경로가 가려져 이동이
+    거부되지 않게(§1.1)."""
+    registry = secret_registry.REGISTRY
+    if not len(registry) or url == URL_MASK:
+        return url
+    scheme_end = url.find("://")
+    if scheme_end < 0 or not _SCHEME.fullmatch(url, 0, scheme_end + 3):
+        return registry.mask_url_part(url)  # about:·data:·상대 주소 — 호스트가 없다
+    start = scheme_end + 3
+    stop = len(url)
+    for mark in "/?#":
+        k = url.find(mark, start)
+        if 0 <= k < stop:
+            stop = k
+    authority = url[start:stop]
+    host, port = authority, ""
+    if not authority.startswith("["):  # IPv6 리터럴은 라벨이 없다
+        head, colon, tail = authority.rpartition(":")
+        if colon and tail.isdigit():
+            host, port = head, colon + tail
+        labels = host.split(".")
+        if any(registry.host_label_registered(label) for label in labels):
+            host = ".".join(MASK if registry.host_label_registered(label) else label for label in labels)
+    return url[:start] + host + port + registry.mask_url_part(url[stop:])
+
+
 def _public_url_field_uncached(value: str) -> str:
-    return _mask_jwts(public_url(value))
+    return _mask_jwts(_registered_in_url(public_url(value)))
 
 
 @functools.lru_cache(maxsize=8)
-def _public_url_field_long(value: str) -> str:
+def _public_url_field_long(value: str, registry_version: int) -> str:
+    """긴 주소 칸 결과 캐시 — 키에 레지스트리 버전(§2 P8: 등록 뒤 옛 결과를 돌려주지 않는다)."""
     return _public_url_field_uncached(value)
 
 
 def _public_url_field(value: str) -> str:
     if len(value) >= _CACHE_MIN_CHARS:
-        return _public_url_field_long(value)
+        return _public_url_field_long(value, secret_registry.version())
     return _public_url_field_uncached(value)
 
 
+# ------------------------------------------------------------------ 제어 필드(§1.5, R4 P2 — R3-B7)
+
+_ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
+_ENUM_WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
+#: 값이 도구 열거 어휘(소문자 snake 낱말)인 제어 키.
+CONTROL_ENUM_KEYS: FrozenSet[str] = frozenset({
+    "status", "state", "holder", "reason", "reason_code", "kind", "mode", "browser_mode", "outcome", "op", "risk",
+    "presented_as", "sticky_reason", "changed",
+})
+#: 값이 도구가 찍은 시각(ISO 8601)인 제어 키.
+CONTROL_TIME_KEYS: FrozenSet[str] = frozenset({
+    "since", "expires_at", "started_at", "created_at", "detected_at", "reset_at",
+})
+#: 그 밖의 제어 키 → 허용 형식(키 이름은 전체 일치, `*_tab_id` 는 접미).
+_CONTROL_ID_KEYS: Dict[str, str] = {
+    "tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id", "server_id": "server_id",
+    "element_id": "element_id", "trigger_element_id": "element_id",
+}
+_ACTION_VALUES: FrozenSet[str] = frozenset(a.value for a in ActionType)
+_ERROR_VALUES: FrozenSet[str] = frozenset(e.value for e in ErrorCode)
+
+
+def control_value(key: Any, value: str) -> bool:
+    """키 이름이 제어 키이고 값이 그 키의 도구 어휘·식별자 형식이면 True — 정제하지 않는다(값이 원래 값과 같아야
+    응답 계약·탭 전환·승인 대기가 동작한다). 형식이 다르면 False(정제 — 방어)."""
+    if not isinstance(key, str):
+        return False
+    if key == "action":
+        return value in _ACTION_VALUES or secret_registry.TOOL_ID_FORMATS["tool_name"].fullmatch(value) is not None
+    if key == "error_code":
+        return value in _ERROR_VALUES
+    fmt = _CONTROL_ID_KEYS.get(key) or ("tab_id" if key.endswith("_tab_id") else None)
+    if fmt is not None:
+        return secret_registry.TOOL_ID_FORMATS[fmt].fullmatch(value) is not None
+    if key in CONTROL_ENUM_KEYS:
+        return _ENUM_WORD.fullmatch(value) is not None
+    if key in CONTROL_TIME_KEYS:
+        return _ISO_TIME.fullmatch(value) is not None
+    return False
+
+
+#: 도구가 만든 고정 키 이름 모양(소문자 snake) — 정제하지 않는다. 그 밖의 키(페이지 유래 이름 등)는 public_text.
+_TOOL_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _payload_key(key: Any) -> Any:
+    if isinstance(key, str) and not _TOOL_KEY.fullmatch(key):
+        return public_text(key)
+    return key
+
+
 def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
-             paths: FrozenSet[Tuple[str, ...]], url_field: bool) -> Any:
+             paths: FrozenSet[Tuple[str, ...]], url_field: bool, key: Any = None) -> Any:
     if isinstance(obj, str):
+        if key is not None and control_value(key, obj):
+            return obj
         return _public_url_field(obj) if url_field else public_text(obj)
     if not isinstance(obj, (dict, list, tuple)):
         return obj
@@ -517,9 +611,9 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
             if sub is not None and sub in paths:
                 out[k] = v  # 페이지 내용(공유 — 소비자는 바로 직렬화한다, 모듈 설명·보고서 참조)
             else:
-                out[k] = _payload(v, sub, depth + 1, paths, _is_url_key(k))
+                out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k)
         return out
-    items = [_payload(v, None, depth + 1, paths, url_field) for v in obj]
+    items = [_payload(v, None, depth + 1, paths, url_field, key) for v in obj]
     return items if isinstance(obj, list) else tuple(items)
 
 
