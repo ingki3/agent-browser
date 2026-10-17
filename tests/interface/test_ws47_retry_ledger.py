@@ -117,8 +117,19 @@ def ledger_path(profile_root, name):
     return profile_dir(name, root=profile_root) / "headless_retry.json"
 
 
-def skipped(code):
-    return {"retried": False, "reason": code, "note": NOTES[code]}
+#: WS-52: cookies_present carries which kind of cookie change blocked the rename.
+CHANGE_NOTES = {
+    "new_cookie": "도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
+    "known_value_changed": ("도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 "
+                            "이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요"),
+}
+
+
+def skipped(code, change=None):
+    out = {"retried": False, "reason": code, "note": NOTES[code]}
+    if change is not None:
+        out.update(cookie_change=change, cookie_change_note=CHANGE_NOTES[change])
+    return out
 
 
 # -- 1. visitor cookie ledger + persistence across restart ------------------
@@ -167,11 +178,14 @@ async def test_login_like_cookie_change_restores_native_name(site, change):
             cookie = {"name": "session", "value": "logged-in", "url": site.url}
         else:
             cookie = {"name": "visitor", "value": "another-value", "url": site.url}
+        # WS-52: a login needs an agent action or a handoff, and either ends the settle tail first.
+        server._headless_retry.cancel_tail()
         await server._page.context.add_cookies([cookie])
         result = await navigate(server, site.url + "/after-login")
         assert result.data["last_http_status"] == 403
         assert "identity" not in result.data
-        assert result.data["retry_skipped"] == skipped("cookies_present")
+        assert result.data["retry_skipped"] == skipped(
+            "cookies_present", "new_cookie" if change == "new_session_cookie" else "known_value_changed")
     assert len(site.received("/after-login")) == 1 and site.headless("/after-login")
 
 
@@ -180,7 +194,7 @@ async def test_preexisting_cookie_before_ledger_means_zero_retries(site):
     async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
         await server._page.context.add_cookies([{"name": "visitor", "value": VISITOR, "url": site.url}])
         result = await navigate(server, site.url + "/one")
-        assert result.data["retry_skipped"] == skipped("cookies_present")
+        assert result.data["retry_skipped"] == skipped("cookies_present", "new_cookie")
         assert not server._headless_retry.attempted
     assert len(site.received("/one")) == 1
 

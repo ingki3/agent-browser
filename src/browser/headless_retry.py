@@ -12,8 +12,9 @@ the memory persists in the profile folder (headless_retry.json, 0600).
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 from itertools import permutations
@@ -44,6 +45,10 @@ MAX_COOKIES = 50
 MAX_FILE_BYTES = 8 * 1024 * 1024
 #: A final failure is retried again after a day (sites change; a stale failure costs one request).
 FAILED_TTL_S = 24 * 3600
+#: WS-52 settle tail: after a committed success, page scripts' cookie writes on
+#: the same tab keep being ledgered this long (unless a stop condition fires first).
+TAIL_S = 10.0
+TAIL_INTERVAL_S = 0.5
 
 SUCCESS_NOTE = "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)"
 REMEMBERED_NOTE = "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다"
@@ -64,8 +69,29 @@ IDENTITY_INSTRUCTIONS = (
 )
 
 
-def skip_reason(code: str) -> dict:
-    return {"retried": False, "reason": code, "note": SKIP_NOTES[code]}
+#: data.retry_skipped.cookie_change(_note) — WS-52 detail for cookies_present (fixed text; no names/values).
+COOKIE_CHANGE_NOTES = {
+    "new_cookie": "도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
+    "known_value_changed": ("도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 "
+                            "이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요"),
+}
+
+
+def skip_reason(code: str, cookie_change: str | None = None) -> dict:
+    out = {"retried": False, "reason": code, "note": SKIP_NOTES[code]}
+    if cookie_change is not None:
+        out["cookie_change"] = cookie_change
+        out["cookie_change_note"] = COOKIE_CHANGE_NOTES[cookie_change]
+    return out
+
+
+def _related_host(host: str, other: str) -> bool:
+    """Could the two hosts share cookies? Over-inclusive on purpose (ends the tail sooner)."""
+    if not host or not other:
+        return False
+    if host == other or host.endswith("." + other) or other.endswith("." + host):
+        return True
+    return host.split(".")[-2:] == other.split(".")[-2:] and "." in host
 
 
 def headed_brand_list(value: str, major: int) -> str:
@@ -140,6 +166,7 @@ class HeadlessRetry:
         self.path: Path | None = None
         self._key = secrets.token_bytes(32)
         self._clock = clock
+        self._tail: _Tail | None = None
 
     @property
     def attempted(self) -> set[str]:
@@ -182,15 +209,134 @@ class HeadlessRetry:
         self.states[origin] = "succeeded"
         self.updated[origin] = self._clock()
         if before is not None and after is not None:
-            known = {tuple(sorted(e.items())) for e in self.ledger.get(origin, [])}
-            prior = {tuple(sorted(e.items())) for e in before}
-            kept = [e for e in self.ledger.get(origin, []) if e in after]
-            created = [e for e in after if tuple(sorted(e.items())) not in prior
-                       and tuple(sorted(e.items())) not in known]
-            merged = kept + created
-            self.ledger[origin] = merged[-MAX_COOKIES:]  # overflow forgets oldest: fewer retries
+            self._merge(origin, before, after)
         self._bound()
         self.save()
+
+    def _merge(self, origin: str, before: list[LedgerEntry], after: list[LedgerEntry]) -> bool:
+        """Ledger what appeared/changed between two snapshots; True when the ledger changed.
+
+        A cookie already present in ``before`` but never ledgered stays excluded.
+        """
+        current = self.ledger.get(origin, [])
+        known = {tuple(sorted(e.items())) for e in current}
+        prior = {tuple(sorted(e.items())) for e in before}
+        kept = [e for e in current if e in after]
+        created = [e for e in after if tuple(sorted(e.items())) not in prior
+                   and tuple(sorted(e.items())) not in known]
+        merged = (kept + created)[-MAX_COOKIES:]  # overflow forgets oldest: fewer retries
+        if merged == current:
+            return False
+        self.ledger[origin] = merged
+        return True
+
+    def absorb(self, origin: str, before: list[LedgerEntry], after: list[LedgerEntry]) -> None:
+        """WS-52 tail: ledger cookie changes after a committed success (same merge rule)."""
+        if self.states.get(origin) != "succeeded" or not self._merge(origin, before, after):
+            return
+        self.updated[origin] = self._clock()
+        self._bound()
+        self.save()
+
+    # -- WS-52 settle tail --------------------------------------------------
+
+    def start_tail(self, page: Page, url: str, origin: str, last: list[LedgerEntry],
+                   guard: Callable[[], bool]) -> None:
+        """Keep ledgering this tab's script cookie writes for TAIL_S after a committed success.
+
+        Runs in the background (the tool response is not delayed). Each sample
+        merges only while ``guard()`` (no human control/handoff, still headless
+        with the feature on) and the tab is open, still on the origin, with no
+        related other tab; the server ends it at any non-read-only tool call.
+        Anything unexpected ends it without merging.
+        """
+        self.cancel_tail()
+        tail = _Tail(page=page, url=url, origin=origin, last=last, guard=guard,
+                     deadline=time.monotonic() + TAIL_S)
+
+        def navigated(frame: object) -> None:
+            # Any later main-frame document (same origin included) was requested with the
+            # native name: its cookies are not ours.
+            if frame is page.main_frame:
+                tail.broken = True
+
+        def closed(*_: object) -> None:
+            tail.broken = True
+
+        tail.listeners = [("framenavigated", navigated), ("close", closed)]
+        try:
+            for event, handler in tail.listeners:
+                page.on(event, handler)
+            tail.task = asyncio.get_running_loop().create_task(self._run_tail(tail))
+        except Exception:  # noqa: BLE001 - no tail is the old (WS-47) behavior
+            _detach(tail)
+            return
+        self._tail = tail
+
+    def cancel_tail(self) -> None:
+        """Stop the tail without a final sample (server close, context replacement)."""
+        tail, self._tail = self._tail, None
+        if tail is not None:
+            tail.stopped = True
+            _detach(tail)
+            if tail.task is not None:
+                tail.task.cancel()
+
+    async def end_tail(self) -> None:
+        """Stop the tail before a non-read-only tool call, after one final sample."""
+        tail, self._tail = self._tail, None
+        if tail is None:
+            return
+        tail.stopped = True
+        if tail.task is not None:
+            tail.task.cancel()
+            try:
+                await tail.task
+            except BaseException:  # noqa: BLE001 - the tail's own end never fails the tool call
+                pass
+        try:
+            if time.monotonic() <= tail.deadline:
+                await self._tail_sample(tail)
+        except Exception:  # noqa: BLE001 - a failed final sample just merges nothing
+            pass
+        finally:
+            _detach(tail)
+
+    async def _run_tail(self, tail: _Tail) -> None:
+        try:
+            while not tail.stopped:
+                await asyncio.sleep(TAIL_INTERVAL_S)
+                if tail.stopped or time.monotonic() > tail.deadline or not await self._tail_sample(tail):
+                    break
+        except Exception:  # noqa: BLE001 - closed tab/context: end silently, nothing half-merged
+            pass
+        finally:
+            if self._tail is tail:
+                self._tail = None
+                _detach(tail)
+
+    def _tail_open(self, tail: _Tail) -> bool:
+        page = tail.page
+        if (tail.broken or self.states.get(tail.origin) != "succeeded" or not tail.guard()
+                or page.is_closed()):
+            return False
+        if _origin(page.url) != tail.origin:
+            return False
+        host = urlsplit(tail.url).hostname or ""
+        return not any(other is not page and _related_host(host, urlsplit(other.url).hostname or "")
+                       for other in page.context.pages)
+
+    async def _tail_sample(self, tail: _Tail) -> bool:
+        """One merge step; False ends the tail (conditions broke or cookies unreadable)."""
+        if not self._tail_open(tail):
+            return False
+        current = await self.snapshot(tail.page.context, tail.url)
+        # Re-check after the await: a change that raced human control/navigation is not merged.
+        if current is None or not self._tail_open(tail):
+            return False
+        self.absorb(tail.origin, tail.last, current)
+        tail.last = current
+        return True
 
     # -- cookies -------------------------------------------------------------
 
@@ -214,6 +360,22 @@ class HeadlessRetry:
             return False
         ledger = self.ledger.get(_origin(url) or "", [])
         return all(entry in ledger for entry in current)
+
+    async def cookie_change(self, context: BrowserContext, url: str) -> str | None:
+        """Why cookies are not cleared: "new_cookie" (an unledgered name/domain/path — maybe a
+        login) wins over "known_value_changed" (only ledgered cookies with other values).
+        None when cleared or unreadable. Never returns names or values."""
+        current = await self.snapshot(context, url)
+        if current is None:
+            return None
+        ledger = self.ledger.get(_origin(url) or "", [])
+        keys = {(e["name"], e["domain"], e["path"]) for e in ledger}
+        changed = [e for e in current if e not in ledger]
+        if not changed:
+            return None
+        if any((e["name"], e["domain"], e["path"]) not in keys for e in changed):
+            return "new_cookie"
+        return "known_value_changed"
 
     # -- persistence ---------------------------------------------------------
 
@@ -340,7 +502,8 @@ class HeadlessRetry:
 
     @asynccontextmanager
     async def present(self, page: Page, url: str, original: str, robots: RobotsSignals,
-                      guard: EgressGuard, proxy: EgressProxy | None) -> AsyncIterator[RetryRequest]:
+                      guard: EgressGuard, proxy: EgressProxy | None,
+                      tail_guard: Callable[[], bool] | None = None) -> AsyncIterator[RetryRequest]:
         """Present the native headed Chromium name and reduced UA during this retry.
 
         Every request/redirect is separately scoped; all existing egress routes
@@ -349,7 +512,9 @@ class HeadlessRetry:
         the navigate keeps the native name), and robots-disallowed subpaths keep
         the native name. Detach restores the native request path even when
         navigation is cancelled or fails. When the caller marks the attempt
-        succeeded, the cookies that appeared or changed are ledgered on exit.
+        succeeded, the cookies that appeared or changed are ledgered on exit;
+        with ``tail_guard`` (WS-52) a background settle tail then keeps ledgering
+        this tab's script cookie writes (see ``start_tail``).
         """
         destination = _origin(url)
         version = re.search(r"HeadlessChrome/([0-9]+)\.", original)
@@ -406,6 +571,8 @@ class HeadlessRetry:
             if attempt.succeeded and destination is not None:
                 after = await self.snapshot(page.context, url)
                 self.commit_success(destination, before, after)
+                if tail_guard is not None and after is not None and tail_guard():
+                    self.start_tail(page, url, destination, after, tail_guard)
 
 
 @dataclass
@@ -416,3 +583,29 @@ class RetryRequest:
     origin: str | None = None
     #: Set by the caller once the final result is a same-origin 2xx (ledger commit on exit).
     succeeded: bool = False
+
+
+@dataclass
+class _Tail:
+    """One running WS-52 settle tail (one per server: a new success replaces it)."""
+
+    page: Page
+    url: str
+    origin: str
+    last: list
+    guard: Callable[[], bool]
+    deadline: float
+    stopped: bool = False
+    #: The tab closed or its main frame navigated: nothing more is merged.
+    broken: bool = False
+    task: "asyncio.Task | None" = field(default=None, repr=False)
+    listeners: list = field(default_factory=list, repr=False)
+
+
+def _detach(tail: _Tail) -> None:
+    listeners, tail.listeners = tail.listeners, []
+    for event, handler in listeners:
+        try:
+            tail.page.remove_listener(event, handler)
+        except Exception:  # noqa: BLE001 - a closed page may refuse; the tail is over either way
+            pass

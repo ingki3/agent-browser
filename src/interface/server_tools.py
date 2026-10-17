@@ -136,8 +136,12 @@ class ToolsMixin:
         WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
         캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
         """
+        from actions.healing import READ_ONLY_ACTIONS
         from interface.on_demand import SWITCH_WAIT_S
 
+        if action_from_tool(name) not in READ_ONLY_ACTIONS:
+            # WS-52: anything that may change the page (login included) ends the settle tail first.
+            await self._headless_retry.end_tail()
         capture: Dict[str, Any] = {}
         if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
             return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,

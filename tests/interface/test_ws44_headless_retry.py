@@ -472,6 +472,8 @@ async def test_remembered_origin_rechecks_conditions_and_retains_memory(sites, c
             # Expire the existing REP cache to model newly fetched site policy.
             server._robots._cache.clear()
         if condition == "cookie":
+            # WS-52: a login needs an agent action or a handoff, and either ends the settle tail first.
+            server._headless_retry.cancel_tail()
             await server._page.context.add_cookies([
                 {"name": "synthetic", "value": "local-mock", "url": site.url}])
         if condition == "disabled":
