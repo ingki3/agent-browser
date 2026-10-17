@@ -600,6 +600,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "presented_as": frozenset({"chrome"}),  # server_signals identity
     "sticky_reason": frozenset(),  # 자유 문장(on_demand — 도메인·사유 문장) — 늘 정제
     "changed": frozenset({"none_pending", "released", "taken", "timeout"}),  # server_handoff._control_wait
+    # actions.dispatcher _NavWatch.aborted → data.nav_aborted (R6 — f"status_{status}" 는 _NO_DOCUMENT_STATUS 204·205)
+    "nav_aborted": frozenset({"download", "request_failed", "status_204", "status_205"}),
 }
 #: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).
 CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
@@ -616,6 +618,7 @@ _CONTROL_ID_KEYS: Dict[str, str] = {
     "tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id", "server_id": "server_id",
     "element_id": "element_id", "trigger_element_id": "element_id",
     "id": "recipe_id",  # recipes.service list·save·run 의 레시피 id(R5 B4)
+    "params": "param_name",  # recipes.service recipe.params 의 자동 이름 textN·choiceN(R6)
 }
 _ACTION_VALUES: FrozenSet[str] = frozenset(a.value for a in ActionType)
 _ERROR_VALUES: FrozenSet[str] = frozenset(e.value for e in ErrorCode)

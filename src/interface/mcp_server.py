@@ -19,6 +19,7 @@ MCP 서버는 stdio로 구동되며 클라이언트 연결당 하나의 브라�
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import numbers
@@ -621,6 +622,9 @@ def install_public_log_filter() -> Callable[[], None]:
     return restore
 
 
+#: logging 패키지 디렉터리 — handleError 의 'Call stack' 이 logging 내부 프레임을 건너뛰는 기준(logging 과 같다).
+_LOGGING_DIR = os.path.dirname(logging.__file__)
+
 #: 로그 인자 정제 상한(R4 §8 — 루트 로거가 DEBUG 면 버려질 레코드도 정제되므로 비용을 묶는다).
 LOG_MAX_STR = 64 * 1024
 LOG_MAX_ITEMS = 1000
@@ -736,8 +740,12 @@ def log_safe_value(obj: Any, depth: int = 0) -> Any:
 
 
 def _log_safe_key(key: Any, depth: int) -> Any:
-    """dict 키 — 값과 같은 규칙(숫자 키가 가려지면 표지 문자열 키 — JSON 직렬화도 된다)."""
-    return log_safe_value(key, depth)
+    """dict 키(중첩 dict 와 extra 의 top-level 비문자열 이름 공통 — R6 F1) — 값과 같은 규칙(숫자 키가 가려지면 표지
+    문자열 키 — JSON 직렬화도 된다). 가려지지 않는 객체 키는 원 객체 그대로(안전 래퍼로 바꾸지 않는다)."""
+    safe = log_safe_value(key, depth)
+    if isinstance(safe, _LogSafe) and not safe.masked():
+        return key
+    return safe
 
 
 #: printf 형식 지정자(logging 의 `%` 스타일). `%%` 는 인자를 쓰지 않는다.
@@ -802,9 +810,12 @@ def _install_public_log_hooks() -> Callable[[], None]:
     import traceback
 
     from security.public_url import public_text
+    from security.secret_registry import mask_registered
 
     previous = logging.getLogRecordFactory()
     original_make = logging.Logger.makeRecord
+    original_handler_format = logging.Handler.format
+    original_handle_error = logging.Handler.handleError
     if getattr(previous, "_ws51_public", False):  # 다른 경로(모듈 재적재 등)로 이미 감싸져 있다
         return lambda: None
 
@@ -865,16 +876,69 @@ def _install_public_log_hooks() -> Callable[[], None]:
                     value = log_safe_value(record.__dict__[key])
                 except Exception as exc:  # noqa: BLE001 - 속성은 남기되 원문은 내보내지 않는다
                     value = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략]"
-                safe_key = _log_text(key) if isinstance(key, str) else key
-                if safe_key == key:
+                # R6 F2: 문자열 속성 이름은 그대로 둔다 — 기존 Formatter 의 `%(name)s`·`{name}`·`${name}` 조회가 훅이
+                # 없을 때와 같아야 한다. 이름이 비밀이면 출력 단계(handler_format·handle_error)가 가린다.
+                # R6 F1: 비문자열 이름(숫자·bytes·tuple …)은 Formatter 가 이름으로 조회할 수 없다 — 중첩 dict 키와
+                # 같은 정책(_log_safe_key)으로 가린 이름으로 옮긴다.
+                safe_key = key if isinstance(key, str) else _log_safe_key(key, 0)
+                if safe_key is key or safe_key == key:
                     record.__dict__[key] = value
                     continue
-                del record.__dict__[key]  # 속성 이름 자체가 등록 값 — 가린 이름으로 옮긴다(Formatter 가 키를 찍는 경로)
+                del record.__dict__[key]
                 name, n = safe_key, 2
                 while name in record.__dict__:
                     name, n = f"{safe_key}#{n}", n + 1
                 record.__dict__[name] = value
         return record
+
+    def handler_format(self: logging.Handler, record: logging.LogRecord) -> str:
+        """R6 F2: 모든 handler 출력(표준·JSON 형 Formatter — 속성 이름·값을 어떻게 찍든)의 최종 문장에서 도구가 본 비밀
+        값(레지스트리 — §1.1 S 의 모든 표현 R)을 가린다. public_text 의 첫 층만 쓴다: URL 문법·JWT 층은 메시지·extra 값
+        단계에서 이미 거쳤고, Formatter 가 이어 붙인 한 줄 전체에 다시 걸면 인용 값 판정이 칸 경계를 넘어 비밀 아닌
+        출력(`… | %(where)s`)을 삼킨다(dd9d3aa 출력 동일성 — 2026-10-17 메인 승인)."""
+        text = original_handler_format(self, record)
+        try:
+            return mask_registered(text) if isinstance(text, str) and text else text
+        except Exception as exc:  # noqa: BLE001 - 가림 실패 — 원문 대신 표지
+            return f"[로그 가림 실패 {type(exc).__name__} — 원문 생략] logger={record.name}"
+
+    def handle_error(self: logging.Handler, record: logging.LogRecord) -> None:
+        """R6 F2: logging.Handler.handleError 와 같은 진단(같은 조건·같은 모양)을 버퍼에 만든 뒤 가려서 stderr 로.
+
+        Formatter 오류(KeyError·'Formatting field not found …')·emit 예외의 traceback·`Message:`/`Arguments:` 줄이
+        속성 이름·값 원문을 담을 수 있다. raiseExceptions 가 False 이거나 stderr 가 없으면 아무것도 쓰지 않는다(원래와 같다).
+        """
+        if not (logging.raiseExceptions and sys.stderr):
+            return
+        t, v, tb = sys.exc_info()
+        buf = io.StringIO()
+        try:
+            buf.write("--- Logging error ---\n")
+            traceback.print_exception(t, v, tb, None, buf)
+            buf.write("Call stack:\n")
+            frame = tb.tb_frame if tb is not None else None
+            while frame and os.path.dirname(frame.f_code.co_filename) == _LOGGING_DIR:
+                frame = frame.f_back
+            if frame:
+                traceback.print_stack(frame, file=buf)
+            else:
+                buf.write("Logged from file %s, line %s\n" % (record.filename, record.lineno))
+            try:
+                buf.write("Message: %r\nArguments: %s\n" % (record.msg, record.args))
+            except RecursionError:
+                raise
+            except Exception:  # noqa: BLE001 - logging 원래 문구
+                buf.write("Unable to print the message and arguments - possible formatting error.\n"
+                          "Use the traceback above to help find the error.\n")
+            try:
+                text = mask_registered(buf.getvalue())  # handler_format 과 같은 층(레지스트리)
+            except Exception as exc:  # noqa: BLE001
+                text = f"--- Logging error --- [진단 가림 실패 {type(exc).__name__} — 원문 생략]\n"
+            sys.stderr.write(text)
+        except OSError:  # logging 과 같다(issue 5971)
+            pass
+        finally:
+            del t, v, tb
 
     def _write_exception(header: str, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
@@ -900,6 +964,8 @@ def _install_public_log_hooks() -> Callable[[], None]:
     make_record._ws51_public = True  # type: ignore[attr-defined]
     logging.setLogRecordFactory(factory)
     logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
+    logging.Handler.format = handler_format  # type: ignore[method-assign]
+    logging.Handler.handleError = handle_error  # type: ignore[method-assign]
     sys.excepthook = excepthook
     threading.excepthook = thread_excepthook
 
@@ -908,6 +974,10 @@ def _install_public_log_hooks() -> Callable[[], None]:
             logging.setLogRecordFactory(previous)
         if logging.Logger.makeRecord is make_record:
             logging.Logger.makeRecord = original_make  # type: ignore[method-assign]
+        if logging.Handler.format is handler_format:
+            logging.Handler.format = original_handler_format  # type: ignore[method-assign]
+        if logging.Handler.handleError is handle_error:
+            logging.Handler.handleError = original_handle_error  # type: ignore[method-assign]
         if sys.excepthook is excepthook:
             sys.excepthook = previous_hook
         if threading.excepthook is thread_excepthook:

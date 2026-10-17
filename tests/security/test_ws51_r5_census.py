@@ -114,6 +114,8 @@ REVIEWED = {
      "f\"{pending.get('domain')} 에서 창에서 해결한 뒤 headless 복귀 후 {pending.get('kind') or '차단'} 재감지 — 서버 수명 동안 창 유지\""): FREE,
     ("sticky_reason", "interface/on_demand.py", "self.sticky_reason"): FREE,
     ("changed", "interface/server_handoff.py", "changed"): "released·taken·timeout",
+    ("nav_aborted", "actions/dispatcher.py", "self.aborted"): "_NavWatch.aborted — download·request_failed·"
+                                                              "status_204·status_205 (R6)",
 }
 
 

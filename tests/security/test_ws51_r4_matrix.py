@@ -361,11 +361,12 @@ def test_control_key_inventory_is_fixed():
     pu = sys.modules["security.public_url"]  # `security.public_url` 속성은 같은 이름의 함수(재수출)
     assert pu.CONTROL_ENUM_KEYS == {"status", "state", "holder", "reason", "reason_code", "kind", "mode",
                                     "browser_mode", "outcome", "op", "risk", "presented_as", "sticky_reason",
-                                    "changed"}
+                                    "changed", "nav_aborted"}  # R6: census 일반화로 드러난 이동 중단 신호
     assert pu.CONTROL_TIME_KEYS == {"since", "expires_at", "started_at", "created_at", "detected_at", "reset_at"}
     assert pu._CONTROL_ID_KEYS == {"tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id",
                                    "server_id": "server_id", "element_id": "element_id",
-                                   "trigger_element_id": "element_id", "id": "recipe_id"}  # R5 B4: 레시피 id
+                                   "trigger_element_id": "element_id", "id": "recipe_id",  # R5 B4: 레시피 id
+                                   "params": "param_name"}  # R6: 레시피 자동 매개변수 이름 textN·choiceN
     assert pu.control_value("popup_tab_id", "tab-3") and pu.control_value("closed_tab_id", "tab-9")
     assert not pu.control_value("tab_id", "tab-1x") and not pu.control_value("status", "Approved!")
 

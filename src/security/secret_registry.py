@@ -62,10 +62,13 @@ TOOL_ID_FORMATS: Dict[str, "re.Pattern[str]"] = {
     "tab_id": re.compile(r"tab-\d+"),                       # browser.core: f"tab-{n}"
     "approval_id": re.compile(r"ap_[A-Za-z0-9_-]{1,64}"),    # handoff: f"ap_{token_urlsafe(12)}"
     "request_id": re.compile(r"rq_[A-Za-z0-9_-]{1,64}"),     # handoff: f"rq_{token_urlsafe(9)}"
-    "element_id": re.compile(r"@[er]\d+"),                   # perception.engine: f"@e{idx}" · recipes.service: f"@r{seq}"
+    # perception.engine: f"@e{idx}" · recipes.service: f"@r{seq}" · vision.bridge: f"{SOM_ID_PREFIX}{used + 1}"(`@s`, R6)
+    "element_id": re.compile(r"@[ers]\d+"),
     "recipe_id": re.compile(r"r_[0-9a-f]{8}"),                # recipes.store: "r_" + token_hex(4)
     "server_id": re.compile(r"\d+-[0-9a-f]{6}|login-[0-9a-f]{8}"),  # handoff: f"{pid}-{hex(3)}" · login_cli
     "tool_name": re.compile(r"browser_[a-z_]{1,48}"),       # MCP 도구 이름
+    # recipes.store 자동 매개변수 이름: f"{prefix}{counters[prefix]}" (AUTO_PARAM_PREFIX·AUTO_CHOICE_PREFIX, R6)
+    "param_name": re.compile(r"(?:text|choice)\d+"),
 }
 
 
