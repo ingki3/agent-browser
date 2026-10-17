@@ -116,6 +116,21 @@ REVIEWED = {
     ("changed", "interface/server_handoff.py", "changed"): "released·taken·timeout",
     ("nav_aborted", "actions/dispatcher.py", "self.aborted"): "_NavWatch.aborted — download·request_failed·"
                                                               "status_204·status_205 (R6)",
+    # R7 — 리터럴 제어값 census(test_ws51_r7_census.py)로 어휘에 들어온 키의 동적 생산자.
+    ("resolved_from", "actions/dispatcher.py", "resolved_from"): "switch_frame 지역 이름 — current_frame·root (R7)",
+    ("category", "security/egress.py", "category"): "EgressGuard._block 인자 — CAT_* (R7)",
+    ("category", "security/egress.py", "self.category"): "EgressDecision.category — CAT_* (R7)",
+    ("code", "security/egress.py", "self.code"): "UpstreamFailure.code — UPSTREAM_RESOLVE/CONNECT_FAILED (R7)",
+    ("code", "security/egress_proxy.py", "code"): "UpstreamError.code — UPSTREAM_* (R7)",
+    ("code", "security/egress_proxy.py", "exc.code"): "UpstreamFailure(code=UpstreamError.code) — UPSTREAM_* (R7)",
+    ("code", "browser/core.py", "code"): NOT_OUT + " (BrowserError.code 예외 속성 — 응답은 error_code 로)",
+    ("code", "interface/cli.py", "args.code"): NOT_OUT + " (approve CLI 인자)",
+    ("code", "interface/code_window.py", "code"): NOT_OUT + " (사람 창 HTML 의 확인 코드)",
+    ("code", "interface/handoff.py", "str(code).strip()"): NOT_OUT + " (approve 명령 파일)",
+    ("code", "interface/server_display.py", "job.code"): NOT_OUT + " (확인 코드 창 표시 인자)",
+    ("scope", "security/robots_signal.py", "scope"): "RobotsScope — all_bots·named_ai·all_bots_and_named_ai·none (R7)",
+    ("source", "browser/site_session.py", "source"): NOT_OUT + " (로그인 추적 이벤트 — interface 가 쓰지 않음)",
+    ("source", "security/hitl.py", "source"): "gate_basis.source — 판정 출처·문맥 신호 원천(TEXT·PATH·TOKEN_SOURCES) (R7)",
 }
 
 

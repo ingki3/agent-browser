@@ -361,7 +361,10 @@ def test_control_key_inventory_is_fixed():
     pu = sys.modules["security.public_url"]  # `security.public_url` 속성은 같은 이름의 함수(재수출)
     assert pu.CONTROL_ENUM_KEYS == {"status", "state", "holder", "reason", "reason_code", "kind", "mode",
                                     "browser_mode", "outcome", "op", "risk", "presented_as", "sticky_reason",
-                                    "changed", "nav_aborted"}  # R6: census 일반화로 드러난 이동 중단 신호
+                                    "changed", "nav_aborted",  # R6: census 일반화로 드러난 이동 중단 신호
+                                    # R7: 리터럴 제어값 census(소비자 표 독립)로 드러난 키
+                                    "nav_frame", "resolved_from", "coordinate_target", "handled", "blocked_by",
+                                    "captured", "code", "category", "scope", "storage", "source", "how_to_wait"}
     assert pu.CONTROL_TIME_KEYS == {"since", "expires_at", "started_at", "created_at", "detected_at", "reset_at"}
     assert pu._CONTROL_ID_KEYS == {"tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id",
                                    "server_id": "server_id", "element_id": "element_id",

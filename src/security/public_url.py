@@ -566,7 +566,8 @@ _PDF_REASONS = ("egress_unavailable", "user_agent_unavailable", "egress_blocked"
                 "parse_timeout", "no_pages", "no_text_layer")  # actions.pdf_document FetchResult·doc.update
 _YOUTUBE_REASONS = ("egress_unavailable", "egress_blocked", "redirect_refused", "request_failed", "response_too_large",
                     "timeout", "invalid_response", "quota_exceeded", "key_invalid", "rate_limited", "bad_request",
-                    "upstream_error", "http_error")  # interface.youtube_search ApiReply.reason
+                    "upstream_error", "http_error",
+                    "invalid_arguments", "key_malformed", "internal_error")  # interface.youtube_search _REASONS(R7)
 CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "status": frozenset(_APPROVAL_STATUS + ("opening", "ready")),  # + server_handoff LoginJob.status
     "state": frozenset({"headless", "headed", "switching", "failed",  # on_demand.WindowState·server_window
@@ -577,6 +578,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "headless_ua_blocked",  # server_signals identity
         "cookies_present", "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
         "browser_recovered", "request_expired", "window_closed",  # server_window notice
+        "control_request", "recover", "taken",  # server_window _switch_window 전환 사유(R7 census)
         "capture_busy", "target_changed",  # server_display·server_hitl
         "not_in_allowlist", "private_network", "unsupported_scheme", "malformed_url",  # security.egress.BlockReason
         "fresh", "epoch_mismatch", "node_detached", "role_changed", "name_changed",  # actions.verification.StalenessReason
@@ -602,6 +604,28 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "changed": frozenset({"none_pending", "released", "taken", "timeout"}),  # server_handoff._control_wait
     # actions.dispatcher _NavWatch.aborted → data.nav_aborted (R6 — f"status_{status}" 는 _NO_DOCUMENT_STATUS 204·205)
     "nav_aborted": frozenset({"download", "request_failed", "status_204", "status_205"}),
+    # R7 — 리터럴 제어값 census(tests/security/test_ws51_r7_census.py, 소비자 표 독립 AST)로 드러난 키.
+    "nav_frame": frozenset({"current_frame"}),  # actions.dispatcher _NavWatch (R6-B1)
+    "resolved_from": frozenset({"current_frame", "root"}),  # actions.dispatcher switch_frame · server_schema 안내
+    "coordinate_target": frozenset({"interactive", "non_interactive", "rejected_by_dispatcher",
+                                    "unresolved"}),  # server_hitl 좌표 대상 근거
+    "handled": frozenset({"accepted", "dismissed"}),  # actions.dispatcher data.dialogs[].handled
+    "blocked_by": frozenset({"approval_code_displayed"}),  # server_display 캡처 차단
+    "captured": frozenset({"root_page"}),  # actions.dispatcher 프레임 안 screenshot
+    "code": frozenset({"egress_blocked",  # security.egress EgressDecision.to_agent
+                       "resolve_failed", "connect_failed"}),  # security.egress UPSTREAM_* (UpstreamFailure.to_agent)
+    "category": frozenset({"loopback", "private", "metadata", "unspecified", "reserved", "not_in_allowlist",
+                           "scheme", "malformed"}),  # security.egress CAT_* (EgressDecision.category)
+    "scope": frozenset({"all_bots", "named_ai", "all_bots_and_named_ai", "none"}),  # robots_signal RobotsScope
+    "storage": frozenset({"profile", "memory"}),  # recipes.service list
+    "source": frozenset({"youtube_data_api_v3",  # interface.youtube_search SOURCE
+                         # security.hitl _basis(gate_basis.source): 판정 출처 + 문맥 신호 원천(TEXT·PATH·TOKEN_SOURCES)
+                         "unresolved", "form_submit", "action",
+                         "name", "text", "aria", "title", "child_title", "alt", "svg_title", "child_aria", "value",
+                         "pseudo", "selector", "detail", "href", "formaction", "form_action",
+                         "class", "id", "name_attr", "testid",
+                         "keyring", "prompt", "ci_env"}),  # browser.session_store KeyResolution.source(응답 출구 아님)
+    "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
 }
 #: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).
 CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
