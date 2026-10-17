@@ -366,9 +366,11 @@ def test_control_key_inventory_is_fixed():
                                     "nav_frame", "resolved_from", "coordinate_target", "handled", "blocked_by",
                                     "captured", "code", "category", "scope", "storage", "source", "how_to_wait",
                                     # R8: 속성 전달값 census 로 드러난 키(목록 경로 dialogs[].type 은 아래 별도 표)
-                                    "vendor", "healing_attempts"}
+                                    "vendor"}
     assert pu.CONTROL_ITEM_VOCABULARY == {("dialogs", "type"): {"alert", "beforeunload", "confirm", "prompt",
                                                                 "unknown"}}
+    # R9: 목록 바로 아래 문자열 원소 경로 어휘(healing_attempts 복합 코드·signals 순수 코드 — test_ws51_r9_census 가 도출)
+    assert set(pu.CONTROL_LIST_VOCABULARY) == {"healing_attempts", "signals"}
     assert pu.CONTROL_TIME_KEYS == {"since", "expires_at", "started_at", "created_at", "detected_at", "reset_at"}
     assert pu._CONTROL_ID_KEYS == {"tab_id": "tab_id", "approval_id": "approval_id", "request_id": "request_id",
                                    "server_id": "server_id", "element_id": "element_id",

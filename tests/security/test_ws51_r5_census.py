@@ -135,7 +135,8 @@ REVIEWED = {
     ("vendor", "interface/server_signals.py", "found.vendor"): "browser.challenge Challenge.vendor — generic·hcaptcha·"
                                                                "cloudflare·recaptcha·naver·akamai (R8)",
     ("vendor", "interface/run_cli.py", "challenge.vendor"): NOT_OUT + " (run CLI 보고)",
-    ("healing_attempts", "actions/dispatcher.py", "healing.attempts"): "HealingResult.attempts — HealingStrategy 값 (R8)",
+    # healing_attempts 는 R9 에 목록 경로 어휘(CONTROL_LIST_VOCABULARY)로 옮겨 이 조사(키 어휘) 밖 — R9 census 가 heal() 의
+    # 원소 틀(복합 코드 포함)에서 도출해 고정한다(tests/security/test_ws51_r9_census.py).
 }
 
 

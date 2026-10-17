@@ -552,6 +552,17 @@ def _public_url_field(value: str) -> str:
 
 # ------------------------------------------------------------------ 제어 필드(§1.5, R4 P2 — R3-B7)
 
+#: actions.healing.HealingStrategy 값과 heal() 이 전략 뒤에 붙이는 결과(R9 R8-B1 — `attempts[-1] = f"{strategy.value}(…)"`).
+_HEAL_STRATEGIES: Tuple[str, ...] = ("role_name", "testid", "text_similarity", "css_path", "css_piercing")
+_HEAL_OUTCOMES: Tuple[str, ...] = ("ambiguous", "identity_changed")
+_DIALOG_TYPES: FrozenSet[str] = frozenset({"alert", "beforeunload", "confirm", "prompt", "unknown"})
+#: actions.verification.verify_post_condition 의 **도구 고정** 신호(페이지·주소·입력값·숫자가 들지 않는 것만 — R9 R8-B2).
+#: `url_changed: A -> B`·`dom_delta: 3 -> 5`·`focus_moved: …`·`value_applied: '…'` 같은 `종류: 상세` 는 넣지 않는다(정제).
+_VERIFY_SIGNAL_CODES: FrozenSet[str] = frozenset(
+    {"text_changed", "element_attr_changed", "element_value_changed: <secret>"}
+    | {f"checked_applied: {b}" for b in (True, False)}
+    | {f"element_checked_changed: {a} -> {b}" for a in (True, False, None) for b in (True, False, None) if a != b})
+
 _ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
 #: 제어 키 → 그 키에 실리는 **도구 열거 어휘**(R5 B3 — 낱말 모양 일반 면제를 폐지하고 코드 상수에서 도출한 실제 값만).
 #: 출처(생산 코드)는 각 줄 주석, 전수 조사는 tests/security/test_ws51_r5_census.py(AST — src/ 전체의 리터럴·상수·str Enum
@@ -628,13 +639,24 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
-    "healing_attempts": frozenset({"role_name", "testid", "text_similarity", "css_path",
-                                   "css_piercing"}),  # actions.healing.HealingStrategy
+    # healing_attempts 는 R9 부터 목록 경로 어휘(CONTROL_LIST_VOCABULARY — 복합 코드는 낱말 모양이 아니다)
 }
 #: 목록 안 dict 의 키 경로로 정해진 제어 값: (목록 키, 항목 키) → 어휘(R8 — 다른 위치의 같은 키 이름은 면제하지 않는다).
 CONTROL_ITEM_VOCABULARY: Dict[Tuple[str, str], FrozenSet[str]] = {
     # actions.dispatcher _on_dialog → data.dialogs[].type: Playwright Dialog.type + 읽기 실패 폴백 "unknown"
-    ("dialogs", "type"): frozenset({"alert", "beforeunload", "confirm", "prompt", "unknown"}),
+    ("dialogs", "type"): _DIALOG_TYPES,
+}
+#: 목록 키 바로 아래 문자열 원소의 제어 값: 목록 키 → 어휘(R9 R8-B1·B2 — `data.healing_attempts`·`data.signals`). 그 목록 안의
+#: 다른 원소(`종류: 상세` 문장)·목록이 아닌 같은 키·다른 목록·안쪽 목록/dict 는 면제하지 않는다.
+CONTROL_LIST_VOCABULARY: Dict[str, FrozenSet[str]] = {
+    # actions.healing heal() → data.healing_attempts: HealingStrategy 값 + 복합 코드 f"{전략}(ambiguous|identity_changed)"
+    # (R9 R8-B1 — tests/security/test_ws51_r9_census.py 가 heal() 의 실제 원소 틀에서 도출해 이 표와 같음을 고정)
+    "healing_attempts": frozenset(
+        set(_HEAL_STRATEGIES) | {f"{s}({o})" for s in _HEAL_STRATEGIES for o in _HEAL_OUTCOMES}),
+    # verify_post_condition 고정 신호 + dispatcher "navigation_started" + _top_effect_signals f"top:{s}"
+    # + _dialog_signals f"dialog_opened:{type}"(dialogs[].type 어휘)
+    "signals": frozenset(_VERIFY_SIGNAL_CODES | {"navigation_started"} | {f"top:{c}" for c in _VERIFY_SIGNAL_CODES}
+                         | {f"dialog_opened:{t}" for t in _DIALOG_TYPES}),
 }
 #: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).
 CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
@@ -680,6 +702,12 @@ def control_value(key: Any, value: str) -> bool:
     return False
 
 
+def control_list_value(container: Any, value: str) -> bool:
+    """목록 `container` 바로 아래 문자열 원소이고 값이 그 목록의 어휘면 True(R9 — `healing_attempts[]`·`signals[]`)."""
+    vocabulary = CONTROL_LIST_VOCABULARY.get(container) if isinstance(container, str) else None
+    return vocabulary is not None and value in vocabulary
+
+
 def control_item_value(container: Any, key: Any, value: str) -> bool:
     """목록 `container` 의 dict 항목 안 `key` 칸이고 값이 그 경로의 어휘면 True(R8 — `dialogs[].type`)."""
     vocabulary = CONTROL_ITEM_VOCABULARY.get((container, key)) if isinstance(container, str) \
@@ -699,7 +727,8 @@ def _payload_key(key: Any) -> Any:
 
 def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
              paths: FrozenSet[Tuple[str, ...]], url_field: bool, key: Any = None, item_of: Any = None) -> Any:
-    # item_of — dict 이면 그 dict 가 원소인 목록의 키, 문자열이면 그 문자열을 담은 dict 가 원소인 목록의 키(R8).
+    # item_of — dict 이면 그 dict 가 원소인 목록의 키, 문자열이면 그 문자열을 담은 dict 가 원소인 목록의 키(R8),
+    # 목록이면 그 목록이 dict 의 바로 아래 값일 때의 키(R9 — 목록 안 목록은 None).
     if isinstance(obj, str):
         if key is not None and (control_value(key, obj) or
                                 (item_of is not None and control_item_value(item_of, key, obj))):
@@ -717,9 +746,11 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
                 out[k] = v  # 페이지 내용(공유 — 소비자는 바로 직렬화한다, 모듈 설명·보고서 참조)
             else:
                 out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k,
-                                                item_of if isinstance(v, str) else None)
+                                                item_of if isinstance(v, str) else
+                                                (k if isinstance(v, (list, tuple)) else None))
         return out
-    items = [_payload(v, None, depth + 1, paths, url_field, key, key if isinstance(v, dict) else None) for v in obj]
+    items = [v if isinstance(v, str) and control_list_value(item_of, v) else
+             _payload(v, None, depth + 1, paths, url_field, key, key if isinstance(v, dict) else None) for v in obj]
     return items if isinstance(obj, list) else tuple(items)
 
 

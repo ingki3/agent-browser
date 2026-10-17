@@ -53,7 +53,8 @@ ATTRS = {
     ("type", "type"): (CONTROL, "actions/dispatcher.py _on_dialog — Playwright Dialog.type → data.dialogs[].type (R7-B1)"),
     ("vendor", "vendor"): (CONTROL, "interface/server_signals.py data.challenge.vendor — browser.challenge 벤더 어휘(R8)"),
     ("healing_attempts", "attempts"): (CONTROL, "actions/dispatcher.py 치유 실패 data.healing_attempts — "
-                                                "actions.healing.HealingStrategy 값 목록(R8)"),
+                                                "actions.healing.HealingStrategy 값 목록(R8) + 복합 코드(R9 census 가 heal() "
+                                                "원소 틀에서 도출)"),
     ("kind", "value"): (CONTROL, "interface/server_signals.py data.challenge.kind — browser.challenge.ChallengeKind"),
     ("reason", "value"): (CONTROL, "security/egress.py data.egress.reason — BlockReason"),
     ("risk", "value"): (CONTROL, "interface/server_hitl.py — security.hitl.RiskLevel"),
@@ -89,7 +90,9 @@ ATTRS = {
     ("host", "host"): (FREE, "data.egress.host — 차단된 외부 주소의 호스트(주소 유래)"),
     ("host", "hostname"): (FREE, "data.egress.host — 차단된 외부 주소의 호스트(주소 유래)"),
     ("how_to_approve", "approval_id"): (FREE, "승인 안내 문장(f-string)"),
-    ("signals", "signals"): (FREE, "actions/verification.py 사후조건 진단 문장(`url_changed: A -> B`·값 원문 포함)"),
+    ("signals", "signals"): (FREE, "actions/verification.py 사후조건 신호 목록 — 칸 전체는 면제 아님(`url_changed: A -> B`·"
+                                   "값 원문 포함 문장 정제). 순수 신호 코드 원소는 R9 census(test_ws51_r9_census.py — "
+                                   "CONTROL_LIST_VOCABULARY signals) 몫"),
     ("unresolved", "__name__"): (FREE, "좌표 판정 불가 사유 문장"),
     # --- PAGE
     ("message", "message"): (PAGE, "actions/dispatcher.py data.dialogs[].message — 페이지가 쓴 대화상자 문구"),
@@ -150,6 +153,8 @@ ATTRS = {
 
 #: 목록 안 dict 의 키 경로로 면제되는 CONTROL 칸: (키, 파일) → 목록 키.
 ITEM_PATHS = {("type", "actions/dispatcher.py"): "dialogs"}
+#: 목록 바로 아래 문자열 원소 경로로 면제되는 CONTROL 칸(R9 — CONTROL_LIST_VOCABULARY): (키, 파일).
+LIST_PATHS = {("healing_attempts", "actions/dispatcher.py")}
 
 
 def _skip(r: AttrRecord) -> bool:
@@ -249,6 +254,8 @@ def _exempt(key, file, value):
     item = ITEM_PATHS.get((key, file))
     if item is not None:
         return pu.control_item_value(item, key, value)
+    if (key, file) in LIST_PATHS:
+        return pu.control_list_value(key, value)
     return pu.control_value(key, value)
 
 
