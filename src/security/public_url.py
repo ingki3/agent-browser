@@ -626,6 +626,15 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                          "class", "id", "name_attr", "testid",
                          "keyring", "prompt", "ci_env"}),  # browser.session_store KeyResolution.source(응답 출구 아님)
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
+    # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
+    "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
+    "healing_attempts": frozenset({"role_name", "testid", "text_similarity", "css_path",
+                                   "css_piercing"}),  # actions.healing.HealingStrategy
+}
+#: 목록 안 dict 의 키 경로로 정해진 제어 값: (목록 키, 항목 키) → 어휘(R8 — 다른 위치의 같은 키 이름은 면제하지 않는다).
+CONTROL_ITEM_VOCABULARY: Dict[Tuple[str, str], FrozenSet[str]] = {
+    # actions.dispatcher _on_dialog → data.dialogs[].type: Playwright Dialog.type + 읽기 실패 폴백 "unknown"
+    ("dialogs", "type"): frozenset({"alert", "beforeunload", "confirm", "prompt", "unknown"}),
 }
 #: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).
 CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
@@ -671,6 +680,13 @@ def control_value(key: Any, value: str) -> bool:
     return False
 
 
+def control_item_value(container: Any, key: Any, value: str) -> bool:
+    """목록 `container` 의 dict 항목 안 `key` 칸이고 값이 그 경로의 어휘면 True(R8 — `dialogs[].type`)."""
+    vocabulary = CONTROL_ITEM_VOCABULARY.get((container, key)) if isinstance(container, str) \
+        and isinstance(key, str) else None
+    return vocabulary is not None and value in vocabulary
+
+
 #: 도구가 만든 고정 키 이름 모양(소문자 snake) — 정제하지 않는다. 그 밖의 키(페이지 유래 이름 등)는 public_text.
 _TOOL_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
@@ -682,9 +698,11 @@ def _payload_key(key: Any) -> Any:
 
 
 def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
-             paths: FrozenSet[Tuple[str, ...]], url_field: bool, key: Any = None) -> Any:
+             paths: FrozenSet[Tuple[str, ...]], url_field: bool, key: Any = None, item_of: Any = None) -> Any:
+    # item_of — dict 이면 그 dict 가 원소인 목록의 키, 문자열이면 그 문자열을 담은 dict 가 원소인 목록의 키(R8).
     if isinstance(obj, str):
-        if key is not None and control_value(key, obj):
+        if key is not None and (control_value(key, obj) or
+                                (item_of is not None and control_item_value(item_of, key, obj))):
             return obj
         return _public_url_field(obj) if url_field else public_text(obj)
     if not isinstance(obj, (dict, list, tuple)):
@@ -698,9 +716,10 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
             if sub is not None and sub in paths:
                 out[k] = v  # 페이지 내용(공유 — 소비자는 바로 직렬화한다, 모듈 설명·보고서 참조)
             else:
-                out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k)
+                out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k,
+                                                item_of if isinstance(v, str) else None)
         return out
-    items = [_payload(v, None, depth + 1, paths, url_field, key) for v in obj]
+    items = [_payload(v, None, depth + 1, paths, url_field, key, key if isinstance(v, dict) else None) for v in obj]
     return items if isinstance(obj, list) else tuple(items)
 
 

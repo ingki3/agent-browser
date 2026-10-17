@@ -131,6 +131,11 @@ REVIEWED = {
     ("scope", "security/robots_signal.py", "scope"): "RobotsScope — all_bots·named_ai·all_bots_and_named_ai·none (R7)",
     ("source", "browser/site_session.py", "source"): NOT_OUT + " (로그인 추적 이벤트 — interface 가 쓰지 않음)",
     ("source", "security/hitl.py", "source"): "gate_basis.source — 판정 출처·문맥 신호 원천(TEXT·PATH·TOKEN_SOURCES) (R7)",
+    # R8 — 속성 전달값 census(test_ws51_r8_census.py)로 어휘에 들어온 키의 동적 생산자.
+    ("vendor", "interface/server_signals.py", "found.vendor"): "browser.challenge Challenge.vendor — generic·hcaptcha·"
+                                                               "cloudflare·recaptcha·naver·akamai (R8)",
+    ("vendor", "interface/run_cli.py", "challenge.vendor"): NOT_OUT + " (run CLI 보고)",
+    ("healing_attempts", "actions/dispatcher.py", "healing.attempts"): "HealingResult.attempts — HealingStrategy 값 (R8)",
 }
 
 
