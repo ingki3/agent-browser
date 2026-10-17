@@ -423,6 +423,11 @@ def create_server(
         return _build_tools()
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+        # WS-52 R1: one barrier for every MCP request, before the branch and any await.
+        with backend.tool_entry(name):
+            return await _route_call(name, arguments)
+
+    async def _route_call(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         if name in SERVER_TOOLS and (recipes or name != RECIPE_TOOL):
             import json
 

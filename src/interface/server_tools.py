@@ -27,8 +27,27 @@ class ToolsMixin:
     _youtube_ledger: Any = None
     _youtube_api_base: Optional[str] = None
 
+    def tool_entry(self, name: str) -> Any:
+        """WS-52 R1 도구 시작 장벽 — 모든 도구 진입점이 await 전에 동기적으로 든다(with).
+
+        읽기 액션(READ_ONLY_ACTIONS)이 아니면(액션·서버 도구·레시피·YouTube 모두) 재시도 장부 꼬리의
+        세대 번호를 올리고 꼬리를 닫힘으로 표시한다 — 이미 진행 중인 쿠키 읽기도 합치기 직전에 버려진다.
+        """
+        from contextlib import nullcontext
+
+        from actions.healing import READ_ONLY_ACTIONS
+
+        retry = getattr(self, "_headless_retry", None)
+        if retry is None:
+            return nullcontext()  # no retry memory → no tail to close (bare test servers)
+        return retry.tool_call(read_only=action_from_tool(name) in READ_ONLY_ACTIONS)
+
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
+        with self.tool_entry(name):
+            return await self._call_server_tool(name, arguments)
+
+    async def _call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         args = dict(arguments or {})
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
@@ -136,12 +155,14 @@ class ToolsMixin:
         WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
         캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
         """
-        from actions.healing import READ_ONLY_ACTIONS
+        # WS-52 R1: anything that may change the page (login included) closes the settle tail
+        # synchronously, before the first await (tool_entry).
+        with self.tool_entry(name):
+            return await self._route_tool_call(name, arguments)
+
+    async def _route_tool_call(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
         from interface.on_demand import SWITCH_WAIT_S
 
-        if action_from_tool(name) not in READ_ONLY_ACTIONS:
-            # WS-52: anything that may change the page (login included) ends the settle tail first.
-            await self._headless_retry.end_tail()
         capture: Dict[str, Any] = {}
         if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
             return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,

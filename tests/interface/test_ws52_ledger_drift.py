@@ -359,6 +359,13 @@ class FakeContext:
         self.cookies_list = cookies
         self.fail = False
         self.pages = []
+        self.listeners = {}
+
+    def on(self, event, handler):
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        self.listeners[event].remove(handler)
 
     async def cookies(self):
         if self.fail:
@@ -410,6 +417,7 @@ async def test_tail_saves_and_other_commits_never_lose_a_write(tmp_path, monkeyp
         context.cookies_list = [_cookie("visitor", f"v{index}")]
         retry.commit_success(f"http://other{index}.test", [], [])
         await asyncio.sleep(0.006)
+    await asyncio.sleep(0.05)  # R1: end_tail no longer takes a final sample — let the tail read the last value
     await retry.end_tail()
     again = module.HeadlessRetry()
     again.load(path)
