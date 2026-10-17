@@ -19,17 +19,22 @@ MCP 서버는 stdio로 구동되며 클라이언트 연결당 하나의 브라�
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import numbers
 import os
+import re
 import signal
+import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from weakref import WeakSet
 
 from playwright.async_api import Frame
@@ -350,6 +355,20 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
         return build_all_tools()
 
 
+def public_tool_error(exc: BaseException) -> RuntimeError:
+    """도구 처리 중 새는 예외(backend·봉투 직렬화)를 모델에 보낼 문구로(R4 P9 — MCP SDK 예외 경로, §1.2 (d)).
+
+    고정 문구 + 가린 예외 종류·메시지. 원 예외는 연결하지 않는다(`from None` — traceback 에 원문 문맥이 붙지 않게).
+    """
+    from security.public_url import public_text
+
+    try:
+        detail = f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001 - str(exc) 자체가 실패
+        detail = type(exc).__name__
+    return RuntimeError("도구 처리 중 내부 오류 — " + public_text(detail[:LOG_MAX_STR]))
+
+
 def create_server(
     *,
     mode: ExecutionMode = ExecutionMode.UNATTENDED,
@@ -422,7 +441,7 @@ def create_server(
     async def _list_tools_impl() -> List[Tool]:
         return _build_tools()
 
-    async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+    async def _call_tool_body(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         if name in SERVER_TOOLS and (recipes or name != RECIPE_TOOL):
             import json
 
@@ -432,6 +451,12 @@ def create_server(
         result = await backend.call_tool(name, arguments)
         # WS-30b: 기본값 필드를 뺀 봉투(빠진 필드 = 계약 기본값, ENVELOPE_RULE).
         return [TextContent(type="text", text=envelope_json(result))]
+
+    async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+        try:
+            return await _call_tool_body(name, arguments)
+        except Exception as exc:  # noqa: BLE001 - R4 P9: SDK 가 str(exc) 를 isError 문구로 모델에 보낸다
+            raise public_tool_error(exc) from None
 
     # SDK 메이저별 등록 방식이 다르다. 2.x의 lowlevel Server에는
     # list_tools/call_tool 데코레이터가 없고 생성자 콜백을 받는다.
@@ -551,7 +576,414 @@ async def run_stdio(
                 read_stream, write_stream, server.create_initialization_options()
             )
 
-    await _serve_until_stop(_serve, backend)
+    restore_log = install_public_log_filter()  # WS-51: 로그 줄의 페이지 주소 비밀 값 가리기
+    try:
+        await _serve_until_stop(_serve, backend)
+    finally:
+        restore_log()
+
+
+#: install_public_log_filter 의 겹친 설치 수(R2 NB-5c) — 마지막 설치가 끝날 때만 원래대로 돌린다.
+_PUBLIC_LOG_STATE: Dict[str, Any] = {"count": 0, "uninstall": None}
+_PUBLIC_LOG_LOCK = threading.Lock()
+
+
+def install_public_log_filter() -> Callable[[], None]:
+    """이 프로세스의 로그·예외 출력에서 도구가 본 비밀 값과 주소의 비밀 값을 가린다(WS-51, R4 P1).
+
+    **가린 뒤 표현**(R3-B2·B3·B4): 레코드 팩토리가 **포맷 전에** args 를 같은 모양으로 재귀 정제한다 — 문자열 리프는
+    public_text, dict(키 포함)·list·tuple·namedtuple·set 은 같은 모양의 새 객체, 그 밖의 객체(예외·모델·URL 객체 …)는
+    str·repr 이 각각 public_text(원 str·repr) 인 안전 래퍼(`_LogSafe`). 깊이·개수·길이 상한을 넘으면 안전 표지.
+    그 뒤 완성된 메시지에 public_text 를 한 번 더(백스톱 — f-string 으로 미리 만든 문장, 임의 깊이 이스케이프 인용).
+    `extra=` 속성은 팩토리 **뒤에** 붙으므로(Logger.makeRecord) makeRecord 도 감싸 같은 규칙으로 정제한다(formatter 의
+    `%(meta)s`). exc_text·stack_info 와 `sys.excepthook`·`threading.excepthook` 의 traceback 도 가린다.
+
+    겹쳐 설치하면 횟수를 세어 마지막 restore 때만 원래대로 돌린다 — 먼저 끝난 쪽이 남은 설치의 가림을 벗기지 않는다.
+    반환: 이 설치를 끝내는 함수(두 번 불러도 한 번만 센다).
+    """
+    with _PUBLIC_LOG_LOCK:
+        if _PUBLIC_LOG_STATE["count"] == 0:
+            _PUBLIC_LOG_STATE["uninstall"] = _install_public_log_hooks()
+        _PUBLIC_LOG_STATE["count"] += 1
+    done = [False]
+
+    def restore() -> None:
+        with _PUBLIC_LOG_LOCK:
+            if done[0]:
+                return
+            done[0] = True
+            _PUBLIC_LOG_STATE["count"] -= 1
+            if _PUBLIC_LOG_STATE["count"] == 0:
+                uninstall = _PUBLIC_LOG_STATE["uninstall"]
+                _PUBLIC_LOG_STATE["uninstall"] = None
+                if uninstall is not None:
+                    uninstall()
+
+    return restore
+
+
+#: logging 패키지 디렉터리 — handleError 의 'Call stack' 이 logging 내부 프레임을 건너뛰는 기준(logging 과 같다).
+_LOGGING_DIR = os.path.dirname(logging.__file__)
+
+#: 로그 인자 정제 상한(R4 §8 — 루트 로거가 DEBUG 면 버려질 레코드도 정제되므로 비용을 묶는다).
+LOG_MAX_STR = 64 * 1024
+LOG_MAX_ITEMS = 1000
+LOG_MAX_DEPTH = 8
+
+
+class _LogSafe:
+    """로그 인자 자리의 비문자열 객체 — str·repr 이 각각 public_text(원 str·repr)(R4 P1). 숫자 변환(`%d` 등)은 원
+    객체에 맡기되, str·repr 이 가려지는 객체면 숫자로 바꾸지 않는다(R5 B1 — 원 숫자가 `%x`·`%05d` 꼴로 새지 않게).
+    원 str/repr 이 실패하면 그 예외를 그대로 낸다(logging 의 형식 오류 경로 — 원문 없이 진단)."""
+
+    __slots__ = ("_obj",)
+
+    def __init__(self, obj: Any) -> None:
+        self._obj = obj
+
+    def __str__(self) -> str:
+        return _log_text(str(self._obj))
+
+    def __repr__(self) -> str:
+        return _log_text(repr(self._obj))
+
+    def __format__(self, spec: str) -> str:
+        return format(str(self), spec)
+
+    def masked(self) -> bool:
+        """원 str·repr 중 하나라도 가려지는가(실패하면 False — 형식 오류 경로에 맡긴다)."""
+        try:
+            text, rep = str(self._obj), repr(self._obj)
+        except Exception:  # noqa: BLE001
+            return False
+        return _log_text(text) != text or _log_text(rep) != rep
+
+    def _number_source(self) -> Any:
+        if self.masked():
+            raise TypeError("가린 로그 값은 숫자로 바꾸지 않습니다")
+        return self._obj
+
+    def __int__(self) -> int:
+        return int(self._number_source())
+
+    def __float__(self) -> float:
+        return float(self._number_source())
+
+    def __index__(self) -> int:
+        return self._number_source().__index__()
+
+
+def _log_text(text: str) -> str:
+    from security.public_url import public_text
+
+    if len(text) > LOG_MAX_STR:
+        return f"[로그 값 생략: {len(text)}자 — 상한 {LOG_MAX_STR}]"
+    return public_text(text)
+
+
+def _masked_number(obj: Any) -> Optional[str]:
+    """숫자(int·float·complex·Decimal·Fraction·IntEnum …)의 str·repr 이 가려지면 가린 문자열, 아니면 None(R5 B1).
+
+    가려지지 않은 숫자는 원 객체 그대로 둔다 — `%d`·`%5.2f`·`%x` 출력이 훅이 없을 때와 같다. 가려진 숫자는 숫자가
+    아니라 표지 문자열이 된다(원 숫자를 다른 진법·자릿수로 찍어 새는 길이 없다). str/repr 이 실패하면(자릿수 상한을
+    넘는 거대 정수 등) None — 원 객체의 형식 오류 경로에 맡긴다."""
+    try:
+        text, rep = str(obj), repr(obj)
+    except Exception:  # noqa: BLE001
+        return None
+    safe = _log_text(text)
+    if safe != text:
+        return safe
+    safe_rep = _log_text(rep)
+    return safe_rep if safe_rep != rep else None
+
+
+def log_safe_value(obj: Any, depth: int = 0) -> Any:
+    """로그 인자·extra 값 하나를 같은 모양으로 정제한다(바뀐 것이 없으면 같은 객체). R4 P1 · R5 B1.
+
+    비문자열 리프 전 유형: None·bool 은 그대로, 숫자는 가려질 때만 표지 문자열(아니면 같은 객체), 그 밖의 객체
+    (bytes·datetime·UUID·Enum·사용자 객체 …)는 _LogSafe(str·repr·format 이 가린 값)."""
+    if obj is None or isinstance(obj, bool):
+        return obj
+    if isinstance(obj, str):
+        out = _log_text(obj)
+        return obj if out == obj else out
+    if isinstance(obj, numbers.Number):
+        masked = _masked_number(obj)
+        return obj if masked is None else masked
+    if depth >= LOG_MAX_DEPTH:
+        return "[REDACTED-DEPTH]"
+    if isinstance(obj, dict):
+        if len(obj) > LOG_MAX_ITEMS:
+            return f"[로그 값 생략: 원소 {len(obj)}개 — 상한 {LOG_MAX_ITEMS}]"
+        pairs = [(_log_safe_key(k, depth + 1), log_safe_value(v, depth + 1)) for k, v in list(obj.items())]
+        if all(a is k and b is v for (a, b), (k, v) in zip(pairs, obj.items())):
+            return obj
+        return OrderedDict(pairs) if isinstance(obj, OrderedDict) else dict(pairs)
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        if len(obj) > LOG_MAX_ITEMS:
+            return f"[로그 값 생략: 원소 {len(obj)}개 — 상한 {LOG_MAX_ITEMS}]"
+        items = [log_safe_value(v, depth + 1) for v in obj]
+        if all(a is b for a, b in zip(items, obj)):
+            return obj
+        if isinstance(obj, tuple) and hasattr(obj, "_fields"):  # namedtuple — 같은 형으로
+            try:
+                return type(obj)._make(items)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - 생성자가 다르면 일반 tuple
+                return tuple(items)
+        if isinstance(obj, list):
+            return items
+        if isinstance(obj, tuple):
+            return tuple(items)
+        return frozenset(items) if isinstance(obj, frozenset) else set(items)
+    return _LogSafe(obj)
+
+
+def _log_safe_key(key: Any, depth: int) -> Any:
+    """dict 키(중첩 dict 와 extra 의 top-level 비문자열 이름 공통 — R6 F1) — 값과 같은 규칙(숫자 키가 가려지면 표지
+    문자열 키 — JSON 직렬화도 된다). 가려지지 않는 객체 키는 원 객체 그대로(안전 래퍼로 바꾸지 않는다)."""
+    safe = log_safe_value(key, depth)
+    if isinstance(safe, _LogSafe) and not safe.masked():
+        return key
+    return safe
+
+
+#: printf 형식 지정자(logging 의 `%` 스타일). `%%` 는 인자를 쓰지 않는다.
+_PCT_SPEC = re.compile(r"%(?:\((?P<key>[^)]*)\))?(?P<flags>[#0\- +]*)(?P<width>\*|\d+)?"
+                       r"(?:\.(?P<prec>\*|\d+))?[hlL]?(?P<conv>[diouxXeEfFgGcrsa%])")
+_NUMERIC_CONV = frozenset("diouxXeEfFgGc")
+
+
+def _was_masked(original: Any, safe: Any) -> bool:
+    """인자 하나가 숫자 형식으로 찍힐 수 없게 가려졌는가(가린 숫자 → 표지 문자열, 가린 _LogSafe)."""
+    if isinstance(safe, str) and not isinstance(original, str):
+        return True
+    return isinstance(safe, _LogSafe) and safe.masked()
+
+
+def _neutralize_masked_specs(msg: str, original: Any, safe: Any) -> Optional[str]:
+    """가린 인자 자리의 숫자 형식 지정자(`%d`·`%5.2f`·`%x` …)를 `%s` 로 바꾼 형식 문자열(R5 B1 — 형식 오류 없이
+    표지). 가려지지 않은 인자 자리는 그대로(원래 출력과 같다). 바꿀 자리가 없으면 msg, 다룰 수 없으면 None."""
+    mapping = isinstance(safe, dict)
+    if not mapping and not isinstance(safe, tuple):
+        return msg
+    out: List[str] = []
+    prev = 0
+    index = 0
+    changed = False
+    for m in _PCT_SPEC.finditer(msg):
+        conv = m.group("conv")
+        if conv == "%":
+            continue
+        if not mapping:
+            stars = (m.group("width") == "*") + (m.group("prec") == "*")
+            index += stars
+            if index >= len(safe):
+                return None
+            hit = _was_masked(original[index], safe[index])
+            index += 1
+        else:
+            key = m.group("key")
+            if key is None or key not in safe:
+                return None
+            hit = _was_masked(original.get(key), safe[key])
+        if not hit or conv not in _NUMERIC_CONV:
+            continue
+        if m.group("prec") == "*":
+            return None  # `%.*d` 의 정밀도 인자를 버리면 인자 수가 어긋난다 — 형식 오류 경로(원문 없음)
+        key_part = f"({m.group('key')})" if mapping else ""
+        flags = "-" if "-" in m.group("flags") else ""
+        out.append(msg[prev:m.start()])
+        out.append(f"%{key_part}{flags}{m.group('width') or ''}s")
+        prev = m.end()
+        changed = True
+    if not changed:
+        return msg
+    out.append(msg[prev:])
+    return "".join(out)
+
+
+def _install_public_log_hooks() -> Callable[[], None]:
+    """레코드 팩토리·Logger.makeRecord·sys/threading excepthook 을 감싸고, 원래대로 돌리는 함수를 돌려준다
+    (refcount 는 호출자)."""
+    import sys
+    import traceback
+
+    from security.public_url import public_text
+    from security.secret_registry import mask_registered
+
+    previous = logging.getLogRecordFactory()
+    original_make = logging.Logger.makeRecord
+    original_handler_format = logging.Handler.format
+    original_handle_error = logging.Handler.handleError
+    if getattr(previous, "_ws51_public", False):  # 다른 경로(모듈 재적재 등)로 이미 감싸져 있다
+        return lambda: None
+
+    def _mask(record: logging.LogRecord) -> None:
+        original_msg, original_args = record.msg, record.args
+        safe_args = log_safe_value(original_args) if original_args else original_args
+        safe_msg = original_msg if isinstance(original_msg, str) else log_safe_value(original_msg)
+        format_msg = safe_msg
+        if isinstance(safe_msg, str) and safe_args and safe_args is not original_args:
+            format_msg = _neutralize_masked_specs(safe_msg, original_args, safe_args)
+            if format_msg is None:
+                format_msg = safe_msg
+            elif format_msg is not safe_msg:
+                safe_msg = format_msg  # 아래 '바뀜' 판정 — 완성 문장으로 바꿔 둔다
+        record.msg, record.args = format_msg, safe_args
+        try:
+            message = record.getMessage()
+            failed = False
+        except Exception as exc:  # noqa: BLE001 - 형식이 깨진 호출(`'bad %d' % url`)
+            # R1 B4: 원 record 를 그대로 두면 handler 의 'Logging error … Arguments: (…)' 진단이 원문 args 를
+            # stderr 로 낸다. 형식 실패 사실은 남기고(조용히 버리지 않는다) msg·args 를 가린 문자열로 바꾼다.
+            try:
+                args_text = repr(safe_args)
+            except Exception:  # noqa: BLE001
+                args_text = "<args repr 실패>"
+            message = f"[로그 형식 오류 {type(exc).__name__}: {exc}] msg={safe_msg!r} args={args_text}"
+            failed = True
+        masked = public_text(message)  # 백스톱(완성된 문장 — 미리 만든 f-string·임의 깊이 이스케이프 인용)
+        if failed or masked != message or safe_args is not original_args or safe_msg is not original_msg:
+            record.msg, record.args = masked, None
+        else:
+            record.msg, record.args = original_msg, original_args
+        if record.exc_text:  # R2 NB-5a: 앞선 팩토리가 이미 채운 traceback 문자열
+            record.exc_text = public_text(record.exc_text)
+        elif record.exc_info and record.exc_info[0] is not None:
+            text = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
+            record.exc_text = public_text(text)  # Formatter 는 exc_text 가 있으면 다시 만들지 않는다
+        if record.stack_info:
+            record.stack_info = public_text(record.stack_info)
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        try:
+            _mask(record)
+        except Exception as exc:  # noqa: BLE001 - 가림이 실패해도 로그는 남기되 원문은 내보내지 않는다
+            record.msg = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략] logger={record.name}"
+            record.args, record.exc_info, record.exc_text, record.stack_info = None, None, None, None
+        return record
+
+    def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = original_make(self, *args, **kwargs)
+        extra = kwargs.get("extra", args[8] if len(args) > 8 else None)
+        if extra:
+            for key in list(extra):  # R2 NB-5b · R4 P1 · R5 B1: extra 속성(값의 모든 리프 + 속성 이름)
+                if key not in record.__dict__:
+                    continue
+                try:
+                    value = log_safe_value(record.__dict__[key])
+                except Exception as exc:  # noqa: BLE001 - 속성은 남기되 원문은 내보내지 않는다
+                    value = f"[로그 가림 실패 {type(exc).__name__} — 원문 생략]"
+                # R6 F2: 문자열 속성 이름은 그대로 둔다 — 기존 Formatter 의 `%(name)s`·`{name}`·`${name}` 조회가 훅이
+                # 없을 때와 같아야 한다. 이름이 비밀이면 출력 단계(handler_format·handle_error)가 가린다.
+                # R6 F1: 비문자열 이름(숫자·bytes·tuple …)은 Formatter 가 이름으로 조회할 수 없다 — 중첩 dict 키와
+                # 같은 정책(_log_safe_key)으로 가린 이름으로 옮긴다.
+                safe_key = key if isinstance(key, str) else _log_safe_key(key, 0)
+                if safe_key is key or safe_key == key:
+                    record.__dict__[key] = value
+                    continue
+                del record.__dict__[key]
+                name, n = safe_key, 2
+                while name in record.__dict__:
+                    name, n = f"{safe_key}#{n}", n + 1
+                record.__dict__[name] = value
+        return record
+
+    def handler_format(self: logging.Handler, record: logging.LogRecord) -> str:
+        """R6 F2: 모든 handler 출력(표준·JSON 형 Formatter — 속성 이름·값을 어떻게 찍든)의 최종 문장에서 도구가 본 비밀
+        값(레지스트리 — §1.1 S 의 모든 표현 R)을 가린다. public_text 의 첫 층만 쓴다: URL 문법·JWT 층은 메시지·extra 값
+        단계에서 이미 거쳤고, Formatter 가 이어 붙인 한 줄 전체에 다시 걸면 인용 값 판정이 칸 경계를 넘어 비밀 아닌
+        출력(`… | %(where)s`)을 삼킨다(dd9d3aa 출력 동일성 — 2026-10-17 메인 승인)."""
+        text = original_handler_format(self, record)
+        try:
+            return mask_registered(text) if isinstance(text, str) and text else text
+        except Exception as exc:  # noqa: BLE001 - 가림 실패 — 원문 대신 표지
+            return f"[로그 가림 실패 {type(exc).__name__} — 원문 생략] logger={record.name}"
+
+    def handle_error(self: logging.Handler, record: logging.LogRecord) -> None:
+        """R6 F2: logging.Handler.handleError 와 같은 진단(같은 조건·같은 모양)을 버퍼에 만든 뒤 가려서 stderr 로.
+
+        Formatter 오류(KeyError·'Formatting field not found …')·emit 예외의 traceback·`Message:`/`Arguments:` 줄이
+        속성 이름·값 원문을 담을 수 있다. raiseExceptions 가 False 이거나 stderr 가 없으면 아무것도 쓰지 않는다(원래와 같다).
+        """
+        if not (logging.raiseExceptions and sys.stderr):
+            return
+        t, v, tb = sys.exc_info()
+        buf = io.StringIO()
+        try:
+            buf.write("--- Logging error ---\n")
+            traceback.print_exception(t, v, tb, None, buf)
+            buf.write("Call stack:\n")
+            frame = tb.tb_frame if tb is not None else None
+            while frame and os.path.dirname(frame.f_code.co_filename) == _LOGGING_DIR:
+                frame = frame.f_back
+            if frame:
+                traceback.print_stack(frame, file=buf)
+            else:
+                buf.write("Logged from file %s, line %s\n" % (record.filename, record.lineno))
+            try:
+                buf.write("Message: %r\nArguments: %s\n" % (record.msg, record.args))
+            except RecursionError:
+                raise
+            except Exception:  # noqa: BLE001 - logging 원래 문구
+                buf.write("Unable to print the message and arguments - possible formatting error.\n"
+                          "Use the traceback above to help find the error.\n")
+            try:
+                text = mask_registered(buf.getvalue())  # handler_format 과 같은 층(레지스트리)
+            except Exception as exc:  # noqa: BLE001
+                text = f"--- Logging error --- [진단 가림 실패 {type(exc).__name__} — 원문 생략]\n"
+            sys.stderr.write(text)
+        except OSError:  # logging 과 같다(issue 5971)
+            pass
+        finally:
+            del t, v, tb
+
+    def _write_exception(header: str, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            text = header + "".join(traceback.format_exception(exc_type, exc, tb))
+            sys.stderr.write(public_text(text))
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 - 예외 출력 실패는 조용히(원문을 대신 내지 않는다)
+            pass
+
+    previous_hook = sys.excepthook
+    previous_thread_hook = threading.excepthook
+
+    def excepthook(exc_type: Any, exc: Any, tb: Any) -> None:
+        _write_exception("", exc_type, exc, tb)
+
+    def thread_excepthook(args: Any) -> None:
+        if args.exc_type is SystemExit:
+            return
+        name = getattr(args.thread, "name", None) or threading.get_ident()
+        _write_exception(f"Exception in thread {name}:\n", args.exc_type, args.exc_value, args.exc_traceback)
+
+    factory._ws51_public = True  # type: ignore[attr-defined]
+    make_record._ws51_public = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+    logging.Logger.makeRecord = make_record  # type: ignore[method-assign]
+    logging.Handler.format = handler_format  # type: ignore[method-assign]
+    logging.Handler.handleError = handle_error  # type: ignore[method-assign]
+    sys.excepthook = excepthook
+    threading.excepthook = thread_excepthook
+
+    def uninstall() -> None:
+        if logging.getLogRecordFactory() is factory:
+            logging.setLogRecordFactory(previous)
+        if logging.Logger.makeRecord is make_record:
+            logging.Logger.makeRecord = original_make  # type: ignore[method-assign]
+        if logging.Handler.format is handler_format:
+            logging.Handler.format = original_handler_format  # type: ignore[method-assign]
+        if logging.Handler.handleError is handle_error:
+            logging.Handler.handleError = original_handle_error  # type: ignore[method-assign]
+        if sys.excepthook is excepthook:
+            sys.excepthook = previous_hook
+        if threading.excepthook is thread_excepthook:
+            threading.excepthook = previous_thread_hook
+
+    return uninstall
 
 
 def _announce_serve(mode: ExecutionMode, browser_mode: str, chrome_profile: Any, keep_open: bool,
