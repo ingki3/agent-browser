@@ -26,21 +26,24 @@ class ToolsMixin:
     #: 운영에서는 None → interface.youtube_search.API_BASE(www.googleapis.com 고정). 환경변수·CLI 로 바꾸는 길은 없다.
     _youtube_ledger: Any = None
     _youtube_api_base: Optional[str] = None
+    #: WS-52 R2: the passive reads a running settle tail survives (only as the sole call in flight).
+    _TAIL_PASSIVE_ACTIONS = frozenset({ActionType.OBSERVE_PAGE, ActionType.EXTRACT, ActionType.TAKE_SCREENSHOT,
+                                       ActionType.WAIT_FOR})
 
     def tool_entry(self, name: str) -> Any:
-        """WS-52 R1 도구 시작 장벽 — 모든 도구 진입점이 await 전에 동기적으로 든다(with).
+        """WS-52 도구 시작 장벽 — 모든 도구 진입점이 await 전에 동기적으로 든다(with).
 
-        읽기 액션(READ_ONLY_ACTIONS)이 아니면(액션·서버 도구·레시피·YouTube 모두) 재시도 장부 꼬리의
-        세대 번호를 올리고 꼬리를 닫힘으로 표시한다 — 이미 진행 중인 쿠키 읽기도 합치기 직전에 버려진다.
+        R2: 모든 호출(액션·서버 도구·레시피·YouTube, 중첩 포함)은 진행 중인 다른 호출을 '겹침'으로 표시하고
+        재시도 장부 꼬리를 영구 중단한다(세대 번호를 올려 진행 중 쿠키 읽기도 합치기 직전에 버린다).
+        예외는 수동 읽기(observe_page·extract·take_screenshot·wait_for)가 유일한 진행 호출일 때뿐 — scroll·hover 는
+        페이지 스크립트를 깨울 수 있어 중단한다.
         """
         from contextlib import nullcontext
-
-        from actions.healing import READ_ONLY_ACTIONS
 
         retry = getattr(self, "_headless_retry", None)
         if retry is None:
             return nullcontext()  # no retry memory → no tail to close (bare test servers)
-        return retry.tool_call(read_only=action_from_tool(name) in READ_ONLY_ACTIONS)
+        return retry.tool_call(read_only=action_from_tool(name) in self._TAIL_PASSIVE_ACTIONS)
 
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""

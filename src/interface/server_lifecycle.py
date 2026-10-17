@@ -210,6 +210,9 @@ class LifecycleMixin:
 
         await self._core.new_context("mcp-session")
         context = self._core.context_for("mcp-session")
+        # WS-52 R2: count this context's requests in flight from adoption on (before any tab of ours) —
+        # the settle tail starts only when nothing outside its own tab is in flight.
+        self._headless_retry.track_context(context)
         # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
         # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
         self._page_status = PageDocumentStatus()
@@ -327,7 +330,8 @@ class LifecycleMixin:
         on("close", _closed)
 
     async def close(self) -> None:
-        self._headless_retry.cancel_tail()  # WS-52: no merge from a closing browser
+        # WS-52: no merge from a closing browser — every tail task is cancelled and joined (R2: none leaks).
+        await self._headless_retry.aclose()
         await self._robots.close()  # WS-41: join background requests before closing their context
         if self._recipes is not None:
             self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)

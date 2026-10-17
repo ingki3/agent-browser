@@ -373,6 +373,16 @@ class FakeContext:
         return list(self.cookies_list)
 
 
+def start_tail(retry, page, url, origin, last, guard):
+    """Start a tail the way a sole navigate call does (R2: one tab, counted requests, one call)."""
+    if page.context not in retry._requests:
+        retry.track_context(page.context)
+        # The fake tab was created before the count (a real server counts first); fakes issue no requests.
+        retry._requests[page.context].ok = True
+    with retry.tool_call(read_only=False):
+        retry.start_tail(page, url, origin, last, guard)
+
+
 def _cookie(name, value, domain="example.test"):
     return {"name": name, "value": value, "domain": domain, "path": "/", "expires": -1,
             "secure": False, "httpOnly": False, "sameSite": "Lax"}
@@ -389,9 +399,9 @@ async def test_unreadable_cookies_end_the_tail_fail_closed(tmp_path, monkeypatch
     after = await retry.snapshot(context, origin + "/")
     retry.commit_success(origin, [], after)
     context.fail = True
-    retry.start_tail(page, origin + "/", origin, after, lambda: True)
+    start_tail(retry, page, origin + "/", origin, after, lambda: True)
     await asyncio.sleep(0.05)
-    assert retry._tail is None and page.listeners == {"framenavigated": [], "close": []}
+    assert retry._tail is None and page.listeners == {"framenavigated": [], "close": [], "crash": []}
     context.fail = False
     context.cookies_list = [_cookie("visitor", "v2")]
     await asyncio.sleep(0.05)
@@ -412,7 +422,7 @@ async def test_tail_saves_and_other_commits_never_lose_a_write(tmp_path, monkeyp
     page = FakePage(origin + "/", context)
     after = await retry.snapshot(context, origin + "/")
     retry.commit_success(origin, [], after)
-    retry.start_tail(page, origin + "/", origin, after, lambda: True)
+    start_tail(retry, page, origin + "/", origin, after, lambda: True)
     for index in range(1, 30):
         context.cookies_list = [_cookie("visitor", f"v{index}")]
         retry.commit_success(f"http://other{index}.test", [], [])
@@ -455,7 +465,7 @@ async def test_change_racing_the_snapshot_with_human_control_is_not_merged(monke
     page = FakePage(origin + "/", context)
     after = [{"name": "visitor", "domain": "example.test", "path": "/", "value_digest": retry._digest("v1")}]
     retry.commit_success(origin, [], after)
-    retry.start_tail(page, origin + "/", origin, after, lambda: open_["ok"])
+    start_tail(retry, page, origin + "/", origin, after, lambda: open_["ok"])
     await asyncio.sleep(0.05)
     assert retry._tail is None
     assert retry.ledger[origin] == after

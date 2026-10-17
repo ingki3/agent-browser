@@ -30,6 +30,7 @@ import stat
 import time
 from typing import AsyncIterator, Callable, Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
+import weakref
 
 from playwright.async_api import BrowserContext, Page
 
@@ -50,8 +51,31 @@ FAILED_TTL_S = 24 * 3600
 #: the same tab keep being ledgered this long (unless a stop condition fires first).
 TAIL_S = 10.0
 TAIL_INTERVAL_S = 0.5
-#: WS-52 R1: set inside a tool call (same task) so the tool's own nested calls do not bump the generation.
-_IN_TOOL_CALL: ContextVar[bool] = ContextVar("headless_retry_in_tool_call", default=False)
+#: WS-52 server.close waits this long for cancelled tail tasks (they own no merge after cancel).
+TAIL_REAP_S = 2.0
+
+
+@dataclass(eq=False)
+class _Call:
+    """One MCP tool call in flight (WS-52 R2); nested calls of the same request share it."""
+
+    passive: bool
+    #: Another call was in flight at some point during this one: its navigate starts no tail.
+    overlapped: bool = False
+
+
+#: WS-52 R2: the top-level tool call this task runs inside (nested calls see their owner's).
+_CURRENT_CALL: ContextVar["_Call | None"] = ContextVar("headless_retry_current_call", default=None)
+
+
+@dataclass(eq=False)
+class _Requests:
+    """Requests of one BrowserContext in flight, counted from when the server adopted it."""
+
+    live: set = field(default_factory=set)
+    #: False when the count cannot be trusted (subscription failed, adopted with open documents,
+    #: or a request finished that was never seen starting): no tail starts in this context.
+    ok: bool = True
 
 SUCCESS_NOTE = "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)"
 REMEMBERED_NOTE = "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다"
@@ -170,8 +194,14 @@ class HeadlessRetry:
         self._key = secrets.token_bytes(32)
         self._clock = clock
         self._tail: _Tail | None = None
-        #: WS-52 R1: bumped synchronously when a non-read-only tool call starts (``tool_call``).
+        #: WS-52 R1: bumped synchronously when a tool call starts (``tool_call``) — refuses in-flight reads.
         self._tool_gen = 0
+        #: WS-52 R2: top-level MCP tool calls in flight (the tail starts only for the sole one).
+        self._calls: set[_Call] = set()
+        #: WS-52 R2: every tail task not yet finished — server close cancels and joins them all.
+        self._tail_tasks: set[asyncio.Task] = set()
+        #: WS-52 R2: in-flight requests per adopted BrowserContext (``track_context``).
+        self._requests: "weakref.WeakKeyDictionary[object, _Requests]" = weakref.WeakKeyDictionary()
 
     @property
     def attempted(self) -> set[str]:
@@ -247,52 +277,125 @@ class HeadlessRetry:
 
     @contextmanager
     def tool_call(self, read_only: bool) -> Iterator[None]:
-        """WS-52 R1 start barrier: enter it at every tool entry, before any await.
+        """WS-52 start barrier: enter it at every tool entry, before any await.
 
-        A non-read-only call synchronously bumps the tool generation and marks the
-        running tail closed, so a tail read already in flight is refused after its
-        await (``_tail_current``). Calls the tool makes itself (the first retry's
-        recursive navigate, recipe steps) still close a running tail but do not bump
-        the generation: they belong to the call that started the navigate, so the
-        tail that navigate starts is not refused because of them.
+        R2 — simple, conservative rules instead of telling overlaps apart one by one:
+        every entry marks every other call in flight as overlapped (a navigate that
+        overlapped another call starts no tail) and, unless it is a passive read
+        (``read_only``: the caller passes it only for observe_page/extract/
+        take_screenshot/wait_for) running as the only call, synchronously bumps the
+        generation and ends the running tail for good — task cancelled, a cookie read
+        in flight refused after its await (``_tail_current``). Nested calls (SDK
+        wrapper → backend, a navigate's first retry, recipe steps) share their
+        request's call; they end a running tail too unless they are the passive
+        call's own wrapper.
         """
-        nested = _IN_TOOL_CALL.get()
-        if not read_only:
-            if not nested:
-                self._tool_gen += 1
+        current = _CURRENT_CALL.get()
+        if current is not None and current not in self._calls:
+            current = None  # a task that outlived its call: count it as a request of its own
+        others = [call for call in self._calls if call is not current]
+        for call in others:
+            call.overlapped = True
+        if not (read_only and not others and (current is None or current.passive)):
+            self._tool_gen += 1
             self._close_tail()
-        token = _IN_TOOL_CALL.set(True)
+        if current is not None:
+            yield
+            return
+        call = _Call(passive=read_only, overlapped=bool(others))
+        self._calls.add(call)
+        token = _CURRENT_CALL.set(call)
         try:
             yield
         finally:
-            _IN_TOOL_CALL.reset(token)
+            _CURRENT_CALL.reset(token)
+            self._calls.discard(call)
+
+    def track_context(self, context: BrowserContext) -> None:
+        """WS-52 R2: count the context's requests in flight from the moment the server adopts it.
+
+        Call it right after the context is created/adopted, before any tab of ours
+        navigates. The count is untrusted — no tail ever starts in that context — when
+        the subscription fails, the context was adopted with a document already open
+        (its requests could predate the count) or a request finishes that was never
+        seen starting. Adopting the same context again keeps the running count.
+        """
+        try:
+            if context in self._requests:
+                return
+            requests = _Requests()
+            self._requests[context] = requests
+        except TypeError:
+            return  # not weak-referenceable: nothing counted, no tail
+
+        def started(request: object) -> None:
+            requests.live.add(request)
+
+        def ended(request: object) -> None:
+            if request in requests.live:
+                requests.live.discard(request)
+            else:
+                requests.ok = False
+
+        try:
+            if any((getattr(other, "url", "") or "about:blank") != "about:blank" for other in context.pages):
+                requests.ok = False
+            context.on("request", started)
+            context.on("requestfinished", ended)
+            context.on("requestfailed", ended)
+        except Exception:  # noqa: BLE001 - uncounted means no tail (fail-closed)
+            requests.ok = False
 
     def _close_tail(self) -> None:
-        """Mark the running tail closed (synchronous; no final sample, nothing merged)."""
+        """End the running tail for good (synchronous): closed mark, listeners off, task cancelled.
+
+        No final sample, nothing merged. The task stays owned (``_tail_tasks``) until it
+        has ended; a lost cancellation is still refused by the generation/closed re-check.
+        """
         tail, self._tail = self._tail, None
         if tail is not None:
             tail.stopped = True
             _detach(tail)
+            if tail.task is not None:
+                tail.task.cancel()
 
     def start_tail(self, page: Page, url: str, origin: str, last: list[LedgerEntry],
-                   guard: Callable[[], bool], gen: int | None = None) -> None:
+                   guard: Callable[[], bool]) -> None:
         """Keep ledgering this tab's script cookie writes for TAIL_S after a committed success.
 
-        Runs in the background (the tool response is not delayed). Each sample
-        merges only while ``guard()`` (no human control/handoff, still headless
-        with the feature on), no tool call started since (generation), the
-        deadline has not passed, and the tab is open, still on the origin, with no
-        related visit in another tab — latched from context events, so a tab that
-        lived between two samples still ends it. Every condition is re-checked
-        after the cookie read's await. Anything unexpected ends it without merging;
-        when the events cannot be subscribed the tail does not start at all.
+        Runs in the background (the tool response is not delayed). R2: starts only when
+        all of these hold — otherwise it does not start at all (nothing to merge):
+
+        1. the tab is the only tab of its BrowserContext;
+        2. no request of the context is in flight except the tab's own subresources
+           (counted since the context was adopted — ``track_context``);
+        3. the calling tool call is the only call in flight and no other call overlapped it.
+
+        Once started it ends for good — nothing merged, a read in flight refused — on any
+        other tool call (a sole passive read excepted, ``tool_call``), a new tab/popup, a
+        request that is not the tab's own subresource (another tab, a service worker, a
+        main-frame document or download), a main-frame navigation or origin change, the
+        tab closing or crashing, the context closing, ``guard()`` turning false (human
+        control/handoff/login/request, headed, feature off), the deadline or server close.
+        Every condition is re-checked after each cookie read's await.
         """
         self.cancel_tail()
-        if gen is not None and gen != self._tool_gen:
-            return  # a tool call started while the navigate ran: its effects are not ours
+        call = _CURRENT_CALL.get()
+        if call is None or call.overlapped or self._calls != {call}:
+            return  # rule 3: another call overlapped this navigate (or no call owns it)
+        try:
+            context = page.context
+            if list(context.pages) != [page]:
+                return  # rule 1
+            requests = self._requests.get(context)
+            if requests is None or not requests.ok:
+                return  # rule 2: the in-flight count is unknown
+            if not all(_own_subresource(page, request) for request in list(requests.live)):
+                return  # rule 2: a request outside this tab's own subresources is in flight
+        except Exception:  # noqa: BLE001 - unreadable state: do not start
+            return
         tail = _Tail(page=page, url=url, origin=origin, last=last, guard=guard,
                      deadline=time.monotonic() + TAIL_S, gen=self._tool_gen)
-        host = urlsplit(url).hostname or ""
 
         def broken(*_: object) -> None:
             tail.broken = True
@@ -303,76 +406,47 @@ class HeadlessRetry:
             if frame is page.main_frame:
                 tail.broken = True
 
-        def other_navigated(frame: object) -> None:
-            try:
-                if _related_host(host, urlsplit(getattr(frame, "url", "") or "").hostname or ""):
-                    tail.broken = True
-            except Exception:  # noqa: BLE001 - unknown frame: assume the worst
-                tail.broken = True
-
-        def watch(other: object) -> None:
-            # Another tab (existing, new or popup): any related visit there latches the end.
-            if other is page:
-                return
-            try:
-                if _related_host(host, urlsplit(getattr(other, "url", "") or "").hostname or ""):
-                    tail.broken = True
-                _listen(tail, other, "framenavigated", other_navigated)
-            except Exception:  # noqa: BLE001 - an unwatchable tab cannot be ruled out
-                tail.broken = True
-
         def requested(request: object) -> None:
-            # Context-wide: every request of every tab (popups included) as it is issued.
-            try:
-                target = urlsplit(getattr(request, "url", "") or "").hostname or ""
-            except Exception:  # noqa: BLE001 - unreadable request: assume the worst
-                tail.broken = True
-                return
-            try:
-                frame = request.frame  # type: ignore[attr-defined]
-                own = frame.page is page
-            except Exception:  # noqa: BLE001 - no frame (service worker): not provably this tab
-                frame, own = None, False
-            if own:
-                try:
-                    # The renamed page's own subresources are same-tab script traffic; a new
-                    # main-frame document (download included) is a native-name visit.
-                    if frame is page.main_frame and request.is_navigation_request():  # type: ignore[attr-defined]
-                        tail.broken = True
-                except Exception:  # noqa: BLE001
-                    tail.broken = True
-                return
-            if _related_host(host, target):
+            # Context-wide, as each request is issued: only the tab's own subresources keep it.
+            if not _own_subresource(page, request):
                 tail.broken = True
 
         try:
             _listen(tail, page, "framenavigated", navigated)
             _listen(tail, page, "close", broken)
-            context = page.context
-            _listen(tail, context, "page", watch)
+            _listen(tail, page, "crash", broken)
+            _listen(tail, context, "page", broken)
             _listen(tail, context, "request", requested)
-            for other in list(context.pages):
-                watch(other)
-            tail.task = asyncio.get_running_loop().create_task(self._run_tail(tail))
+            _listen(tail, context, "close", broken)
+            task = asyncio.get_running_loop().create_task(self._run_tail(tail))
         except Exception:  # noqa: BLE001 - unwatched means not started (fail-closed; WS-47 behavior)
             _detach(tail)
             return
+        tail.task = task
+        self._tail_tasks.add(task)
+        task.add_done_callback(self._tail_tasks.discard)
         self._tail = tail
 
     def cancel_tail(self) -> None:
-        """Stop the tail without a final sample (server close, context replacement)."""
-        tail = self._tail
+        """Stop the tail without a final sample (cancelled; nothing merged)."""
         self._close_tail()
-        if tail is not None and tail.task is not None:
-            tail.task.cancel()
 
     async def end_tail(self) -> None:
-        """Stop the tail: cancel only — R1 takes no final sample (fail-closed).
+        """Stop the tail: cancel only — no final sample (fail-closed).
 
         A script change in the last moment before the end is lost; the next visit
         then honestly reports ``known_value_changed``/``new_cookie``.
         """
         self.cancel_tail()
+
+    async def aclose(self) -> None:
+        """Server close: end the tail and cancel + join every tail task still owned (no leak)."""
+        self._close_tail()
+        tasks = [task for task in self._tail_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=TAIL_REAP_S)
 
     async def _run_tail(self, tail: _Tail) -> None:
         try:
@@ -399,9 +473,7 @@ class HeadlessRetry:
             return False
         if _origin(page.url) != tail.origin:
             return False
-        host = urlsplit(tail.url).hostname or ""
-        return not any(other is not page and _related_host(host, urlsplit(other.url).hostname or "")
-                       for other in page.context.pages)
+        return list(page.context.pages) == [page]
 
     async def _tail_sample(self, tail: _Tail) -> bool:
         """One merge step; False ends the tail (conditions broke or cookies unreadable)."""
@@ -413,7 +485,7 @@ class HeadlessRetry:
         except asyncio.TimeoutError:
             return False  # the read outlasted the maximum window
         # Re-check after the await (nothing awaits between here and the merge): a tool call,
-        # human control, navigation, related visit or the deadline that raced the read wins.
+        # human control, navigation, crash, other request or the deadline that raced the read wins.
         if current is None or not self._tail_current(tail) or not self._tail_open(tail):
             return False
         self.absorb(tail.origin, tail.last, current)
@@ -603,7 +675,6 @@ class HeadlessRetry:
         if version is None:
             raise ValueError("unavailable native headless version")
         major = int(version[1])
-        gen = self._tool_gen  # the calling tool already passed the barrier; a later call refuses the tail
         before = await self.snapshot(page.context, url)
         session = await page.context.new_cdp_session(page)
         attempt = RetryRequest(origin=destination)
@@ -655,7 +726,7 @@ class HeadlessRetry:
                 after = await self.snapshot(page.context, url)
                 self.commit_success(destination, before, after)
                 if tail_guard is not None and after is not None and tail_guard():
-                    self.start_tail(page, url, destination, after, tail_guard, gen)
+                    self.start_tail(page, url, destination, after, tail_guard)
 
 
 @dataclass
@@ -679,14 +750,28 @@ class _Tail:
     guard: Callable[[], bool]
     deadline: float
     stopped: bool = False
-    #: The tab closed, its main frame navigated, or a related visit happened in another tab
-    #: (latched from events): nothing more is merged.
+    #: The tab closed or crashed, its main frame navigated, a new tab opened, the context closed
+    #: or a request outside the tab's own subresources started (latched from events).
     broken: bool = False
     #: The tool generation at the start (HeadlessRetry._tool_gen); any later tool call refuses merges.
     gen: int = 0
     task: "asyncio.Task | None" = field(default=None, repr=False)
     #: (emitter, event, handler) — removed together when the tail ends.
     listeners: list = field(default_factory=list, repr=False)
+
+
+def _own_subresource(page: object, request: object) -> bool:
+    """A request the tab's own page issued that is not a main-frame document (WS-52 R2).
+
+    Anything else — another tab, no frame (service worker), a main-frame document or
+    download, or an unreadable request — is not provably this renamed page's traffic.
+    """
+    try:
+        frame = request.frame  # type: ignore[attr-defined]
+        return frame.page is page and not (
+            frame is page.main_frame and request.is_navigation_request())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _listen(tail: _Tail, emitter: object, event: str, handler: Callable[..., None]) -> None:
