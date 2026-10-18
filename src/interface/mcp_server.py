@@ -146,6 +146,8 @@ from interface.server_workspace import (  # noqa: E402,F401
     _CALL_STATE,
     _CallScope,
     _PER_CALL,
+    _SERIAL_HELD,
+    _WorkspaceSerial,
     _call_field,
     _closed,
     _runtime_field,

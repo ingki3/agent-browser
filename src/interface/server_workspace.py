@@ -212,6 +212,23 @@ class WorkspaceMixin:
             lock = locks[name] = asyncio.Lock()
         return lock
 
+    def _dispatch_serial(self) -> "_WorkspaceSerial":
+        """현재 작업 공간의 액션 직렬화 구간(async with). WS-57 R2(B1): 디스패처는 호출 임시 상태(_dialogs·_nav_info·
+        _opened_pages·_top_attribution)를 인스턴스에 두고 dispatch 입구에서 초기화한다 — 같은 작업 공간의 두 호출이
+        겹치면 한쪽 alert 가 다른 쪽 효과로 읽혔다. 다른 작업 공간끼리는 락이 달라 지금처럼 동시에 돈다.
+        같은 호출 흐름 안의 중첩 호출(헤드리스 재시도·레시피 재생 단계)은 이미 쥔 락을 다시 잡지 않는다."""
+        return _WorkspaceSerial(self, current_workspace())
+
+    def _dispatch_lock(self, name: str) -> Any:
+        import asyncio
+
+        # _workspace_lock(첫 호출 탭 만들기)과 다른 락 — 직렬화 구간 안에서 _ensure_workspace 가 그 락을 잡는다.
+        locks = self.__dict__.setdefault("_ws_dispatch_locks", {})
+        lock = locks.get(name)
+        if lock is None:
+            lock = locks[name] = asyncio.Lock()
+        return lock
+
     async def _ensure_workspace(self) -> None:
         """기본 외 작업 공간의 첫 호출: 자기 탭(같은 영속 컨텍스트 — 로그인 공유)·엔진·디스패처를 만든다.
         자기 활성 탭이 사라졌으면(사람·사이트가 닫음) 남은 자기 탭(없으면 새 탭)으로 바꾸고 epoch 를 올린다.
@@ -314,6 +331,42 @@ class _CallScope:
             scope.__exit__(*exc)
         finally:
             _CALL_STATE.reset(state_token)
+
+
+#: 이 호출 흐름(태스크와 그 하위 태스크)이 이미 쥔 작업 공간 직렬화 락 이름들 — 중첩 호출의 자기 교착 방지.
+_SERIAL_HELD: ContextVar[frozenset] = ContextVar("agent_browser_serial_held", default=frozenset())
+
+
+class _WorkspaceSerial:
+    """_dispatch_serial 의 async 컨텍스트 관리자(_CallScope 와 같은 이유로 클래스). 기다리다 취소되면 아무것도 쥐지
+    않고, 쥔 뒤 취소·예외면 __aexit__ 가 놓는다."""
+
+    def __init__(self, owner: Any, name: str) -> None:
+        self.owner = owner
+        self.name = name
+        self._lock: Any = None
+        self._token: Any = None
+        #: 다른 호출이 쥐고 있어 기다렸는가(기다린 사이 바뀐 상태를 다시 볼지 정한다).
+        self.waited = False
+
+    async def __aenter__(self) -> None:
+        held = _SERIAL_HELD.get()
+        if self.name in held:
+            return  # 같은 호출 흐름의 중첩 호출 — 바깥이 쥐고 있다
+        lock = self.owner._dispatch_lock(self.name)
+        self.waited = lock.locked()
+        await lock.acquire()
+        self._lock = lock
+        self._token = _SERIAL_HELD.set(held | {self.name})
+
+    async def __aexit__(self, *exc: Any) -> None:
+        lock, self._lock = self._lock, None
+        if lock is None:
+            return
+        try:
+            _SERIAL_HELD.reset(self._token)
+        finally:
+            lock.release()
 
 
 def _closed(page: Any) -> bool:

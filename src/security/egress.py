@@ -132,6 +132,10 @@ class UpstreamFailure:
     code: str  # UPSTREAM_RESOLVE_FAILED | UPSTREAM_CONNECT_FAILED
     url: str = ""
     port: Optional[int] = None
+    #: WS-57 R2: 이 실패를 낸 요청의 Page(탭)와 그 이동의 리다이렉트 앞 홉 호스트들 — 브라우저 쪽 응답·실패 이벤트로
+    #: 귀속한다(프록시는 요청의 탭을 모른다). None = 귀속 불가(서비스 워커 등) → 어느 호출 오류에도 붙이지 않는다.
+    page: object = field(default=None, repr=False, compare=False)
+    chain_hosts: Tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.url = redact_url(self.url)
@@ -153,6 +157,9 @@ class EgressDecision:
     category: str = ""
     #: 해석으로 판정했으면 해석된 IP 목록, 검증한 접속 대상 IP(프록시 고정용)
     resolved: Tuple[str, ...] = ()
+    #: WS-57 R2: 기록한 차단을 낸 요청의 Page(탭)·리다이렉트 앞 홉 호스트들(UpstreamFailure 와 같음). 판정 값이 아니다.
+    page: object = field(default=None, repr=False, compare=False)
+    chain_hosts: Tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # 판정 기록에는 쿼리·조각·사용자정보를 남기지 않는다(NB-4) — 로그·blocked_requests 공통.
@@ -478,7 +485,9 @@ class EgressGuard:
             self.record_block(decision)
         return decision.allowed
 
-    def record_block(self, decision: EgressDecision) -> None:
+    def record_block(self, decision: EgressDecision, origin: Optional[Tuple[object, Tuple[str, ...]]] = None) -> None:
+        if origin is not None:
+            decision.page, decision.chain_hosts = origin
         self._blocked_log.append(decision)
         self._blocked_total += 1
 
@@ -559,10 +568,107 @@ class EgressGuard:
             if decision.allowed:
                 await route.continue_()
                 return
-            self.record_block(decision)
+            self.record_block(decision, request_origin(request))
             logger.info(
                 "Egress 차단: %s (%s)", decision.url, decision.reason.value if decision.reason else "?"
             )
             await route.abort("blockedbyclient")
 
         await context.route("**/*", _handler)
+        self._watch_proxy_refusals(context)
+
+    # -- 요청 출처 귀속 (WS-57 R2) ------------------------------------------------
+
+    def _watch_proxy_refusals(self, context) -> None:  # noqa: ANN001
+        """프록시가 막거나(403) 업스트림에 닿지 못한(502) 기록을 브라우저 쪽 응답·실패 이벤트의 요청 Page 에 귀속한다.
+
+        프록시는 요청이 어느 탭의 것인지 모른다. 프록시는 기록한 뒤 응답하므로 그 응답(표시 머리 BLOCK_HEADER)이나
+        터널 실패(https CONNECT 거부)를 브라우저가 볼 때 같은 호스트·포트의 아직 귀속되지 않은 최근 기록을 그 요청의
+        Page 에 붙인다. 귀속되지 않은 기록(서비스 워커 요청 등)은 어느 호출 오류에도 붙지 않는다(MCP 경계).
+        """
+        from security.egress_proxy import BLOCK_HEADER, UPSTREAM_FAIL_MARK
+
+        header = BLOCK_HEADER.lower()
+
+        def on_response(response) -> None:  # noqa: ANN001
+            try:
+                mark = (response.headers or {}).get(header)
+                mark = str(mark or "")
+                if mark.startswith(UPSTREAM_FAIL_MARK):
+                    self._claim(response.request, upstream=True)
+                elif mark.startswith("blocked"):
+                    self._claim(response.request, upstream=False)
+            except Exception:  # noqa: BLE001 - 이벤트 처리 중 — 귀속 실패는 '귀속 불가'일 뿐
+                logger.debug("egress 응답 귀속 실패", exc_info=True)
+
+        def on_request_failed(request) -> None:  # noqa: ANN001
+            try:
+                failure = str(request.failure or "")
+                if "TUNNEL" in failure or "PROXY" in failure:
+                    self._claim(request, upstream=None)
+            except Exception:  # noqa: BLE001
+                logger.debug("egress 실패 귀속 실패", exc_info=True)
+
+        on = getattr(context, "on", None)
+        if not callable(on):
+            return  # 가짜 컨텍스트(단위 테스트)
+        try:
+            on("response", on_response)
+            on("requestfailed", on_request_failed)
+        except Exception:  # noqa: BLE001
+            logger.debug("egress 귀속 이벤트 등록 실패", exc_info=True)
+
+    def _claim(self, request, *, upstream: Optional[bool]) -> None:  # noqa: ANN001
+        """request 와 같은 호스트·포트의 귀속되지 않은 가장 최근 프록시 기록을 그 요청 Page 에. upstream: True=502 기록만,
+        False=차단 기록만, None=둘 다(터널 실패는 어느 쪽인지 브라우저가 구별하지 못한다)."""
+        origin = request_origin(request)
+        if origin is None:
+            return
+        target = _host_port(getattr(request, "url", ""))
+        if target is None:
+            return
+        logs: List[Deque] = []
+        if upstream is not True:
+            logs.append(self._blocked_log)
+        if upstream is not False:
+            logs.append(self._upstream_failures)
+        for log in logs:
+            for rec in reversed(log):
+                if rec.page is not None:
+                    continue
+                port = rec.port if isinstance(rec, UpstreamFailure) else None
+                key = _host_port(rec.url) if port is None else ((rec.host or "").lower().strip("[]"), port)
+                if key == target:
+                    rec.page, rec.chain_hosts = origin
+                    return
+
+
+def request_origin(request) -> Optional[Tuple[object, Tuple[str, ...]]]:  # noqa: ANN001
+    """요청의 (Page, 리다이렉트 앞 홉 호스트들). 프레임이 없으면(서비스 워커 요청 등) None — 귀속 불가 (WS-57 R2)."""
+    try:
+        page = request.frame.page
+    except Exception:  # noqa: BLE001 - Playwright: 서비스 워커 요청은 frame 접근이 오류
+        return None
+    if page is None:
+        return None
+    hosts: List[str] = []
+    try:
+        prev = request.redirected_from
+        while prev is not None and len(hosts) < 32:
+            host = (urlsplit(prev.url).hostname or "").lower()
+            if host:
+                hosts.append(host)
+            prev = prev.redirected_from
+    except Exception:  # noqa: BLE001
+        pass
+    return page, tuple(hosts)
+
+
+def _host_port(url: str) -> Optional[Tuple[str, Optional[int]]]:
+    try:
+        parts = urlsplit(url or "")
+        host = (parts.hostname or "").lower()
+        port = parts.port or {"http": 80, "https": 443, "ws": 80, "wss": 443}.get(parts.scheme.lower())
+    except ValueError:
+        return None
+    return (host, port) if host else None

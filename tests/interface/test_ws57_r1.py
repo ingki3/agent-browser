@@ -183,7 +183,8 @@ async def test_r1_tab_closed_notice_goes_to_the_owner_only(site):
 
 @requires_chromium
 async def test_r2_concurrent_approved_calls_keep_their_own_heal_guard(site):
-    """같은 작업 공간의 두 승인 클릭이 겹쳐도, 먼저 끝난 쪽이 남은 쪽의 치유 금지를 풀지 않는다."""
+    """같은 작업 공간의 두 승인 클릭을 동시에 보내도, 먼저 끝난 쪽이 남은 쪽의 치유 금지를 풀지 않는다.
+    WS-57 R2: 같은 작업 공간 dispatch 는 이제 직렬화돼 두 호출이 디스패처 안에서 겹치지 않는다(overlap=False)."""
     async with BrowserMCPServer(recipes=False) as s:
         s._human_can_see = lambda: True
         await s._page.set_content("""<title>local</title>
@@ -206,7 +207,12 @@ async def test_r2_concurrent_approved_calls_keep_their_own_heal_guard(site):
         async def delayed(disp, action, p, *rest):
             if p["element_id"] == params[0]["element_id"]:
                 a_enter.set()
-                await b_enter.wait()
+                # WS-57 R2(B1): 같은 작업 공간 dispatch 는 직렬화 — B 는 A 가 끝나기 전에 디스패처에 들어오지 못한다.
+                try:
+                    await asyncio.wait_for(b_enter.wait(), 0.5)
+                    seen["overlap"] = True
+                except asyncio.TimeoutError:
+                    seen["overlap"] = False
                 seen["a"] = disp.heal_disabled
                 return await original(disp, action, p, *rest)
             b_enter.set()
@@ -231,7 +237,7 @@ async def test_r2_concurrent_approved_calls_keep_their_own_heal_guard(site):
         await a_enter.wait()
         tb = asyncio.create_task(click(params[1]))
         ra, rb = await asyncio.gather(ta, tb)
-        assert seen == {"a": True, "b": True}, seen
+        assert seen == {"overlap": False, "a": True, "b": True}, seen
         # A 는 승인한 그 요소를 눌렀다(data-* 변화는 사후조건 효과가 아니라 결과 봉투는 E_TIMEOUT 일 수 있다).
         assert ra["data"]["approval"]["status"] == "used", ra
         assert await s._page.locator("#a").get_attribute("data-done") == "yes"

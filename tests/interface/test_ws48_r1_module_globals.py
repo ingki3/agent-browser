@@ -59,6 +59,8 @@ PRESERVED = (
     "DEFAULT_WORKSPACE", "WORKSPACE_ARG", "WorkspaceNameError", "WorkspaceRuntime", "_CALL_STATE", "_CallScope",
     "_all_tabs", "_closed", "_snapshot_tabs", "current_workspace", "pop_workspace_arg", "validate_workspace",
     "workspace_scope",
+    # WS-57 R2 작업 공간 직렬화
+    "_SERIAL_HELD", "_WorkspaceSerial",
 )
 
 

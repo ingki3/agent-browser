@@ -86,7 +86,12 @@ async def test_real_saved_recipe_overlapping_a_navigate_starts_no_tail(monkeypat
                 return await real_run(*args, **kwargs)
 
             monkeypatch.setattr(service, "run_recipe", scheduled_recipe)
-            other = asyncio.create_task(server.call_server_tool("browser_recipe", {"op": "run", "id": recipe_id}))
+            # WS-57 R2: 같은 작업 공간의 호출은 이제 직렬화돼 겹치지 못한다 — 겹침은 다른 작업 공간(같은 컨텍스트·쿠키)의
+            # 요청으로만 생긴다. 그 작업 공간 탭을 같은 페이지로 열어 둔 뒤 거기서 저장 레시피를 돌린다.
+            opened = await server.call_tool("browser_navigate", {"url": site.url + "/one", "workspace": "watch"})
+            assert opened.success, opened
+            other = asyncio.create_task(server.call_server_tool(
+                "browser_recipe", {"op": "run", "id": recipe_id, "workspace": "watch"}))
             await recipe_ready.wait()
             original = retry.snapshot
 
