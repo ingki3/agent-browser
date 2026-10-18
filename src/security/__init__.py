@@ -34,6 +34,7 @@ from security.masking import (
     mask_mapping,
     mask_text,
 )
+from security.public_url import has_redaction_mark, public_payload, public_text, public_url
 from security.prompt_isolation import (
     InjectionVerdict,
     detect_injection,
@@ -65,6 +66,11 @@ __all__ = [
     "MaskingReport",
     "MASK",
     "MASK_RULES",
+    # 에이전트에게 나가는 주소 가리기 (WS-51)
+    "public_url",
+    "public_text",
+    "public_payload",
+    "has_redaction_mark",
     "SecretStore",
     "SecretsError",
     "SecretResolution",

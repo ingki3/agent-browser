@@ -671,6 +671,21 @@ def _merge_variants(old_step: Dict[str, Any], new_step: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _register_step_urls(recipes: Dict[str, Any]) -> None:
+    """WS-51 R4 P7: 파일에서 읽은 레시피의 단계 이동 주소를 비밀 값 레지스트리에 — 재시작 뒤 같은 값이 응답·로그
+    문장에 나와도 가린다(레시피 파일은 원문 주소를 보관한다). 예외를 내지 않는다."""
+    from security.secret_registry import register_urls
+
+    def urls() -> Any:
+        for rec in recipes.values():
+            for step in rec.get("steps") or ():
+                args = step.get("args") if isinstance(step, dict) else None
+                if isinstance(args, dict) and isinstance(args.get("url"), str):
+                    yield args["url"]
+
+    register_urls(urls())
+
+
 class RecipeStore:
     """레시피 저장소. path 가 None 이면 메모리만(서버 종료 시 소멸)."""
 
@@ -741,6 +756,7 @@ class RecipeStore:
             return
         self._recipes = recipes
         self._index = index
+        _register_step_urls(recipes)
 
     @staticmethod
     def _validate(data: Any) -> tuple:

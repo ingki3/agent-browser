@@ -116,6 +116,10 @@ class WindowMixin:
         if w is None or w.state not in ("headless", "headed") or self._browser_dead():
             return
         w.last_tabs = self._tab_snapshot()
+        # WS-51 R3 등록 지점 (d): 서버가 보관하는 탭 원문 주소(복원에 쓰는 값) — 응답·문장에서는 가린다.
+        from security.secret_registry import register_urls
+
+        register_urls(t.get("url") for t in w.last_tabs)
 
     def _tab_snapshot(self) -> List[Dict[str, Any]]:
         core = self._core

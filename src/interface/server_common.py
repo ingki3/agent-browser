@@ -29,11 +29,13 @@ def _stderr_line(text: str) -> None:
     """stderr 에 한 줄(신호 처리기 안에서도 안전하게 os.write). stdout 은 MCP 전용.
 
     한 줄 보장: 외부 유래 문자열(에이전트 reason·URL·예외 문구)이 섞여도 제어문자·개행·양방향
-    제어를 보이는 표기로 바꾼다(WS-29 R1 BLOCKING-1 — 운영자 터미널 위조 방지).
+    제어를 보이는 표기로 바꾼다(WS-29 R1 BLOCKING-1 — 운영자 터미널 위조 방지). 주소의 비밀 값은 가린다(WS-51).
     """
     from interface.handoff import display_safe
+    from security.public_url import public_text
 
     try:
-        os.write(2, (display_safe(text, 4000) + "\n").encode("utf-8", "replace"))
+        # WS-51: 줄 안의 페이지 주소는 비밀 값을 가린다(에이전트 응답과 같은 public_url).
+        os.write(2, (display_safe(public_text(text), 4000) + "\n").encode("utf-8", "replace"))
     except OSError:
         pass

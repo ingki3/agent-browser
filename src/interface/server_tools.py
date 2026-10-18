@@ -46,11 +46,18 @@ class ToolsMixin:
         return retry.tool_call(read_only=action_from_tool(name) in self._TAIL_PASSIVE_ACTIONS)
 
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답)."""
-        with self.tool_entry(name):
-            return await self._call_server_tool(name, arguments)
+        """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답).
 
-    async def _call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        WS-51: 응답의 페이지/탭 주소(window.tabs[].url·탭 알림·레시피 단계 결과 …)는 비밀 값을 가린 새 dict 로
+        돌려준다(security.public_url). 서버 내부 상태(last_tabs 등)는 원문 그대로 둔다.
+        """
+        from security.public_url import public_payload
+
+        with self.tool_entry(name):
+            return public_payload(await self._server_tool_payload(name, arguments))
+
+    async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """call_server_tool 본문(가리기 전 원문 응답)."""
         args = dict(arguments or {})
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,

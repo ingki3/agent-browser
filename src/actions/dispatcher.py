@@ -2243,6 +2243,10 @@ class ActionDispatcher:
             ) as dl:
                 await target.click(timeout=5000)
             download = await dl.value
+            # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
+            from security.secret_registry import register_url
+
+            register_url(getattr(download, "url", ""))
             # save_dir 는 _dispatch_inner 에서 절대 경로로 정규화됐다(R1 NB-5).
             save_path = os.path.join(params["save_dir"], download.suggested_filename)
             await download.save_as(save_path)
@@ -2321,6 +2325,9 @@ class ActionDispatcher:
 
     async def _elementless_navigate(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """navigate(WS-48 분해)."""
+        refused = self._refuse_redacted_url(action, params.get("url"))
+        if refused is not None:
+            return refused
         try:
             await page.goto(
                 params["url"],
@@ -2341,6 +2348,29 @@ class ActionDispatcher:
         self.ctx.engine.bump_epoch("navigate")
         return self._result(
             success=True, action=action, retry_safe=True, data={"url": page.url}
+        )
+
+    def _refuse_redacted_url(self, action: ActionType, url: Any) -> Optional[ActionResult]:
+        """WS-51: 결과에서 가린 주소(`[REDACTED]` 표지)를 그대로 넘기면 이동하지 않고 E_INVALID_URL.
+
+        표지 문자열로 사이트에 요청이 나가면 토큰이 필요한 페이지가 깨지고(대기열 이탈 등) 의미 없는 요청이
+        남는다. 원문은 서버 안에만 있으니 reload·go_back·탭 전환이나 링크 재추출로 가게 안내한다.
+        """
+        from security.public_url import REDACTED_NAVIGATE_HINT, has_redaction_mark
+
+        if not has_redaction_mark(url):
+            # WS-51 R3 등록 지점 (b): 이동 대상(navigate·tab create)의 비밀 값을 goto 전에 레지스트리에 — 이동이
+            # 실패해 오류 문구(`Page.goto: … navigating to "URL"`)에 실려도 그 값은 가려진다. 예외를 내지 않는다.
+            from security.secret_registry import register_url
+
+            register_url(url)
+            return None
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.INVALID_URL,
+            error_message=REDACTED_NAVIGATE_HINT,
         )
 
     async def _elementless_go_back(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
@@ -2604,6 +2634,9 @@ class ActionDispatcher:
 
             if command in ("create", "new"):
                 # 계약(TabControlInput)은 "create", 내부 호출 호환용으로 "new" 도 받는다.
+                refused = self._refuse_redacted_url(action, params.get("url"))
+                if refused is not None:
+                    return refused
                 tab = await core.new_tab(
                     core.active_profile, url=params.get("url")
                 )

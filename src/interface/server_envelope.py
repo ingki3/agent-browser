@@ -59,7 +59,8 @@ def _compact_observation(obs: Any) -> Any:
 
 
 def envelope_dict(result: ActionResult) -> Dict[str, Any]:
-    """MCP 응답 봉투(dict). `ActionResult.model_validate(봉투)` 는 원래 결과와 같다."""
+    """MCP 응답 봉투(dict). `ActionResult.model_validate(봉투)` 는 원래 결과와 같다 — 단 페이지/탭 상태
+    주소 칸의 비밀 값은 가린다(WS-51, security.public_url — 주소에 비밀이 없으면 원래 결과와 같다)."""
     full = result.model_dump(mode="json")
     out: Dict[str, Any] = {}
     for name, field in ActionResult.model_fields.items():
@@ -72,7 +73,11 @@ def envelope_dict(result: ActionResult) -> Dict[str, Any]:
     data = out.get("data")
     if isinstance(data, dict) and "observation" in data:
         out["data"] = dict(data, observation=_compact_observation(data["observation"]))
-    return out
+    # WS-51: 에이전트에게 나가는 모든 주소(current_url·data.url·observation.url·window.tabs[].url·오류 문구 안의
+    # 주소 …)의 비밀 값을 가린다. 관찰 요소·extract 항목(페이지 내용)은 원문 — public_url.CONTENT_PATHS(경로 기준).
+    from security.public_url import public_payload
+
+    return public_payload(out)
 
 
 def envelope_json(result: ActionResult) -> str:
