@@ -18,8 +18,12 @@
          assertion·nonce·authorization)이 들어 있거나(`gatetoken`·`GaTeToKeN`·`JSESSIONID`),
       ② 정규화한 키를 영문/숫자 덩어리로 쪼갠 낱말이 짧은 낱말(key·sid·sig·otp·pwd·jwt·code·auth·sess·saml)
          이나 붙여 쓴 흔한 이름(apikey·phpsessid·passcode …) 과 **통째로** 같거나(`sId`·`API_KEY`),
-      ③ 원래 키의 camelCase 낱말이 그렇다(`sortKey`·`promoCode` — 기존 낱말 분해 규칙).
+      ③ 원래 키의 camelCase 낱말이 그렇다(`promoCode`·`pageKey` — 기존 낱말 분해 규칙).
       짧은 낱말을 부분 일치로 보지 않아 `keyword`·`monkey`·`codec`·`zipcode`·`author` 는 남는다.
+      ⓪ (WS-55, ①~③ 보다 먼저) 정규화한 키에서 `_`·`-` 를 뺀 정규형이 **비밀 아닌 복합어** 허용 목록
+      (`_NOT_SECRET_KEYS` — sortkey·countrycode·productcode·statuscode …)과 정확히 같으면 비밀 키가 아니다
+      (`sortKey`·`sort_key`·`SORTKEY` 같은 판정). 같은 정규형이 `_COMPOUNDS`(promocode·couponcode …)면 비밀 키.
+      허용 목록 키도 값 판정 (b) 와 레지스트리 가림은 그대로 받는다.
       ①② 는 casefold 만 보므로 어떤 대소문자 조합도 같은 판정이다. ③ 은 그 위에 더하는 규칙이다.
   (b) 값 자체가 비밀처럼 보임(`_secret_value`): JWT(`eyJ….….…`), 또는 길이 ≥ 24 의 base64/hex/url-safe
       문자열 중 ① 16진수만 ② 대문자·소문자·숫자가 모두 섞임 ③ 구분자 없는 24자 이상 덩어리에 글자와
@@ -115,7 +119,23 @@ _SHORT_WORDS = frozenset({"key", "sid", "sig", "otp", "pwd", "jwt", "code", "aut
 _COMPOUNDS = frozenset({
     "apikey", "accesskey", "privatekey", "authkey", "sessid", "phpsessid",
     "authcode", "passcode", "otpcode", "samlresponse", "samlrequest",
+    # WS-55: 개인 1회용일 수 있는 할인 코드 — 소문자 붙여쓰기도 camelCase(`promoCode`)와 같은 판정(가림).
+    "promocode", "couponcode",
 })
+#: 비밀이 아닌 붙여 쓴 키 이름(WS-55 — WS-51 NB-2 과잉 가림). 정규형(`_secret_key`: 퍼센트 디코딩·NFKC·casefold 뒤 `_`·`-` 제거)의
+#: **정확 일치**만 — 낱말 휴리스틱(②③)보다 먼저 본다. 정렬·국가/지역·우편·상태/오류·언어·통화·상품 분류 같은
+#: 공개 열거 값의 이름이다. 커서일 수 있는 `pagekey`, 개인 코드일 수 있는 `promocode`·`couponcode`, OAuth `code`,
+#: `token_type` 은 넣지 않는다. 키가 허용 목록이어도 값 판정(`_secret_value` — JWT·고엔트로피)과 레지스트리
+#: 등록 값 가림은 그대로다(`_public_param`·`_registered_in_url`). 근거 표: .hermes/state/ws55/report.md.
+_NOT_SECRET_KEYS = frozenset({
+    "sortkey", "sortorder", "orderby",
+    "countrycode", "zipcode", "postcode", "postalcode", "regioncode", "areacode", "citycode", "statecode",
+    "airportcode", "stationcode",
+    "statuscode", "errorcode", "keycode",
+    "languagecode", "langcode", "currencycode",
+    "productcode", "itemcode", "categorycode", "colorcode", "stylecode", "sizecode",
+})
+_KEY_JOINERS = re.compile(r"[_\-]")
 
 _KEY_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 _KEY_SEGMENT = re.compile(r"[a-z]+|\d+")
@@ -164,6 +184,11 @@ def _secret_key(raw_key: str) -> bool:
         key = decoded
     key = unicodedata.normalize("NFKC", key)
     low = key.casefold()
+    compact = _KEY_JOINERS.sub("", low)  # WS-55: sortKey·sort_key·sort-key·SORTKEY 는 같은 키
+    if compact in _NOT_SECRET_KEYS:
+        return False
+    if compact in _COMPOUNDS:
+        return True
     if any(word in low for word in _LONG_WORDS):
         return True
     for seg in _KEY_SEGMENT.findall(low):
