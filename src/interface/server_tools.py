@@ -305,6 +305,7 @@ class ToolsMixin:
         # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
         self._pending_gate_basis = None
         self._used_approval = None
+        self._approval_via = None
         blocked = await self._check_hitl(action, params, approval_id=approval_id)
         if blocked is not None:
             return blocked
@@ -385,9 +386,13 @@ class ToolsMixin:
         # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
         target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
-        result, remembered = await self._dispatch_with_approval(action, params, used)
+        # WS-56: 정책·elicitation 으로 연 호출도 승인한 그 요소만 — 치유 끔, 결과에 via·outcome.
+        via, self._approval_via = self._approval_via, None
+        result, remembered = await self._dispatch_with_approval(action, params, used, heal_off=via is not None)
         if used is not None:
             self._attach_approval_outcome(used, result)
+        elif via is not None:
+            self._attach_via_outcome(via, result)
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
@@ -405,16 +410,17 @@ class ToolsMixin:
             if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
                 self._recipes.reset("navigation_blocked")
             else:
-                self._recipes.post(action, params, recipe_pre, result, used is not None)
+                self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
             if action is ActionType.OBSERVE_PAGE:
                 await self._recipes.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
     async def _dispatch_with_approval(self, action: ActionType, params: Dict[str, Any],
-                                      used: Optional[str]) -> tuple:
-        """디스패처 실행(승인 증표 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
-        if used is not None:
+                                      used: Optional[str], heal_off: bool = False) -> tuple:
+        """디스패처 실행(승인 증표·정책·elicitation 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
+        no_heal = used is not None or heal_off
+        if no_heal:
             # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
             self._dispatcher.heal_disabled = True
         try:
@@ -428,7 +434,7 @@ class ToolsMixin:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
         finally:
-            if used is not None:
+            if no_heal:
                 self._dispatcher.heal_disabled = False
         return result, remembered
 

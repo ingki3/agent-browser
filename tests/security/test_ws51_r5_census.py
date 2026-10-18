@@ -237,6 +237,10 @@ ID_PRODUCERS = {
     ("browser/session_store.py", "secrets.token_bytes(SALT_BYTES)"): ("암호화 salt(바이트) — 출구 아님", None, None),
     ("browser/session_store.py", "secrets.token_bytes(NONCE_BYTES)"): ("암호화 nonce(바이트) — 출구 아님", None, None),
     ("recipes/store.py", "_secrets.token_hex(3)"): ("임시 파일 이름 — 출구 아님", None, None),
+    # WS-56
+    ("interface/server_elicit.py", "secrets.token_hex(3)"): ("elicitation 문구 꼬리표(클라이언트 사람 확인 문구) — "
+                                                            "도구 응답 출구 아님", None, None),
+    ("security/approve_policy.py", "secrets.token_hex(6)"): ("정책 임시 파일 이름(.tmp-policy-) — 출구 아님", None, None),
 }
 
 

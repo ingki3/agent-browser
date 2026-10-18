@@ -147,29 +147,27 @@ class HitlMixin:
         self, action: ActionType, params: Dict[str, Any], approval_id: Any = None
     ) -> Optional[ActionResult]:
         """고위험 액션 승인 게이트. 차단 시 ActionResult를 반환한다."""
-        from security import ActionContext
-
         target = await self._gate_target(action, params)
         if isinstance(target, ActionResult):
             return target
         element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis = target
 
-        decision = self._hitl.evaluate(
-            ActionContext(
-                action=action,
-                element_name=element_name,
-                selector=selector,
-                domain=self._current_domain(),
-                submits_form=submits_form,
-                unresolved_target=unresolved,
-                signals=signals,
-                basis_extra=basis_extra,
-            )
-        )
+        gate_ctx = self._gate_context(action, target)
+        decision = self._hitl.evaluate(gate_ctx)
         if decision.allowed:
             if report_basis:
                 self._pending_gate_basis = dict(decision.basis)
             return None
+
+        # WS-56: approval_id 없는 호출은 먼저 대역 밖 승인 — 사람 CLI 정책, 그다음 클라이언트 elicitation(사람 버튼).
+        # 둘 다 아니면(거절·시간 초과·미지원) 아래 기존 경로 그대로.
+        self._oob_note = None
+        if not approval_id:
+            oob = await self._out_of_band(action, params, decision, gate_ctx, report_basis)
+            if oob is True:
+                return None
+            if isinstance(oob, ActionResult):
+                return oob
 
         # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve` + 창의 확인 코드)에서 승인한
         # 바로 그 행동만 통과. R1: 사람이 볼 창이 없으면(headless) 증표를 발급하지 않는다 —
@@ -184,7 +182,24 @@ class HitlMixin:
             ap, approval, rejected = issued
         else:
             rejected = None
-        return self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected)
+        return self._attach_oob_note(
+            self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected))
+
+    def _gate_context(self, action: ActionType, target: tuple) -> Any:
+        """_gate_target 해석 결과 → 게이트 판정 입력(ActionContext)."""
+        from security import ActionContext
+
+        element_name, selector, submits_form, unresolved, signals, basis_extra, _report = target
+        return ActionContext(
+            action=action,
+            element_name=element_name,
+            selector=selector,
+            domain=self._current_domain(),
+            submits_form=submits_form,
+            unresolved_target=unresolved,
+            signals=signals,
+            basis_extra=basis_extra,
+        )
 
     async def _gate_target(self, action: ActionType, params: Dict[str, Any]) -> Any:
         """게이트가 판정할 대상 해석. 반환: (이름, selector, 폼 제출, 판정 불가 사유, 문맥 신호,

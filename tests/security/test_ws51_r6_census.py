@@ -84,6 +84,8 @@ CANDIDATES = {
     ("interface/mcp_server.py", "f'{safe_key}#{n}'"): ("로그 레코드 속성 이름 충돌 꼬리(가린 비문자열 extra 키, R6 F1) — "
                                                        "출구 아님(출력은 handler_format 이 가림)", None, None),
     ("security/hitl.py", "key + '-'"): ("아이콘 클래스 접두 비교용 조각 — 값 생산 아님", None, None),
+    ("security/approve_policy.py", "key + '-'"): ("WS-56 아이콘 클래스 접두 비교용 조각(정책 최고위험 판정) — 값 생산 아님",
+                                                   None, None),
     ("security/public_url.py", "'#' + _public_fragment(fragment, depth, sink)"): ("주소 fragment 조립(이미 가린 값) — "
                                                                                   "식별자 아님", None, None),
 }
