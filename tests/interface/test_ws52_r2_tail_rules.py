@@ -16,6 +16,12 @@ request outside the tab's own subresources, a main-frame navigation, tab close o
 crash, context close, human control/handoff, the deadline or server close. Every
 stop cancels the task; the server owns every tail task until it has ended.
 
+R3: rules (1) and (2) are gone — the tail ledgers only cookie writes the tab's own
+scripts provably made (test_ws52_r3_script_writes.py), so a second tab or a request in
+flight no longer has to stop it; the B6/B7 regressions below keep their final
+assertion (the next visit keeps the native name). Every event now ends the tail at once
+through one end function (task cancelled, observer torn down).
+
 Synthetic loopback sites only; profiles under the per-test temporary
 AGENT_BROWSER_PROFILE_ROOT (tests/interface/conftest.py).
 """
@@ -35,7 +41,7 @@ import pytest
 from interface.mcp_server import BrowserMCPServer
 from test_run_cli import requires_chromium
 from test_ws52_ledger_drift import (REWRITTEN, FakeContext, FakePage, Site, _cookie, assert_native_next,
-                                    drift_site, first_retry, navigate, script, start_tail)
+                                    drift_site, fake_observer, first_retry, navigate, script, start_tail, wrote)
 
 
 def _entry(retry, value):
@@ -180,7 +186,7 @@ async def test_request_issued_before_the_tail_cannot_ledger_other_tab_download()
                 assert other.url == "about:blank"
                 first = await navigate(server, site.url + "/one")
                 assert first.data["identity"]["original_status"] == 403, first.data
-                assert server._headless_retry._tail is None, "a tail started beside another tab's request in flight"
+                # R3: the tail may run (rule 2 removed) — a download's Set-Cookie is never observed.
                 site.download_release.set()
                 await asyncio.gather(download, return_exceptions=True)
                 await asyncio.sleep(0.8)
@@ -204,7 +210,7 @@ async def test_second_tab_means_no_tail_even_without_requests():
             await asyncio.sleep(0.3)
             first = await navigate(server, site.url + "/one")
             assert first.data["identity"]["original_status"] == 403, first.data
-            assert server._headless_retry._tail is None, "a tail started beside a second tab"
+            # R3: the tail may run (rule 1 removed) — another tab's script is another target, never observed.
             await other.evaluate("setTimeout(() => { document.cookie = "
                                  "'session_marker=other-tab-script; path=/; max-age=31536000'; }, 600)")
             await asyncio.sleep(1.4)
@@ -224,7 +230,7 @@ async def test_actual_renderer_crash_discards_the_inflight_read(monkeypatch):
             retry = server._headless_retry
             before = list(retry.ledger[site.url])
             entered, release, crashed = asyncio.Event(), asyncio.Event(), asyncio.Event()
-            original = retry.snapshot
+            original = retry._cookies
             server._page.on("crash", lambda *args: crashed.set())
 
             async def held(*args):
@@ -232,10 +238,10 @@ async def test_actual_renderer_crash_discards_the_inflight_read(monkeypatch):
                 await release.wait()
                 return await original(*args)
 
-            monkeypatch.setattr(retry, "snapshot", held)
+            monkeypatch.setattr(retry, "_cookies", held)
+            # R3: a cookie read happens once the observer saw a write (this one would be mergeable).
+            await server._page.evaluate("document.cookie = 'visitor=synthetic-post-read-change; path=/'")
             await asyncio.wait_for(entered.wait(), 2)
-            await server._page.context.add_cookies([{"name": "visitor", "value": "synthetic-post-read-change",
-                                                     "url": site.url}])
             session = await server._page.context.new_cdp_session(server._page)
             crash = asyncio.create_task(session.send("Page.crash"))
             try:
@@ -266,7 +272,7 @@ async def test_server_close_reaps_the_read_after_a_tool_barrier(monkeypatch, bar
         retry = server._headless_retry
         task = retry._tail.task
         entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        original = retry.snapshot
+        original = retry._cookies
 
         lost = {"left": 1 if stubborn else 0}
 
@@ -284,7 +290,8 @@ async def test_server_close_reaps_the_read_after_a_tool_barrier(monkeypatch, bar
                     raise
             return await original(*args)
 
-        monkeypatch.setattr(retry, "snapshot", held)
+        monkeypatch.setattr(retry, "_cookies", held)
+        await server._page.evaluate("document.cookie = 'visitor=synthetic-write; path=/'")  # R3: observed write
         try:
             await asyncio.wait_for(entered.wait(), 2)
             if barrier:
@@ -320,7 +327,8 @@ async def test_every_stop_cancels_the_task_and_close_joins_it(monkeypatch):
     page = FakePage(origin, Hanging([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "hanging-read")
     task = retry._tail.task
     await entered.wait()
     with retry.tool_call(read_only=False):
@@ -331,122 +339,20 @@ async def test_every_stop_cancels_the_task_and_close_joins_it(monkeypatch):
     assert not retry._tail_tasks
 
 
-# -- rule 2 (unit): requests in flight when the tail would start -----------------------
+# -- R3: rule 1 (one tab) and rule 2 (request counter) were removed — positive identification
+# and same-site attribution replace them (tests/interface/test_ws52_r3_script_writes.py).
 
 
-class FakeRequest:
-    def __init__(self, frame, navigation=False):
-        self._frame = frame
-        self.navigation = navigation
-
-    @property
-    def frame(self):
-        if self._frame is None:
-            raise RuntimeError("service worker request has no frame")
-        return self._frame
-
-    def is_navigation_request(self):
-        return self.navigation
-
-
-def _emit(context, event, request):
-    for handler in list(context.listeners.get(event, [])):
-        handler(request)
-
-
-def _counted_tab(retry, origin="http://example.test"):
+def _fake_tab(retry, origin="http://example.test"):
     context = FakeContext([])
-    retry.track_context(context)  # counted from adoption, before the tab opens
     page = FakePage(origin, context)
     page.main_frame = SimpleNamespace(page=page)
+    fake_observer(retry, origin)
     return context, page
 
 
-def _try_start(retry, page, origin="http://example.test"):
-    before = _entry(retry, "before")
-    retry.commit_success(origin, [], before)
-    with retry.tool_call(read_only=False):
-        retry.start_tail(page, origin, origin, before, lambda: True)
-    started = retry._tail is not None
-    retry.cancel_tail()
-    return started
-
-
-@pytest.mark.parametrize("kind,starts", [
-    ("other_tab", False), ("service_worker", False), ("own_main_frame_document", False),
-    ("own_subresource", True), ("own_iframe_subresource", True), ("none", True)])
-def test_start_requires_no_request_outside_the_tab_in_flight(kind, starts):
-    from browser.headless_retry import HeadlessRetry
-
-    async def run():
-        retry = HeadlessRetry()
-        context, page = _counted_tab(retry)
-        other_page = SimpleNamespace()
-        request = {
-            "other_tab": FakeRequest(SimpleNamespace(page=other_page)),
-            "service_worker": FakeRequest(None),
-            "own_main_frame_document": FakeRequest(page.main_frame, navigation=True),
-            "own_subresource": FakeRequest(page.main_frame),
-            "own_iframe_subresource": FakeRequest(SimpleNamespace(page=page)),
-            "none": None,
-        }[kind]
-        if request is not None:
-            _emit(context, "request", request)
-        assert _try_start(retry, page) is starts
-        if request is not None and not starts:
-            _emit(context, "requestfinished", request)  # once it is over the tail may start again
-            assert _try_start(retry, page)
-
-    asyncio.run(run())
-
-
-def test_unknown_request_count_never_starts_a_tail():
-    from browser.headless_retry import HeadlessRetry
-
-    async def run():
-        retry = HeadlessRetry()
-        # Never counted (no track_context) → unknown.
-        page = FakePage("http://example.test", FakeContext([]))
-        assert not _try_start(retry, page)
-        # A finish never seen starting: it was in flight before the count → untrusted for good.
-        context, page = _counted_tab(retry)
-        _emit(context, "requestfailed", FakeRequest(SimpleNamespace(page=SimpleNamespace())))
-        assert not _try_start(retry, page)
-        # Adopted with a document already open: its requests could predate the count.
-        context = FakeContext([])
-        page = FakePage("http://example.test", context)
-        retry.track_context(context)
-        assert not _try_start(retry, page)
-
-    asyncio.run(run())
-
-
-async def test_tab_requests_keep_the_tail_and_any_other_request_ends_it(monkeypatch):
-    from browser import headless_retry as module
-
-    monkeypatch.setattr(module, "TAIL_INTERVAL_S", 0.01)
-    retry = module.HeadlessRetry()
-    origin = "http://example.test"
-    context, page = _counted_tab(retry)
-    context.cookies_list = [_cookie("visitor", "before")]
-    before = await retry.snapshot(context, origin)
-    retry.commit_success(origin, [], before)
-    with retry.tool_call(read_only=False):
-        retry.start_tail(page, origin, origin, before, lambda: True)
-    tail = retry._tail
-    _emit(context, "request", FakeRequest(page.main_frame))  # the page's own beacon
-    context.cookies_list = [_cookie("visitor", "script-1")]
-    await asyncio.sleep(0.05)
-    assert retry._tail is tail and retry.ledger[origin] == await retry.snapshot(context, origin)
-    _emit(context, "request", FakeRequest(SimpleNamespace(page=SimpleNamespace())))  # another tab
-    merged = list(retry.ledger[origin])
-    context.cookies_list = [_cookie("visitor", "after-other-tab")]
-    await asyncio.sleep(0.05)
-    assert retry._tail is None and retry.ledger[origin] == merged
-
-
 @pytest.mark.parametrize("emitter,event", [("page", "close"), ("page", "crash"), ("page", "framenavigated"),
-                                           ("context", "page"), ("context", "close")])
+                                           ("context", "close")])
 async def test_tab_and_context_events_end_the_tail_for_good(monkeypatch, emitter, event):
     # Rule 5 as events: latched at once, the read in flight refused, nothing merged afterwards.
     from browser import headless_retry as module
@@ -454,18 +360,19 @@ async def test_tab_and_context_events_end_the_tail_for_good(monkeypatch, emitter
     monkeypatch.setattr(module, "TAIL_INTERVAL_S", 0.01)
     retry = module.HeadlessRetry()
     origin = "http://example.test"
-    context, page = _counted_tab(retry)
+    context, page = _fake_tab(retry)
     context.cookies_list = [_cookie("visitor", "before")]
     before = await retry.snapshot(context, origin)
     retry.commit_success(origin, [], before)
     with retry.tool_call(read_only=False):
-        retry.start_tail(page, origin, origin, before, lambda: True)
+        assert await retry.start_tail(page, origin, origin, lambda: True)
     tail = retry._tail
     source = page if emitter == "page" else context
     argument = page.main_frame if event == "framenavigated" else SimpleNamespace()
     for handler in list(source.listeners.get(event, [])):
         handler(argument)
-    assert tail.broken
+    assert tail.stopped and tail.observer.closed  # R3: every event ends it at once (single end)
+    tail.observer.binding_called(1, '{"late": true}')
     context.cookies_list = [_cookie("visitor", "after-event")]
     await asyncio.sleep(0.05)
     assert retry._tail is None and retry.ledger[origin] == before
@@ -517,11 +424,11 @@ async def test_a_call_overlapping_a_passive_read_ends_the_tail(monkeypatch):
     monkeypatch.setattr(module, "TAIL_INTERVAL_S", 5.0)
     retry = module.HeadlessRetry()
     origin = "http://example.test"
-    context, page = _counted_tab(retry)
+    context, page = _fake_tab(retry)
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
     with retry.tool_call(read_only=False):
-        retry.start_tail(page, origin, origin, before, lambda: True)
+        assert await retry.start_tail(page, origin, origin, lambda: True)
     tail = retry._tail
     inside = asyncio.Event()
     leave = asyncio.Event()
@@ -551,7 +458,7 @@ async def test_passive_read_running_when_the_navigate_ends_prevents_the_tail():
 
     retry = HeadlessRetry()
     origin = "http://example.test"
-    context, page = _counted_tab(retry)
+    context, page = _fake_tab(retry)
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
     leave = asyncio.Event()
@@ -567,7 +474,7 @@ async def test_passive_read_running_when_the_navigate_ends_prevents_the_tail():
     with retry.tool_call(read_only=False):
         leave.set()
         await reader
-        retry.start_tail(page, origin, origin, before, lambda: True)
+        assert not await retry.start_tail(page, origin, origin, lambda: True)
     assert retry._tail is None
 
 

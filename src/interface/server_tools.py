@@ -45,6 +45,13 @@ class ToolsMixin:
             return nullcontext()  # no retry memory → no tail to close (bare test servers)
         return retry.tool_call(read_only=action_from_tool(name) in self._TAIL_PASSIVE_ACTIONS)
 
+    async def _retry_settled(self) -> None:
+        """WS-52 R3: the tail this call just ended is torn down (init script removed) before the
+        call acts — a document it opens never gets the cookie-write observer."""
+        retry = getattr(self, "_headless_retry", None)
+        if retry is not None:
+            await retry.settled()
+
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답).
 
@@ -54,6 +61,7 @@ class ToolsMixin:
         from security.public_url import public_payload
 
         with self.tool_entry(name):
+            await self._retry_settled()
             return public_payload(await self._server_tool_payload(name, arguments))
 
     async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,6 +176,7 @@ class ToolsMixin:
         # WS-52 R1: anything that may change the page (login included) closes the settle tail
         # synchronously, before the first await (tool_entry).
         with self.tool_entry(name):
+            await self._retry_settled()
             return await self._route_tool_call(name, arguments)
 
     async def _route_tool_call(self, name: str, arguments: Dict[str, Any]) -> ActionResult:

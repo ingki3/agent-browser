@@ -210,9 +210,6 @@ class LifecycleMixin:
 
         await self._core.new_context("mcp-session")
         context = self._core.context_for("mcp-session")
-        # WS-52 R2: count this context's requests in flight from adoption on (before any tab of ours) —
-        # the settle tail starts only when nothing outside its own tab is in flight.
-        self._headless_retry.track_context(context)
         # 새 탭·팝업 문서 응답도 잡도록 context 단위로 달되, 응답을 온 탭에 묶는다
         # (WS-26b: 팝업 403 이 원래 탭 판정에 새지 않게).
         self._page_status = PageDocumentStatus()

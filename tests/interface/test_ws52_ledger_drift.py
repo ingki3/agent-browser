@@ -373,14 +373,36 @@ class FakeContext:
         return list(self.cookies_list)
 
 
-def start_tail(retry, page, url, origin, last, guard):
-    """Start a tail the way a sole navigate call does (R2: one tab, counted requests, one call)."""
-    if page.context not in retry._requests:
-        retry.track_context(page.context)
-        # The fake tab was created before the count (a real server counts first); fakes issue no requests.
-        retry._requests[page.context].ok = True
+FAKE_NONCE = "fake-observer-nonce"
+
+
+def fake_observer(retry, origin):
+    """Fakes have no CDP: install an observer whose records the test feeds (``wrote``)."""
+    from browser.headless_retry import _Observer
+
+    async def install(tail):
+        observer = _Observer(retry=retry, origin=origin, nonce=FAKE_NONCE, binding="fake",
+                             on_break=lambda: retry._end(tail))
+        observer.contexts[1] = origin
+        tail.observer = observer
+        tail.ready.set()
+        return observer
+
+    retry._install_observer = install
+
+
+async def start_tail(retry, page, url, origin, last=None, guard=lambda: True):
+    """Start a tail the way a sole navigate call does (one call in flight), with a fake observer."""
+    fake_observer(retry, origin)
     with retry.tool_call(read_only=False):
-        retry.start_tail(page, url, origin, last, guard)
+        return await retry.start_tail(page, url, origin, guard)
+
+
+def wrote(retry, name, value, old=None):
+    """The fake page's script wrote name=value — what the R3 observer would report."""
+    record = {"k": FAKE_NONCE, "a": {"0": {"n": name, "v": value}},
+              "r": {} if old is None else {"0": {"n": name, "v": old}}}
+    retry._tail.observer.binding_called(1, json.dumps(record))
 
 
 def _cookie(name, value, domain="example.test"):
@@ -399,9 +421,11 @@ async def test_unreadable_cookies_end_the_tail_fail_closed(tmp_path, monkeypatch
     after = await retry.snapshot(context, origin + "/")
     retry.commit_success(origin, [], after)
     context.fail = True
-    start_tail(retry, page, origin + "/", origin, after, lambda: True)
+    await start_tail(retry, page, origin + "/", origin, after, lambda: True)
+    wrote(retry, "visitor", "v2")  # R3: a cookie read happens once something was observed
     await asyncio.sleep(0.05)
     assert retry._tail is None and page.listeners == {"framenavigated": [], "close": [], "crash": []}
+    assert context.listeners == {"close": []}
     context.fail = False
     context.cookies_list = [_cookie("visitor", "v2")]
     await asyncio.sleep(0.05)
@@ -422,9 +446,10 @@ async def test_tail_saves_and_other_commits_never_lose_a_write(tmp_path, monkeyp
     page = FakePage(origin + "/", context)
     after = await retry.snapshot(context, origin + "/")
     retry.commit_success(origin, [], after)
-    start_tail(retry, page, origin + "/", origin, after, lambda: True)
+    await start_tail(retry, page, origin + "/", origin, after, lambda: True)
     for index in range(1, 30):
         context.cookies_list = [_cookie("visitor", f"v{index}")]
+        wrote(retry, "visitor", f"v{index}", f"v{index - 1}")
         retry.commit_success(f"http://other{index}.test", [], [])
         await asyncio.sleep(0.006)
     await asyncio.sleep(0.05)  # R1: end_tail no longer takes a final sample — let the tail read the last value
@@ -465,7 +490,8 @@ async def test_change_racing_the_snapshot_with_human_control_is_not_merged(monke
     page = FakePage(origin + "/", context)
     after = [{"name": "visitor", "domain": "example.test", "path": "/", "value_digest": retry._digest("v1")}]
     retry.commit_success(origin, [], after)
-    start_tail(retry, page, origin + "/", origin, after, lambda: open_["ok"])
+    await start_tail(retry, page, origin + "/", origin, after, lambda: open_["ok"])
+    wrote(retry, "visitor", "changed-during-handoff")
     await asyncio.sleep(0.05)
     assert retry._tail is None
     assert retry.ledger[origin] == after

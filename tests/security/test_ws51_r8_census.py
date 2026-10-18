@@ -132,6 +132,8 @@ ATTRS = {
     ("op", "op"): (NOT_OUT, "interface/handoff.py 명령 파일"),
     ("login_id", "login_id"): (NOT_OUT, "interface/handoff.py 내부 _apply 명령"),
     ("key", "hex()"): (NOT_OUT, "browser/headless_retry.py 상태 파일"),
+    ("identifier", "script"): (NOT_OUT, "browser/headless_retry.py WS-52 R3 CDP removeScriptToEvaluateOnNewDocument 인자"),
+    ("name", "binding"): (NOT_OUT, "browser/headless_retry.py WS-52 R3 CDP addBinding·removeBinding 인자"),
     ("cssPath", "css_path"): (NOT_OUT, "actions/verification.py page.evaluate 인자"),
     ("profile", "profile"): (NOT_OUT, "interface/mcp_server.py 생성자 인자"),
     ("proxy", "playwright_proxy()"): (NOT_OUT, "security/egress_runtime.py 브라우저 실행 인자"),

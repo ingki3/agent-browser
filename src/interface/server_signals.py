@@ -192,6 +192,8 @@ class SignalsMixin:
                 and _origin(result.current_url) == remembered.origin):
             identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
                         "note": REMEMBERED_NOTE}
+            # WS-52 R3: the scope exit adds cookie_write_observer when the observer starts.
+            remembered.identity = identity
             status = result.data.get("last_http_status")
             if status == 403:
                 self._headless_retry.mark_failed(remembered.origin or "")
@@ -293,6 +295,8 @@ class SignalsMixin:
             self._headless_retry.mark_failed(origin)
             identity["retry_failed"] = True
             identity["note"] = FAILED_NOTE
+        elif attempt.observing:
+            identity["cookie_write_observer"] = True  # WS-52 R3: disclosed, never hidden
         retried.data["identity"] = identity
         return retried
 

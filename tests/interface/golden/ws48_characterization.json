@@ -1032,6 +1032,7 @@
    "data": {
     "challenge": null,
     "identity": {
+     "cookie_write_observer": true,
      "note": "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다",
      "presented_as": "chrome",
      "reason": "headless_ua_blocked",
@@ -1053,6 +1054,7 @@
    "data": {
     "challenge": null,
     "identity": {
+     "cookie_write_observer": true,
      "note": "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)",
      "original_status": 403,
      "presented_as": "chrome",

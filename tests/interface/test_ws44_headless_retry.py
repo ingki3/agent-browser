@@ -135,7 +135,8 @@ async def test_retry_success_wire_identity_and_native_client_hints(sites):
         assert result.success and result.data["challenge"] is None
         assert result.data["last_http_status"] == 200
         assert result.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "original_status": 403, "note": SUCCESS_NOTE}
+                                           "original_status": 403, "note": SUCCESS_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
         assert await server._page.evaluate("navigator.webdriver") is True
         assert await server._page.evaluate("navigator.userAgent") == original
     headers = site.received()
@@ -386,7 +387,8 @@ async def test_fragment_retry_sends_document_request(sites):
         result = await navigate(server, site.url + "/read?x=1#frag")
         assert result.data["last_http_status"] == 200
         assert result.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "original_status": 403, "note": SUCCESS_NOTE}
+                                           "original_status": 403, "note": SUCCESS_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
     assert len(site.received("/read?x=1")) == 2
 
 
@@ -445,7 +447,8 @@ async def test_remembered_origin_starts_with_headed_name_and_keeps_scope(sites):
         assert first.data["identity"]["original_status"] == 403
         assert second.data["last_http_status"] == 200
         assert second.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "remembered": True, "note": REMEMBERED_NOTE}
+                                           "remembered": True, "note": REMEMBERED_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
         assert len(server._recipes.trajectory.entries) == 2
         assert "HeadlessChrome" in await server._page.evaluate("navigator.userAgent")
         await server._page.evaluate("fetch('/late')")

@@ -23,7 +23,7 @@ import pytest
 from interface.mcp_server import BrowserMCPServer, create_server
 from test_run_cli import requires_chromium
 from test_ws52_ledger_drift import (FakeContext, FakePage, _cookie, assert_native_next, drift_site,
-                                    first_retry, script, start_tail)
+                                    fake_observer, first_retry, script, start_tail, wrote)
 
 
 def _entry(retry, value):
@@ -131,7 +131,8 @@ async def test_real_ten_second_maximum_is_enforced_after_await():
     page = FakePage(origin, Slow([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "synthetic-write-after-ten-seconds")
     task = retry._tail.task
     begun = time.monotonic()
     await started.wait()
@@ -159,7 +160,8 @@ async def test_snapshot_completing_after_deadline_must_not_merge(monkeypatch):
     page = FakePage(origin, Slow([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "after-window")
     task = retry._tail.task
     await entered.wait()
     await asyncio.sleep(0.1)
@@ -186,7 +188,8 @@ async def test_read_that_overruns_the_deadline_without_yielding_is_discarded(mon
     page = FakePage(origin, Blocking([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "after-window")
     await retry._tail.task
     assert retry.ledger[origin] == before
 
@@ -240,7 +243,7 @@ async def test_tail_does_not_start_when_event_subscription_fails():
     page = FakePage(origin, NoEvents([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    assert not await start_tail(retry, page, origin, origin, before, lambda: True)
     assert retry._tail is None
     assert all(not handlers for handlers in page.listeners.values())
 
@@ -262,7 +265,7 @@ async def test_two_concurrent_calls_do_not_merge_action_cookie(monkeypatch, firs
             retry = server._headless_retry
             entered = asyncio.Event()
             release = asyncio.Event()
-            original = retry.snapshot
+            original = retry._cookies
 
             async def held(context, url):
                 # Every cookie read from now on (the background sample, or any final sample a
@@ -271,7 +274,9 @@ async def test_two_concurrent_calls_do_not_merge_action_cookie(monkeypatch, firs
                 await release.wait()
                 return await original(context, url)
 
-            monkeypatch.setattr(retry, "snapshot", held)
+            monkeypatch.setattr(retry, "_cookies", held)
+            # R3: the tail reads cookies only once its observer saw a write.
+            await server._page.evaluate("document.cookie = 'pre_marker=1; path=/'")
             await asyncio.wait_for(entered.wait(), 2)  # a tail sample is in flight
             if first_tool == "browser_tab_control":
                 first = asyncio.create_task(server.call_tool(first_tool, {"command": "list"}))
@@ -285,7 +290,7 @@ async def test_two_concurrent_calls_do_not_merge_action_cookie(monkeypatch, firs
                 release.set()
                 await first
             await asyncio.sleep(0.1)
-            monkeypatch.setattr(retry, "snapshot", original)
+            monkeypatch.setattr(retry, "_cookies", original)
             cookies = {c["name"]: c["value"] for c in await server._page.context.cookies()}
             assert cookies["visitor"] == "after-action" and cookies["session_marker"] == "after-action"
             await assert_native_next(server, site, "new_cookie")
@@ -315,7 +320,8 @@ async def test_in_flight_read_whose_cancel_is_lost_is_refused_by_generation(monk
     page = FakePage(origin, Stubborn([]))
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "after-tool-call")
     task = retry._tail.task
     await entered.wait()
     # R2 cancels the task at the barrier; model the cancellation being lost entirely (the handle
@@ -361,7 +367,8 @@ async def test_end_tail_cancels_without_a_final_merge(monkeypatch):
     page = FakePage(origin, context)
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
-    start_tail(retry, page, origin, origin, before, lambda: True)
+    await start_tail(retry, page, origin, origin, before, lambda: True)
+    wrote(retry, "visitor", "changed-just-before-the-end")
     task = retry._tail.task
     await retry.end_tail()
     await asyncio.sleep(0)
@@ -377,10 +384,10 @@ async def test_tool_call_during_the_navigate_prevents_the_tail():
     retry = HeadlessRetry()
     origin = "http://example.test"
     context = FakeContext([])
-    retry.track_context(context)  # counted from adoption, before the tab opened
     page = FakePage(origin, context)
     before = _entry(retry, "before")
     retry.commit_success(origin, [], before)
+    fake_observer(retry, origin)
 
     async def other_call():
         with retry.tool_call(read_only=True):  # even a passive read overlaps
@@ -390,9 +397,9 @@ async def test_tool_call_during_the_navigate_prevents_the_tail():
         # Another MCP request (its own task, outside this call — as the SDK dispatches it),
         # started and ended while the navigate ran.
         await asyncio.create_task(other_call(), context=contextvars.Context())
-        retry.start_tail(page, origin, origin, before, lambda: True)
+        assert not await retry.start_tail(page, origin, origin, lambda: True)
     assert retry._tail is None
     with retry.tool_call(read_only=False):
-        retry.start_tail(page, origin, origin, before, lambda: True)
+        assert await retry.start_tail(page, origin, origin, lambda: True)
     assert retry._tail is not None
     retry.cancel_tail()
