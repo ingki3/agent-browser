@@ -142,6 +142,11 @@ async def fill_login_fields(page: Any, cred: Credential, *, only_empty: bool = F
             f"현재 페이지가 {cred.domain} 도메인이 아니라 자격증명을 입력하지 않습니다."
         )
     found = await page.evaluate(_MARK_FIELDS_JS)
+    # WS-55 R1 B1: 채울 자격증명(아이디·비밀번호)은 도구가 비밀로 아는 값 — 페이지가 주소·제목에 반사해도 응답에서
+    # 가려지게 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+    from security.secret_registry import register_secret_values
+
+    register_secret_values([cred.username, cred.password])
 
     async def fill(role: str, value: str) -> bool:
         sel = f"[data-ab-login={role}]"
