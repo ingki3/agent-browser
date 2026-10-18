@@ -3,10 +3,10 @@
 R0~R2 classified requests (which ones might have set a cookie) and every round an
 independent check found another path — downloads, workers, requests issued before
 the tail (B1~B11). R3 identifies script writes positively instead: after a
-successful renamed navigate a disclosed observer wraps ``document.cookie`` (and
-``CookieStore.set/delete``) in that tab for at most 10 s and reports the
+successful renamed navigate a disclosed observer wraps ``document.cookie`` (R4:
+not ``CookieStore``) in that tab for at most 10 s and reports the
 difference the native getter shows before/after each write. A cookie is ledgered
-only when (1) the observer saw it appear, (2) in a same-site execution context of
+only when (1) the observer saw it appear, (2) in a same-origin (R4) execution context of
 this tab, (3) it is the jar's only non-HttpOnly item with that name/value, (4) it is
 the name's latest observation, (5) no Set-Cookie with that name/value was seen during
 the tail and (6) the main-frame document is still the one the tail started on. The
@@ -555,14 +555,8 @@ async def test_wrapper_keeps_returns_errors_getter_and_conversions(site):
     assert cs == native_cs.replace("cs2", "cs1") == "undefined:true"
 
 
-@requires_chromium
-async def test_cookie_store_writes_are_observed(site):
-    async with server() as srv:
-        await first_retry(srv, site)
-        await srv._page.evaluate("cookieStore.set({name: 'cs_pref', value: 'dark', path: '/'})")
-        await settle()
-        assert ledgered(srv, site)["cs_pref"]["js"] is True
-        await assert_renamed(srv, site)
+# R4 (B4): cookieStore is no longer wrapped — its writes are not merged
+# (tests/interface/test_ws52_r4_attribution.py::test_cookie_store_writes_are_not_observed_or_merged).
 
 
 # -- 7. unit: observation rules (no browser) --------------------------------------
@@ -575,6 +569,8 @@ def _observer(retry, origin="http://example.test"):
     obs.contexts[1] = "http://example.test"
     obs.contexts[2] = "http://cross.test"
     obs.contexts[3] = "http://sub.example.test"
+    obs.contexts[4] = "http://example.test:8080"
+    obs.contexts[5] = "https://example.test"
     return obs
 
 
@@ -583,16 +579,18 @@ def _payload(added=(), removed=(), nonce="n0nce"):
                        "r": {str(i): {"n": n, "v": v} for i, (n, v) in enumerate(removed)}})
 
 
-def test_observer_attributes_records_to_same_site_contexts_only():
+def test_observer_attributes_records_to_same_origin_contexts_only():
     from browser.headless_retry import HeadlessRetry
 
     retry = HeadlessRetry()
     obs = _observer(retry)
     obs.binding_called(1, _payload([("a", "1")]))
     obs.binding_called(2, _payload([("b", "2")]))  # cross-site frame
-    obs.binding_called(3, _payload([("c", "3")]))  # same site, sub host
+    obs.binding_called(3, _payload([("c", "3")]))  # same site, sub host: another origin (R4, B3)
+    obs.binding_called(4, _payload([("e", "5")]))  # another port
+    obs.binding_called(5, _payload([("f", "6")]))  # another scheme
     obs.binding_called(9, _payload([("d", "4")]))  # unknown / destroyed context
-    assert set(obs.latest) == {"a", "c"} and not obs.broken
+    assert set(obs.latest) == {"a"} and not obs.broken
 
 
 def test_observer_needs_the_nonce_and_a_well_formed_payload():

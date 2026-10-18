@@ -14,7 +14,8 @@ WS-52 R3: for up to TAIL_S after a success, a disclosed observer in that tab
 identifies the cookie writes the tab's own scripts made (native getter
 difference, same-site execution context, non-HttpOnly, latest value, no
 Set-Cookie seen); only those are ledgered, marked ``js`` — and a ``js`` key may
-later change its value while it stays non-HttpOnly (D).
+later change its value while it stays non-HttpOnly (D). R4: same origin only,
+the setter's receiver must be the installed Document, cookieStore not wrapped.
 """
 from __future__ import annotations
 
@@ -400,8 +401,8 @@ class HeadlessRetry:
         observer). Starts only when the calling tool call is the only call in flight and no
         other call overlapped it (R2 rule 3); True when the observer is installed.
 
-        R3: a disclosed observer (``_OBSERVER_JS``) wraps ``document.cookie`` and
-        ``CookieStore.set/delete`` in this tab's same-site documents and reports, per write,
+        R3: a disclosed observer (``_OBSERVER_JS``) wraps ``document.cookie`` (R4: not
+        ``CookieStore``) in this tab's same-origin documents and reports, per write,
         the difference the native getter shows before/after. Only cookies identified by
         ``_identified`` are ledgered (marked ``js``). Server Set-Cookie never produces an
         observation on any path, so no request classification is needed.
@@ -456,7 +457,7 @@ class HeadlessRetry:
 
     async def _install_observer(self, tail: _Tail) -> "_Observer | None":
         """CDP session on the tab + binding + init script (sub-frames, later documents) +
-        the same wrapper evaluated in the current same-site documents (R3 §3)."""
+        the same wrapper evaluated in the current same-origin documents (R3 §3, R4)."""
         observer = _Observer(retry=self, origin=tail.origin, nonce=secrets.token_hex(16),
                              binding=_binding_name(), on_break=lambda: self._end(tail))
         tail.observer = observer
@@ -489,7 +490,7 @@ class HeadlessRetry:
             added = await session.send("Page.addScriptToEvaluateOnNewDocument", {"source": source})
             observer.script = str(added["identifier"])
             for context_id, context_origin in list(observer.contexts.items()):
-                if _same_site(context_origin, tail.origin):
+                if _same_origin(context_origin, tail.origin):
                     try:
                         await session.send("Runtime.evaluate", {"expression": source, "contextId": context_id})
                     except Exception:  # noqa: BLE001 - a frame that went away: nothing to wrap
@@ -571,7 +572,7 @@ class HeadlessRetry:
     def _identified(self, origin: str, observer: "_Observer",
                     current: list[tuple[LedgerEntry, bool]]) -> list[LedgerEntry]:
         """R3 §1 — the jar cookies a script of this tab provably wrote (rules 1~5; rule 6 and
-        the same-site attribution of rule 2 are enforced when a record arrives)."""
+        the same-origin attribution of rule 2 are enforced when a record arrives)."""
         known = {_fp(entry) for entry in self.ledger.get(origin, [])}
         counts: dict[tuple[str, str], int] = {}
         for entry, _ in current:
@@ -908,7 +909,7 @@ class _Observer:
     The page can call the binding itself (it may grab it before the wrapper hides it, review
     F2) and patch any intrinsic the wrapper did not capture (F1): a record counts only with
     the per-tail nonce the wrapper keeps in a closure, from a default-world execution
-    context of this tab whose CDP origin is same-site with the retried origin. Records carry
+    context of this tab whose CDP origin is the retried origin (R4). Records carry
     the native getter's difference, never the assigned string.
     """
 
@@ -976,8 +977,8 @@ class _Observer:
         if self.closed or self.broken:
             return
         origin = self.contexts.get(context_id)
-        if origin is None or not _same_site(origin, self.origin):
-            return  # rule 2: another site's frame (or a context of no document of this tab)
+        if origin is None or not _same_origin(origin, self.origin):
+            return  # rule 2 (R4): another origin's frame (or a context of no document of this tab)
         if not isinstance(payload, str):
             return
         if len(payload.encode("utf-8", "surrogatepass")) > OBSERVER_MAX_PAYLOAD:
@@ -1025,16 +1026,25 @@ def _pairs(raw: object) -> list[tuple[str, str]]:
     return out
 
 
-def _same_site(origin: str, other: str) -> bool:
-    """Conservative same-site: same scheme and the same host or a parent/child host.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
-    Sibling hosts (a.example.com vs b.example.com) count as different — fewer merges.
+
+def _same_origin(origin: str, other: str) -> bool:
+    """WS-52 R4 (B3): exactly the same origin — scheme, host and port.
+
+    A parent/child host string is no same-site proof (``github.io``/``evil.github.io``
+    are different sites) and there is no public-suffix list, so a sub-domain frame of the
+    same site is not attributed either (fewer merges). Opaque origins never match.
     """
-    first, second = urlsplit(origin or ""), urlsplit(other or "")
-    host, peer = (first.hostname or ""), (second.hostname or "")
-    if not host or not peer or first.scheme != second.scheme:
+    try:
+        first, second = urlsplit(origin or ""), urlsplit(other or "")
+        ports = (first.port or _DEFAULT_PORTS.get(first.scheme), second.port or _DEFAULT_PORTS.get(second.scheme))
+    except ValueError:
         return False
-    return host == peer or host.endswith("." + peer) or peer.endswith("." + host)
+    host, peer = (first.hostname or ""), (second.hostname or "")
+    if not host or not first.scheme or ports[0] is None:
+        return False
+    return (first.scheme, host, ports[0]) == (second.scheme, peer, ports[1])
 
 
 def _binding_name() -> str:
@@ -1053,6 +1063,10 @@ def _current_task() -> "asyncio.Task | None":
 #: native setter — same return, exceptions, getter and value conversions; the wrapper's
 #: own source/name/stack frames are observable. Intrinsics are captured at install; the
 #: binding global is deleted at once and every record carries a closure-held nonce.
+#: R4: a record only when the setter's receiver is the Document the wrapper was installed
+#: in (B2 — a popup borrowing it writes another document); ``CookieStore`` is not wrapped
+#: (B4 — a rejection handler would swallow ``unhandledrejection``). Intrinsics changed by
+#: the page *before* the install are trusted (B1, an accepted limit — README).
 _OBSERVER_JS = r"""(() => {
   const g = globalThis;
   let B;
@@ -1061,8 +1075,8 @@ _OBSERVER_JS = r"""(() => {
   const K = __NONCE__;
   const O = Object, apply = Reflect.apply, gopd = O.getOwnPropertyDescriptor, def = O.defineProperty, mk = O.create;
   const stringify = JSON.stringify, split = String.prototype.split, indexOf = String.prototype.indexOf;
-  const slice = String.prototype.slice, then = g.Promise && g.Promise.prototype.then;
-  const D = g.Document && g.Document.prototype;
+  const slice = String.prototype.slice;
+  const D = g.Document && g.Document.prototype, doc = g.document;
   const d = D && gopd(D, 'cookie');
   if (!d || typeof d.get !== 'function' || typeof d.set !== 'function' || !d.configurable) return;
   const get = d.get, set = d.set;
@@ -1089,26 +1103,12 @@ _OBSERVER_JS = r"""(() => {
   };
   const read = (doc) => { try { return apply(get, doc, []); } catch (e) { return undefined; } };
   const quiet = (before, after) => { try { report(before, after); } catch (e) {} };
-  const wrapped = { set(v) { const before = read(this); const r = apply(set, this, [v]); quiet(before, read(this)); return r; } }.set;
+  const wrapped = { set(v) {
+    if (this !== doc) return apply(set, this, [v]);  // B2: another Document's write (e.g. a borrowing popup)
+    const before = read(this); const r = apply(set, this, [v]); quiet(before, read(this)); return r; } }.set;
   const desc = mk(null);
   desc.get = get; desc.set = wrapped; desc.enumerable = d.enumerable; desc.configurable = true;
   def(D, 'cookie', desc);
-  const S = g.CookieStore && g.CookieStore.prototype, doc = g.document;
-  const store = (m) => {
-    const od = S && gopd(S, m);
-    if (!od || typeof od.value !== 'function' || typeof then !== 'function') return;
-    const orig = od.value;
-    const w = { [m]() {
-      const before = read(doc);
-      const p = apply(orig, this, arguments);
-      try { apply(then, p, [() => quiet(before, read(doc)), () => {}]); } catch (e) {}
-      return p;
-    } }[m];
-    const nd = mk(null);
-    nd.value = w; nd.writable = od.writable; nd.enumerable = od.enumerable; nd.configurable = od.configurable;
-    def(S, m, nd);
-  };
-  try { store('set'); store('delete'); } catch (e) {}
 })();"""
 
 
