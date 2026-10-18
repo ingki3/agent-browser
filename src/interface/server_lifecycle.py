@@ -335,6 +335,8 @@ class LifecycleMixin:
         on("close", _closed)
 
     async def close(self) -> None:
+        # WS-52: no merge from a closing browser — every tail task is cancelled and joined (R2: none leaks).
+        await self._headless_retry.aclose()
         await self._robots.close()  # WS-41: join background requests before closing their context
         if self._recipes is not None:
             self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)

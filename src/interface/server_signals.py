@@ -144,8 +144,30 @@ class SignalsMixin:
             yield None
             return
         async with self._headless_retry.present(page, url, original, self._robots,
-                                                self._egress, self._egress_proxy) as attempt:
+                                                self._egress, self._egress_proxy,
+                                                self._retry_tail_guard()) as attempt:
             yield attempt
+
+    def _retry_tail_guard(self) -> Any:
+        """WS-52: the settle tail may merge only while no human could have touched the browser.
+
+        Captured before the navigate: any handoff event since then (take/release/request/
+        login — hub.version moves), a human holder, a pending request or login job, a
+        headed window, or the feature/headless turning off ends the tail without merging.
+        """
+        from interface.handoff import HOLDER_AGENT
+
+        hub = self.hub
+        version = hub.version
+
+        def guard() -> bool:
+            window = self._window
+            return bool(self.headless_retry and getattr(self._core, "headless", False) and self._started
+                        and (window is None or window.state == "headless")
+                        and hub.holder == HOLDER_AGENT and not hub.requested and hub.login is None
+                        and hub.version == version)
+
+        return guard
 
     async def _attach_robots(self, result: ActionResult) -> None:
         """navigate·observe_page 결과에 robots.txt 의사 표시 신호(data.robots, WS-41)를 싣는다."""
@@ -170,6 +192,8 @@ class SignalsMixin:
                 and _origin(result.current_url) == remembered.origin):
             identity = {"presented_as": "chrome", "reason": "headless_ua_blocked", "remembered": True,
                         "note": REMEMBERED_NOTE}
+            # WS-52 R3: the scope exit adds cookie_write_observer when the observer starts.
+            remembered.identity = identity
             status = result.data.get("last_http_status")
             if status == 403:
                 self._headless_retry.mark_failed(remembered.origin or "")
@@ -225,7 +249,10 @@ class SignalsMixin:
         if self._headless_retry.state(origin) == "failed":
             return skip("already_failed")
         if not await self._headless_retry.cookies_cleared(page.context, page.url):
-            return skip("cookies_present")
+            # WS-52: say whether an unknown cookie (maybe a login) or only a known value changed.
+            result.data["retry_skipped"] = skip_reason(
+                "cookies_present", await self._headless_retry.cookie_change(page.context, page.url))
+            return None
         if self._headless_retry.state(origin) is not None:
             return None  # remembered success that did not apply to this navigate
         original = await self._robots._context_user_agent(page.context)
@@ -241,7 +268,8 @@ class SignalsMixin:
         failed = False
         try:
             async with self._headless_retry.present(page, page.url, original, self._robots,
-                                                    self._egress, self._egress_proxy) as attempt:
+                                                    self._egress, self._egress_proxy,
+                                                    self._retry_tail_guard()) as attempt:
                 retried = await self.call_tool(name, retry_arguments)
                 retry_status = retried.data.get("last_http_status")
                 if (attempt.document_requested and "document" not in retried.data
@@ -267,6 +295,8 @@ class SignalsMixin:
             self._headless_retry.mark_failed(origin)
             identity["retry_failed"] = True
             identity["note"] = FAILED_NOTE
+        elif attempt.observing:
+            identity["cookie_write_observer"] = True  # WS-52 R3: disclosed, never hidden
         retried.data["identity"] = identity
         return retried
 

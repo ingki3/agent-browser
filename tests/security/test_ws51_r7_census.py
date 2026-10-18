@@ -63,6 +63,8 @@ TABLES = {
     ("actions/dispatcher.py", "_KEY_ALIASES"): (NOT_OUT, "키 이름 정규화 조회표(Playwright 로 넘기는 입력)"),
     ("actions/dispatcher.py", "_PARAM_ALIASES"): (NOT_OUT, "계약 입력 키 → 디스패처 키 조회표"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
+    ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
+                                                               "(키는 cookie_change 낱말)"),
     ("interface/handoff.py", "_KEY_LABEL"): (FREE, "승인 불일치 사유 문장에 쓰는 사람용 이름"),
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
     ("security/hitl.py", "ICON_CLASS_RISK"): (NOT_OUT, "아이콘 class → 위험 키워드 조회표(판정 입력)"),

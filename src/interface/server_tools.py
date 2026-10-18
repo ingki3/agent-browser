@@ -26,6 +26,31 @@ class ToolsMixin:
     #: 운영에서는 None → interface.youtube_search.API_BASE(www.googleapis.com 고정). 환경변수·CLI 로 바꾸는 길은 없다.
     _youtube_ledger: Any = None
     _youtube_api_base: Optional[str] = None
+    #: WS-52 R2: the passive reads a running settle tail survives (only as the sole call in flight).
+    _TAIL_PASSIVE_ACTIONS = frozenset({ActionType.OBSERVE_PAGE, ActionType.EXTRACT, ActionType.TAKE_SCREENSHOT,
+                                       ActionType.WAIT_FOR})
+
+    def tool_entry(self, name: str) -> Any:
+        """WS-52 도구 시작 장벽 — 모든 도구 진입점이 await 전에 동기적으로 든다(with).
+
+        R2: 모든 호출(액션·서버 도구·레시피·YouTube, 중첩 포함)은 진행 중인 다른 호출을 '겹침'으로 표시하고
+        재시도 장부 꼬리를 영구 중단한다(세대 번호를 올려 진행 중 쿠키 읽기도 합치기 직전에 버린다).
+        예외는 수동 읽기(observe_page·extract·take_screenshot·wait_for)가 유일한 진행 호출일 때뿐 — scroll·hover 는
+        페이지 스크립트를 깨울 수 있어 중단한다.
+        """
+        from contextlib import nullcontext
+
+        retry = getattr(self, "_headless_retry", None)
+        if retry is None:
+            return nullcontext()  # no retry memory → no tail to close (bare test servers)
+        return retry.tool_call(read_only=action_from_tool(name) in self._TAIL_PASSIVE_ACTIONS)
+
+    async def _retry_settled(self) -> None:
+        """WS-52 R3: the tail this call just ended is torn down (init script removed) before the
+        call acts — a document it opens never gets the cookie-write observer."""
+        retry = getattr(self, "_headless_retry", None)
+        if retry is not None:
+            await retry.settled()
 
     async def call_server_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """계약 밖 서버 도구(WS-29). 결과는 dict(JSON 응답).
@@ -35,7 +60,9 @@ class ToolsMixin:
         """
         from security.public_url import public_payload
 
-        return public_payload(await self._server_tool_payload(name, arguments))
+        with self.tool_entry(name):
+            await self._retry_settled()
+            return public_payload(await self._server_tool_payload(name, arguments))
 
     async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """call_server_tool 본문(가리기 전 원문 응답)."""
@@ -146,6 +173,13 @@ class ToolsMixin:
         WS-29 R2 (d): 캡처를 시작한 뒤 확인 코드 오버레이가 한 번이라도 켜졌으면(세대 번호가 바뀜)
         캡처 결과를 버리고 거부한다 — 코드 표시 쪽의 기다림(b)이 없어도 막히는 겹 방어.
         """
+        # WS-52 R1: anything that may change the page (login included) closes the settle tail
+        # synchronously, before the first await (tool_entry).
+        with self.tool_entry(name):
+            await self._retry_settled()
+            return await self._route_tool_call(name, arguments)
+
+    async def _route_tool_call(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
         from interface.on_demand import SWITCH_WAIT_S
 
         capture: Dict[str, Any] = {}

@@ -453,10 +453,12 @@ def create_server(
         return [TextContent(type="text", text=envelope_json(result))]
 
     async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-        try:
-            return await _call_tool_body(name, arguments)
-        except Exception as exc:  # noqa: BLE001 - R4 P9: SDK 가 str(exc) 를 isError 문구로 모델에 보낸다
-            raise public_tool_error(exc) from None
+        # WS-52 R1: one barrier for every MCP request, before the branch and any await.
+        with backend.tool_entry(name):
+            try:
+                return await _call_tool_body(name, arguments)
+            except Exception as exc:  # noqa: BLE001 - R4 P9: SDK 가 str(exc) 를 isError 문구로 모델에 보낸다
+                raise public_tool_error(exc) from None
 
     # SDK 메이저별 등록 방식이 다르다. 2.x의 lowlevel Server에는
     # list_tools/call_tool 데코레이터가 없고 생성자 콜백을 받는다.
