@@ -116,14 +116,19 @@ def _cmd_remove(name: str, yes: bool) -> int:
 
 
 _NAMES_SHOWN = 50
+#: 이번 import 가 읽은 모든 쿠키 값의 로컬 집합(chrome_cookies.ValueGuard) — 출력 직전 최종 검사(R1).
+_GUARD: Any = None
 
 
 def _import_say(line: str, *, err: bool = False) -> None:
-    """출력 직전 살균(제어문자) + 이 프로세스가 읽은 쿠키 값 가림(WS-51 레지스트리)."""
+    """출력 직전 살균(제어문자) + 이번 import 가 읽은 값 전부(로컬 집합) + 이 프로세스의 등록 값(WS-51 레지스트리) 가림."""
     from interface.handoff import display_safe
     from security.secret_registry import mask_registered
 
-    print(mask_registered(display_safe(line, 4000)), file=sys.stderr if err else sys.stdout)
+    text = display_safe(line, 4000)
+    if _GUARD is not None:
+        text = _GUARD.mask(text)
+    print(mask_registered(text), file=sys.stderr if err else sys.stdout)
 
 
 def _skip_text(skipped: "dict[str, int]") -> str:
@@ -132,8 +137,14 @@ def _skip_text(skipped: "dict[str, int]") -> str:
     return ", ".join(f"{SKIP_LABELS.get(k, k)} {n}개" for k, n in sorted(skipped.items()) if n)
 
 
+def _shown_name(name: str) -> str:
+    if not name:
+        return "(이름 없음)"
+    return _GUARD.name(name) if _GUARD is not None else name
+
+
 def _names_text(names: "list[str]") -> str:
-    shown = ", ".join(n if n else "(이름 없음)" for n in names[:_NAMES_SHOWN])
+    shown = ", ".join(_shown_name(n) for n in names[:_NAMES_SHOWN])
     more = len(names) - _NAMES_SHOWN
     return shown + (f" 외 {more}개" if more > 0 else "")
 
@@ -146,6 +157,8 @@ def _cmd_import(args: argparse.Namespace) -> int:
     from browser import login_ledger
     from browser import serve_profile as sp
 
+    global _GUARD
+    _GUARD = None
     name = args.profile
     try:
         sp.profile_dir(name)
@@ -158,7 +171,8 @@ def _cmd_import(args: argparse.Namespace) -> int:
         db = cc.find_cookie_db(chrome_dir, args.chrome_profile)
         _import_say("평소 Chrome 쿠키를 읽습니다 — macOS 키체인 'Chrome Safe Storage' 허용 창이 뜨면 "
                     "'허용'을 누르세요(값을 풀기 위해 이 명령이 묻습니다).")
-        plan = cc.read_cookies(db, sites, password_provider=lambda: cc.keychain_password())
+        plan = cc.read_cookies(db, sites, password_provider=lambda: cc.keychain_password(), chrome_dir=chrome_dir)
+        _GUARD = plan.guard()
     except (cc.CookieImportError, sp.ProfileError, sp.ProfileInUseError) as exc:
         _import_say(f"agent-browser profile import-cookies: 오류: {exc}", err=True)
         return 2
@@ -193,7 +207,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
             _import_say(f"agent-browser profile import-cookies: 오류: 쿠키를 넣지 못했습니다({type(exc).__name__}).",
                         err=True)
             return 2
-        done = [s for s, r in results.items() if r.written]
+        done = [s for s, r in results.items() if r.written]  # 저장소에서 값·속성까지 확인된 사이트만
         if done:
             try:
                 login_ledger.record(lock.path, [f"https://{s}" for s in done],
@@ -207,8 +221,10 @@ def _cmd_import(args: argparse.Namespace) -> int:
     _import_say(f"봇 프로필 {name!r} 에 가져왔습니다(쿠키 이름만 표시):")
     for site, res in results.items():
         skipped = dict(plan.sites[site].skipped)
-        if res.rejected:
-            skipped["rejected"] = res.rejected
+        if res.rejected - res.kept_existing:
+            skipped[cc.SKIP_REJECTED] = res.rejected - res.kept_existing
+        if res.kept_existing:
+            skipped[cc.SKIP_KEPT_EXISTING] = res.kept_existing
         _import_say(f"{site}: 가져온 쿠키 {len(res.written)}개" + (f" — {_names_text(res.written)}" if res.written else ""))
         if skipped:
             _import_say(f"  건너뜀: {_skip_text(skipped)}")

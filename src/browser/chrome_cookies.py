@@ -1,12 +1,16 @@
 """일상 Chrome 에서 고른 사이트의 로그인 쿠키만 읽기 (WS-59) — 사람 CLI `profile import-cookies` 전용.
 
 에이전트(MCP)·서버 도구에는 노출하지 않는다. 일상 Chrome 프로필에 **연결하지 않는다**(user_chrome 의 평소 프로필
-거부 규칙은 그대로) — 쿠키 DB 파일 하나(`Cookies`, 있으면 `Cookies-wal`)만 바이트 복사해 읽는다.
+거부 규칙은 그대로) — 쿠키 DB 파일(`Cookies`, 있으면 곁 파일 `Cookies-journal`·`Cookies-wal`)만 바이트 복사해 읽는다.
 
 읽기
-  `<chrome-dir>/<chrome-profile>/Network/Cookies`(없으면 `<…>/Cookies`)를 임시 0700 폴더로 복사(심볼릭 링크 거부)
-  → 사본을 sqlite `mode=ro` 로 열고 → 끝나면(실패해도) 폴더째 지운다. sqlite 로 원본을 열지 않으므로 Chrome 이
-  실행 중이어도(배타 잠금) 동작하고 원본을 바꾸지 않는다. 비밀번호·기록 등 다른 파일은 열지 않는다.
+  `<chrome-dir>/<chrome-profile>/Network/Cookies`(없으면 `<…>/Cookies`)와 곁 파일을 임시 0700 폴더로 복사 → 원본을
+  같은 순서로 다시 읽어 내용이 같을 때만(한 시점의 일관된 묶음) 받아들이고, 아니면 짧게 다시 시도한 뒤 거부 →
+  사본을 sqlite 로 연다(곁 파일이 있으면 SQLite 가 hot rollback journal 을 되돌리고 WAL 의 커밋만 읽도록 사본을
+  읽기·쓰기로, 없으면 `mode=ro`) → 끝나면(실패해도) 폴더째 지운다. sqlite 로 원본을 열지 않으므로 Chrome 이 실행
+  중이어도(Chrome 은 쿠키 DB 를 배타 잠금으로 연다) 동작하고 원본을 바꾸지 않는다. 비밀번호·기록 등 다른 파일은
+  열지 않는다. `--chrome-dir`(기준점, 포함)부터 DB·곁 파일까지 경로 구성요소가 하나라도 심볼릭 링크면 거부한다
+  (기준점 위의 OS 링크 — 예: macOS `/var` → `/private/var` — 는 검사하지 않는다).
 
 복호화(macOS, 공개된 형식)
   키체인 'Chrome Safe Storage' 비밀 → PBKDF2-HMAC-SHA1(salt `saltysalt`, 1003회, 16바이트) → AES-128-CBC
@@ -21,12 +25,16 @@
 
 쓰기
   봇 프로필(serve_profile.profile_dir)을 serve 가 쓰는 중이면 거부. 아니면 프로필 잠금을 쥐고 Playwright 영속
-  컨텍스트를 headless 로 잠깐 열어 add_cookies(만료·secure·httpOnly·sameSite 보존) → 브라우저가 실제로 받아들였는지
-  확인 → 닫는다. 성공한 사이트는 로그인 기록(login_ledger, source `chrome_import`)에 `https://<site>` 로 적는다.
+  컨텍스트를 headless 로 잠깐 열어 add_cookies(만료·secure·httpOnly·sameSite 보존) → 저장소를 다시 읽어 name/domain/
+  path 와 값·secure·httpOnly·sameSite·만료(1초 오차, Chromium 400일 상한)가 요청과 같은 것만 성공으로 센다(같은 키의
+  기존 쿠키가 남은 거부는 따로 센다) → 닫는다. 확인된 쿠키가 있는 사이트만 로그인 기록(login_ledger, source
+  `chrome_import`)에 `https://<site>` 로 적는다.
 
 비노출
   쿠키 값·키체인 비밀·복호화 키는 출력·로그·예외 문구에 싣지 않는다. 값은 repr 에서 숨기고, 읽은 값은 프로세스
-  비밀 값 레지스트리(WS-51)에 등록해 CLI 출력 줄을 한 번 더 가린다. 예외는 종류만 남기고 원 예외 연쇄를 끊는다.
+  비밀 값 레지스트리(WS-51)에 등록해 CLI 출력 줄을 한 번 더 가린다. 레지스트리는 값 256개 상한이라, CLI 는 이번
+  import 가 읽은 **모든** 값의 로컬 집합(ValueGuard)으로 출력 직전에 다시 검사한다 — 값이 든 쿠키 이름은 통째로
+  `[REDACTED]`. 예외는 종류만 남기고 원 예외 연쇄를 끊는다.
 """
 
 from __future__ import annotations
@@ -64,6 +72,7 @@ SKIP_EXPIRED = "expired"
 SKIP_SESSION = "session"
 SKIP_PARTITIONED = "partitioned"
 SKIP_REJECTED = "rejected"
+SKIP_KEPT_EXISTING = "rejected_kept_existing"
 #: 사람에게 보일 건너뜀 이유(고정 문구).
 SKIP_LABELS: Dict[str, str] = {
     SKIP_UNKNOWN: "알 수 없는 형식",
@@ -72,6 +81,7 @@ SKIP_LABELS: Dict[str, str] = {
     SKIP_SESSION: "세션 쿠키(브라우저를 닫으면 사라져 가져오지 않음)",
     SKIP_PARTITIONED: "파티션 쿠키",
     SKIP_REJECTED: "브라우저가 거부",
+    SKIP_KEPT_EXISTING: "브라우저가 거부 — 같은 이름의 기존 쿠키가 그대로 남음",
 }
 
 #: 등록 도메인으로 받지 않는 공용 접미사(근사 — 공용 접미사 목록 라이브러리가 의존성에 없다).
@@ -188,9 +198,14 @@ class SitePlan:
 @dataclass
 class ImportPlan:
     sites: Dict[str, SitePlan]
+    #: 이번 가져오기가 읽은(복호화·평문) **모든** 값 — 건너뛴 쿠키 값 포함. 출력 최종 검사(ValueGuard) 몫.
+    read_values: List[str] = field(default_factory=list)
 
     def values(self) -> List[str]:
         return [c.value for p in self.sites.values() for c in p.cookies]
+
+    def guard(self) -> "ValueGuard":
+        return ValueGuard(list(self.read_values) + self.values())
 
     def __repr__(self) -> str:
         parts = ", ".join(f"{s}: {len(p.cookies)} cookies" for s, p in self.sites.items())
@@ -274,20 +289,52 @@ def _refuse_symlink(path: Path, what: str) -> None:
         raise CookieImportError(f"{what} 이(가) 심볼릭 링크라 읽지 않습니다.")
 
 
+def _anchor(chrome_dir: Path) -> Path:
+    """기준점 — 사용자가 준(또는 기본) `--chrome-dir` 그 자체(절대 경로, 링크를 풀지 않음)."""
+    return Path(os.path.abspath(Path(chrome_dir).expanduser()))
+
+
+def _refuse_link_chain(chrome_dir: Path, target: Path) -> None:
+    """기준점(`--chrome-dir`, 포함)부터 target(포함)까지 모든 경로 구성요소를 lstat — 링크면 거부(R4).
+
+    기준점 위(예: 홈·macOS `/var` → `/private/var`·`/tmp` 같은 OS 링크)는 사용자가 고른 경로라 검사하지 않는다.
+    target 이 기준점 아래가 아니면 거부한다.
+    """
+    anchor = _anchor(chrome_dir)
+    full = Path(os.path.abspath(target))
+    try:
+        rel = full.relative_to(anchor)
+    except ValueError:
+        raise CookieImportError("Chrome 쿠키 DB 가 --chrome-dir 아래에 있지 않습니다.") from None
+    if any(part in ("", ".", "..") for part in rel.parts):
+        raise CookieImportError("Chrome 쿠키 DB 경로 형식이 잘못됐습니다.")
+    _refuse_symlink(anchor, "Chrome 데이터 폴더(--chrome-dir)")
+    cur = anchor
+    for part in rel.parts:
+        cur = cur / part
+        _refuse_symlink(cur, "Chrome 쿠키 DB 경로의 폴더·파일")
+
+
 def find_cookie_db(chrome_dir: Path, chrome_profile: str = DEFAULT_CHROME_PROFILE) -> Path:
-    """`<chrome_dir>/<profile>/Network/Cookies` 또는 `<…>/Cookies`. 프로필 이름은 폴더 이름 한 칸만."""
+    """`<chrome_dir>/<profile>/Network/Cookies` 또는 `<…>/Cookies`. 프로필 이름은 폴더 이름 한 칸만.
+
+    기준점(`chrome_dir`)부터 DB 파일까지 경로 구성요소가 하나라도 심볼릭 링크면 거부한다(R4).
+    """
     if not isinstance(chrome_profile, str) or not _CHROME_PROFILE_RE.fullmatch(chrome_profile) \
             or chrome_profile.strip() != chrome_profile:
         raise CookieImportError("--chrome-profile 은 'Default'·'Profile 1' 같은 폴더 이름 하나여야 합니다.")
-    base = Path(chrome_dir).expanduser() / chrome_profile
+    base = _anchor(chrome_dir) / chrome_profile
     for cand in (base / "Network" / "Cookies", base / "Cookies"):
         if os.path.lexists(cand):
+            _refuse_link_chain(chrome_dir, cand)
             return cand
     raise CookieImportError(
         f"Chrome 쿠키 DB(Cookies)를 찾지 못했습니다 — --chrome-dir·--chrome-profile({chrome_profile})을 확인하세요.")
 
 
-def _copy_nofollow(src: Path, dst: Path) -> None:
+def _copy_nofollow(src: Path, dst: Path) -> str:
+    """src 를 dst(0600, 새 파일)로 바이트 복사하고 내용의 SHA256 을 돌려준다(링크·일반 파일 아님은 거부)."""
+    digest = hashlib.sha256()
     fd = os.open(src, os.O_RDONLY | _NOFOLLOW)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -298,11 +345,73 @@ def _copy_nofollow(src: Path, dst: Path) -> None:
                 chunk = os.read(fd, 1 << 20)
                 if not chunk:
                     break
+                digest.update(chunk)
                 os.write(out, chunk)
         finally:
             os.close(out)
     finally:
         os.close(fd)
+    return digest.hexdigest()
+
+
+def _hash_file(src: Path) -> Optional[str]:
+    """원본을 다시 읽어 SHA256(없으면 None). 링크·일반 파일 아님은 거부."""
+    try:
+        fd = os.open(src, os.O_RDONLY | _NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    digest = hashlib.sha256()
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CookieImportError("Chrome 쿠키 DB 가 일반 파일이 아닙니다.")
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+#: 원본 DB 와 함께 복사하는 SQLite 곁 파일 — rollback journal(R2)·WAL.
+_SIDE_SUFFIXES = ("-journal", "-wal")
+#: 일관된 사본을 못 얻으면 이 간격으로 다시 시도한다(합계 약 0.75초) — 그래도 안 되면 거부.
+_SNAPSHOT_DELAYS = (0.05, 0.1, 0.2, 0.4)
+
+
+def _snapshot(db_path: Path, tmp: Path) -> bool:
+    """원본 DB 와 곁 파일(-journal·-wal)을 tmp 로 복사해 **한 시점의 일관된 묶음**을 만든다(R2).
+
+    복사(DB → journal → wal) 직후 같은 순서로 원본을 다시 읽어 내용(SHA256)이 모두 같을 때만 받아들인다 — 복사 중
+    Chrome 이 쓰면(커밋·체크포인트·cache spill) 다시 시도하고, 끝내 안정되지 않으면 CookieImportError.
+    곁 파일까지 함께 복사한 사본은 SQLite 가 열 때 스스로 처리한다: 살아 있는(hot) rollback journal 은 되돌려
+    **커밋된 내용만** 남기고, WAL 은 커밋된 프레임만 읽는다. 원본은 열기만 하고(읽기 전용·O_NOFOLLOW) 바꾸지 않는다.
+    곁 파일을 하나라도 복사했으면 True(사본을 읽기·쓰기로 열어야 되돌리기가 된다).
+    """
+    sides = [(s, db_path.with_name(db_path.name + s)) for s in _SIDE_SUFFIXES]
+    for attempt in range(len(_SNAPSHOT_DELAYS) + 1):
+        first: Dict[str, Optional[str]] = {"": _copy_nofollow(db_path, tmp / "Cookies")}
+        for suffix, src in sides:
+            if os.path.lexists(src):
+                _refuse_symlink(src, "Chrome 쿠키 DB 곁 파일(-journal·-wal)")
+                try:
+                    first[suffix] = _copy_nofollow(src, tmp / ("Cookies" + suffix))
+                except FileNotFoundError:
+                    first[suffix] = None
+            else:
+                first[suffix] = None
+        second: Dict[str, Optional[str]] = {"": _hash_file(db_path)}
+        for suffix, src in sides:
+            second[suffix] = _hash_file(src)
+        if first == second:
+            return any(first[s] is not None for s, _ in sides)
+        for child in list(tmp.iterdir()):
+            child.unlink()
+        if attempt < len(_SNAPSHOT_DELAYS):
+            time.sleep(_SNAPSHOT_DELAYS[attempt])
+    raise CookieImportError(
+        "Chrome 이 쿠키 DB 를 계속 쓰고 있어 일관된 사본을 얻지 못했습니다 — 잠시 뒤 다시 실행하세요.")
 
 
 def _columns(db: sqlite3.Connection) -> List[str]:
@@ -315,25 +424,26 @@ _REQUIRED = ("host_key", "name", "value", "encrypted_value", "path", "expires_ut
 Row = Tuple[object, ...]
 
 
-def _read_rows(db_path: Path, tmp_root: Optional[Path]) -> Tuple[Optional[int], List[str], List[Row]]:
-    if db_path.parent.name == "Network":
-        _refuse_symlink(db_path.parent.parent, "Chrome 프로필 폴더")
-    _refuse_symlink(db_path.parent, "Chrome 프로필 폴더")
-    _refuse_symlink(db_path, "Chrome 쿠키 DB")
+def _read_rows(db_path: Path, tmp_root: Optional[Path],
+               chrome_dir: Optional[Path] = None) -> Tuple[Optional[int], List[str], List[Row]]:
+    if chrome_dir is None:
+        # 기준점을 주지 않으면 Chrome 배치(`<chrome-dir>/<profile>/[Network/]Cookies`)에서 데이터 폴더를 기준점으로 본다.
+        full = Path(os.path.abspath(db_path))
+        chrome_dir = full.parents[2] if full.parent.name == "Network" else full.parents[1]
+    _refuse_link_chain(chrome_dir, db_path)  # find_cookie_db 뒤 바뀌었을 수 있다 — 복사 직전 다시
     tmp = Path(tempfile.mkdtemp(prefix="ab-chrome-cookies-", dir=str(tmp_root) if tmp_root else None))
     try:
         os.chmod(tmp, 0o700)
         copy = tmp / "Cookies"
         try:
-            _copy_nofollow(db_path, copy)
-            wal = db_path.with_name(db_path.name + "-wal")
-            if os.path.lexists(wal):
-                _refuse_symlink(wal, "Chrome 쿠키 DB 로그")
-                _copy_nofollow(wal, tmp / "Cookies-wal")
+            with_sides = _snapshot(db_path, tmp)
         except OSError:
             raise CookieImportError("Chrome 쿠키 DB 를 복사하지 못했습니다(권한·파일 상태 확인).") from None
+        # 곁 파일이 있으면 사본(우리 0700 폴더 안)을 읽기·쓰기로 연다 — SQLite 가 hot journal 을 되돌리고 WAL 을
+        # 읽게. 원본은 sqlite 로 열지 않는다.
+        mode = "rw" if with_sides else "ro"
         try:
-            with sqlite3.connect(copy.as_uri() + "?mode=ro", uri=True, timeout=0.5) as db:
+            with sqlite3.connect(copy.as_uri() + f"?mode={mode}", uri=True, timeout=0.5) as db:
                 meta_version: Optional[int]
                 try:
                     row = db.execute("SELECT value FROM meta WHERE key='version'").fetchone()
@@ -354,11 +464,15 @@ def _read_rows(db_path: Path, tmp_root: Optional[Path]) -> Tuple[Optional[int], 
 
 
 def read_cookies(db_path: Path, sites: Sequence[str], *, password_provider: Callable[[], bytes],
-                 now: Optional[float] = None, tmp_root: Optional[Path] = None) -> ImportPlan:
-    """고른 사이트의 쿠키만 복호화해 계획으로. 다른 사이트 행은 복호화하지 않는다."""
+                 now: Optional[float] = None, tmp_root: Optional[Path] = None,
+                 chrome_dir: Optional[Path] = None) -> ImportPlan:
+    """고른 사이트의 쿠키만 복호화해 계획으로. 다른 사이트 행은 복호화하지 않는다.
+
+    chrome_dir(기준점)을 주면 그곳부터 DB 까지 경로 구성요소의 심볼릭 링크를 복사 직전에 다시 거부한다(R4).
+    """
     picked = [validate_site(s) for s in sites]
     plan = ImportPlan(sites={s: SitePlan(site=s) for s in dict.fromkeys(picked)})
-    meta_version, cols, rows = _read_rows(Path(db_path), tmp_root)
+    meta_version, cols, rows = _read_rows(Path(db_path), tmp_root, chrome_dir)
     when = time.time() if now is None else now
     key: Optional[bytes] = None
     for raw in rows:
@@ -381,11 +495,13 @@ def read_cookies(db_path: Path, sites: Sequence[str], *, password_provider: Call
                 if key is None:
                     key = derive_key(password_provider())
                 value = _decrypt_v10(enc, key, host, meta_version)
+                plan.read_values.append(value)
             else:
                 plain = r.get("value")
                 if not isinstance(plain, str):
                     raise _Skip(SKIP_UNKNOWN)
                 value = plain
+            plan.read_values.append(value)
             name, path = r.get("name"), r.get("path")
             if not isinstance(name, str) or not isinstance(path, str) or not path.startswith("/"):
                 raise _Skip(SKIP_UNKNOWN)
@@ -411,6 +527,43 @@ def read_cookies(db_path: Path, sites: Sequence[str], *, password_provider: Call
     return plan
 
 
+class ValueGuard:
+    """이번 가져오기가 읽은 **모든** 쿠키 값의 로컬 집합 — CLI 출력 직전 최종 검사(R1).
+
+    전역 레지스트리(WS-51, 값 256개 LRU)는 쿠키가 많으면 앞 값을 잊는다. 이 객체는 이번 import 의 값만 상한 없이
+    기억한다(같은 판정 규칙을 쓰려고 SecretRegistry 를 **별도 인스턴스**로 쓴다 — 전역 상한·정책은 그대로):
+    ≥ 8자는 부분 일치, 4~7자(순수 알파벳 제외)는 경계 일치, 도구 어휘·식별자 형식은 제외.
+    값은 밖으로 내보내지 않는다(repr 은 개수만).
+    """
+
+    __slots__ = ("_reg",)
+
+    def __init__(self, values: Iterable[str]) -> None:
+        from security.secret_registry import SecretRegistry
+
+        unique = list(dict.fromkeys(v for v in values if isinstance(v, str)))
+        self._reg = SecretRegistry(cap=max(1, len(unique)), max_chars=sys.maxsize)
+        self._reg.add_values(unique)
+
+    def __repr__(self) -> str:
+        return f"<ValueGuard {len(self._reg)} values (values hidden)>"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> object:
+        raise TypeError("ValueGuard 는 직렬화하지 않는다")
+
+    def mask(self, text: str) -> str:
+        """문장 속 값(표현)을 `[REDACTED]` 로."""
+        return self._reg.mask(text)
+
+    def name(self, name: str) -> str:
+        """쿠키 이름에 값(전체·부분)이 들어 있으면 이름을 통째로 `[REDACTED]`."""
+        from security.masking import MASK
+
+        return MASK if self._reg.mask(name) != name else name
+
+
 def _register_values(values: Iterable[str]) -> None:
     """읽은 값을 이 프로세스의 비밀 값 레지스트리(WS-51)에 등록 — CLI 출력 줄을 한 번 더 가린다."""
     try:
@@ -427,8 +580,16 @@ def _register_values(values: Iterable[str]) -> None:
 @dataclass
 class SiteResult:
     site: str
+    #: 저장소에서 값·속성까지 요청과 같다고 확인된 쿠키 이름.
     written: List[str] = field(default_factory=list)
+    #: 실패 전부 — 브라우저가 받지 않았거나(없음) 다른 값·속성으로 저장됐거나 기존 쿠키가 남음.
     rejected: int = 0
+    #: rejected 중, 같은 name/domain/path 의 **기존** 쿠키가 바뀌지 않고 그대로 남은 것(R3 — 성공으로 세지 않는다).
+    kept_existing: int = 0
+
+    @property
+    def failed(self) -> int:
+        return self.rejected
 
 
 @asynccontextmanager
@@ -451,14 +612,41 @@ def _key(c: Dict[str, object]) -> Tuple[str, str, str]:
     return (str(c.get("name")), str(c.get("domain")), str(c.get("path")))
 
 
+#: 만료 비교 허용 오차(초) — Chromium 은 마이크로초로 저장한다.
+EXPIRES_TOLERANCE_S = 1.0
+#: Chromium 의 쿠키 만료 상한(400일) — 이보다 먼 만료는 저장할 때 잘린다.
+CHROMIUM_MAX_EXPIRY_S = 400 * 86400
+
+
+def _matches(want: ChromeCookie, got: Dict[str, object], t0: float, t1: float) -> bool:
+    """저장된 쿠키가 요청(값·secure·httpOnly·sameSite·만료)과 같은가(R3). t0·t1 은 주입 전후 시각."""
+    if got.get("value") != want.value or bool(got.get("secure")) != want.secure \
+            or bool(got.get("httpOnly")) != want.http_only:
+        return False
+    if want.same_site is not None and got.get("sameSite") != want.same_site:
+        return False
+    exp = got.get("expires")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return False
+    if abs(float(exp) - want.expires) <= EXPIRES_TOLERANCE_S:
+        return True
+    # 400일보다 먼 만료는 Chromium 이 '주입 시각 + 400일'로 자른다 — 그 범위 안이면 같은 쿠키다.
+    return (want.expires > t0 + CHROMIUM_MAX_EXPIRY_S
+            and t0 + CHROMIUM_MAX_EXPIRY_S - EXPIRES_TOLERANCE_S <= float(exp) <= t1 + CHROMIUM_MAX_EXPIRY_S
+            + EXPIRES_TOLERANCE_S)
+
+
 async def write_cookies(profile_path: Path, plan: ImportPlan) -> Dict[str, SiteResult]:
-    """잠금을 쥔 프로필 폴더에 쿠키를 넣고 브라우저가 받아들인 것만 사이트별로 돌려준다.
+    """잠금을 쥔 프로필 폴더에 쿠키를 넣고, 주입 뒤 저장소를 다시 읽어 **값·속성까지 요청과 같은 것만** 성공으로
+    사이트별로 돌려준다(R3). 같은 키의 기존 쿠키가 남은 거부는 kept_existing 으로 따로 센다.
 
     실패는 CookieImportError(예외 종류만 — Playwright 문구에는 쿠키 값·경로가 들어갈 수 있다).
     """
     results = {s: SiteResult(site=s) for s in plan.sites}
     try:
         async with _playwright_context(profile_path) as ctx:
+            before = {_key(c): c for c in await ctx.cookies()}  # type: ignore[attr-defined]
+            t0 = time.time()
             for site, sp in plan.sites.items():
                 if not sp.cookies:
                     continue
@@ -466,12 +654,13 @@ async def write_cookies(profile_path: Path, plan: ImportPlan) -> Dict[str, SiteR
                 try:
                     await ctx.add_cookies(batch)  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 - 하나라도 형식이 틀리면 묶음 전체가 실패한다
-                    for one in batch:  # 하나씩 — 거부된 것만 빠진다(아래 수용 확인이 센다)
+                    for one in batch:  # 하나씩 — 거부된 것만 빠진다(아래 저장소 대조가 센다)
                         try:
                             await ctx.add_cookies([one])  # type: ignore[attr-defined]
                         except Exception:  # noqa: BLE001
                             continue
-            stored = {_key(c) for c in await ctx.cookies()}  # type: ignore[attr-defined]
+            t1 = time.time()
+            stored = {_key(c): c for c in await ctx.cookies()}  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         raise CookieImportError(
             f"봇 프로필에 쿠키를 넣지 못했습니다({type(exc).__name__}). 다른 프로그램이 그 프로필을 쓰는지 확인하세요."
@@ -479,9 +668,12 @@ async def write_cookies(profile_path: Path, plan: ImportPlan) -> Dict[str, SiteR
     for site, sp in plan.sites.items():
         for c in sp.cookies:
             want = (c.name, c.host_key, c.path)
-            if want in stored:
+            got = stored.get(want)
+            if got is not None and _matches(c, got, t0, t1):
                 results[site].written.append(c.name)
             else:
                 results[site].rejected += 1
+                if got is not None and before.get(want) == got:  # 기존 쿠키가 바뀌지 않고 남았다
+                    results[site].kept_existing += 1
         results[site].written.sort()
     return results
