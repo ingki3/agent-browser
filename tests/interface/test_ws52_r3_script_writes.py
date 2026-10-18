@@ -165,11 +165,11 @@ async def next_visit(srv, site, path="/next"):
 
 
 async def assert_native(srv, site, change, path="/next"):
-    result = await next_visit(srv, site, path)
-    assert result.data["last_http_status"] == 403, result.data
-    assert "identity" not in result.data
-    assert result.data["retry_skipped"] == present(change)
-    assert site.headless(path)
+    """WS-58 (intended change): the WS-52 invariant is checked on the ledger (strict comparison —
+    the change was not merged); the next visit follows WS-58 rule (b)."""
+    from ws58_helpers import assert_unmerged_next
+
+    return await assert_unmerged_next(srv, site, change, navigate, path)
 
 
 async def assert_renamed(srv, site, path="/next"):

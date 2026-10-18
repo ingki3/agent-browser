@@ -362,7 +362,7 @@ remembered: true}`가 붙으며, 그 요청이 403이면 `retry_failed: true`도
 `--profile NAME`이면 출처별 상태(succeeded·failed)·장부·갱신 시각을 프로필 폴더의 `headless_retry.json`(0600, 임시 파일 +
 rename)에 둡니다. 상한은 출처 1,000개·출처당 쿠키 50개·파일 8 MiB(읽기 상한과 같음)이며 넘치면 오래된 것부터
 버립니다(기억을 잃는 방향). 파일이 손상되었거나(유한하지 않은 갱신 시각 포함) 읽을 수 없으면 기억 없이 시작합니다(첫
-재시도 조건부터 다시 판단 — 쿠키가 있으면 재시도하지 않음).
+재시도 조건부터 다시 판단 — WS-58 이후 HttpOnly 쿠키가 있으면 재시도하지 않음).
 `failed`는 24시간 뒤 잊습니다. 장부 내용(쿠키 이름·지문)은 로그·결과·`profile` 출력에 싣지 않습니다.
 이름을 바꾸는 동안의 요청 가로채기는 어떤 인증 요청에도 답하지 않습니다(인증 가로채기 옵션을 켜지 않음 — 우리 코드는
 자격을 다루지 않음). 검증 프록시는 **자격을 요구하지 않으므로**(WS-47 R3) 브라우저에 프록시 자격이 없고, 사이트의 인증
@@ -381,20 +381,37 @@ egress 프록시는 실제로 연결할 해석된 IP·포트가 자기 리스너
 
 | reason | note |
 | :--- | :--- |
-| `cookies_present` | 이 사이트에 로그인 등 기존 쿠키가 있어 이름을 바꾸지 않았습니다 |
+| `login_recorded` | 이 사이트는 도구가 아는 로그인 기록이 있어(로그인 흐름·사람 조작·가져온 쿠키) 이름을 바꾸지 않았습니다 |
+| `new_server_cookie` | 도구가 모르는 서버 전용(HttpOnly) 쿠키가 있어(로그인 세션 가능성) 이름을 바꾸지 않았습니다 |
+| `login_ledger_unreadable` | 로그인 기록 파일을 읽지 못해(손상) 안전을 위해 이름을 바꾸지 않았습니다 — 운영자에게 이 프로필의 로그인 기록 확인을 요청하세요 |
+| `cookies_unreadable` | 이 사이트의 쿠키를 확인하지 못해 안전을 위해 이름을 바꾸지 않았습니다 |
 | `already_failed` | 앞서 일반 Chrome 이름으로도 막혀 다시 시도하지 않았습니다 |
 | `robots_not_confirmed` | robots.txt 가 일반 접근 허용을 확정해 주지 않아 이름을 바꾸지 않았습니다 |
 | `vendor_challenge` | 보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다 |
 | `disabled` | 헤드리스 이름 재시도가 꺼져 있어(--no-headless-retry) 다시 시도하지 않았습니다 |
 | `headed` | 창 모드 브라우저라 헤드리스 이름 문제가 아니어서 다시 시도하지 않았습니다 |
 
-`cookies_present`에는 세부 필드 `cookie_change`와 고정 문구 `cookie_change_note`가 붙습니다(WS-52, 쿠키를 읽지 못하면 생략).
+`new_server_cookie`에는 세부 필드 `cookie_change`와 고정 문구 `cookie_change_note`가 붙습니다(WS-52).
 쿠키 이름·값은 싣지 않습니다.
 
 | cookie_change | 뜻 | cookie_change_note |
 | :--- | :--- | :--- |
-| `new_cookie` | 장부에 없는 쿠키(이름·domain·path)가 있음 — 로그인 가능성 | 도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다 |
-| `known_value_changed` | 장부의 쿠키만 있는데 값이 바뀜 | 도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요 |
+| `new_cookie` | 장부에 없는 HttpOnly 키(이름·domain·path) — 로그인 가능성 | 도구가 남기지 않은 새 서버 전용(HttpOnly) 쿠키 키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다 |
+| `known_value_changed` | 스크립트 쿠키(`js`)로 적은 키가 HttpOnly 로 바뀜 | 도구가 사이트 스크립트 쿠키로 남긴 키가 서버 전용(HttpOnly)으로 바뀌어(로그인 가능성) 이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요 |
+
+**'쿠키가 있으면'에서 '로그인한 사이트면'으로(WS-58)** — 분석·광고 쿠키 때문에 재시도가 막히던 문제를 고쳤습니다. 이제
+이름을 바꾸지 않는 경우는 둘뿐입니다. (a) **로그인 기록**이 그 호스트를 덮음 — `--profile` 이면 프로필 폴더의
+`login_ledger.json`(WS-59 형식, 0600), 없으면 서버 메모리. 기록 `example.com` 은 `example.com` 과 그 하위 도메인만 덮습니다
+(`evil-example.com`·`example.com.evil.test` 아님, scheme·포트 무관 — WS-59 가져오기·자격증명 도메인과 같은 규칙). (b) 장부에
+서버 쿠키로 없는 **HttpOnly 키**(이름·domain·path)가 있음(서버 세션 가능성). 비 HttpOnly 쿠키의 추가·변경과, 장부에 있는 HttpOnly
+키의 값만 바뀐 경우(`__cf_bm`·`AWSALB` 처럼 서버가 값을 돌림)는 막지 않습니다 — 장부 키는 값을 따라갑니다. 로그인 기록을
+읽지 못하면(손상) 재시도하지 않고 `login_ledger_unreadable` 을 알립니다(파일은 덮어쓰지 않음).
+로그인 기록에 남는 사건(값·이름·경로 없이 origin 만): `agent-browser login` 작업을 사람이 끝냄·자격증명 플레이스홀더 입력
+성공·`login_with_handoff(ledger_profile=…)` 성공(`login_flow`), 사람 조작권 구간(take~release)의 비밀번호 칸 제출·새 HttpOnly 쿠키
+(그 쿠키 도메인)·`secret_wanted` 인계(`human_control`), `profile import-cookies`(`chrome_import`). 조작권 구간의 비밀번호 제출은
+CDP 격리 world(페이지 스크립트와 전역을 공유하지 않음)의 DOM 이벤트 감시로 알아보며 반납 때 걷습니다 — shadow DOM 안 칸·다른
+프로세스 iframe 은 보지 못합니다(이때도 규칙 (b)는 그대로). WS-52 꼬리·관찰기는 유지하되 판정에서는 `js` 표시 키가 HttpOnly 로
+바뀌는 경우를 가르는 보조로만 쓰입니다(비 HttpOnly 쿠키는 이제 어차피 허용).
 
 **재시도 장부의 안정화 꼬리(WS-52)** — 실사용(2026-10-17 GeekNews)에서 재시도로 200을 받던 사이트가 이후 늘
 `cookies_present`로 403에 멈췄습니다. 원인: 장부는 재시도 `navigate`가 끝난 순간의 쿠키 지문만 적었는데, 광고·분석

@@ -30,10 +30,11 @@ from test_run_cli import requires_chromium
 
 VISITOR = "visitor-WS52-original-4d1e"
 REWRITTEN = "rewritten-by-script-9b2c"
-NOTE = "이 사이트에 로그인 등 기존 쿠키가 있어 이름을 바꾸지 않았습니다"
+#: WS-58: cookies_present → new_server_cookie (only an HttpOnly key the ledger does not hold as a server cookie).
+NOTE = "도구가 모르는 서버 전용(HttpOnly) 쿠키가 있어(로그인 세션 가능성) 이름을 바꾸지 않았습니다"
 CHANGE_NOTES = {
-    "new_cookie": "도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
-    "known_value_changed": ("도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 "
+    "new_cookie": "도구가 남기지 않은 새 서버 전용(HttpOnly) 쿠키 키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
+    "known_value_changed": ("도구가 사이트 스크립트 쿠키로 남긴 키가 서버 전용(HttpOnly)으로 바뀌어(로그인 가능성) "
                             "이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요"),
 }
 
@@ -120,7 +121,7 @@ async def names(server):
 
 
 def present(change):
-    return {"retried": False, "reason": "cookies_present", "note": NOTE,
+    return {"retried": False, "reason": "new_server_cookie", "note": NOTE,
             "cookie_change": change, "cookie_change_note": CHANGE_NOTES[change]}
 
 
@@ -132,11 +133,12 @@ async def first_retry(server, site, path="/one"):
 
 
 async def assert_native_next(server, site, change, path="/next"):
-    result = await navigate(server, site.url + path)
-    assert result.data["last_http_status"] == 403
-    assert "identity" not in result.data
-    assert result.data["retry_skipped"] == present(change)
-    assert len(site.received(path)) == 1 and site.headless(path)
+    """WS-58 (intended change): the WS-52 invariant is checked on the ledger (the change was not
+    merged — strict WS-52 comparison); the next visit follows WS-58 rule (b)."""
+    from ws58_helpers import assert_unmerged_next
+
+    await assert_unmerged_next(server, site, change, navigate, path)
+    assert len(site.received(path)) == 1
 
 
 async def assert_renamed_next(server, site, path="/next"):
@@ -321,10 +323,14 @@ async def test_cookie_change_detail_without_names_or_values(site, change, caplog
         await first_retry(server, site)
         await asyncio.sleep(1.0)  # the tail ran out
         assert server._headless_retry._tail is None
+        # WS-58: the detail rides on new_server_cookie — an HttpOnly key that is new, or a script
+        # (js) key that turned HttpOnly.
         if change == "new_cookie":
-            cookie = {"name": "session-ws52", "value": "secret-ws52-login", "url": site.url}
+            cookie = {"name": "session-ws52", "value": "secret-ws52-login", "url": site.url, "httpOnly": True}
         else:
-            cookie = {"name": "visitor", "value": "secret-ws52-login", "url": site.url}
+            ledger = server._headless_retry.ledger[site.url]
+            server._headless_retry.ledger[site.url] = [{**e, "js": True} for e in ledger]
+            cookie = {"name": "visitor", "value": "secret-ws52-login", "url": site.url, "httpOnly": True}
         await server._page.context.add_cookies([cookie])
         result = await navigate(server, site.url + "/after")
         assert result.data["retry_skipped"] == present(change)
@@ -431,6 +437,10 @@ async def test_unreadable_cookies_end_the_tail_fail_closed(tmp_path, monkeypatch
     await asyncio.sleep(0.05)
     await retry.end_tail()
     assert retry.ledger[origin] == after  # nothing merged after the read failure
+    # WS-58 (intended change): the unmerged non-HttpOnly value no longer blocks — the decision
+    # still fails closed when cookies cannot be read.
+    assert await retry.cookies_cleared(context, origin + "/")
+    context.fail = True
     assert not await retry.cookies_cleared(context, origin + "/")
 
 

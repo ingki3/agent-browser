@@ -216,6 +216,9 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, Handof
         from browser.headless_retry import HeadlessRetry
 
         self._headless_retry = HeadlessRetry()
+        #: WS-58: 조작권 구간 로그인 감시(browser.login_watch)·진행 중인 로그인 작업 주소.
+        self._login_watch: Any = None
+        self._login_job_url: Optional[str] = None
         self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
         self._navigation_scope: ContextVar[AsyncExitStack | None] = ContextVar("headless_navigation_scope", default=None)
         #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은

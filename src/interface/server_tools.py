@@ -386,6 +386,12 @@ class ToolsMixin:
         target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
         result, remembered = await self._dispatch_with_approval(action, params, used)
+        if (action is ActionType.TYPE_TEXT and result.success and result.data.get("secret_resolved") is True
+                and hasattr(self, "_record_login")):
+            # WS-58: 자격증명 채우기(디스패처가 키를 값으로 치환해 입력함)는 도구가 아는 로그인 사건.
+            from browser.login_ledger import SOURCE_LOGIN_FLOW
+
+            self._record_login(self._agent_page_url(), SOURCE_LOGIN_FLOW)
         if used is not None:
             self._attach_approval_outcome(used, result)
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
