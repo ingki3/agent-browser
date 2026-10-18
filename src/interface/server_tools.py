@@ -432,23 +432,42 @@ class ToolsMixin:
     async def _dispatch_with_approval(self, action: ActionType, params: Dict[str, Any],
                                       used: Optional[str]) -> tuple:
         """디스패처 실행(승인 증표 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
-        if used is not None:
-            # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
-            self._dispatcher.heal_disabled = True
+        # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다. WS-57 R1(R2): 호출 문맥 단위
+        # (heal_disabled_scope) — 같은 디스패처의 다른 동시 호출이 끝나며 이 호출의 금지를 풀지 않는다.
+        heal_guard = self._heal_guard(used is not None)
         try:
-            scope = self._navigation_scope.get()
-            remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
-                          if scope is not None else None)
-            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
-                                             self._egress_proxy, self._robots, self.max_result_chars)
+            with heal_guard:
+                scope = self._navigation_scope.get()
+                remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
+                              if scope is not None else None)
+                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                                 self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
-        finally:
-            if used is not None:
-                self._dispatcher.heal_disabled = False
         return result, remembered
+
+    def _heal_guard(self, on: bool) -> Any:
+        """승인 증표 호출 동안 자가 치유 끄기(WS-57 R1 R2: 호출 문맥 단위). 디스패처가 scope 를 모르면 예전 방식."""
+        import contextlib
+
+        disp = self._dispatcher
+        if not on or disp is None:
+            return contextlib.nullcontext()
+        scope = getattr(disp, "heal_disabled_scope", None)
+        if callable(scope):
+            return scope()
+
+        @contextlib.contextmanager
+        def legacy() -> Any:
+            disp.heal_disabled = True
+            try:
+                yield
+            finally:
+                disp.heal_disabled = False
+
+        return legacy()
 
     def _error_result(
         self,

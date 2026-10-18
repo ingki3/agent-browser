@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from contracts import ErrorCode, thresholds
 
 from browser.session_store import SessionStore
-from browser.workspace import DEFAULT_WORKSPACE, current_workspace
+from browser.workspace import DEFAULT_WORKSPACE, PENDING_WORKSPACE, current_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,10 @@ class BrowserCore:
         #: WS-57: 작업 공간 → 활성 탭 id. `_active_tab_id` 는 현재 작업 공간(ContextVar)의 값이다.
         self._active_by_ws: Dict[str, Optional[str]] = {}
         self._tab_counter = 0
+        #: WS-57 R1(R4): new_tab 이 새 페이지를 기다리는 중인 수 — 그 사이 context 'page' 이벤트로 먼저 들어온 탭은
+        #: 아직 주인이 정해지지 않은 탭(PENDING_WORKSPACE, 어느 작업 공간 목록에도 안 보임)이고 new_tab(부른 쪽)·
+        #: opener 의 'popup' 이벤트(연 탭의 주인)가 주인을 정한다 — 남의 새 탭이 잠깐 기본 작업 공간 탭으로 세지 않게.
+        self._creating_tabs = 0
         #: user-chrome: 우리가 띄운 Chrome(UserChrome)과 아직 탭으로 채택하지 않은 첫 페이지
         self._user_chrome: Any = None
         self._adoptable_page: Any = None
@@ -535,7 +539,9 @@ class BrowserCore:
             try:
                 # WS-57: 이벤트 문맥의 작업 공간은 믿을 수 없다(Playwright 연결 태스크의 문맥) — 일단 기본 작업
                 # 공간으로 두고, new_tab(부른 쪽)·opener 의 'popup' 이벤트(연 탭의 주인)가 바로잡는다.
-                self._register_page(profile_name, page, popup=True, owner=DEFAULT_WORKSPACE)
+                # WS-57 R1: new_tab 이 새 페이지를 기다리는 중이면 주인 미정(어느 작업 공간에도 안 보임)으로.
+                owner = PENDING_WORKSPACE if self._creating_tabs else DEFAULT_WORKSPACE
+                self._register_page(profile_name, page, popup=True, owner=owner)
             except Exception:  # noqa: BLE001 - 등록 실패로 브라우저 이벤트 처리를 막지 않는다
                 logger.warning("새 페이지 탭 등록 실패", exc_info=True)
 
@@ -645,7 +651,17 @@ class BrowserCore:
             adopt = self.is_user_chrome or self.is_persistent
             page = self._take_adoptable_page() if adopt else None
             if page is None:
-                page = await managed.context.new_page()
+                self._creating_tabs += 1
+                try:
+                    page = await managed.context.new_page()
+                finally:
+                    self._creating_tabs -= 1
+                    if not self._creating_tabs:
+                        # 기다리는 동안 들어온 새 페이지는 예전처럼 기본 작업 공간으로(await 없이 아래에서 이 호출의
+                        # 페이지는 부른 쪽 주인으로 바뀐다) — 팝업이면 opener 의 'popup' 이벤트가 그 주인으로 바꾼다.
+                        for other in self._tab_index.values():
+                            if other.workspace == PENDING_WORKSPACE:
+                                other.workspace = DEFAULT_WORKSPACE
 
         # context 'page' 이벤트가 먼저 등록했으면 그 탭을 그대로 쓴다(이중 등록 없음).
         tab = self._register_page(profile_name, page, popup=False)
@@ -727,6 +743,18 @@ class BrowserCore:
         """다른 작업 공간의 탭 수(목록에는 개수만 알린다 — 주소는 비노출)."""
         ws = current_workspace()
         return sum(1 for t in self._tab_index.values() if t.workspace != ws)
+
+    def workspace_page_count(self, pages: Any) -> int:
+        """pages(컨텍스트의 Page 들) 중 현재 작업 공간 몫의 수 — 다른 작업 공간·주인 미정 탭은 빼고, 관리 탭이
+        아닌 Page 는 센다(예전 len(context.pages) 와 같은 기준). 클릭 사후조건의 '새 탭' 신호가 남의 탭 생성을 내
+        효과로 세지 않게(WS-57 R1 R4)."""
+        ws = current_workspace()
+        n = 0
+        for page in pages:
+            tab = self._find_tab_by_page(page)
+            if tab is None or tab.workspace == ws:
+                n += 1
+        return n
 
     def workspace_active_tab(self, workspace: str) -> Optional[str]:
         return self._active_by_ws.get(workspace)

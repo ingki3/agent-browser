@@ -20,21 +20,41 @@ class LifecycleMixin:
     """BrowserMCPServer 의 수명주기·세션 연결·영속 프로필·닫힌 탭 복구 (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
 
     async def start(self) -> None:
-        """브라우저 세션과 파이프라인을 초기화한다."""
+        """브라우저 세션과 파이프라인을 초기화한다.
+
+        WS-57 R1(R6·R7): 단일 비행 — 동시에 들어온 첫 호출들은 같은 시작 하나를 기다린다(브라우저·검증 프록시
+        하나). 시작은 서버 수명 소유의 태스크라 기다리던 요청이 취소돼도(붙은 연결 끊김·notifications/cancelled)
+        멈추거나 되감지 않는다 — 요청 취소가 primary 의 프로필 잠금·브라우저를 건드리지 않는다. 실패하면 다음
+        호출이 다시 시도한다. close() 가 진행 중인 시작을 멈추고 정리한다.
+        """
         if self._started:
             return
-        from browser.workspace import DEFAULT_WORKSPACE, workspace_scope
+        task = self.__dict__.get("_start_task")
+        if task is None:
+            from browser.workspace import DEFAULT_WORKSPACE, workspace_scope
 
-        # WS-57: 어느 작업 공간의 호출이 처음 띄우든 첫 탭·디스패처·배경 태스크(Playwright 연결·인계 감시)는
-        # 기본 작업 공간 문맥에서 만든다 — 태스크는 만든 문맥을 물려받는다.
-        with workspace_scope(DEFAULT_WORKSPACE):
-            await self._start_session()
+            # WS-57: 어느 작업 공간의 호출이 처음 띄우든 첫 탭·디스패처·배경 태스크(Playwright 연결·인계 감시)는
+            # 기본 작업 공간 문맥에서 만든다 — 태스크는 만든 문맥을 물려받는다.
+            with workspace_scope(DEFAULT_WORKSPACE):
+                task = asyncio.get_running_loop().create_task(self._start_session())
+            self.__dict__["_start_task"] = task
+            task.add_done_callback(self._start_finished)
+        await asyncio.shield(task)
+
+    def _start_finished(self, task: "asyncio.Task[None]") -> None:
+        if self.__dict__.get("_start_task") is task:
+            self.__dict__["_start_task"] = None
+        if not task.cancelled():
+            task.exception()  # 기다리던 요청이 모두 취소됐어도 '회수되지 않은 예외' 경고를 남기지 않는다
 
     async def _start_session(self) -> None:
         from browser import BrowserCore
         from security.egress_runtime import EgressRuntime
 
         # WS-32: 영속 프로필이면 먼저 잠근다 — 다른 serve 가 쓰는 중이면 아무것도 띄우지 않고 거부.
+        # WS-57 R1(R7): 시작 실패 되감기는 **이 시작이 잡은** 잠금만 푼다 — run_stdio 가 서버 수명 동안 쥔 잠금은
+        # 서버가 끝날 때(close) 푼다(시작 실패 중에 다른 serve 가 같은 프로필을 잡지 않게).
+        held_before = self._profile_held()
         persistent = self.acquire_profile()
         if self.profile is not None and persistent is not None and self._headless_retry.path is None:
             # WS-47: --profile 이면 재시도 기억·쿠키 장부도 프로필 폴더에(0600). 없으면 메모리만.
@@ -51,7 +71,8 @@ class LifecycleMixin:
         try:
             await runtime.start()
         except BaseException:
-            self.release_profile()
+            if not held_before:
+                self.release_profile()
             raise
         self._egress_runtime = runtime
         try:
@@ -71,7 +92,8 @@ class LifecycleMixin:
             self._core = await core.start()
         except BaseException:
             await self._close_egress()
-            self.release_profile()
+            if not held_before:
+                self.release_profile()
             raise
         try:
             await self._init_session()
@@ -85,7 +107,8 @@ class LifecycleMixin:
                 logger.warning("시작 실패 뒤 브라우저 정리 실패", exc_info=True)
             self._core = None
             await self._close_egress()
-            self.release_profile()
+            if not held_before:
+                self.release_profile()
             raise
         self._started = True
         self.open_handoff()
@@ -121,6 +144,11 @@ class LifecycleMixin:
         self._profile_lock = serve_profile.acquire(self.profile, server_id=self.hub.server_id)
         return self._profile_lock.path
 
+    def _profile_held(self) -> bool:
+        """이미 프로필(또는 on-demand 임시 프로필) 잠금을 쥐고 있는가(run_stdio 가 먼저 잡은 경우)."""
+        lock = self._profile_lock if self.profile is not None else self._ephemeral_lock
+        return lock is not None and bool(getattr(lock, "held", False))
+
     def release_profile(self) -> None:
         lock, self._profile_lock = self._profile_lock, None
         if lock is not None:
@@ -155,7 +183,17 @@ class LifecycleMixin:
 
     async def _recover_closed_tab(self) -> None:
         """조작권 반납 때 에이전트 활성 탭이 살아 있는지 확인(NB-3). 사람이 닫았으면 남은 탭(없으면
-        새 탭)으로 바꾸고 알린다 — 닫힌 탭을 관찰해 PAGE_CRASHED 가 나지 않게."""
+        새 탭)으로 바꾸고 알린다 — 닫힌 탭을 관찰해 PAGE_CRASHED 가 나지 않게.
+        WS-57 R1: 반납은 브라우저 전체 사건 — 반납을 어느 작업 공간 문맥이 집었든 작업 공간마다 자기 탭을 본다.
+        알림(tab_closed_by_human)은 그 탭 주인 작업 공간에만 남는다."""
+        from browser.workspace import workspace_scope
+
+        for name in list(self._workspace_runtimes()):
+            with workspace_scope(name):
+                await self._recover_closed_tab_here()
+
+    async def _recover_closed_tab_here(self) -> None:
+        """현재 작업 공간의 _recover_closed_tab."""
         core, dispatcher = self._core, self._dispatcher
         ctx = getattr(dispatcher, "ctx", None)
         if core is None or ctx is None or not hasattr(core, "get_tab"):
@@ -371,6 +409,12 @@ class LifecycleMixin:
         on("close", _closed)
 
     async def close(self) -> None:
+        # WS-57 R1(R6): 진행 중인 시작(단일 비행)을 멈추고 끝날 때까지 기다린다 — 시작 중 만든 브라우저·프록시는
+        # 시작의 되감기가 닫고, 남은 것은 아래 정리가 닫는다.
+        start, self.__dict__["_start_task"] = self.__dict__.get("_start_task"), None
+        if start is not None and not start.done():
+            start.cancel()
+            await asyncio.wait({start}, timeout=10.0)
         # WS-52: no merge from a closing browser — every tail task is cancelled and joined (R2: none leaks).
         await self._headless_retry.aclose()
         await self._robots.close()  # WS-41: join background requests before closing their context

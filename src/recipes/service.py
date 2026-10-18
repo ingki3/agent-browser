@@ -65,8 +65,14 @@ class ServerHost:
         from interface.mcp_server import tool_name
 
         disp = self.server._dispatcher
+        scope = getattr(disp, "heal_disabled_scope", None)
+        if callable(scope):
+            # 재생은 찾은 그 요소만 — 비슷한 요소로 바꿔 누르지 않는다. WS-57 R1: 이 재생 호출 문맥에만(같은
+            # 디스패처를 쓰는 다른 동시 호출의 치유는 그대로, 안쪽 승인 호출이 끝나도 재생 중 금지는 유지).
+            with scope():
+                return await self.server.call_tool(tool_name(ActionType(action)), args)
         if disp is not None:
-            disp.heal_disabled = True  # 재생은 찾은 그 요소만 — 비슷한 요소로 바꿔 누르지 않는다
+            disp.heal_disabled = True
         try:
             return await self.server.call_tool(tool_name(ActionType(action)), args)
         finally:

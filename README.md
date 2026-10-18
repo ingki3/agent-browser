@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-5248개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+5290개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -763,6 +763,8 @@ agent-browser serve --profile private --browser on-demand --attach --workspace w
 - **따로인 것**: `browser_tab_control` list/switch/close(남의 탭은 `E_TAB_NOT_FOUND`, list 는 남의 탭을 `data.other_workspace_tabs` 개수로만), navigate·관찰 대상 탭, epoch, 레시피 궤적, 호출별 승인·판정 근거 상태. 마지막 자기 탭을 닫으면 빈 탭으로 바뀝니다(WS-50 규칙, 남의 탭에 영향 없음).
 - **함께인 것**: 쿠키·로그인, Egress 가드, 탭 상한(전체 10개), 창(on-demand 창 전환은 브라우저 재기동 — 모든 작업 공간 탭을 주인째 복원하고 각 epoch 를 올림), 사람 조작권(브라우저 전체), 승인 정책, 레시피 저장소.
 - 한 작업 공간만 쓰면(기존 설정) 동작·응답은 예전 그대로입니다(`other_workspace_tabs` 없음). 도구 스키마는 그대로입니다 — `workspace` 인자는 서버 instructions 한 줄로만 알립니다(스키마에 넣으면 tools/list 토큰 예산 2500 을 넘음, 실측 2654).
+- **브라우저 전체 사건의 보고·무효화(WS-57 R1)**: 창 전환(재기동) 보고 `data.window.tabs`(도구 결과·`control_wait`·`control_request`)는 부른 작업 공간의 탭만 싣고 다른 작업 공간은 `other_workspace_tabs` 개수로만 — 작업 공간마다 한 번씩 듣습니다. 사람이 닫은 탭 알림 `tab_closed_by_human` 은 그 탭 주인에게만. 사람 조작권 반납·사람이 창을 닫음·창 재기동은 **모든** 작업 공간의 epoch 를 올려 반납 전 `element_id`·승인 증표를 어디서도 다시 쓰지 못합니다. 클릭의 '새 탭' 효과는 자기 작업 공간 탭만 셉니다(남의 탭 생성은 효과가 아님). 자기 탭이 사람·사이트에 닫혔으면 남의 탭이 살아 있어도 다음 호출이 자기 새 탭으로 복구합니다(기본 작업 공간 포함). 승인 증표 호출의 치유 끄기는 호출 문맥 단위입니다(같은 작업 공간의 동시 호출이 서로 풀지 않음).
+- **시작·붙기 수명(WS-57 R1)**: 첫 동시 호출들은 브라우저·검증 프록시 시작 하나를 함께 기다립니다(단일 비행, 종료 때 진행 중 시작도 정리). 붙은 연결의 요청 취소·연결 종료는 그 시작을 멈추지 않고 primary 의 프로필 잠금을 풀지 않습니다(잠금은 primary 수명 소유 — 시작 실패 되감기도 시작이 잡은 잠금만 풂). 붙기 통로의 MCP 줄에는 길이 상한이 없습니다(stdio 와 같음, 악수 줄만 1KiB).
 
 ### 필요할 때만 창 (`serve --browser on-demand`)
 

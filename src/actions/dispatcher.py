@@ -24,9 +24,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -867,7 +869,29 @@ class ActionDispatcher:
         self._top_attribution: Optional[Dict[str, Any]] = None
         #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
         #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
-        self.heal_disabled = False
+        #: WS-57 R1(R2): 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는 동시 호출 하나가 끝나며
+        #: 다른 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로 두고, 켜고 끄기는 heal_disabled_scope().
+        self._heal_off: ContextVar[bool] = ContextVar(f"heal_disabled@{id(self):x}", default=False)
+
+    @property
+    def heal_disabled(self) -> bool:
+        """이 호출(태스크 문맥)에서 자가 치유가 꺼져 있는가."""
+        return self._heal_off.get()
+
+    @heal_disabled.setter
+    def heal_disabled(self, value: bool) -> None:
+        # 이 호출 문맥에만 적용된다(다른 동시 호출에는 보이지 않는다).
+        self._heal_off.set(bool(value))
+
+    @contextlib.contextmanager
+    def heal_disabled_scope(self) -> Any:
+        """이 블록(과 그 안에서 만든 하위 태스크) 동안 자가 치유를 끈다. 끝나면 들어오기 전 값으로 —
+        중첩(레시피 재생 안의 승인 호출)에서도 바깥 금지를 풀지 않는다."""
+        token = self._heal_off.set(True)
+        try:
+            yield
+        finally:
+            self._heal_off.reset(token)
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -886,6 +910,22 @@ class ActionDispatcher:
         return self._healing_successes / self._healing_attempts
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
+
+    async def _capture_state(self, page: Any, handle: Optional[ElementHandle] = None) -> Any:
+        """capture_state + 탭 수는 이 호출의 작업 공간 몫만(WS-57 R1 R4) — 같은 컨텍스트를 쓰는 다른 작업 공간이
+        그 사이 연 탭을 이 액션의 '새 탭' 효과로 세지 않는다. 작업 공간을 모르는 코어·탭 수를 못 읽은 경우는 그대로."""
+        state = await (capture_state(page, handle) if handle is not None else capture_state(page))
+        if not state.page_count:
+            return state
+        counter = getattr(getattr(self.ctx, "core", None), "workspace_page_count", None)
+        if callable(counter):
+            try:
+                n = counter(list(page.context.pages))
+            except Exception:  # noqa: BLE001 — 가짜 페이지/컨텍스트 없음: 예전 값
+                n = None
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                state.page_count = n
+        return state
 
     def _set_active_page(self, page: Any, tab_id: str) -> None:
         """탭 전환·생성·종료로 활성 페이지를 바꾼다 (WS-26b, 검증 NB-4).
@@ -1682,7 +1722,7 @@ class ActionDispatcher:
         if root is None:
             return None
         try:
-            state = await capture_state(root)
+            state = await self._capture_state(root)
         except Exception as exc:  # noqa: BLE001 — 문서 교체 중 등
             logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return None
@@ -1861,7 +1901,7 @@ class ActionDispatcher:
     ) -> Any:
         """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
-        before = await capture_state(self.ctx.page, handle)
+        before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
         # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
@@ -1916,7 +1956,7 @@ class ActionDispatcher:
         """[3] 사후 상태 읽기·늦은 효과 유예·팝업 반영(WS-48 분해). 반환: (후 상태, 최상위 후 상태) 또는 결과."""
         # --- [3] 사후조건 검증 ------------------------------------------------
         try:
-            after = await capture_state(self.ctx.page, handle)
+            after = await self._capture_state(self.ctx.page, handle)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise
@@ -1943,7 +1983,7 @@ class ActionDispatcher:
             ):
                 try:
                     await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     if root_before is not None:
                         root_after = await self._capture_root()
                 except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
@@ -1990,7 +2030,7 @@ class ActionDispatcher:
             if not top_weak_ok and self._top_attribution is not None:
                 # 관찰 창이 유예 대기를 겸했다 — 대상 문서의 늦은 효과를 다시 본다.
                 try:
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     post = verify_post_condition(
                         before,
                         after,
@@ -2046,7 +2086,7 @@ class ActionDispatcher:
                 healed=healed_flag,
             )
 
-        retry_after = await capture_state(self.ctx.page, handle)
+        retry_after = await self._capture_state(self.ctx.page, handle)
         retry_post = verify_post_condition(
             before,
             retry_after,
@@ -2554,7 +2594,7 @@ class ActionDispatcher:
                 error_message=f"좌표 ({x}, {y})가 뷰포트 {vw}x{vh} 밖입니다.",
             )
 
-        before = await capture_state(page)
+        before = await self._capture_state(page)
         watch = _NavWatch(page) if self.ctx.nav_settle else None
         try:
             await page.mouse.click(x, y, button=params.get("button", "left"))
@@ -2572,7 +2612,7 @@ class ActionDispatcher:
         if watch is not None:
             self._nav_info = await watch.settle()
         try:
-            after = await capture_state(page)
+            after = await self._capture_state(page)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise

@@ -17,6 +17,8 @@ from typing import Any, Iterator
 
 #: 작업 공간을 지정하지 않은 호출(기존 단일 세션 동작).
 DEFAULT_WORKSPACE = "default"
+#: 주인이 아직 정해지지 않은 탭(코어 내부 표시 — 이름 규칙에 맞지 않아 어떤 호출의 작업 공간과도 같지 않다).
+PENDING_WORKSPACE = "<pending>"
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 _CURRENT: ContextVar[str] = ContextVar("agent_browser_workspace", default=DEFAULT_WORKSPACE)

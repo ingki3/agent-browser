@@ -172,16 +172,15 @@ class WindowMixin:
                 w.state = target
                 w.error = ""
                 w.last_tabs = [] if headed else w.last_tabs
-                for engine in self._all_engines():  # WS-57: 모든 작업 공간의 관찰이 낡았다
-                    engine.bump_epoch("window_reopen")
+                self._bump_all_epochs("window_reopen")  # WS-57: 모든 작업 공간의 관찰이 낡았다
                 self._switch_seq += 1
                 info = dict(w.info(), reopened=True, reason=reason, switch_ms=ms,
                             tabs=tabs_info, skipped=skipped,
                             hint=HEADED_HINT if headed else HEADLESS_HINT)
                 if self._engine is not None:
                     info["snapshot_epoch"] = self._engine.epoch
-                self._last_window_result = info
-                self._window_unreported = True
+                self._last_window_result = info  # 복원 전체 기록(서버 내부) — 호출자 보고는 _window_view 로 거른다
+                self._mark_window_unreported()  # WS-57 R1: 작업 공간마다 한 번씩 알린다
                 self._sync_window()
                 if headed and self._control_banner:
                     await self._set_banner(self._control_banner)
@@ -264,8 +263,7 @@ class WindowMixin:
                     "hint": ("사람이 창을 닫았습니다 — 조작권을 에이전트에게 돌리고 headless 로 다시 열어 "
                              "마지막 탭을 복원했습니다. 다시 관찰하세요.")}
         self.hub.release_by_server()
-        if self._engine is not None:
-            self._engine.bump_epoch("window_closed_by_human")
+        self._bump_all_epochs("window_closed_by_human")  # WS-57 R1: 창 = 브라우저 전체
         self._control_banner = None
         _stderr_line("agent-browser serve: 사람이 창을 닫음 — headless 로 돌아갑니다")
         self._spawn_switch(False, "window_closed", snapshot=list(w.last_tabs))

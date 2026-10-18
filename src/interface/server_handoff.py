@@ -80,9 +80,9 @@ class HandoffMixin:
                 self._spawn_login()
             if event == "released":
                 self._release_unreported = True
-                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
-                if self._engine is not None:
-                    self._engine.bump_epoch("control_release")
+                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로. WS-57 R1(R3): 모든 작업 공간 —
+                # 반납을 어느 작업 공간 문맥이 먼저 집어도 반납 전 관찰·승인 근거는 어디서도 다시 쓰이지 않는다.
+                self._bump_all_epochs("control_release")
                 if self._window is not None:
                     # WS-34 D2: 창을 닫고 headless 로 다시 연다(sticky 면 창 유지). 탭은 다시 열려
                     # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
@@ -250,7 +250,7 @@ class HandoffMixin:
                         + ("브라우저를 닫았습니다 — 다음 도구 호출 때 headless 로 다시 엽니다. "
                            if self._window.state == "failed" else "")
                         + "잠시 뒤 다시 요청하거나 운영자에게 알리세요."),
-                    "data": {"window": window_out.get("window") or self._window.info()},
+                    "data": {"window": self._window_view(window_out.get("window") or self._window.info())},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
         out["login_hint"] = self._login_hint()
@@ -268,7 +268,7 @@ class HandoffMixin:
         _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         if window_out is not None:
-            out = dict(out, window=window_out["window"])
+            out = dict(out, window=self._window_view(window_out["window"]))
         return {"success": True, "data": out}
 
     async def _open_window_for_request(self) -> Dict[str, Any]:
@@ -370,7 +370,7 @@ class HandoffMixin:
             self._window_unreported = False
             out = dict(self._last_window_result)
             out.update(self._window.info())
-            return out
+            return self._window_view(out)  # WS-57 R1: 이 작업 공간 탭만(다른 작업 공간은 개수만)
         return dict(self._window.info(), reopened=False)
 
     async def _approval_wait(self, approval_id: str, timeout: float) -> Dict[str, Any]:

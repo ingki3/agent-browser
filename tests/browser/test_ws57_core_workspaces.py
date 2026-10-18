@@ -115,3 +115,41 @@ async def test_tab_limit_is_shared(fake_pw):  # noqa: F811
         with pytest.raises(BrowserCoreError) as e:
             await core.new_tab("mcp-session")
     assert e.value.code is ErrorCode.TAB_LIMIT_EXCEEDED
+
+
+async def test_page_created_for_another_workspace_is_never_counted_as_mine(fake_pw):  # noqa: F811
+    """WS-57 R1(R4): 다른 작업 공간의 new_tab 이 새 페이지를 기다리는 동안('page' 이벤트가 먼저 옴) 그 페이지는
+    기본 작업 공간의 탭·탭 수(클릭 사후조건의 '새 탭' 신호)에 잡히지 않는다."""
+    import asyncio
+
+    core = await _core()
+    a = await core.new_tab("mcp-session")
+    ctx = core.context_for("mcp-session")
+    gate, emitted = asyncio.Event(), asyncio.Event()
+
+    async def slow_new_page():
+        page = FakePage()
+        ctx.emit_page(page)
+        emitted.set()
+        await gate.wait()
+        return page
+
+    ctx.new_page = slow_new_page
+
+    async def watch_creates():
+        with workspace_scope("watch"):
+            return await core.new_tab("mcp-session")
+
+    task = asyncio.create_task(watch_creates())
+    await asyncio.wait_for(emitted.wait(), 5)
+    assert core.workspace_page_count(ctx.pages) == 1
+    assert [t.tab_id for t in core.tabs()] == [a.tab_id]
+    gate.set()
+    b = await task
+    assert core.workspace_page_count(ctx.pages) == 1
+    with workspace_scope("watch"):
+        assert core.workspace_page_count(ctx.pages) == 1
+        assert [t.tab_id for t in core.tabs()] == [b.tab_id]
+    # 아무도 만들지 않을 때 생긴 페이지(팝업)는 예전처럼 기본 작업 공간 몫
+    ctx.emit_page(FakePage())
+    assert core.workspace_page_count(ctx.pages) == 2

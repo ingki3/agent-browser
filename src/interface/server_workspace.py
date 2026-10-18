@@ -51,6 +51,10 @@ class WorkspaceRuntime:
     cdp: Any = None
     #: 레시피 기록(궤적·구간) — 작업 공간마다 따로, 저장소(recipes.json)는 기본 작업 공간 것을 함께 쓴다.
     recipes: Any = None
+    #: WS-57 R1: 사람이 닫은 이 작업 공간 탭 알림(tab_closed_by_human) — 주인 작업 공간에만 알린다.
+    tab_notice: Optional[Dict[str, Any]] = None
+    #: WS-57 R1: 이 작업 공간이 아직 듣지 못한 창 전환(재기동) — 작업 공간마다 한 번씩 알린다.
+    window_unreported: bool = False
 
 
 def _runtime_field(field: str) -> property:
@@ -93,6 +97,8 @@ class WorkspaceMixin:
     _cdp = _runtime_field("cdp")
     _pending_gate_basis = _call_field("_pending_gate_basis")
     _used_approval = _call_field("_used_approval")
+    _tab_notice = _runtime_field("tab_notice")
+    _window_unreported = _runtime_field("window_unreported")
 
     @property
     def _recipes(self) -> Any:
@@ -155,6 +161,33 @@ class WorkspaceMixin:
     def _all_engines(self) -> list:
         return [r.engine for r in self._workspace_runtimes().values() if r.engine is not None]
 
+    def _bump_all_epochs(self, why: str) -> None:
+        """브라우저 전체 사건(사람 조작권 반납·사람이 창을 닫음·창 재기동): 모든 작업 공간의 관찰·승인 근거를
+        무효로 — 사건을 어느 작업 공간 문맥이 먼저 처리해도 결과가 같다(WS-57 R1 R3)."""
+        for engine in self._all_engines():
+            engine.bump_epoch(why)
+
+    def _mark_window_unreported(self) -> None:
+        """창 전환(재기동)을 모든 작업 공간이 한 번씩 듣게 한다(각자 자기 탭 복원 내역만, WS-57 R1)."""
+        for runtime in self._workspace_runtimes().values():
+            runtime.window_unreported = True
+
+    def _window_view(self, info: Any) -> Any:
+        """호출자에게 보낼 창 보고(WS-57 R1 R1): 복원 내역(tabs)은 이 작업 공간 탭만, 다른 작업 공간은 개수만.
+        서버가 쥔 원본(_last_window_result·last_tabs — 복원용 전체 기록)은 그대로 둔다."""
+        if not isinstance(info, dict) or not isinstance(info.get("tabs"), list):
+            return info
+        ws = current_workspace()
+        tabs = info["tabs"]
+        mine = [t for t in tabs if not isinstance(t, dict) or t.get("workspace", DEFAULT_WORKSPACE) == ws]
+        out = dict(info, tabs=mine)
+        others = len(tabs) - len(mine)
+        if others:
+            out["other_workspace_tabs"] = others
+        if "snapshot_epoch" in out and self._engine is not None:
+            out["snapshot_epoch"] = self._engine.epoch  # 전환을 일으킨 작업 공간이 아니라 이 작업 공간의 epoch
+        return out
+
     def _forget_workspace_handles(self) -> None:
         """창 전환으로 브라우저를 다시 열었다: 기본 외 작업 공간의 페이지·CDP·디스패처는 옛 브라우저 것 —
         다음 호출 입구(_ensure_workspace)가 복원된 자기 활성 탭으로 다시 만든다. epoch(엔진)은 유지."""
@@ -170,12 +203,42 @@ class WorkspaceMixin:
 
         return self._error_result(action, ErrorCode.TAB_NOT_FOUND, str(exc))
 
+    def _workspace_lock(self, name: str) -> Any:
+        import asyncio
+
+        locks = self.__dict__.setdefault("_ws_locks", {})
+        lock = locks.get(name)
+        if lock is None:
+            lock = locks[name] = asyncio.Lock()
+        return lock
+
     async def _ensure_workspace(self) -> None:
         """기본 외 작업 공간의 첫 호출: 자기 탭(같은 영속 컨텍스트 — 로그인 공유)·엔진·디스패처를 만든다.
-        자기 활성 탭이 사라졌으면(사람·사이트가 닫음) 남은 자기 탭(없으면 새 탭)으로 바꾸고 epoch 를 올린다."""
+        자기 활성 탭이 사라졌으면(사람·사이트가 닫음) 남은 자기 탭(없으면 새 탭)으로 바꾸고 epoch 를 올린다.
+        WS-57 R1: 같은 작업 공간의 동시 첫 호출은 직렬화(탭 하나, R6). 기본 작업 공간도 자기 탭이 외부에서 닫혔는데
+        다른 작업 공간 탭이 살아 있으면(브라우저가 꺼진 것으로 보지 않는다) 같은 경로로 복구한다(R5)."""
         name = current_workspace()
+        if self._core is None:
+            return
+        if name == DEFAULT_WORKSPACE and not self._default_needs_recovery():
+            return
+        async with self._workspace_lock(name):
+            await self._ensure_workspace_locked(name)
+
+    def _default_needs_recovery(self) -> bool:
+        """기본 작업 공간의 디스패처 탭이 닫혔고, 다른 작업 공간 탭이 살아 있는가(그 경우만 — 혼자일 때의 기존
+        경로[on-demand 브라우저 복구·기존 오류]는 그대로)."""
         core = self._core
-        if name == DEFAULT_WORKSPACE or core is None:
+        ctx = getattr(self._dispatcher, "ctx", None)
+        counter = getattr(core, "foreign_tab_count", None)
+        if ctx is None or not callable(counter) or not counter():
+            return False
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
+        return core.get_tab(getattr(ctx, "tab_id", None)) is None or _closed(page)
+
+    async def _ensure_workspace_locked(self, name: str) -> None:
+        core = self._core
+        if core is None or (name == DEFAULT_WORKSPACE and not self._default_needs_recovery()):
             return
         from actions import ActionDispatcher, DispatchContext
         from perception import PerceptionEngine
@@ -195,7 +258,7 @@ class WorkspaceMixin:
             tab = tabs[0] if tabs else await core.new_tab("mcp-session")
             core.set_active_tab(tab.tab_id)
         ctx = getattr(runtime.dispatcher, "ctx", None)
-        if ctx is not None and ctx.tab_id == tab.tab_id and runtime.page is not None:
+        if ctx is not None and ctx.tab_id == tab.tab_id and runtime.page is not None and not _closed(ctx.page):
             return
         cdp = await core.new_cdp_session(tab.tab_id)
         if ctx is not None:

@@ -221,20 +221,44 @@ class AttachListener:
             pass
 
 
+#: 붙은 연결의 MCP 스트림을 읽는 덩어리 크기(줄 길이 상한이 아니다).
+READ_CHUNK = 65536
+
+
 class StreamLines:
-    """asyncio StreamReader → mcp stdio_server 의 stdin(줄 단위 비동기 반복)."""
+    """asyncio StreamReader → mcp stdio_server 의 stdin(줄 단위 비동기 반복).
+
+    WS-57 R1(R8): StreamReader.readline() 은 연결의 기본 한도(64KiB)를 넘는 줄에서 ValueError 를 내 붙은 세션을
+    끝냈다(큰 정상 요청 → 붙은 serve 종료·'첫 serve 가 끝나' 오진). stdio(mcp stdio_server 의 텍스트 줄 반복)처럼
+    줄 길이 상한 없이 덩어리로 읽어 줄을 나눈다. 악수 줄의 1KiB 상한(HANDSHAKE_MAX)은 그대로다.
+    """
 
     def __init__(self, reader: asyncio.StreamReader) -> None:
         self._reader = reader
+        self._buf = bytearray()
+        self._scanned = 0
 
     def __aiter__(self) -> "StreamLines":
         return self
 
     async def __anext__(self) -> str:
-        line = await self._reader.readline()
-        if not line:
-            raise StopAsyncIteration
-        return line.decode("utf-8", errors="replace")
+        while True:
+            i = self._buf.find(b"\n", self._scanned)
+            if i >= 0:
+                line = bytes(self._buf[: i + 1])
+                del self._buf[: i + 1]
+                self._scanned = 0
+                return line.decode("utf-8", errors="replace")
+            self._scanned = len(self._buf)
+            chunk = await self._reader.read(READ_CHUNK)
+            if not chunk:
+                if self._buf:  # 마지막 줄(줄바꿈 없음) — readline 과 같은 끝 처리
+                    line = bytes(self._buf)
+                    self._buf.clear()
+                    self._scanned = 0
+                    return line.decode("utf-8", errors="replace")
+                raise StopAsyncIteration
+            self._buf.extend(chunk)
 
 
 class StreamText:
