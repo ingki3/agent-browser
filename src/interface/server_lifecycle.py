@@ -23,7 +23,14 @@ class LifecycleMixin:
         """브라우저 세션과 파이프라인을 초기화한다."""
         if self._started:
             return
+        from browser.workspace import DEFAULT_WORKSPACE, workspace_scope
 
+        # WS-57: 어느 작업 공간의 호출이 처음 띄우든 첫 탭·디스패처·배경 태스크(Playwright 연결·인계 감시)는
+        # 기본 작업 공간 문맥에서 만든다 — 태스크는 만든 문맥을 물려받는다.
+        with workspace_scope(DEFAULT_WORKSPACE):
+            await self._start_session()
+
+    async def _start_session(self) -> None:
         from browser import BrowserCore
         from security.egress_runtime import EgressRuntime
 
@@ -197,6 +204,16 @@ class LifecycleMixin:
 
     async def _wire_session(self, restore: Optional[List[Dict[str, Any]]] = None,
                             cookies: Optional[List[Dict[str, Any]]] = None) -> tuple:
+        """WS-57: 연결은 기본 작업 공간 몫(첫 탭·디스패처) — 다른 작업 공간의 호출이 전환을 일으켜도 같다.
+        다른 작업 공간의 옛 핸들은 버리고(다음 호출이 복원된 자기 탭으로 다시 만든다) 탭은 주인째 복원한다."""
+        from browser.workspace import DEFAULT_WORKSPACE, workspace_scope
+
+        self._forget_workspace_handles()
+        with workspace_scope(DEFAULT_WORKSPACE):
+            return await self._wire_default_session(restore, cookies)
+
+    async def _wire_default_session(self, restore: Optional[List[Dict[str, Any]]],
+                                    cookies: Optional[List[Dict[str, Any]]]) -> tuple:
         """열린 브라우저에 서버 연결을 단다 — 처음 시작과 창 전환 뒤(WS-34)가 **같은 경로**.
 
         컨텍스트 채택 → 문서 상태 추적(PageDocumentStatus) → 첫 탭(about:blank)·CDP·디스패처 → Egress
@@ -260,18 +277,34 @@ class LifecycleMixin:
 
         from security.secret_registry import register_urls
 
-        order = sorted(snapshot, key=lambda t: not t.get("active"))
+        from browser.workspace import DEFAULT_WORKSPACE, workspace_scope
+
+        # WS-57: 기본 작업 공간 탭 먼저(첫 탭 자리), 다른 작업 공간 탭은 주인째 그 작업 공간 문맥에서 새 탭으로.
+        order = sorted(snapshot, key=lambda t: (t.get("workspace", DEFAULT_WORKSPACE) != DEFAULT_WORKSPACE,
+                                                not t.get("active")))
         register_urls(str(item.get("url") or "") for item in order)  # WS-51 R3 (d): 보관한 탭 원문 주소
         tabs_info: List[Dict[str, Any]] = []
         skipped = 0
+        first_used = False
+        ws_active: Dict[str, str] = {}
         for item in order:
             url = str(item.get("url") or "")
+            ws = str(item.get("workspace") or DEFAULT_WORKSPACE)
             if not on_demand.restorable_url(url):
                 skipped += 1
                 continue
-            tab = first if not tabs_info else await self._core.new_tab("mcp-session")
+            if ws == DEFAULT_WORKSPACE and not first_used:
+                tab, first_used = first, True
+            else:
+                with workspace_scope(ws):
+                    tab = await self._core.new_tab("mcp-session")
+            is_active = ws not in ws_active
+            if is_active:
+                ws_active[ws] = tab.tab_id
             entry: Dict[str, Any] = {"tab_id": tab.tab_id, "was": item.get("tab_id"), "url": url,
-                                     "active": not tabs_info, "restored": False}
+                                     "active": is_active, "restored": False}
+            if ws != DEFAULT_WORKSPACE:
+                entry["workspace"] = ws
             egress = self._egress
             up_before = egress.upstream_total if egress is not None else 0
             try:
@@ -294,6 +327,9 @@ class LifecycleMixin:
                 entry["error"] = safe_reason(exc)
             tabs_info.append(entry)
         self._core.set_active_tab(first.tab_id)
+        for ws, tab_id in ws_active.items():
+            if ws != DEFAULT_WORKSPACE:
+                self._core.set_workspace_active_tab(ws, tab_id)
         return tabs_info, skipped
 
     async def _session_cookies(self) -> List[Dict[str, Any]]:
@@ -338,8 +374,7 @@ class LifecycleMixin:
         # WS-52: no merge from a closing browser — every tail task is cancelled and joined (R2: none leaks).
         await self._headless_retry.aclose()
         await self._robots.close()  # WS-41: join background requests before closing their context
-        if self._recipes is not None:
-            self._recipes.close()  # 모아 둔 실행 통계 마지막 쓰기(WS-38)
+        self._close_recipes()  # 모아 둔 실행 통계 마지막 쓰기(WS-38) — 작업 공간마다(WS-57)
         task, self._hub_task = self._hub_task, None
         if task is not None:
             task.cancel()

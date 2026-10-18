@@ -55,7 +55,7 @@ class HandoffMixin:
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
         if events and self._recipes is not None and ("taken" in events or "released" in events):
-            self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
+            self._reset_all_recipes("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38, 모든 작업 공간 WS-57)
         for event in events:
             if event == "cookie_sites":
                 from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
@@ -156,7 +156,7 @@ class HandoffMixin:
                 self.hub.secret_wanted = True  # Human login contents stay out of observations.
                 self.hub._write_control()
                 if self._recipes is not None:
-                    self._recipes.reset("human_control")
+                    self._reset_all_recipes("human_control")
                 if not await self._drain_calls():
                     raise ValueError("진행 중인 도구 호출이 끝나지 않았습니다.")
                 if self.hub.login is not job:
@@ -278,7 +278,9 @@ class HandoffMixin:
         w = self._window
         assert w is not None
         w.take_sticky_for_request()
-        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in self._core.tabs()] \
+        from interface.server_window import _all_tabs
+
+        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in _all_tabs(self._core)] \
             if self._core is not None else []
         if w.state == "headed":
             self._sync_window()

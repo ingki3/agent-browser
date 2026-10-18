@@ -15,6 +15,7 @@ from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
 from interface.server_envelope import cap_result_size
+from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
 
@@ -61,8 +62,14 @@ class ToolsMixin:
         from security.public_url import public_payload
 
         with self.tool_entry(name):
-            await self._retry_settled()
-            return public_payload(await self._server_tool_payload(name, arguments))
+            try:
+                # WS-57: 작업 공간 인자(계약 밖) — 레시피만 쓰고, 조작권 도구는 브라우저 전체 단위라 무시한다.
+                arguments, workspace = pop_workspace_arg(arguments)
+            except WorkspaceNameError as exc:
+                return {"success": False, "error_code": ErrorCode.TAB_NOT_FOUND.value, "error_message": str(exc)}
+            with self._call_scope(workspace):
+                await self._retry_settled()
+                return public_payload(await self._server_tool_payload(name, arguments))
 
     async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """call_server_tool 본문(가리기 전 원문 응답)."""
@@ -71,6 +78,8 @@ class ToolsMixin:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
         if name == RECIPE_TOOL:
+            if self._started:
+                await self._ensure_workspace()
             return await self._recipe_tool(args)
         if name == YOUTUBE_TOOL:
             return await self._youtube_tool(args)
@@ -176,8 +185,14 @@ class ToolsMixin:
         # WS-52 R1: anything that may change the page (login included) closes the settle tail
         # synchronously, before the first await (tool_entry).
         with self.tool_entry(name):
-            await self._retry_settled()
-            return await self._route_tool_call(name, arguments)
+            try:
+                # WS-57: 작업 공간 인자(계약 밖 서버 메타) — 계약 입력 검증 전에 떼어 낸다.
+                arguments, workspace = pop_workspace_arg(arguments)
+            except WorkspaceNameError as exc:
+                return self._workspace_error(action_from_tool(name) or ActionType.OBSERVE_PAGE, exc)
+            with self._call_scope(workspace):
+                await self._retry_settled()
+                return await self._route_tool_call(name, arguments)
 
     async def _route_tool_call(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
         from interface.on_demand import SWITCH_WAIT_S
@@ -203,6 +218,8 @@ class ToolsMixin:
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
             action = action_from_tool(name)
+            if action is ActionType.TAB_CONTROL and result.success and "tabs" in result.data:
+                self._note_other_workspaces(result)  # WS-57: 다른 작업 공간 탭은 개수만
             if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
                 result.data["login_hint"] = self._login_hint()
             if action is not None:
@@ -288,6 +305,7 @@ class ToolsMixin:
 
         if not self._started:
             await self.start()
+        await self._ensure_workspace()  # WS-57: 기본 외 작업 공간은 자기 탭·엔진·디스패처
 
         params: Dict[str, Any] = dict(arguments or {})
         # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.

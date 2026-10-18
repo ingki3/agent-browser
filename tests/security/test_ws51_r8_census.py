@@ -94,6 +94,8 @@ ATTRS = {
                                    "값 원문 포함 문장 정제). 순수 신호 코드 원소는 R9 census(test_ws51_r9_census.py — "
                                    "CONTROL_LIST_VOCABULARY signals) 몫"),
     ("unresolved", "__name__"): (FREE, "좌표 판정 불가 사유 문장"),
+    ("workspace", "workspace"): (FREE, "WS-57 interface/server_lifecycle.py 창 전환 복원 window.tabs[].workspace — 작업 "
+                                         "공간 이름(사용자·연결이 정함, 면제 없음)"),
     # --- PAGE
     ("message", "message"): (PAGE, "actions/dispatcher.py data.dialogs[].message — 페이지가 쓴 대화상자 문구"),
     ("name", "element_name"): (PAGE, "security/hitl.py gate_basis.name — 요소 접근성 이름"),

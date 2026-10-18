@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-5145개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+5248개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -735,7 +735,7 @@ agent-browser serve --profile work
 - **이름**: 영문 소문자·숫자·하이픈 1~32자(`[a-z0-9-]`). 경로 문자(`/`·`..`)는 거부합니다.
 - **보관 위치**: `~/.agent-browser/profiles/serve-NAME/`(폴더 권한 700). 루트 폴더는 우리가 새로 만들 때만 700 으로 만들고, 이미 있는 루트(예: `AGENT_BROWSER_PROFILE_ROOT=$HOME`)의 권한은 바꾸지 않습니다. 사이트별 프로필 폴더와 같은 루트이며 `serve-` 앞머리로 구분합니다. 루트는 환경변수 `AGENT_BROWSER_PROFILE_ROOT`로 바꿀 수 있습니다(테스트는 임시 폴더를 씁니다). 평소 Chrome 프로필 아래와 user-chrome 전용 폴더(`~/.agent-browser/chrome-profile`) 아래는 거부합니다.
 - **보안 정책은 그대로**: Egress 검증 프록시(사설망 기본 차단·CONNECT 만·fail-closed), QUIC 끔, WebRTC 비프록시 UDP 차단, route 가드, 문서 상태·차단 신호, HITL·승인 증표·조작권·안내 띠가 영속 모드에서도 같은 경로로 설치됩니다.
-- **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다.
+- **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다. 두 serve 가 `--attach` 이면 거부 대신 붙습니다(아래 '함께 쓰기' 절).
 - **잠금 파일을 직접 지우지 마십시오**: 프로필 폴더 안 `.agent-browser-serve.lock` 을 지우면 같은 프로필의 동시 사용을 막지 못할 수 있습니다(잠금은 파일 단위라, 지운 뒤 새로 만든 파일은 다른 서버의 잠금과 별개가 됩니다). 서버가 죽으면 잠금은 OS 가 풀어 주므로 지울 필요가 없습니다. 폴더를 없애려면 `agent-browser profile remove` 를 쓰십시오.
 - **`--browser user-chrome`과 함께 쓸 수 없습니다** — user-chrome 은 이미 전용 영속 프로필(`--chrome-profile`)을 씁니다.
 - **에이전트에게 보이는 것**: `browser_control_status`의 `data.profile = {name, persistent: true}`(경로는 싣지 않음). headless + `--profile` 서버에서 로그인이 필요해 `browser_control_request`를 부르면 "창 없음" 안내에 `--browser human --profile NAME`으로 한 번 로그인하라는 문구가 붙습니다.
@@ -747,6 +747,22 @@ agent-browser profile remove work     # 확인 프롬프트(사용 중이면 거
 ```
 
 **한계.** ① **쿠키는 평문**입니다 — Playwright Chromium 프로필은 OS 키체인 암호화를 쓰지 않아 폴더 권한 700 으로만 보호됩니다. 같은 OS 사용자로 도는 프로그램은 읽을 수 있습니다. ② **사이트가 세션 쿠키(만료 없음)만 주면 유지되지 않습니다** — Chromium 은 재시작 때 세션 쿠키를 버립니다(실측: Mock 사이트의 영속 쿠키는 남고 세션 쿠키는 사라짐). 로그인할 때 '로그인 상태 유지'를 체크하십시오. 쿠키 수명을 늘리거나 바꾸는 조작은 하지 않습니다(사이트가 준 그대로). ③ 서버를 SIGTERM·SIGINT·stdin 종료로 끝내면 브라우저를 닫아 쿠키를 디스크에 씁니다. SIGKILL 같은 강제 종료는 직전 변경이 남지 않을 수 있습니다. ④ 영속 프로필에는 캐시·서비스워커 등록도 남습니다(서비스워커 요청도 검증 프록시를 거칩니다).
+
+### 대화와 정기 작업이 같은 프로필을 함께 쓰기 (`serve --attach`, 작업 공간)
+
+같은 serve 를 대화와 정기 작업(cron 감시 등)이 동시에 쓰면 예전에는 활성 탭·`snapshot_epoch`·탭 닫기가 서로에게 샜습니다(실사용: 감시 작업이 대화가 사람에게 열어 준 창의 마지막 탭을 닫음). 이제 호출자마다 **작업 공간**(자기 탭 묶음·자기 활성 탭·자기 관찰 epoch·자기 레시피 궤적)을 갖고, 로그인(쿠키)은 같은 영속 컨텍스트라 공유합니다.
+
+- **연결 단위(권장)**: 같은 `--profile` 의 serve 를 둘 띄우되 둘 다 `--attach` 를 붙입니다. 먼저 뜬 쪽이 브라우저를 띄우고, 나중 쪽은 잠금 오류 대신 그 serve 에 붙습니다(프로필 폴더 안 0700 디렉터리의 0600 소켓, 같은 OS 사용자만 — 연결마다 상대 uid 확인, 심볼릭 링크 거부). `--workspace NAME` 이 그 연결의 기본 작업 공간입니다(없으면 첫 serve 는 `default`, 붙은 쪽은 `attach-N`). 첫 serve 가 끝나면 붙은 serve 는 stderr 한 줄 + 종료 코드 3 으로 끝납니다(클라이언트가 다시 띄우면 새로 붙거나 직접 브라우저를 띄움). 붙은 serve 의 브라우저 옵션은 쓰이지 않습니다(첫 serve 것).
+
+```text
+agent-browser serve --profile private --browser on-demand --attach                      # 대화
+agent-browser serve --profile private --browser on-demand --attach --workspace watch    # 감시(cron)
+```
+
+- **호출 단위**: 한 연결을 여럿이 나눠 쓰면 도구 인자 `workspace`(영문 소문자·숫자·하이픈 1~32자, 계약 밖 서버 메타)를 매 호출에 붙입니다. 연결 기본값보다 우선합니다. 규칙 위반 이름은 `E_TAB_NOT_FOUND` 로 거부(브라우저 무접촉).
+- **따로인 것**: `browser_tab_control` list/switch/close(남의 탭은 `E_TAB_NOT_FOUND`, list 는 남의 탭을 `data.other_workspace_tabs` 개수로만), navigate·관찰 대상 탭, epoch, 레시피 궤적, 호출별 승인·판정 근거 상태. 마지막 자기 탭을 닫으면 빈 탭으로 바뀝니다(WS-50 규칙, 남의 탭에 영향 없음).
+- **함께인 것**: 쿠키·로그인, Egress 가드, 탭 상한(전체 10개), 창(on-demand 창 전환은 브라우저 재기동 — 모든 작업 공간 탭을 주인째 복원하고 각 epoch 를 올림), 사람 조작권(브라우저 전체), 승인 정책, 레시피 저장소.
+- 한 작업 공간만 쓰면(기존 설정) 동작·응답은 예전 그대로입니다(`other_workspace_tabs` 없음). 도구 스키마는 그대로입니다 — `workspace` 인자는 서버 instructions 한 줄로만 알립니다(스키마에 넣으면 tools/list 토큰 예산 2500 을 넘음, 실측 2654).
 
 ### 필요할 때만 창 (`serve --browser on-demand`)
 
