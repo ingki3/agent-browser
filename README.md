@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-5145개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+5243개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -674,6 +674,26 @@ headless 전용 서버나 화면 없는 환경에서는 실패합니다. 맥 앞
 두 경로 모두 사이트 목록 12KB 상한을 넘으면 `truncated: true` 또는 잘림 안내가 나옵니다.
 등록 도메인 집계는 흔한 공용 접미사만 포함한 근사입니다. 그 밖은 호스트가 덜 묶이거나 더
 묶일 수 있으며 표시용일 뿐 보안 판정에 쓰지 않습니다.
+
+**평소 Chrome 의 로그인 쿠키 가져오기(WS-59, 사람 전용).** 평소 Chrome 에 이미 로그인한 사이트를 골라
+그 쿠키만 봇 프로필로 한 번 복사합니다. 맥 앞에서 사람이 직접 실행하는 명령이며 에이전트(MCP)에는 없습니다.
+
+```text
+agent-browser profile import-cookies --profile private --site example.com --dry-run
+agent-browser profile import-cookies --profile private --site example.com --site example.co.kr
+```
+
+- 실행하면 macOS 키체인 **'Chrome Safe Storage' 허용 창**이 뜹니다(쿠키 값을 풀기 위해). '허용'을 누르세요 —
+  거부하면 아무것도 가져오지 않습니다. `--chrome-profile 'Profile 1'`·`--chrome-dir PATH` 로 다른 Chrome 프로필을 고릅니다.
+- `--site` 는 등록 도메인(`example.com`)이며 그 하위 도메인 쿠키까지 가져옵니다. `evil-example.com` 같은 닮은
+  이름은 제외하고, 공용 접미사(`github.io`·`co.uk`)·하위 도메인(`www.example.com`)·IP 는 거부합니다.
+- 평소 Chrome 의 `Cookies` DB 파일만 임시 폴더(0700)로 복사해 읽고 바로 지웁니다(Chrome 이 켜져 있어도 됨).
+  비밀번호·기록 등 다른 파일은 읽지 않고, 평소 프로필에 연결하지도 않습니다.
+- 그 프로필을 `serve` 가 쓰는 중이면 거부합니다(서버를 끝내고 실행). 만료·secure·HttpOnly·SameSite 는 그대로
+  넣고, 만료된 쿠키·세션 쿠키(브라우저를 닫으면 사라짐)·알 수 없는 암호 형식은 건너뛰고 이유별 개수만 알려 줍니다.
+- 출력은 사이트별 쿠키 **개수·이름**만입니다. 값·키체인 비밀은 화면·로그에 나오지 않습니다. `--dry-run` 은 쓰지 않습니다.
+- 가져온 사이트는 프로필의 로그인 기록(`login_ledger.json`, 0600)에 `chrome_import` 로 남습니다.
+- 주의: 가져온 뒤에는 봇이 그 계정으로 행동할 수 있습니다. 꼭 필요한 사이트만 고르세요.
 
 로그인이 풀리면 맥 앞에서 다시 실행해야 합니다. 세션 쿠키만 발급하거나 매번 휴대폰 인증을
 요구하는 사이트에는 미리 로그인 방식이 맞지 않을 수 있습니다. 밖에서 급하면 Chrome 원격
