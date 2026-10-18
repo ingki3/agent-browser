@@ -1421,6 +1421,11 @@ class ActionDispatcher:
             looks_like_key = bool(SECRET_KEY_PATTERN.match(text))
             return params, (False if looks_like_key else None)
 
+        # WS-55 R1 B1: 해석한 실제 값은 도구가 비밀로 아는 값이다 — 페이지가 그 값을 주소(허용 목록 키 `?sortKey=` 포함)·
+        # 제목에 반사해도 응답에서 가려지게 입력 전에 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([resolution.value])
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
         # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
@@ -2211,7 +2216,15 @@ class ActionDispatcher:
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
             # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
-            await target.type(params.get("text", ""), timeout=5000)
+            text = params.get("text", "")
+            if not params.get(_CONCEAL_KEY) and await self.is_sensitive_field(handle):
+                # WS-55 R1 B1: 비밀번호 칸에 친 값 — **입력 시점**(치기 전) 판정이라 입력 뒤 페이지가 type 을 바꿔도
+                # 흔들리지 않는다. SecretStore 해석 값은 _resolve_secret 에서 이미 등록했다. 일반 칸의 값(검색어)은
+                # 에이전트가 자기 호출 인자로 이미 아는 값이라 등록하지 않는다(과잉 가림 방지).
+                from security.secret_registry import register_secret_values
+
+                register_secret_values([text])
+            await target.type(text, timeout=5000)
             if params.get("press_enter"):
                 await target.press("Enter", timeout=5000)
 

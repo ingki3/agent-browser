@@ -559,6 +559,16 @@ def register_urls(urls: Iterable[Any]) -> None:
         return
 
 
+def register_secret_values(values: Iterable[Any]) -> None:
+    """도구가 주소 밖에서 비밀로 아는 값(WS-55 R1 B1 — SecretStore 해석 값·민감 입력칸에 친 값·로그인 칸 자격증명)을
+    등록한다. 판정·상한은 주소 값과 같다(`_eligible` — 4자 미만·4~7자 순수 알파벳·도구 어휘 제외, 값 단위 LRU).
+    값은 메모리에만 있고, 예외를 내지 않는다(등록 실패가 입력을 막지 않는다)."""
+    try:
+        REGISTRY.add_values([v for v in values if isinstance(v, str) and v])
+    except Exception:  # noqa: BLE001
+        return
+
+
 def mask_registered(text: str) -> str:
     return REGISTRY.mask(text)
 

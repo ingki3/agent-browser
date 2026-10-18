@@ -121,6 +121,14 @@ _COMPOUNDS = frozenset({
     "authcode", "passcode", "otpcode", "samlresponse", "samlrequest",
     # WS-55: 개인 1회용일 수 있는 할인 코드 — 소문자 붙여쓰기도 camelCase(`promoCode`)와 같은 판정(가림).
     "promocode", "couponcode",
+    # WS-55 R1 B3: 커서·페이지 토큰(다음 페이지를 여는 불투명 값 — 세션·계정에 묶이기도 한다). camelCase(`pageKey`)는 ③,
+    # `page_key` 는 ② 로 이미 가렸고 소문자·대문자 붙여쓰기(`pagekey`·`PAGEKEY`)만 공개되던 철자 차이를 정규형으로 없앤다.
+    # `*token` 꼴(pagetoken·continuationtoken)은 ① 이 낱말 사이 구분자 없는 철자를 이미 가리고, 글자마다 `_`·`-` 를 끼운
+    # 철자(`p_a_g_e_t_o_k_e_n`)까지 같은 판정이 되게 정규형 정확 일치로도 둔다(① 을 정규형으로 넓히면 `auto_kenya` 같은
+    # 키가 `token` 을 품게 되어 과잉 가림 — 정확 일치만).
+    "pagekey", "nextpagekey", "cursorkey", "nextkey", "pagingkey", "continuationkey", "resumekey",
+    "startkey", "exclusivestartkey", "lastevaluatedkey",
+    "pagetoken", "nextpagetoken", "continuationtoken", "cursortoken", "nexttoken", "pagingtoken",
 })
 #: 비밀이 아닌 붙여 쓴 키 이름(WS-55 — WS-51 NB-2 과잉 가림). 정규형(`_secret_key`: 퍼센트 디코딩·NFKC·casefold 뒤 `_`·`-` 제거)의
 #: **정확 일치**만 — 낱말 휴리스틱(②③)보다 먼저 본다. 정렬·국가/지역·우편·상태/오류·언어·통화·상품 분류 같은
@@ -331,6 +339,26 @@ def _public_fragment(fragment: str, depth: int, sink: _Sink = None) -> str:
     return fragment
 
 
+def _public_matrix(prefix: str, has_netloc: bool, depth: int, sink: _Sink = None) -> str:
+    """경로 matrix 매개변수(`/p;jsessionid=…;v=2/q;sortKey=…`, WS-55 R1 B2) — 세그먼트마다 첫 `;` 뒤 조각을 쿼리와
+    같은 `_public_param` 으로 판정·등록한다(같은 함수라 secret_values·주소 칸·자유 문장·로그가 갈라지지 않는다).
+    세그먼트 이름(첫 `;` 앞)·호스트·구분자는 그대로. 호스트가 있으면 그 뒤 첫 `/` 부터가 경로다."""
+    start = 0
+    if has_netloc:
+        auth = prefix.find("//")
+        start = prefix.find("/", auth + 2) if auth >= 0 else -1
+        if start < 0:
+            return prefix  # 경로 없음(`https://h;x=1` — 호스트 쪽은 판정하지 않는다)
+    head, path = prefix[:start], prefix[start:]
+    segments = path.split("/")
+    for i, seg in enumerate(segments):
+        if ";" not in seg:
+            continue
+        pieces = seg.split(";")
+        segments[i] = ";".join([pieces[0]] + [_public_param(p, depth, sink) for p in pieces[1:]])
+    return head + "/".join(segments)
+
+
 def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
     if len(url) > MAX_URL_CHARS:
         return URL_MASK
@@ -348,6 +376,8 @@ def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
             user, _, password = netloc.rsplit("@", 1)[0].partition(":")
             sink.append(password or user)
         prefix = prefix.replace("//" + netloc, "//" + netloc.rsplit("@", 1)[1], 1)
+    if ";" in prefix:
+        prefix = _public_matrix(prefix, bool(netloc), depth, sink)
     out = prefix
     if has_query:
         out += "?" + _public_query(query, depth, sink)
