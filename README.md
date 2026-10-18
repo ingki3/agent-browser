@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-5348개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+5372개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 ### 3. LLM 연동 (선택)
 
@@ -322,8 +322,8 @@ click         ->  element_id="@e3", epoch=0
 agent-browser는 **캡차 자동 풀이·Cloudflare/Akamai 등의 확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
 
 **헤드리스 이름 재시도(WS-44)** — headless `navigate`가 HTTP 403 + 짧은 generic 차단 본문을 받았고,
-robots 조회가 확정되어 그 경로를 `*` 기준 허용하며 그 출처에 유효한 쿠키가 없거나 **전부 우리 재시도가 생기게 한
-쿠키(장부)와 같을 때만**, 출처(scheme·host·port)당 **한 번 시도**해 같은 URL을 다시 엽니다. 성공하면 그 출처를
+robots 조회가 확정되어 그 경로를 `*` 기준 허용하며 **로그인 기록이 없고 장부 밖 HttpOnly 키가 없을 때만**(WS-58 — 아래),
+출처(scheme·host·port)당 **한 번 시도**해 같은 URL을 다시 엽니다. 성공하면 그 출처를
 기억하며, 다음 `navigate`는 첫 요청부터 창 모드 이름으로 엽니다(`--profile` 없으면 서버 메모리만, 있으면 아래 영속).
 매번 headless·기능 켬·robots 일반 허용 확정·쿠키 조건을 다시 확인합니다.
 조건이 깨지면 기억은 유지하되 원래 이름을 보내며, 조건이 다시 충족되면 기억을 재사용합니다.
@@ -337,7 +337,7 @@ Client Hints의 headless 브랜드만 제거해 같은 버전 창 모드의 순�
 `navigator.webdriver`·JS UA·플러그인·지문은 건드리지 않습니다 — 바꾸는 것은 **이름·Client Hints** 뿐이고, 성공한 재시도·기억
 재사용 뒤 **최대 10초 동안 그 탭의 쿠키 쓰기를 관찰**합니다(WS-52 R3, 숨기지 않고 `data.identity.cookie_write_observer`로 공개 — 아래).
 이후 지연 로드 하위 자원과 JS의 `navigator.userAgent`는 원래 값입니다.
-robots 금지·조회 불가·쿠키 있음·알려진 확인 화면·401(로그인)·429(속도 제한)은 재시도 대상이 아닙니다.
+robots 금지·조회 불가·로그인 기록 있음·장부 밖 HttpOnly 키 있음·알려진 확인 화면·401(로그인)·429(속도 제한)은 재시도 대상이 아닙니다.
 `cf-mitigated` 헤더(값 무관) 또는 `server: cloudflare`가 있는 403도 확인 화면으로 보아 재시도하지 않습니다.
 재시도 URL에서 fragment를 제거하며, 문서 요청이 나가지 않으면 실패 재시도로 표시하거나 출처 예약을 소진하지 않습니다.
 재시도도 같은 MCP 관문(egress·robots·IPI·레시피)을 거치며, 레시피에는 최초 이동 전 상태와
@@ -357,8 +357,9 @@ remembered: true}`가 붙으며, 그 요청이 403이면 `retry_failed: true`도
 **쿠키 장부·영속(WS-47)** — 재시도(첫 재시도·기억 재사용 모두)가 성공한 그 `navigate` 동안 그 출처에 새로 생기거나
 값이 바뀐 쿠키를 "우리가 생기게 한 쿠키"로 장부에 적습니다(이름·domain·path·값 지문만 — 지문은 프로필별 무작위
 32바이트 키의 HMAC-SHA256, 값 원문·평문 해시는 저장하지 않음). 그 출처 쿠키가 전부 장부와 같으면(같은 이름·domain·path·
-값 지문) 쿠키 없음과 같게 봅니다. 새 쿠키가 생기거나 값이 바뀌면(로그인 등) 원래 이름을 보냅니다. 재시도 `navigate` 진행
-중 새로 생긴 쿠키는 그 `navigate`가 끝나 장부에 들어가기 전까지 남은 요청에 원래 이름을 보냅니다.
+값 지문) 쿠키 없음과 같게 봅니다. WS-58 이후 판정은 장부 밖 **HttpOnly 키**가 생길 때만 원래 이름을 보냅니다(비 HttpOnly
+추가·변경, 장부 HttpOnly 키의 값 회전은 막지 않음). 재시도 `navigate` 진행 중 새로 생긴 HttpOnly 키는 그 `navigate`가 끝나
+장부에 들어가기 전까지 남은 요청에 원래 이름을 보냅니다.
 `--profile NAME`이면 출처별 상태(succeeded·failed)·장부·갱신 시각을 프로필 폴더의 `headless_retry.json`(0600, 임시 파일 +
 rename)에 둡니다. 상한은 출처 1,000개·출처당 쿠키 50개·파일 8 MiB(읽기 상한과 같음)이며 넘치면 오래된 것부터
 버립니다(기억을 잃는 방향). 파일이 손상되었거나(유한하지 않은 갱신 시각 포함) 읽을 수 없으면 기억 없이 시작합니다(첫
@@ -407,10 +408,12 @@ egress 프록시는 실제로 연결할 해석된 IP·포트가 자기 리스너
 키의 값만 바뀐 경우(`__cf_bm`·`AWSALB` 처럼 서버가 값을 돌림)는 막지 않습니다 — 장부 키는 값을 따라갑니다. 로그인 기록을
 읽지 못하면(손상) 재시도하지 않고 `login_ledger_unreadable` 을 알립니다(파일은 덮어쓰지 않음).
 로그인 기록에 남는 사건(값·이름·경로 없이 origin 만): `agent-browser login` 작업을 사람이 끝냄·자격증명 플레이스홀더 입력
-성공·`login_with_handoff(ledger_profile=…)` 성공(`login_flow`), 사람 조작권 구간(take~release)의 비밀번호 칸 제출·새 HttpOnly 쿠키
-(그 쿠키 도메인)·`secret_wanted` 인계(`human_control`), `profile import-cookies`(`chrome_import`). 조작권 구간의 비밀번호 제출은
-CDP 격리 world(페이지 스크립트와 전역을 공유하지 않음)의 DOM 이벤트 감시로 알아보며 반납 때 걷습니다 — shadow DOM 안 칸·다른
-프로세스 iframe 은 보지 못합니다(이때도 규칙 (b)는 그대로). WS-52 꼬리·관찰기는 유지하되 판정에서는 `js` 표시 키가 HttpOnly 로
+성공·`login_with_handoff(ledger_profile=…)` 성공(`login_flow`), 사람 조작권 구간(take~release)의 POST/PUT 요청(그 대상 origin)·
+쿠키 추가·값 변경(그 쿠키 도메인)·비밀번호 칸 제출·`secret_wanted` 인계(`human_control`), `profile import-cookies`(`chrome_import`).
+자격증명 입력·`secret_wanted` 는 에이전트의 활성 frame(실제 입력 문서) origin 을 기록합니다. 조작권 구간의 요청은 브라우저
+Network 계층(CDP `Network.requestWillBeSent`, 메서드·origin 만 — 본문 미열람)으로 보므로 페이지가 DOM 이벤트 전파를 끊어도
+숨길 수 없습니다(보수 방향: 사람 조작 중 POST·쿠키 변화는 로그인으로 간주, 과차단 허용). CDP 격리 world 의 DOM 이벤트
+감시는 보조입니다. 감시 설치가 실패하면 그 구간에 방문한 origin 전부를 기록합니다(fail-closed). WS-52 꼬리·관찰기는 유지하되 판정에서는 `js` 표시 키가 HttpOnly 로
 바뀌는 경우를 가르는 보조로만 쓰입니다(비 HttpOnly 쿠키는 이제 어차피 허용).
 
 **재시도 장부의 안정화 꼬리(WS-52)** — 실사용(2026-10-17 GeekNews)에서 재시도로 200을 받던 사이트가 이후 늘

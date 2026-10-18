@@ -132,12 +132,13 @@ async def first_retry(server, site, path="/one"):
     return first
 
 
-async def assert_native_next(server, site, change, path="/next"):
+async def assert_native_next(server, site, change, path="/next", recorded=False):
     """WS-58 (intended change): the WS-52 invariant is checked on the ledger (the change was not
-    merged — strict WS-52 comparison); the next visit follows WS-58 rule (b)."""
+    merged — strict WS-52 comparison); the next visit follows WS-58 rule (b), or rule (a) when the
+    change happened under human control (WS-58 R1: recorded as a login)."""
     from ws58_helpers import assert_unmerged_next
 
-    await assert_unmerged_next(server, site, change, navigate, path)
+    await assert_unmerged_next(server, site, change, navigate, path, recorded=recorded)
     assert len(site.received(path)) == 1
 
 
@@ -222,7 +223,8 @@ async def test_human_control_during_tail_is_never_merged(site, handoff):
             hub.login = None
         await asyncio.sleep(0.6)
         assert server._headless_retry._tail is None
-        await assert_native_next(server, site, "new_cookie")
+        # WS-58 R1 (intended change): a cookie change while the human holds control is a login record.
+        await assert_native_next(server, site, "new_cookie", recorded=handoff == "take_release")
 
 
 @requires_chromium

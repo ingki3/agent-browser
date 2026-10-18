@@ -1,21 +1,22 @@
 """WS-58 — 사람 조작권(control take~release) 동안 생긴 로그인 사건을 알아본다.
 
-사람이 창에서 직접 로그인하면 도구가 그 사실을 모른다. 조작권 구간 동안만 다음 둘을 본다:
+사람이 창에서 직접 로그인하면 도구가 그 사실을 모른다. 조작권 구간 동안 다음을 본다(보수 방향 — 사람 조작 중의
+POST·쿠키 변화는 로그인으로 간주한다, 과차단은 허용):
 
-1. **비밀번호 칸 제출** — 각 탭의 문서에 *격리 world*(페이지 스크립트와 전역을 공유하지 않는 CDP isolated world)
-   로 작은 감시 스크립트를 넣는다. DOM 이벤트(capture)만 듣고, 값이 들어 있는 ``input[type=password]`` 가 있는
-   폼 제출·버튼 클릭·비밀번호 칸 Enter 가 있으면 그 문서의 origin 만 바인딩으로 보고한다(값·이름은 보내지 않는다).
-   페이지는 격리 world 의 함수·바인딩을 볼 수 없어 보고를 위조할 수 없다. 이후 문서(같은 탭의 이동)에는
-   ``Page.addScriptToEvaluateOnNewDocument(worldName)`` 로 들어간다. 조작권이 끝나면 스크립트·바인딩·세션을 걷는다.
-   한계: shadow DOM 안 비밀번호 칸, 설치 전에 끝난 제출, 다른 프로세스 iframe(OOPIF)은 보지 못한다.
-2. **새 서버 전용(HttpOnly) 쿠키** — 조작권을 가져갈 때의 쿠키 키(name/domain/path)와 반납할 때를 비교해
-   새로 생긴(또는 HttpOnly 로 바뀐) HttpOnly 키의 *쿠키 도메인*을 기록 대상으로 둔다. 비밀번호 제출이 있었으면
-   그 구간에 새로 생기거나 값이 바뀐 쿠키 도메인 전부를 기록한다(로그인 하위 도메인이 상위 도메인에 쿠키를
-   심는 경우 — 기록 범위는 '그 호스트와 하위').
+1. **본문을 싣는 요청(POST/PUT)** — 컨텍스트의 ``request`` 사건(Playwright 가 브라우저 CDP Network 계층
+   ``Network.requestWillBeSent`` 로 받는 것 — 모든 탭·iframe·팝업, 문서·fetch·XHR 공통)으로 메서드와 대상 origin
+   만 본다(본문·주소 경로·머리는 읽지도 저장하지도 않는다). 페이지 스크립트는 DOM 이벤트 전파를 끊을 수 있어도
+   이미 나간 요청을 이 계층에서 지울 수 없다(WS-58 R1 B1 — window capture ``stopImmediatePropagation`` 우회).
+2. **쿠키 저장소 변화** — 조작권을 가져갈 때의 쿠키(name/domain/path → 값 지문)와 반납할 때를 비교해 새로 생기거나
+   값이 바뀐(또는 HttpOnly 로 바뀐) 쿠키의 *쿠키 도메인*을 기록 대상으로 둔다(이름·값은 남기지 않는다).
+3. **비밀번호 칸 제출(보조)** — 각 탭의 문서에 *격리 world* 로 작은 감시 스크립트를 넣어, 값이 든
+   ``input[type=password]`` 가 있는 폼 제출·버튼 클릭·Enter 를 보고받는다(실제 요청 없는 가짜 이벤트도 기록 쪽).
+   페이지가 이벤트를 숨길 수 있으므로 1·2 의 보조일 뿐이다.
 
-결과는 origin 집합(쿠키 도메인은 Secure 면 https, 아니면 http — 판정은 scheme 을 보지 않는다). 기록·판정은
-browser.login_records 몫이다. 감시 설치·해제 실패는 조용히 넘어간다 — 이 감시는 기록을 *더할* 뿐, 판정 규칙 (b)
-(새 HttpOnly 키 거부)는 이 감시와 무관하게 늘 적용된다.
+감시 설치가 실패하면(요청 사건 등록 실패, 탭의 CDP 세션 불가, 쿠키 기준점 읽기 실패) 그 구간은 **fail-closed** —
+조작권 동안 방문한(문서를 연) origin 전부를 기록한다. 결과는 origin 집합(쿠키 도메인은 Secure 면 https, 아니면
+http — 판정은 scheme 을 보지 않는다). 기록·판정은 browser.login_records 몫이다. 판정 규칙 (b)(새 HttpOnly 키
+거부)는 이 감시와 무관하게 늘 적용된다.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 STEP_TIMEOUT_S = 2.0
 #: 한 조작권 구간에서 받는 보고 상한(넘으면 더 받지 않는다 — 이미 받은 것은 남는다).
 MAX_REPORTS = 64
+#: 본문을 싣는 요청 — 로그인 제출로 간주한다(메서드·origin 만 본다).
+BODY_METHODS = frozenset({"POST", "PUT"})
 
 CookieKey = Tuple[str, str, str]
 
@@ -78,6 +81,13 @@ def cookie_origin(cookie: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _origin(url: Any) -> Optional[str]:
+    try:
+        return login_ledger.normalize_origin(str(url or ""))
+    except login_ledger.LedgerError:
+        return None  # about:blank·data:·blob: 등 — 기록할 origin 이 아니다
+
+
 def _snapshot(cookies: Any) -> Dict[CookieKey, Tuple[str, bool]]:
     out: Dict[CookieKey, Tuple[str, bool]] = {}
     for c in cookies or []:
@@ -95,7 +105,13 @@ class ControlLoginWatch:
         self.binding = "abw" + secrets.token_hex(8)
         #: 비밀번호 칸 제출이 보고된 origin.
         self.submitted: Set[str] = set()
-        #: secret_wanted 구간에 사람이 보던(에이전트 활성 탭) origin.
+        #: 본문을 싣는 요청(POST/PUT)이 간 origin(Network 계층).
+        self.posted: Set[str] = set()
+        #: 이 구간에 문서를 연 origin — 감시가 불완전(degraded)할 때 fail-closed 로 기록한다.
+        self.visited: Set[str] = set()
+        #: 감시 설치 일부가 실패했는가(요청 사건·CDP 세션·쿠키 기준점).
+        self.degraded = False
+        #: secret_wanted 구간에 사람이 보던(에이전트 활성 frame) origin.
         self.secret_origins: Set[str] = set()
         self.baseline: Optional[Dict[CookieKey, Tuple[str, bool]]] = None
         self._contexts: list = []
@@ -114,8 +130,9 @@ class ControlLoginWatch:
         if self.baseline is None:
             try:
                 self.baseline = _snapshot(await context.cookies())
-            except Exception:  # noqa: BLE001 - 기준점이 없으면 쿠키 비교는 하지 않는다(판정 규칙 b 는 그대로)
+            except Exception:  # noqa: BLE001 - 기준점이 없으면 지금 쿠키 전부가 '새 쿠키'로 보인다 + fail-closed
                 self.baseline = {}
+                self.degraded = True
         if context not in self._contexts:
             self._contexts.append(context)
 
@@ -127,11 +144,52 @@ class ControlLoginWatch:
                 task.add_done_callback(self._pending.discard)
 
             try:
+                context.on("request", self._on_request)
                 context.on("page", opened)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 - 요청 신호를 받을 수 없다 → 방문 origin 전부 기록(fail-closed)
+                self.degraded = True
+        self._note_pages(context)
         for page in list(getattr(context, "pages", []) or []):
             await self._attach(page)
+
+    def _on_request(self, request: Any) -> None:
+        """컨텍스트 요청 사건 — 메서드·대상 origin 만 본다(본문·경로·머리 미열람)."""
+        if self.closed:
+            return
+        try:
+            method = str(request.method or "").upper()
+            url = request.url
+            navigation = bool(request.is_navigation_request())
+        except Exception:  # noqa: BLE001 - 요청을 읽지 못함: 신호를 잃었으니 fail-closed
+            self.degraded = True
+            return
+        origin = _origin(url)
+        if origin is None:
+            return
+        if method in BODY_METHODS:
+            self.posted.add(origin)
+        if navigation:
+            self.visited.add(origin)
+
+    def note_visited(self, url: Any) -> None:
+        """사람이 보던 문서(fail-closed 기록 후보)."""
+        origin = _origin(url)
+        if origin is not None and not self.closed:
+            self.visited.add(origin)
+
+    def mark_degraded(self) -> None:
+        """감시를 이 구간에 걸 수 없었다(서버 쪽 실패) — 반납 때 방문 origin 전부 기록."""
+        self.degraded = True
+
+    def _note_pages(self, context: Any) -> None:
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:  # noqa: BLE001
+            return
+        for page in pages:
+            self.note_visited(getattr(page, "url", ""))
+            for frame in list(getattr(page, "frames", []) or []):
+                self.note_visited(getattr(frame, "url", ""))
 
     async def _attach(self, page: Any) -> None:
         if self.closed or page in self._pages:
@@ -144,7 +202,8 @@ class ControlLoginWatch:
         self._pages[page] = (None, None)
         try:
             session = await asyncio.wait_for(page.context.new_cdp_session(page), STEP_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 - 설치 실패: 이 탭은 쿠키 비교만
+        except Exception:  # noqa: BLE001 - 설치 실패: 이 구간은 방문 origin 전부 기록(fail-closed)
+            self.mark_degraded()
             return
         self._pages[page] = (session, None)
 
@@ -207,11 +266,21 @@ class ControlLoginWatch:
     # -- 끝 -----------------------------------------------------------------
 
     async def finish(self, context: Any) -> Dict[str, str]:
-        """감시를 걷고 기록할 origin → 사건 이름(``password_submit``·``server_cookie``·``secret_handoff``)."""
+        """감시를 걷고 기록할 origin → 사건 이름(``network_request``·``password_submit``·``cookie_change``·
+        ``secret_handoff``·``watch_unavailable``)."""
+        if context is not None:
+            self._note_pages(context)
         self.closed = True
         for task in list(self._pending):
             task.cancel()
+        for ctx in self._contexts:
+            try:
+                ctx.remove_listener("request", self._on_request)
+            except Exception:  # noqa: BLE001 - 닫힌 컨텍스트
+                pass
         out: Dict[str, str] = {}
+        for origin in self.posted:
+            out.setdefault(origin, "network_request")
         for origin in self.submitted:
             out.setdefault(origin, "password_submit")
         for origin in self.secret_origins:
@@ -219,8 +288,9 @@ class ControlLoginWatch:
         if context is not None and self.baseline is not None:
             try:
                 cookies = list(await context.cookies())
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 - 반납 때 쿠키를 못 읽음: fail-closed
                 cookies = []
+                self.degraded = True
             now = _snapshot(cookies)
             for cookie in cookies:
                 key = (str(cookie.get("name", "")), str(cookie.get("domain", "")), str(cookie.get("path") or "/"))
@@ -228,10 +298,13 @@ class ControlLoginWatch:
                 before = self.baseline.get(key)
                 new_server = http_only and (before is None or not before[1])
                 changed = before is None or before[0] != digest
-                if new_server or (self.submitted and changed):
+                if new_server or changed:
                     origin = cookie_origin(cookie)
                     if origin is not None:
-                        out.setdefault(origin, "server_cookie")
+                        out.setdefault(origin, "cookie_change")
+        if self.degraded:
+            for origin in self.visited:
+                out.setdefault(origin, "watch_unavailable")
         for page in list(self._pages):
             await self._detach(page)
         return out

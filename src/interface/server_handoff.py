@@ -140,6 +140,18 @@ class HandoffMixin:
         page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
         return str(getattr(page, "url", "") or "")
 
+    def _agent_input_url(self) -> str:
+        """입력 사건(자격증명 치환·secret_wanted)의 대상 문서 — 에이전트의 *활성 frame*(switch_frame 뒤면 그 iframe).
+
+        디스패처가 비밀 치환 허용을 판단하는 문서(``ctx.page``)와 같다. ``_agent_page_url`` 의 root 우선 의미는
+        그대로 둔다(WS-58 R1 B2)."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None) or getattr(ctx, "root_page", None) or self._page
+        try:
+            return str(getattr(page, "url", "") or "")
+        except Exception:  # noqa: BLE001 - 떨어진 frame
+            return ""
+
     async def _login_watch_tick(self) -> None:
         """사람이 조작 중이면 현재 컨텍스트의 모든 탭에 감시를 건다(on-demand 창 전환 뒤 새 컨텍스트 포함)."""
         from interface.handoff import HOLDER_HUMAN
@@ -155,10 +167,13 @@ class HandoffMixin:
         if watch is None or self.hub.holder != HOLDER_HUMAN or not self._started or self._core is None:
             return
         if self.hub.secret_wanted:
-            watch.note_secret(self._agent_page_url())
+            watch.note_secret(self._agent_input_url())
+        watch.note_visited(self._agent_page_url())
+        watch.note_visited(self._agent_input_url())
         try:
             await watch.ensure(self._core.context_for("mcp-session"))
-        except Exception:  # noqa: BLE001 - 감시는 기록을 더할 뿐 — 실패해도 조작권 흐름은 그대로
+        except Exception:  # noqa: BLE001 - 감시를 걸 수 없음: 조작권 흐름은 그대로, 반납 때 방문 origin 전부 기록
+            watch.mark_degraded()
             logger.debug("조작권 로그인 감시 실패", exc_info=True)
 
     async def _login_watch_finish(self) -> None:

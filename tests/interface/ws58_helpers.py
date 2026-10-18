@@ -43,14 +43,23 @@ def ws58_blocking(srv, url, changed):
     return [e for e, h in changed if h and (_key(e) not in by_key or by_key[_key(e)].get("js"))]
 
 
-async def assert_unmerged_next(srv, site, change, navigate, path="/next"):
-    """WS-52 불변식(엄격 대조로 change 가 남아 있음 = 합치지 않음) + WS-58 판정에 맞는 다음 방문."""
+async def assert_unmerged_next(srv, site, change, navigate, path="/next", recorded=False):
+    """WS-52 불변식(엄격 대조로 change 가 남아 있음 = 합치지 않음) + WS-58 판정에 맞는 다음 방문.
+
+    recorded: 그 변화가 사람 조작권 구간에 생겨 로그인 기록(human_control)이 된 경우(WS-58 R1 — 조작권 중 쿠키
+    변화는 로그인으로 간주) — 다음 방문은 규칙 (a) ``login_recorded``."""
     kind, changed = await strict_drift(srv, site.url)
     assert kind == change, (kind, change)
     blocking = ws58_blocking(srv, site.url, changed)
     keys = {_key(e) for e in srv._headless_retry.ledger.get(site.url, [])}
+    assert srv._headless_retry.logins.covers(site.url) is recorded
     result = await navigate(srv, site.url + path)
-    if blocking:
+    if recorded:
+        assert result.data["last_http_status"] == 403, result.data
+        assert "identity" not in result.data
+        assert result.data["retry_skipped"] == skip_reason("login_recorded")
+        assert site.headless(path)
+    elif blocking:
         detail = "new_cookie" if any(_key(e) not in keys for e in blocking) else "known_value_changed"
         assert result.data["last_http_status"] == 403, result.data
         assert "identity" not in result.data
