@@ -238,7 +238,12 @@ def _cmd_import(args: argparse.Namespace) -> int:
 
 def run(args: argparse.Namespace) -> int:
     if args.profile_action == "import-cookies":
-        return _cmd_import(args)
+        try:
+            return _cmd_import(args)
+        except Exception as exc:  # noqa: BLE001 - 최외곽: 원 문구·traceback 에 경로·값이 있을 수 있다(R2 B2)
+            print("agent-browser profile import-cookies: 오류: 예상하지 못한 오류로 중단했습니다"
+                  f"({type(exc).__name__}).", file=sys.stderr)
+            return 2
     if args.profile_action == "sites":
         from browser.serve_profile import ProfileError, bound_cookie_sites, cookie_sites
         from interface.handoff import display_safe

@@ -15,7 +15,8 @@
 위 규칙은 읽기·쓰기 양쪽에서 검사하고, 어기면 LedgerError(fail-closed).
 
 안전: 봇 프로필 루트(프로필의 부모 폴더)·프로필 폴더·장부 파일 중 하나라도 심볼릭 링크면 읽기·쓰기 모두 거부
-(루트 위는 검사하지 않는다 — serve_profile.prepare 와 같은 기준점), 쓰기는 같은 폴더 임시 파일(0600) → fsync → rename(원자적).
+(루트 위는 검사하지 않는다 — serve_profile.prepare 와 같은 기준점), 쓰기는 같은 폴더 임시 파일(0600) → 전체 쓰기(짧은 쓰기 반복) → fsync → rename(원자적).
+열기·읽기·쓰기·정리의 OS 오류는 모두 비밀 없는 LedgerError(원 문구의 경로를 내보내지 않는다).
 깨진 파일은 빈 기록으로 보지 않고 LedgerError — 판정하는 쪽이 보수적으로 처리하게 하고, 덮어써서 기록을 잃지
 않는다. 상한 MAX_ORIGINS 를 넘으면 오래된(at 작은) origin 부터 잊는다.
 """
@@ -137,15 +138,19 @@ def load(profile: Path) -> Dict[str, Entry]:
     except OSError:
         raise LedgerError("로그인 기록 파일을 열 수 없습니다(심볼릭 링크·권한).") from None
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
-            raise LedgerError("로그인 기록 파일이 일반 파일이 아니거나 너무 큽니다.")
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            raw = fh.read(MAX_BYTES + 1)
-    finally:
-        if fd >= 0:
-            os.close(fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+                raise LedgerError("로그인 기록 파일이 일반 파일이 아니거나 너무 큽니다.")
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                raw = fh.read(MAX_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    except OSError:
+        # 원 문구에는 경로(프로필 이름)가 들어 있다 — 비밀 없는 고정 문구로 닫는다(R2 B2).
+        raise LedgerError("로그인 기록 파일을 읽지 못했습니다(입출력 오류).") from None
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -175,19 +180,39 @@ def record(profile: Path, origins: Iterable[str], *, source: str, at: Optional[f
         current = dict(ordered[len(current) - MAX_ORIGINS:])
     body = json.dumps({"version": VERSION, "origins": current}, ensure_ascii=True, indent=1).encode("ascii")
     tmp = profile / f".{LEDGER_FILE}.{secrets.token_hex(6)}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+    # 모든 OS 오류(생성·권한·쓰기·fsync·close·replace·정리)는 비밀 없는 LedgerError — 원 문구에 경로가 있다(R2 B2).
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
+    except OSError:
+        raise LedgerError("로그인 기록 임시 파일을 만들지 못했습니다(권한·공간 확인).") from None
+    replaced = False
     try:
         try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, body)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, _path(profile))
-    except OSError:
-        raise LedgerError("로그인 기록을 쓰지 못했습니다.") from None
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, body)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, _path(profile))
+            replaced = True
+        except OSError:
+            raise LedgerError("로그인 기록을 쓰지 못했습니다.") from None
     finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+        if not replaced:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise LedgerError("로그인 기록 임시 파일을 지우지 못했습니다.") from None
+
+
+def _write_all(fd: int, body: bytes) -> None:
+    """body 전체가 쓰일 때까지 반복한다(짧은 쓰기). 진전이 없으면 LedgerError — 호출자는 교체하지 않는다(R2 B3)."""
+    view = memoryview(body)
+    while view:
+        n = os.write(fd, view)
+        if not isinstance(n, int) or n <= 0:
+            raise LedgerError("로그인 기록을 끝까지 쓰지 못했습니다.")
+        view = view[n:]

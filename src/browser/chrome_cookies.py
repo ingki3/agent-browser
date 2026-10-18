@@ -346,12 +346,22 @@ def _copy_nofollow(src: Path, dst: Path) -> str:
                 if not chunk:
                     break
                 digest.update(chunk)
-                os.write(out, chunk)
+                _write_all(out, chunk)
         finally:
             os.close(out)
     finally:
         os.close(fd)
     return digest.hexdigest()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """data 전체가 쓰일 때까지 반복한다(짧은 쓰기). 진전이 없으면 사본이 불완전하므로 거부(R2 B3)."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if not isinstance(n, int) or n <= 0:
+            raise CookieImportError("Chrome 쿠키 DB 사본을 끝까지 쓰지 못했습니다.")
+        view = view[n:]
 
 
 def _hash_file(src: Path) -> Optional[str]:
@@ -533,10 +543,12 @@ class ValueGuard:
     전역 레지스트리(WS-51, 값 256개 LRU)는 쿠키가 많으면 앞 값을 잊는다. 이 객체는 이번 import 의 값만 상한 없이
     기억한다(같은 판정 규칙을 쓰려고 SecretRegistry 를 **별도 인스턴스**로 쓴다 — 전역 상한·정책은 그대로):
     ≥ 8자는 부분 일치, 4~7자(순수 알파벳 제외)는 경계 일치, 도구 어휘·식별자 형식은 제외.
+    그 등록 제외는 이 집합의 **정확 일치**에는 상속하지 않는다(R2 B1): 읽은 값(빈 값 제외) 중 하나와 이름 전체가
+    정확히 같으면 짧은 값·순수 알파벳·도구 식별자형이어도 그 이름을 가린다. 부분 일치는 위 규칙 그대로.
     값은 밖으로 내보내지 않는다(repr 은 개수만).
     """
 
-    __slots__ = ("_reg",)
+    __slots__ = ("_reg", "_exact")
 
     def __init__(self, values: Iterable[str]) -> None:
         from security.secret_registry import SecretRegistry
@@ -544,6 +556,7 @@ class ValueGuard:
         unique = list(dict.fromkeys(v for v in values if isinstance(v, str)))
         self._reg = SecretRegistry(cap=max(1, len(unique)), max_chars=sys.maxsize)
         self._reg.add_values(unique)
+        self._exact = frozenset(v for v in unique if v)
 
     def __repr__(self) -> str:
         return f"<ValueGuard {len(self._reg)} values (values hidden)>"
@@ -558,9 +571,11 @@ class ValueGuard:
         return self._reg.mask(text)
 
     def name(self, name: str) -> str:
-        """쿠키 이름에 값(전체·부분)이 들어 있으면 이름을 통째로 `[REDACTED]`."""
+        """쿠키 이름이 읽은 값과 정확히 같거나(제외 없음) 값(부분 일치 규칙)이 들어 있으면 이름을 통째로 `[REDACTED]`."""
         from security.masking import MASK
 
+        if name in self._exact:
+            return MASK
         return MASK if self._reg.mask(name) != name else name
 
 
