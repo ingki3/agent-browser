@@ -690,7 +690,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                          "name", "text", "aria", "title", "child_title", "alt", "svg_title", "child_aria", "value",
                          "pseudo", "selector", "detail", "href", "formaction", "form_action",
                          "class", "id", "name_attr", "testid",
-                         "keyring", "prompt", "ci_env"}),  # browser.session_store KeyResolution.source(응답 출구 아님)
+                         "keyring", "prompt", "ci_env",  # browser.session_store KeyResolution.source(응답 출구 아님)
+                         "chrome_import", "login_flow", "human_control"}),  # browser.login_ledger SOURCE_*(WS-59, 기록 파일)
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge

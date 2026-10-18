@@ -52,6 +52,7 @@ NOT_OUT_FILES = {
     "interface/observability.py": "run CLI 관측 기록",
     "interface/session_cli.py": "session CLI stdout",
     "interface/profile_cli.py": "profile CLI stdout",
+    "browser/chrome_cookies.py": "WS-59 profile import-cookies 전용(사람 CLI — MCP·서버 도구에서 import 하지 않음)",
     "interface/login_cli.py": "login CLI",
     "interface/cli.py": "CLI 진입점",
     "interface/server_schema.py": "도구 스키마(정적 — 응답 data 아님, WS-48 골든 고정)",
