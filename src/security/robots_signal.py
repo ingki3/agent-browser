@@ -50,13 +50,29 @@ ROBOTS_INSTRUCTIONS = (
     "사용자에게 robots 를 설명할 때 note 를 그대로 쓰세요. "
     "ai_agents_disallowed 는 이름으로 지정된 것만입니다. "
     "ai_agents_disallowed 는 주로 학습·수집 봇 목록이며 사용자가 요청한 읽기 자체를 막는 뜻은 "
-    "아닙니다(기존 목록에는 사용자 요청 봇도 포함) — disallowed·user_fetch_agents_allowed·content_signal 을 참고하세요."
+    "아닙니다(기존 목록에는 사용자 요청 봇도 포함) — disallowed·user_fetch_agents_allowed·content_signal 을 참고하세요. "
+    "data.robots.user_request 가 있으면 따르세요: 사용자가 직접 준 주소·콕 집은 한 페이지 읽기는 named_ai 금지여도 "
+    "진행하고 robots 신호를 한 줄로 알리되, 같은 사이트 여러 페이지 수집·반복 크롤은 하지 마세요. "
+    "all_bots(`User-agent: *` 금지)는 사용자 확인 뒤에만 진행하세요."
 )
 RobotsScope = Literal["all_bots", "named_ai", "all_bots_and_named_ai", "none"]
 _SCOPE_NOTES = {
     "all_bots": "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다.",
     "named_ai": "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다.",
     "all_bots_and_named_ai": "이 경로는 robots.txt 가 모든 봇에 대해 금지하고, AI 봇 일부도 이름으로 따로 금지합니다.",
+}
+#: WS-54: data.robots.user_request 고정 문장 — 금지 신호(scope != none)가 있을 때만 싣는다(허용·none·미확인은 생략).
+#: 키는 scope 어휘. named_ai 만 '사용자가 직접 요청한 한 페이지 읽기는 진행', `*` 금지는 사용자 확인 뒤.
+_USER_REQUEST_NOTES = {
+    "named_ai": "사용자가 이 주소를 직접 주거나 이 페이지를 콕 집어 요청한 한 페이지 읽기는 사람이 브라우저로 여는 것과 "
+                "같은 성격이라 진행해도 됩니다 — 결과에 robots 신호(note)를 한 줄로 알리세요. "
+                "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
+    "all_bots": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 줬더라도 "
+                "robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. "
+                "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
+    "all_bots_and_named_ai": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 "
+                             "줬더라도 robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. "
+                             "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
 }
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
 _AGENT = re.compile(r"[A-Za-z_-]+|\*(?=\s|$)")
@@ -72,6 +88,7 @@ class RobotsSignal(TypedDict):
     content_signal: str
     scope: RobotsScope
     note: NotRequired[str]
+    user_request: NotRequired[str]
 
 
 def _octets(value: str) -> str:
@@ -214,6 +231,7 @@ class RobotsRules:
         }
         if scope != "none":
             signal["note"] = _SCOPE_NOTES[scope]
+            signal["user_request"] = _USER_REQUEST_NOTES[scope]
         return signal
 
 

@@ -122,7 +122,8 @@ def main():
     active_files = [
         "README.md",
         "src/AGENTS.md"
-    ] + glob.glob("src/**/*.md", recursive=True) + glob.glob("scripts/**/*.py", recursive=True)
+    ] + glob.glob("src/**/*.md", recursive=True) + glob.glob("scripts/**/*.py", recursive=True) \
+      + glob.glob("docs/**/*.md", recursive=True)  # WS-53: README 상세를 옮긴 docs/
     active_files = list(set(active_files))
     all_passed = True
     

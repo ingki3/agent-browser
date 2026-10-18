@@ -1085,7 +1085,8 @@
      "robots_url": "http://SITE_A/robots.txt",
      "rule": "Disallow: /private",
      "scope": "all_bots",
-     "user_fetch_agents_allowed": []
+     "user_fetch_agents_allowed": [],
+     "user_request": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 줬더라도 robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. 같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요."
     },
     "url": "http://SITE_A/private"
    },
@@ -1132,7 +1133,8 @@
      "robots_url": "http://SITE_A/robots.txt",
      "rule": "Disallow: /private",
      "scope": "all_bots",
-     "user_fetch_agents_allowed": []
+     "user_fetch_agents_allowed": [],
+     "user_request": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 줬더라도 robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. 같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요."
     }
    },
    "reobserve_required": false,
@@ -1165,7 +1167,8 @@
      "robots_url": "http://SITE_C/robots.txt",
      "rule": "Disallow: /blocked",
      "scope": "all_bots",
-     "user_fetch_agents_allowed": []
+     "user_fetch_agents_allowed": [],
+     "user_request": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 줬더라도 robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. 같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요."
     },
     "url": "http://SITE_C/blocked"
    },
