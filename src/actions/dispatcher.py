@@ -24,9 +24,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -845,6 +847,28 @@ def _normalize_key(key: str) -> str:
     return _KEY_ALIASES.get(raw.lower(), raw)
 
 
+@dataclass
+class PinnedTarget:
+    """사람 승인(elicitation·승인 증표)을 요청한 그 시점의 대상 **노드 정체** (WS-56 R1 B1).
+
+    이름·role·css 일치는 노드 정체가 아니다 — 페이지가 같은 id·이름·자리의 새 노드로 바꾸면 모두 맞는다.
+    그래서 승인 요청 때 실제 노드의 JS 핸들(Playwright ElementHandle)을 잡아 두고, 실행 직전 지금 대상이 그
+    노드(=== · 연결됨 · 같은 프레임 · 같은 문서)인지 본다. 문서가 바뀌면 핸들의 실행 문맥이 사라져 확인이
+    예외 → 불일치(fail-closed). 실행도 이 핸들로만 한다(로케이터 재해석 금지).
+    """
+
+    #: Playwright ElementHandle — 승인 요청 때 그 노드.
+    node: Any
+    #: 잡을 때의 활성 문맥(Page 또는 switch_frame 한 Frame) — 다른 프레임이면 불일치.
+    frame: Any
+    #: 무엇으로 지목했나("element_id:@e3" / "selector:#pay") — 다른 대상 호출에 쓰지 않는다.
+    key: str
+
+
+#: 지금 대상이 잡아 둔 그 노드인가(같은 문맥에서 === , 연결됨, 같은 문서).
+_PIN_SAME_JS = "(el, pinned) => el === pinned && el.isConnected && el.ownerDocument === document"
+
+
 class ActionDispatcher:
     """19종 액션 실행기."""
 
@@ -867,7 +891,46 @@ class ActionDispatcher:
         self._top_attribution: Optional[Dict[str, Any]] = None
         #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
         #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
-        self.heal_disabled = False
+        #: WS-56 R1 B2(WS-57 R1 R2 와 같은 모양): 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는
+        #: 동시 호출 하나가 끝나며 다른 승인 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로, 켜고 끄기는
+        #: heal_disabled_scope().
+        self._heal_off: ContextVar[bool] = ContextVar(f"heal_disabled@{id(self):x}", default=False)
+        #: WS-56 R1 B1: 사람 승인 때 잡아 둔 대상 노드(PinnedTarget) — 이 호출 문맥에서만. pinned_scope().
+        self._pinned: ContextVar[Optional["PinnedTarget"]] = ContextVar("agent_browser_approved_node", default=None)
+
+    @property
+    def heal_disabled(self) -> bool:
+        """이 호출(태스크 문맥)에서 자가 치유가 꺼져 있는가."""
+        return self._heal_off.get()
+
+    @heal_disabled.setter
+    def heal_disabled(self, value: bool) -> None:
+        # 이 호출 문맥에만 적용된다(다른 동시 호출에는 보이지 않는다).
+        self._heal_off.set(bool(value))
+
+    @contextlib.contextmanager
+    def heal_disabled_scope(self) -> Any:
+        """이 블록(과 그 안에서 만든 하위 태스크) 동안 자가 치유를 끈다. 끝나면 들어오기 전 값으로 —
+        중첩(레시피 재생 안의 승인 호출)에서도 바깥 금지를 풀지 않는다."""
+        token = self._heal_off.set(True)
+        try:
+            yield
+        finally:
+            self._heal_off.reset(token)
+
+    def _current_pin(self) -> Optional["PinnedTarget"]:
+        """이 호출 문맥에서 잡아 둔 승인 대상 노드(없으면 None). __init__ 없이 만든 가짜 디스패처도 None."""
+        cv = self.__dict__.get("_pinned")
+        return cv.get() if cv is not None else None
+
+    @contextlib.contextmanager
+    def pinned_scope(self, pin: Optional["PinnedTarget"]) -> Any:
+        """이 블록 동안 요소 액션은 잡아 둔 그 노드에만(WS-56 R1 B1) — 호출 문맥 단위."""
+        token = self._pinned.set(pin)
+        try:
+            yield
+        finally:
+            self._pinned.reset(token)
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -1085,6 +1148,88 @@ class ActionDispatcher:
         except Exception as exc:  # noqa: BLE001
             return {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
         return {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
+
+    # -- WS-56 R1 B1: 승인 대상 노드 결속 ---------------------------------------
+
+    @staticmethod
+    def pin_key(params: Dict[str, Any]) -> Optional[str]:
+        """노드를 잡을 요소 대상의 키. element_id·selector 대상이 아니면(좌표·키·요소 없음) None."""
+        if params.get("element_id"):
+            return f"element_id:{params['element_id']}"
+        if params.get("selector"):
+            return f"selector:{params['selector']}"
+        return None
+
+    async def _pin_locator(self, params: Dict[str, Any]) -> Tuple[Any, str]:
+        """디스패처가 실행 때 지목할 바로 그 로케이터(element_id → _locator_for, selector → 정확히 1개)."""
+        element_id = params.get("element_id")
+        if element_id:
+            handle = self.ctx.engine.get_handle(element_id)
+            if handle is None:
+                return None, "요소 핸들 없음"
+            return self._locator_for(handle), ""
+        selector = params.get("selector")
+        if selector:
+            locator = self.ctx.page.locator(selector)
+            count = await locator.count()
+            if count != 1:
+                return None, f"selector 가 {count}개 요소에 맞음"
+            return locator.first, ""
+        return None, "요소 대상 아님"
+
+    async def pin_target(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """사람 승인을 요청하는 지금, 대상의 실제 노드를 잡는다. {"pin": PinnedTarget} 또는 {"unresolved": 사유}."""
+        key = self.pin_key(params)
+        if key is None:
+            return {"unresolved": "요소 대상 아님"}
+        try:
+            locator, why = await self._pin_locator(params)
+            if locator is None:
+                return {"unresolved": why}
+            node = await locator.element_handle(timeout=2000)
+        except Exception as exc:  # noqa: BLE001 — 못 잡으면 결속할 수 없다(fail-closed)
+            return {"unresolved": f"대상 노드 확인 실패: {type(exc).__name__}"}
+        if node is None:
+            return {"unresolved": "대상 노드 없음"}
+        return {"pin": PinnedTarget(node=node, frame=self.ctx.page, key=key)}
+
+    async def _pin_mismatch(self, pin: PinnedTarget, locator: Any) -> Optional[str]:
+        """지금 locator 가 가리키는 노드가 잡아 둔 그 노드가 아니면 사유, 같으면 None."""
+        if self.ctx.page is not pin.frame:
+            return "승인 때와 다른 프레임"
+        try:
+            same = await locator.evaluate(_PIN_SAME_JS, pin.node, timeout=2000)
+        except Exception as exc:  # noqa: BLE001 — 문서 교체(핸들 문맥 사라짐)·노드 없음 = 같은 노드 아님
+            return f"승인한 노드 확인 실패: {type(exc).__name__}"
+        if same is not True:
+            return "승인한 노드가 아님(같은 이름·css 의 다른 노드로 바뀜)"
+        return None
+
+    async def pinned_target_check(self, pin: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+        """실행 직전: 지금 대상이 승인 요청 때 잡은 그 노드인가. {"fresh": bool, "detail": str} — 확인 실패는 False."""
+        if not isinstance(pin, PinnedTarget) or pin.key != self.pin_key(params):
+            return {"fresh": False, "detail": "승인 때 잡은 대상 노드 없음"}
+        try:
+            locator, why = await self._pin_locator(params)
+        except Exception as exc:  # noqa: BLE001
+            return {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
+        if locator is None:
+            return {"fresh": False, "detail": why}
+        mismatch = await self._pin_mismatch(pin, locator)
+        return {"fresh": mismatch is None, "detail": mismatch or ""}
+
+    @staticmethod
+    async def release_pin(pin: Any) -> None:
+        """잡아 둔 노드 핸들을 놓는다(브라우저 쪽 참조 해제). 실패는 무해(문서·세션이 이미 바뀜)."""
+        node = getattr(pin, "node", None)
+        dispose = getattr(node, "dispose", None)
+        if dispose is None:
+            return
+        try:
+            await dispose()
+        except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 핸들 해제 실패는 무해하다(문서·세션이 이미 바뀜).
+            pass
 
     async def describe_element_for_gate(self, element_id: str) -> Dict[str, Any]:
         """element_id 클릭의 게이트 판정용 DOM 정보 (WS-31 문맥 신호).
@@ -1815,6 +1960,19 @@ class ActionDispatcher:
         healed_flag: bool,
     ) -> ActionResult:
         """[2] 이벤트 발송 → [3] 사후조건 검증."""
+        pin = self._current_pin()
+        if pin is not None:
+            # WS-56 R1 B1: 사람이 승인한 그 노드가 아니면(같은 이름·id·css 의 새 노드 포함) 누르지 않는다.
+            mismatch = await self._pin_mismatch(pin, self._locator_for(handle))
+            if mismatch is not None:
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,  # 발송 전
+                    error_code=ErrorCode.TOCTOU_MISMATCH,
+                    error_message=f"승인한 대상이 바뀌어 실행하지 않았습니다({mismatch}). 다시 관찰하세요.",
+                    reobserve_required=True,
+                )
         sent = await self._send_element_event(action, handle, params, healed_flag)
         if isinstance(sent, ActionResult):
             return sent
@@ -2202,7 +2360,10 @@ class ActionDispatcher:
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]
     ) -> None:
         """요소 대상 액션을 실제로 발송한다."""
-        target = self._locator_for(handle)
+        pin = self._current_pin()
+        # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
+        # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
+        target = pin.node if pin is not None else self._locator_for(handle)
 
         if action is ActionType.CLICK:
             await target.click(button=params.get("button", "left"), timeout=5000)

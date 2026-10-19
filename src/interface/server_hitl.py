@@ -74,6 +74,10 @@ _UNCERTAIN_CODES = frozenset({
 class HitlMixin:
     """BrowserMCPServer 의 HITL 승인 게이트·승인 증표 사용·대상 판정(WS-29·30·31·39) (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
 
+    #: WS-56 R1 B1: 증표별로 잡아 둔 대상 노드 장부 상한(서버 메모리 — 넘치면 오래된 것부터 놓는다).
+    #: (클래스 속성 — WS-48 분리 모듈의 함수는 mcp_server 전역으로 돌아 모듈 전역을 새로 둘 수 없다.)
+    _PIN_BOOK_CAP = 32
+
     def _current_origin(self) -> str:
         from urllib.parse import urlsplit
 
@@ -127,6 +131,9 @@ class HitlMixin:
                 target = await check(params)
             except Exception as exc:  # noqa: BLE001
                 target = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
+        if target.get("fresh"):
+            # WS-56 R1 B1: 이름·role·css 가 같아도 증표 발급(승인 요청) 때 잡은 그 노드여야 한다.
+            target = await self._pinned_check(self._approval_pins().get(approval_id), params)
         if not target.get("fresh"):
             return self._error_result(
                 action,
@@ -141,7 +148,26 @@ class HitlMixin:
         if not ok:  # 그사이 다른 호출이 썼다
             return {"approval_id": approval_id, "reason": why, "reason_code": "used"}
         self._used_approval = approval_id
+        # 증표는 한 번 쓴다 — 잡은 노드는 이번 호출의 실행 대상으로 넘기고(디스패처가 그 노드에만) 장부에서 뺀다.
+        self._approval_pin = self._approval_pins().pop(approval_id, None)
         return True
+
+    def _approval_pins(self) -> Dict[str, Any]:
+        """승인 증표 id → 발급(승인 요청) 때 잡은 대상 노드(WS-56 R1 B1). 서버 메모리, 지연 생성."""
+        return self.__dict__.setdefault("_approval_pin_book", {})
+
+    async def _pin_for_token(self, approval_id: str, params: Dict[str, Any]) -> None:
+        """증표 발급 때 대상 노드를 잡아 둔다. 못 잡으면 장부에 없음 → 사용 때 대상 바뀜으로 거부(fail-closed)."""
+        from interface.server_elicit import _release
+
+        pinned = await self._pin_approval_target(params)
+        if not pinned:
+            return
+        book = self._approval_pins()
+        book[approval_id] = pinned
+        while len(book) > self._PIN_BOOK_CAP:  # 오래된 것부터 놓는다(증표 상한과 같은 취지)
+            oldest = next(iter(book))
+            await _release(self._dispatcher, book.pop(oldest))
 
     async def _check_hitl(
         self, action: ActionType, params: Dict[str, Any], approval_id: Any = None
@@ -290,6 +316,7 @@ class HitlMixin:
             "reason": decision.reason,
             "domain": self._current_domain(),
         })
+        await self._pin_for_token(ap.approval_id, params)
         # NB-7: action_digest 는 싣지 않는다 — 사람 CLI 가 상태 파일에서 읽는다.
         approval = {
             "approval_id": ap.approval_id,

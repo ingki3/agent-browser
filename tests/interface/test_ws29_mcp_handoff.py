@@ -101,6 +101,13 @@ class _Dispatcher:
     async def approval_target_check(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return {"fresh": True, "detail": ""}
 
+    # WS-56 R1 B1: 승인 요청 때 대상 노드를 잡고 실행 직전 같은 노드인지 본다(가짜는 늘 같은 노드).
+    async def pin_target(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"pin": ("fake-node", params.get("element_id") or params.get("selector"))}
+
+    async def pinned_target_check(self, pin: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"fresh": True, "detail": ""}
+
     async def dispatch(self, action: ActionType, params: Dict[str, Any]) -> ActionResult:
         self.calls.append(action)
         err = self.next_error

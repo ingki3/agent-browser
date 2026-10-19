@@ -306,8 +306,10 @@ class ToolsMixin:
         self._pending_gate_basis = None
         self._used_approval = None
         self._approval_via = None
+        self._approval_pin = None
         blocked = await self._check_hitl(action, params, approval_id=approval_id)
         if blocked is not None:
+            await self._drop_approval_pin()
             return blocked
         return await self._run_gated_action(name, arguments, action, params)
 
@@ -420,23 +422,56 @@ class ToolsMixin:
                                       used: Optional[str], heal_off: bool = False) -> tuple:
         """디스패처 실행(승인 증표·정책·elicitation 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
         no_heal = used is not None or heal_off
-        if no_heal:
-            # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
-            self._dispatcher.heal_disabled = True
+        # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다. WS-56 R1 B2: 호출 문맥 단위
+        # (heal_disabled_scope) — 같은 디스패처의 다른 동시 호출이 끝나며 이 호출의 금지를 풀지 않는다.
+        # B1: 사람 승인 때 잡은 그 노드에만 동작(pinned_scope) — 같은 css 의 새 노드로 바뀌면 디스패처가 거부.
+        heal_guard = self._heal_guard(no_heal)
+        pin = self._approval_pin if no_heal else None
+        pin_guard = self._pin_guard(pin)
         try:
-            scope = self._navigation_scope.get()
-            remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
-                          if scope is not None else None)
-            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
-                                             self._egress_proxy, self._robots, self.max_result_chars)
+            with heal_guard, pin_guard:
+                scope = self._navigation_scope.get()
+                remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
+                              if scope is not None else None)
+                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                                 self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
         finally:
-            if no_heal:
-                self._dispatcher.heal_disabled = False
+            await self._drop_approval_pin()
         return result, remembered
+
+    def _heal_guard(self, on: bool) -> Any:
+        """승인 호출 동안 자가 치유 끄기(호출 문맥 단위, WS-57 R1 R2 와 같은 모양). 디스패처가 scope 를 모르면 예전 방식."""
+        import contextlib
+
+        disp = self._dispatcher
+        if not on or disp is None:
+            return contextlib.nullcontext()
+        scope = getattr(disp, "heal_disabled_scope", None)
+        if callable(scope):
+            return scope()
+
+        @contextlib.contextmanager
+        def legacy() -> Any:
+            disp.heal_disabled = True
+            try:
+                yield
+            finally:
+                disp.heal_disabled = False
+
+        return legacy()
+
+    def _pin_guard(self, pin: Any) -> Any:
+        """승인 때 잡은 노드로 디스패처 실행을 묶는다(WS-56 R1 B1). 잡은 노드가 없거나 디스패처가 모르면 그대로."""
+        import contextlib
+
+        scope = getattr(self._dispatcher, "pinned_scope", None)
+        if pin is None or not callable(scope):
+            return contextlib.nullcontext()
+        return scope(pin)
 
     def _error_result(
         self,

@@ -41,9 +41,24 @@ CURRENT_ELICITOR: ContextVar[Optional["Elicitor"]] = ContextVar("agent_browser_e
 #: 호출별 상태(ElicitMixin 속성의 저장소) — 이번 호출의 실행 근거 · 폴백 결과 표지.
 _APPROVAL_VIA: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_approval_via", default=None)
 _OOB_NOTE: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_oob_note", default=None)
+#: WS-56 R1 B2: 승인 증표 호출 표지·통과 근거도 호출 문맥에 — 인스턴스 속성이면 동시 호출 하나가 call 입구에서
+#: None 으로 지워(다른 호출의 치유 금지·증표 결과가 사라짐) 섞였다. (WS-57 의 _CALL_STATE 와 병합 때 맞출 것.)
+_USED_APPROVAL: ContextVar[Optional[str]] = ContextVar("agent_browser_used_approval", default=None)
+_PENDING_GATE_BASIS: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_pending_gate_basis",
+                                                                        default=None)
+#: WS-56 R1 B1: 이번 호출이 사람 승인으로 열렸을 때 승인 요청 시점에 잡은 대상 노드(디스패처 PinnedTarget).
+_APPROVAL_PIN: ContextVar[Any] = ContextVar("agent_browser_approval_pin", default=None)
 
 #: 응답 action → data.elicitation.answer
 _STATUS = {"decline": "declined", "cancel": "cancelled", "timeout": "timeout", "error": "error"}
+
+
+async def _release(dispatcher: Any, pin: Any) -> None:
+    if pin is None:
+        return
+    release = getattr(dispatcher, "release_pin", None)
+    if release is not None:
+        await release(pin)
 
 
 def elicit_timeout(approval_ttl_s: float) -> float:
@@ -133,6 +148,33 @@ class ElicitMixin:
     def _oob_note(self, value: Optional[Dict[str, Any]]) -> None:
         _OOB_NOTE.set(value)
 
+    @property
+    def _used_approval(self) -> Optional[str]:
+        """이번 호출이 쓴 승인 증표 id(_use_approval 이 통과시킴) — 호출 문맥 단위(B2)."""
+        return _USED_APPROVAL.get()
+
+    @_used_approval.setter
+    def _used_approval(self, value: Optional[str]) -> None:
+        _USED_APPROVAL.set(value)
+
+    @property
+    def _pending_gate_basis(self) -> Optional[Dict[str, Any]]:
+        """통과한 게이트 근거(좌표 클릭 등) — 결과에 싣는다. 호출 문맥 단위(B2)."""
+        return _PENDING_GATE_BASIS.get()
+
+    @_pending_gate_basis.setter
+    def _pending_gate_basis(self, value: Optional[Dict[str, Any]]) -> None:
+        _PENDING_GATE_BASIS.set(value)
+
+    @property
+    def _approval_pin(self) -> Any:
+        """이번 호출을 연 사람 승인의 대상 노드(승인 요청 때 잡음) — 디스패처는 이 노드에만 동작한다(B1)."""
+        return _APPROVAL_PIN.get()
+
+    @_approval_pin.setter
+    def _approval_pin(self, value: Any) -> None:
+        _APPROVAL_PIN.set(value)
+
     _policy_store: Any = None
 
     def _approval_policies(self) -> Any:
@@ -162,16 +204,28 @@ class ElicitMixin:
         if elicitor is None or not elicitor.supported():
             return None
         components = self._approval_components(action, params, dict(decision.basis))
+        # B1: 사람에게 묻는 지금의 실제 노드를 잡는다 — 못 잡으면 결속할 수 없으니 묻지 않는다(기존 경로).
+        pinned = await self._pin_approval_target(params)
+        if pinned is False:
+            return None
         message = elicitation_message(action, ctx.element_name or ctx.selector, components["origin"],
                                       components["tab_id"], decision.reason, secrets.token_hex(3))
-        answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
+        self._approval_pin = pinned
+        try:
+            answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
+            checked = (await self._recheck_after_accept(action, params, components)
+                       if answer == "accept" else None)
+        except BaseException:
+            await self._drop_approval_pin()
+            raise
         if answer != "accept":
+            await self._drop_approval_pin()
             note = dict(self._oob_note or {})
             note["elicitation"] = {"answer": _STATUS.get(answer, "error")}
             self._oob_note = note
             return None
-        checked = await self._recheck_after_accept(action, params, components)
         if checked is not None:
+            await self._drop_approval_pin()
             return checked
         via: Dict[str, Any] = {"via": "elicitation"}
         if self._oob_note and "policy_refused" in self._oob_note:
@@ -227,7 +281,47 @@ class ElicitMixin:
                 fresh = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
         if not fresh.get("fresh"):
             return self._elicitation_toctou(action, str(fresh.get("detail") or ""))
+        # B1: 이름·role·css 가 같아도 승인 요청 때 그 노드가 아니면(새 노드로 교체) 실행하지 않는다.
+        same = await self._pinned_check(self._approval_pin, params)
+        if not same.get("fresh"):
+            return self._elicitation_toctou(action, str(same.get("detail") or ""))
         return None
+
+    async def _pin_approval_target(self, params: Dict[str, Any]) -> Any:
+        """사람 승인을 요청하는 지금 대상 노드를 잡는다(B1). None = 요소 대상 아님(좌표·키 — 결속 대상 없음),
+        False = 요소 대상인데 못 잡음(fail-closed), 그 밖 = 잡은 노드(PinnedTarget)."""
+        from actions.dispatcher import ActionDispatcher
+
+        if ActionDispatcher.pin_key(params) is None:
+            return None
+        pin = getattr(self._dispatcher, "pin_target", None)
+        if pin is None:
+            return False
+        try:
+            got = await pin(params)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("승인 대상 노드 확인 실패(%s)", type(exc).__name__)
+            return False
+        return got.get("pin") or False
+
+    async def _pinned_check(self, pin: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+        """실행 직전 지금 대상이 잡아 둔 그 노드인가. 요소 대상이 아니면 통과, 확인 수단·노드가 없으면 실패."""
+        from actions.dispatcher import ActionDispatcher
+
+        if ActionDispatcher.pin_key(params) is None:
+            return {"fresh": True, "detail": ""}
+        check = getattr(self._dispatcher, "pinned_target_check", None)
+        if pin is None or check is None:
+            return {"fresh": False, "detail": "승인 때 잡은 대상 노드 없음"}  # fail-closed
+        try:
+            return await check(pin, params)
+        except Exception as exc:  # noqa: BLE001
+            return {"fresh": False, "detail": f"대상 노드 확인 실패: {type(exc).__name__}"}
+
+    async def _drop_approval_pin(self) -> None:
+        """이번 호출의 잡은 노드를 놓는다(호출 끝·실행 안 함)."""
+        pin, self._approval_pin = self._approval_pin, None
+        await _release(self._dispatcher, pin)
 
     def _elicitation_toctou(self, action: ActionType, detail: str) -> ActionResult:
         return self._error_result(
