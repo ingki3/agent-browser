@@ -123,31 +123,42 @@ class ControlLoginWatch:
 
     # -- 시작·유지 -----------------------------------------------------------
 
+    def arm(self, context: Any) -> None:
+        """요청 감시(Network 계층 ``request``)·새 탭 사건을 **await 없이** 붙인다(WS-58 R2 NB1).
+
+        조작권을 사람이 가져간 그 동기 구간에서 부른다 — 이후 어떤 await(쿠키 기준점 읽기·안내 띠·탭별 CDP
+        설치) 동안 나간 요청도 기록된다. 같은 컨텍스트에 두 번 붙이지 않는다."""
+        if self.closed or context is None or context in self._contexts:
+            return
+        self._contexts.append(context)
+
+        def opened(page: Any) -> None:
+            if self.closed:
+                return
+            task = asyncio.get_running_loop().create_task(self._attach(page))
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+
+        try:
+            context.on("request", self._on_request)
+            context.on("page", opened)
+        except Exception:  # noqa: BLE001 - 요청 신호를 받을 수 없다 → 방문 origin 전부 기록(fail-closed)
+            self.degraded = True
+
     async def ensure(self, context: Any) -> None:
-        """이 컨텍스트의 모든 탭(이후 새 탭 포함)에 감시를 건다. 처음 부를 때 쿠키 기준점을 잡는다."""
+        """이 컨텍스트의 모든 탭(이후 새 탭 포함)에 감시를 건다. 요청 감시를 먼저 붙인 뒤(arm) 처음 부를 때
+        쿠키 기준점을 잡는다 — 기준점 읽기(await) 동안의 요청도 놓치지 않는다."""
         if self.closed or context is None:
             return
+        self.arm(context)
         if self.baseline is None:
             try:
                 self.baseline = _snapshot(await context.cookies())
             except Exception:  # noqa: BLE001 - 기준점이 없으면 지금 쿠키 전부가 '새 쿠키'로 보인다 + fail-closed
                 self.baseline = {}
                 self.degraded = True
-        if context not in self._contexts:
-            self._contexts.append(context)
-
-            def opened(page: Any) -> None:
-                if self.closed:
-                    return
-                task = asyncio.get_running_loop().create_task(self._attach(page))
-                self._pending.add(task)
-                task.add_done_callback(self._pending.discard)
-
-            try:
-                context.on("request", self._on_request)
-                context.on("page", opened)
-            except Exception:  # noqa: BLE001 - 요청 신호를 받을 수 없다 → 방문 origin 전부 기록(fail-closed)
-                self.degraded = True
+        if self.closed:
+            return
         self._note_pages(context)
         for page in list(getattr(context, "pages", []) or []):
             await self._attach(page)

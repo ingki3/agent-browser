@@ -54,6 +54,10 @@ class HandoffMixin:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if "taken" in events:
+            # WS-58 R2 NB1: poll 이 holder 를 human 으로 바꾼 그 동기 구간에서 요청 감시를 붙인다 — 아래 어떤
+            # await(쿠키 사이트 응답·안내 띠)보다 먼저.
+            self._login_watch_begin()
         if events and self._recipes is not None and ("taken" in events or "released" in events):
             self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
         for event in events:
@@ -129,11 +133,23 @@ class HandoffMixin:
             retry.logins.record(url, source)
 
     def _login_watch_begin(self) -> None:
-        """조작권 구간 시작 — 감시를 만든다(설치는 다음 tick, 컨텍스트가 정해진 뒤)."""
+        """조작권 구간 시작 — 감시를 만들고 요청 감시를 **이 동기 구간에서** 붙인다(WS-58 R2 NB1: holder 가
+        human 이 된 뒤 첫 await 전에). 쿠키 기준점·탭별 설치는 다음 tick(컨텍스트가 정해진 뒤)."""
         from browser.login_watch import ControlLoginWatch
 
         if self._login_watch is None:
             self._login_watch = ControlLoginWatch()
+        self._login_watch_arm()
+
+    def _login_watch_arm(self, context: Any = None) -> None:
+        """현재(또는 주어진 — on-demand 창 전환 직후 새) 컨텍스트에 요청 감시를 await 없이 붙인다."""
+        watch = self._login_watch
+        if watch is None or self._core is None or (context is None and not self._started):
+            return
+        try:
+            watch.arm(context if context is not None else self._core.context_for("mcp-session"))
+        except Exception:  # noqa: BLE001 - 붙일 수 없음: 반납 때 방문 origin 전부 기록(fail-closed)
+            watch.mark_degraded()
 
     def _agent_page_url(self) -> str:
         ctx = getattr(self._dispatcher, "ctx", None)
