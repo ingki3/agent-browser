@@ -1315,6 +1315,9 @@ class ActionDispatcher:
         # WS-30: 계약 키(trigger_element_id 등)를 디스패처 키로 맞춘다.
         params = normalize_action_params(action, params)
         params, secret_resolved = self._resolve_secret(action, params)
+        if action is ActionType.TYPE_TEXT and secret_resolved is not True:
+            # WS-55 R2: 입력 중 민감 판정 표시(_CONCEAL_KEY)를 사본에만 붙인다 — 호출자 params(트레이스)엔 남기지 않는다.
+            params = dict(params)
         if secret_resolved is True and not self._secret_allowed_here():
             # 도메인에 묶인 자격증명(credentials.BoundSecrets)을 다른 사이트에서
             # 쓰려 함 — 값도 키 이름도 입력하지 않고 실패한다.
@@ -1421,6 +1424,11 @@ class ActionDispatcher:
             looks_like_key = bool(SECRET_KEY_PATTERN.match(text))
             return params, (False if looks_like_key else None)
 
+        # WS-55 R1 B1: 해석한 실제 값은 도구가 비밀로 아는 값이다 — 페이지가 그 값을 주소(허용 목록 키 `?sortKey=` 포함)·
+        # 제목에 반사해도 응답에서 가려지게 입력 전에 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([resolution.value])
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
         # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
@@ -2169,6 +2177,24 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _mark_sensitive_input(
+        self, handle: ElementHandle, params: Dict[str, Any], text: str
+    ) -> None:
+        """입력 액션의 한 시점에서 민감 칸을 판정하고, 민감이면 친 값을 등록한다(WS-55 R2).
+
+        이미 민감으로 판정됐거나(sticky) SecretStore 해석 값(_CONCEAL_KEY)이면 다시 보지 않는다. 민감이면
+        params 에 _CONCEAL_KEY 를 붙여 액션 끝까지(사후조건·재시도 신호) 값을 싣지 않게 한다 — params 는
+        dispatch() 가 만든 사본이라 호출자 트레이스에는 나타나지 않는다.
+        """
+        if params.get(_CONCEAL_KEY):
+            return
+        if not await self.is_sensitive_field(handle):
+            return
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([text])
+        params[_CONCEAL_KEY] = True
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 
@@ -2208,10 +2234,20 @@ class ActionDispatcher:
             await target.click(button=params.get("button", "left"), timeout=5000)
 
         elif action is ActionType.TYPE_TEXT:
+            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
+            text = params.get("text", "")
+            # WS-55 R2(검증 B1-R1): 민감 칸 판정은 이 액션의 **첫 부작용 전**(clear·focus·첫 input 이벤트 이전, 대상
+            # 해석 직후)에 한다. clear 도 input 이벤트를 일으키므로 그 사이 페이지가 type 을 바꾸거나 노드를 교체하면
+            # 최초의 password 정보가 사라진다. 한 번이라도 민감이면 액션 끝까지 유지(sticky)하고, 보수적으로
+            # clear 후·입력 후에도 다시 보아 새로 민감해진 칸도 등록한다(OR). SecretStore 해석 값은 _resolve_secret
+            # 에서 이미 등록했다. 일반 칸의 값(검색어)은 에이전트가 자기 호출 인자로 이미 아는 값이라 등록하지 않는다
+            # (과잉 가림 방지, 결정 A).
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
-            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
-            await target.type(params.get("text", ""), timeout=5000)
+                await self._mark_sensitive_input(handle, params, text)
+            await target.type(text, timeout=5000)
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
                 await target.press("Enter", timeout=5000)
 
