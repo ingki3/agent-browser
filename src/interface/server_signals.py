@@ -359,6 +359,8 @@ class SignalsMixin:
         chrome-error:// 로 바뀌어 현재 주소로는 호스트를 알 수 없기 때문이다.
         WS-57 R2(B2): 이 호출 작업 공간 탭에 귀속된 기록만 본다(_egress_record_mine) — 다른 작업 공간의 차단 호스트가
         내 오류로 복사되지 않게. 대상 호스트(또는 그 이동의 리다이렉트 앞 홉)와 맞는 기록만 — 출처 없는 fallback 없음.
+        WS-57 R3(B3): 그 탭 메인 프레임 문서 요청(과 리다이렉트 체인)의 기록만 — 하위 자원 차단은 싣지 않는다. 막힌 기록이
+        있어도 navigate 가 성공했고 탭이 지금 주소로 200 문서를 받았으면 성공 그대로.
         """
         if self._egress is None:
             return result
@@ -375,11 +377,16 @@ class SignalsMixin:
                 h = None
             if h:
                 hosts.add(h.lower())
+        # WS-57 R3(B3): 탭 메인 프레임 문서 이동(과 그 리다이렉트 체인)의 차단만 — 같은 페이지 하위 자원(이미지·스크립트·
+        # fetch·iframe 하위 문서)이 앞 홉 호스트가 같은 채 막혀도 문서 이동 차단이 아니다.
         hit = next((d for d in reversed(new)
-                    if (d.host and d.host.lower() in hosts) or any(h in hosts for h in d.chain_hosts)), None)
+                    if getattr(d, "main_document", False)
+                    and ((d.host and d.host.lower() in hosts) or any(h in hosts for h in d.chain_hosts))), None)
         if hit is None:
             return result
         info = hit.to_agent()
+        if action is ActionType.NAVIGATE and result.success and self._main_document_loaded(hit):
+            return result  # 그 뒤 문서가 실제로 열렸다(응답 200·현재 주소) — 성공 유지
         if action is ActionType.NAVIGATE:
             return self._error_result(
                 action,
@@ -389,6 +396,15 @@ class SignalsMixin:
             )
         result.data["egress"] = info
         return result
+
+    def _main_document_loaded(self, record: Any) -> bool:
+        """차단 기록의 탭이 지금 주소로 200 메인 문서를 받았는가 (WS-57 R3) — 막힌 이동 뒤 다른 문서가 정상으로 열렸다."""
+        if self._page_status is None:
+            return False
+        try:
+            return self._page_status.judge_status_for(record.page) == 200
+        except Exception:  # noqa: BLE001 - 판정 불가는 차단 보고 유지(fail-closed)
+            return False
 
     def _egress_record_mine(self, record: Any) -> bool:
         """egress 기록(차단·업스트림 실패)이 이 호출 작업 공간의 탭에서 나왔는가 (WS-57 R2 B2).

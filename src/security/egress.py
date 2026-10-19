@@ -124,6 +124,10 @@ def redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
+#: request_origin() 결과 — (Page, 리다이렉트 앞 홉 호스트들, 메인 프레임 문서 이동인가).
+RequestOrigin = Tuple[object, Tuple[str, ...], bool]
+
+
 @dataclass
 class UpstreamFailure:
     """프록시가 검증은 통과했지만 업스트림에 닿지 못해 스스로 만든 실패 응답(502) 기록."""
@@ -136,6 +140,9 @@ class UpstreamFailure:
     #: 귀속한다(프록시는 요청의 탭을 모른다). None = 귀속 불가(서비스 워커 등) → 어느 호출 오류에도 붙이지 않는다.
     page: object = field(default=None, repr=False, compare=False)
     chain_hosts: Tuple[str, ...] = field(default=(), repr=False, compare=False)
+    #: WS-57 R3(B3): 그 요청이 탭 메인 프레임의 문서 이동(또는 그 리다이렉트 홉)인가 — 하위 자원(이미지·스크립트·
+    #: fetch·iframe 하위 문서) 차단이 정상 문서의 navigate 실패로 바뀌지 않게 한다. 귀속 전·불명은 False.
+    main_document: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.url = redact_url(self.url)
@@ -160,6 +167,9 @@ class EgressDecision:
     #: WS-57 R2: 기록한 차단을 낸 요청의 Page(탭)·리다이렉트 앞 홉 호스트들(UpstreamFailure 와 같음). 판정 값이 아니다.
     page: object = field(default=None, repr=False, compare=False)
     chain_hosts: Tuple[str, ...] = field(default=(), repr=False, compare=False)
+    #: WS-57 R3(B3): 그 요청이 탭 메인 프레임의 문서 이동(또는 그 리다이렉트 홉)인가 — 하위 자원(이미지·스크립트·
+    #: fetch·iframe 하위 문서) 차단이 정상 문서의 navigate 실패로 바뀌지 않게 한다. 귀속 전·불명은 False.
+    main_document: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # 판정 기록에는 쿼리·조각·사용자정보를 남기지 않는다(NB-4) — 로그·blocked_requests 공통.
@@ -485,9 +495,9 @@ class EgressGuard:
             self.record_block(decision)
         return decision.allowed
 
-    def record_block(self, decision: EgressDecision, origin: Optional[Tuple[object, Tuple[str, ...]]] = None) -> None:
+    def record_block(self, decision: EgressDecision, origin: Optional[RequestOrigin] = None) -> None:
         if origin is not None:
-            decision.page, decision.chain_hosts = origin
+            decision.page, decision.chain_hosts, decision.main_document = origin
         self._blocked_log.append(decision)
         self._blocked_total += 1
 
@@ -639,18 +649,25 @@ class EgressGuard:
                 port = rec.port if isinstance(rec, UpstreamFailure) else None
                 key = _host_port(rec.url) if port is None else ((rec.host or "").lower().strip("[]"), port)
                 if key == target:
-                    rec.page, rec.chain_hosts = origin
+                    rec.page, rec.chain_hosts, rec.main_document = origin
                     return
 
 
-def request_origin(request) -> Optional[Tuple[object, Tuple[str, ...]]]:  # noqa: ANN001
-    """요청의 (Page, 리다이렉트 앞 홉 호스트들). 프레임이 없으면(서비스 워커 요청 등) None — 귀속 불가 (WS-57 R2)."""
+def request_origin(request) -> Optional[RequestOrigin]:  # noqa: ANN001
+    """요청의 (Page, 리다이렉트 앞 홉 호스트들, 메인 문서 이동 여부). 프레임이 없으면(서비스 워커 요청 등) None — 귀속 불가
+    (WS-57 R2). 메인 문서 이동 = 문서 이동 요청이고 그 프레임이 탭 최상위(부모 없음) — 리다이렉트 홉도 같은 요청 체인이라
+    같은 값이다(WS-57 R3 B3: 이미지·스크립트·fetch·iframe 하위 문서는 False)."""
     try:
-        page = request.frame.page
+        frame = request.frame
+        page = frame.page
     except Exception:  # noqa: BLE001 - Playwright: 서비스 워커 요청은 frame 접근이 오류
         return None
     if page is None:
         return None
+    try:
+        main_document = bool(request.is_navigation_request()) and frame.parent_frame is None
+    except Exception:  # noqa: BLE001 - 판별 불가는 하위 요청으로 본다(이동 실패로 바꾸지 않음)
+        main_document = False
     hosts: List[str] = []
     try:
         prev = request.redirected_from
@@ -661,7 +678,7 @@ def request_origin(request) -> Optional[Tuple[object, Tuple[str, ...]]]:  # noqa
             prev = prev.redirected_from
     except Exception:  # noqa: BLE001
         pass
-    return page, tuple(hosts)
+    return page, tuple(hosts), main_document
 
 
 def _host_port(url: str) -> Optional[Tuple[str, Optional[int]]]:
