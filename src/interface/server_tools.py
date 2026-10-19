@@ -307,11 +307,18 @@ class ToolsMixin:
         self._used_approval = None
         self._approval_via = None
         self._approval_pin = None
-        blocked = await self._check_hitl(action, params, approval_id=approval_id)
-        if blocked is not None:
-            await self._drop_approval_pin()
-            return blocked
-        return await self._run_gated_action(name, arguments, action, params)
+        # R2 B4: 승인 실행 구간 락은 이 호출이 잡았으면 여기서 푼다(성공·거부·예외 모두). 바깥 호출(중첩)이 잡은
+        # 락이면 그대로 둔다.
+        held_outside = self._approval_exec_held()
+        try:
+            blocked = await self._check_hitl(action, params, approval_id=approval_id)
+            if blocked is not None:
+                await self._drop_approval_pin()
+                return blocked
+            return await self._run_gated_action(name, arguments, action, params)
+        finally:
+            if not held_outside:
+                self._release_approval_exec()
 
     async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
                                         capture: Dict[str, Any]) -> Optional[ActionResult]:

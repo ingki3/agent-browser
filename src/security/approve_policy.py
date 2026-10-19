@@ -10,12 +10,13 @@
 ('제출' 버튼인데 문맥에 '결제'가 있으면 거부). 범주:
 
 * payment — 돈 이동(되돌릴 수 없는 금전 손실)
-* account_termination — 계정 해지·탈퇴(계정 단위 비가역)
+* account_termination — 계정 해지·탈퇴·삭제·비활성화(계정 단위 비가역; 계정 명사+삭제 동사 조합, R2 B5)
 * permission — 권한 변경(보안 상승)
 * unresolved_target — 판정 불가 대상(무엇을 누를지 모르면 정책 일치를 판단할 수 없다)
 * upload_file — 로컬 파일 유출(정책은 사이트 단위라 파일 범위를 묶지 못한다)
 
-fail-closed: 파일 손상·형식 오류·권한 느슨함(0600 아님)·심볼릭 링크·다른 소유자 → 정책 없음.
+fail-closed: 파일 손상·형식 오류·권한 느슨함(0600 아님)·심볼릭 링크·다른 소유자·사람 CLI 서명(HMAC) 불일치 → 정책 없음.
+WS-56 R2 B1: 도구가 이 파일(과 프로필·서버 상태 폴더)을 쓰지 못하게 `is_protected_path` 경계를 둔다(download_file).
 """
 
 from __future__ import annotations
@@ -63,6 +64,23 @@ FORBIDDEN_ACTIONS: Dict[ActionType, str] = {ActionType.UPLOAD_FILE: "upload_file
 
 _KEYWORD_CATEGORY: Dict[str, str] = {kw: cat for cat, kws in FORBIDDEN_KEYWORDS.items() for kw in kws}
 
+#: WS-56 R2 B5: 계정 단위 삭제·비활성화(조합) → account_termination. 한쪽만으로는 범주가 아니다 — '메일 삭제'·
+#: 'Remove from cart'(일반 데이터 삭제)·'My account'(계정 화면 열기)는 정책으로 열 수 있다. 공백을 뺀 정규형에서
+#: 부분 문자열로 본다('계정삭제'·'deleteAccount'·'delete-account' 모두).
+ACCOUNT_NOUNS: Tuple[str, ...] = ("계정", "회원", "프로필", "account", "profile")
+ACCOUNT_REMOVAL_VERBS: Tuple[str, ...] = ("삭제", "비활성", "delete", "deletion", "remove", "removal",
+                                          "close", "closure", "erase")
+CATEGORY_ACCOUNT = "account_termination"
+
+
+def _account_removal(compact: str) -> bool:
+    """공백·구두점 사이 없이 붙인 정규 문자열에 계정 명사와 삭제·비활성화 동사가 함께 있는가."""
+    return any(n in compact for n in ACCOUNT_NOUNS) and any(v in compact for v in ACCOUNT_REMOVAL_VERBS)
+
+
+def _compact(text: str) -> str:
+    return "".join(ch for ch in normalize_gate_text(text) if ch.isalnum())
+
 
 class PolicyError(ValueError):
     """정책 값·파일이 잘못됨(fail-closed 사유)."""
@@ -76,6 +94,8 @@ def _text_category(text: str) -> Optional[str]:
     norm = normalize_gate_text(text)
     if not norm:
         return None
+    if _account_removal(_compact(norm)):
+        return CATEGORY_ACCOUNT
     for cat, kws in FORBIDDEN_KEYWORDS.items():
         for kw in kws:
             if kw.lower() in norm:
@@ -85,6 +105,8 @@ def _text_category(text: str) -> Optional[str]:
 
 def _token_category(tokens: List[str]) -> Optional[str]:
     present = set(tokens)
+    if _account_removal("".join(tokens)):
+        return CATEGORY_ACCOUNT
     for cat, kws in FORBIDDEN_KEYWORDS.items():
         for kw in kws:
             if kw.isascii() and " " not in kw and kw in present:
@@ -229,7 +251,7 @@ def _check_file(path: Path) -> os.stat_result:
 
 
 def read_policies(path: Path) -> List[Dict[str, Any]]:
-    """정책 목록. 파일이 없으면 []. 손상·권한·링크 → PolicyError(fail-closed)."""
+    """정책 목록. 파일이 없으면 []. 손상·권한·링크·서명 불일치 → PolicyError(fail-closed)."""
     path = Path(path)
     try:
         _check_file(path)
@@ -243,7 +265,115 @@ def read_policies(path: Path) -> List[Dict[str, Any]]:
         raise PolicyError(f"정책 파일을 읽을 수 없습니다({type(exc).__name__})") from None
     if not isinstance(data, dict) or data.get("version") != FILE_VERSION or not isinstance(data.get("policies"), list):
         raise PolicyError("정책 파일 형식이 아닙니다")
+    _verify_mac(path, data)
     return [_validate_entry(item) for item in data["policies"]]
+
+
+# ---------------------------------------------------------------------------- 사람 CLI 서명(WS-56 R2 B1)
+#
+# 0600·같은 소유자·일반 파일 검사만으로는 '이 사용자 권한으로 돌아가는 서버가 대신 쓴 파일'(예: download_file 이
+# 프로필 폴더에 내려받은 approve_policy.json)을 사람 CLI 가 쓴 파일과 구별하지 못한다(검증 BLOCKING-1). 그래서 CLI
+# 가 쓸 때 정책 내용 + 프로필 폴더(canonical 경로)에 대한 HMAC-SHA256 을 파일에 함께 남기고, 서버는 읽을 때마다
+# 검증한다. 키는 프로필 밖 서버 상태 폴더(handoff.state_root — 승인 증표 상태와 같은 신뢰 구역)의 0600 파일이며
+# 처음 `add` 때 만든다. 그 폴더도 다운로드 금지 경계(protected_write_roots) 안이다. 키·파일 어느 쪽이든 없음·변조·
+# 권한 느슨함·다른 프로필에서 복사 → 정책 없음. 한계: 같은 OS 사용자로 임의 파일을 쓸 수 있는 프로세스(셸 도구)는
+# 키도 읽을 수 있다 — 그 경계는 README '사람 인계' 절의 같은 사용자 한계와 같다.
+
+#: 서버 상태 폴더 안 키 파일 이름.
+KEY_FILE = "approve_policy.key"
+_KEY_BYTES = 32
+
+
+def policy_key_path() -> Path:
+    from interface.handoff import state_root
+
+    return Path(state_root()) / KEY_FILE
+
+
+def _read_key(create: bool) -> bytes:
+    path = policy_key_path()
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        if not create:
+            raise PolicyError("정책 서명 키가 없습니다 — 사람 CLI(`agent-browser approve-policy add`)로 다시 추가하세요") from None
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, secrets.token_hex(_KEY_BYTES).encode("ascii"))
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+        st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise PolicyError("정책 서명 키가 일반 파일이 아닙니다")
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise PolicyError("정책 서명 키 소유자·권한(0600)이 맞지 않습니다")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(4 * _KEY_BYTES + 1)
+        key = bytes.fromhex(raw.decode("ascii").strip())
+    except (OSError, ValueError) as exc:
+        raise PolicyError(f"정책 서명 키를 읽을 수 없습니다({type(exc).__name__})") from None
+    if len(key) != _KEY_BYTES:
+        raise PolicyError("정책 서명 키 형식이 아닙니다")
+    return key
+
+
+def _mac(key: bytes, path: Path, rows: List[Any]) -> str:
+    import hashlib
+    import hmac
+
+    body = json.dumps({"version": FILE_VERSION, "folder": os.path.realpath(Path(path).parent), "policies": rows},
+                      ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hmac.new(key, body.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def _verify_mac(path: Path, data: Dict[str, Any]) -> None:
+    import hmac
+
+    mac = data.get("mac")
+    if not isinstance(mac, str) or not mac:
+        raise PolicyError("정책 파일에 사람 CLI 서명이 없습니다(직접 쓰거나 다른 경로로 바뀐 파일)")
+    want = _mac(_read_key(create=False), path, data["policies"])
+    if not hmac.compare_digest(mac, want):
+        raise PolicyError("정책 파일 서명이 맞지 않습니다(사람 CLI 밖에서 바뀌었거나 다른 프로필에서 옮겨 옴)")
+
+
+# ---------------------------------------------------------------------------- 쓰기 금지 경계(WS-56 R2 B1)
+
+
+def protected_write_roots() -> List[Path]:
+    """도구(download_file 등)가 파일을 쓰면 안 되는 agent-browser 자체 폴더(canonical). 프로필(정책 파일·브라우저
+    프로필) — 기본 ~/.agent-browser 전체와 환경변수로 옮긴 프로필 루트 — 및 서버 상태 폴더(승인 증표 상태·정책 키)."""
+    from browser.serve_profile import profile_root
+    from browser.site_session import DEFAULT_PROFILE_ROOT
+    from interface.handoff import DEFAULT_STATE_ROOT, state_root
+
+    roots = [Path.home() / ".agent-browser", DEFAULT_PROFILE_ROOT, profile_root(), DEFAULT_STATE_ROOT, state_root()]
+    out: List[Path] = []
+    for root in roots:
+        real = Path(os.path.realpath(Path(root).expanduser()))
+        if real not in out:
+            out.append(real)
+    return out
+
+
+def is_protected_path(path: str) -> bool:
+    """canonical(realpath — symlink 해석 후) 경로가 보호 폴더 안(또는 그 자체)인가. 판정 실패 = 보호(fail-closed)."""
+    try:
+        real = os.path.realpath(path)
+        roots = protected_write_roots()
+    except Exception:  # noqa: BLE001 - 경계를 확인할 수 없으면 쓰지 않는다
+        return True
+    for root in roots:
+        try:
+            if os.path.commonpath([real, str(root)]) == str(root):
+                return True
+        except ValueError:  # 다른 드라이브 등
+            continue
+    return False
 
 
 def _write(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -254,11 +384,12 @@ def _write(path: Path, rows: List[Dict[str, Any]]) -> None:
         raise PolicyError("프로필 자리가 일반 폴더가 아닙니다")
     if path.exists() or path.is_symlink():
         _check_file(path)
+    mac = _mac(_read_key(create=True), path, rows)
     tmp = parent / f".tmp-policy-{secrets.token_hex(6)}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"version": FILE_VERSION, "policies": rows}, fh, ensure_ascii=True, indent=1)
+            json.dump({"version": FILE_VERSION, "policies": rows, "mac": mac}, fh, ensure_ascii=True, indent=1)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
@@ -329,7 +460,12 @@ class PolicyStore:
             return None
         except OSError as exc:
             return ("error", type(exc).__name__)
-        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid)
+        try:  # R2 B1: 서명 키가 바뀌거나 사라져도 다시 검증한다
+            kst = os.lstat(policy_key_path())
+            key_sig: Any = (kst.st_ino, kst.st_size, kst.st_mtime_ns, kst.st_mode, kst.st_uid)
+        except OSError as exc:
+            key_sig = ("error", type(exc).__name__)
+        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, key_sig)
 
     def refresh(self) -> None:
         sig = self._signature()

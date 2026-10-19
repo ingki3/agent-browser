@@ -241,6 +241,9 @@ ID_PRODUCERS = {
     ("interface/server_elicit.py", "secrets.token_hex(3)"): ("elicitation 문구 꼬리표(클라이언트 사람 확인 문구) — "
                                                             "도구 응답 출구 아님", None, None),
     ("security/approve_policy.py", "secrets.token_hex(6)"): ("정책 임시 파일 이름(.tmp-policy-) — 출구 아님", None, None),
+    # WS-56 R2 B1
+    ("security/approve_policy.py", "secrets.token_hex(_KEY_BYTES)"): ("정책 서명 HMAC 키(서버 상태 폴더 0600 파일) — 출구 아님",
+                                                                      None, None),
 }
 
 

@@ -48,6 +48,8 @@ _PENDING_GATE_BASIS: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_br
                                                                         default=None)
 #: WS-56 R1 B1: 이번 호출이 사람 승인으로 열렸을 때 승인 요청 시점에 잡은 대상 노드(디스패처 PinnedTarget).
 _APPROVAL_PIN: ContextVar[Any] = ContextVar("agent_browser_approval_pin", default=None)
+#: WS-56 R2 B4: 이 호출이 승인 실행 구간 락(ElicitMixin._approval_exec_lock)을 잡았는가.
+_EXEC_HELD: ContextVar[bool] = ContextVar("agent_browser_approval_exec_held", default=False)
 
 #: 응답 action → data.elicitation.answer
 _STATUS = {"decline": "declined", "cancel": "cancelled", "timeout": "timeout", "error": "error"}
@@ -102,14 +104,19 @@ class Elicitor:
 
 
 def elicitation_message(action: ActionType, element_name: str, origin: str, tab_id: str,
-                        reason: str, nonce: str) -> str:
-    """사람에게 보일 승인 문구. 페이지 유래 문자열은 가림(WS-51) → 코드 흉내 숫자 가림 → 표시 살균(제어·양방향)."""
+                        reason: str, nonce: str, destination: Optional[Dict[str, Any]] = None) -> str:
+    """사람에게 보일 승인 문구. 페이지 유래 문자열은 가림(WS-51) → 코드 흉내 숫자 가림 → 표시 살균(제어·양방향).
+
+    R2 B3: destination(승인 대상 노드의 실행 의미 — 링크 href · 폼 action/method/target)이 있으면 '목적지' 줄을 더한다
+    (주소는 public_url 가림 · 코드 흉내 숫자 가림 · 표시 살균). 실행 직전 같은 값인지 다시 본다.
+    """
     from interface.handoff import SITE_NAME_LABEL, display_safe, mask_code_like
     from security.public_url import public_text, public_url
 
     name = display_safe(mask_code_like(public_text(str(element_name or ""))), 120) or "(이름 없음)"
     site = display_safe(public_url(str(origin or "")), 120) or "(알 수 없음)"
     why = display_safe(mask_code_like(public_text(str(reason or ""))), 200)
+    dest = destination_text(destination)
     return "\n".join([
         f"agent-browser 고위험 동작 승인 요청 [{nonce}]",
         "'항상 허용'·'세션 허용'은 누르지 마세요 — 이번 한 건만 승인하세요"
@@ -117,10 +124,32 @@ def elicitation_message(action: ActionType, element_name: str, origin: str, tab_
         f"동작: {action.value}",
         f"대상: {SITE_NAME_LABEL} {name}",
         f"사이트: {site}",
+        *([f"목적지: {dest}"] if dest else []),
         f"탭: {display_safe(str(tab_id or ''), 40)}",
         f"이유: {why}",
         "승인하면 실행 직전에 대상이 그대로인지 다시 확인합니다. 요청한 적 없는 동작이면 거절하세요.",
     ])
+
+
+def destination_text(meaning: Any) -> str:
+    """승인 대상의 목적지 한 줄(표시용, 가림 적용). 링크면 href, 폼 제출이면 'METHOD action'. 없으면 ''."""
+    from interface.handoff import display_safe, mask_code_like
+    from security.public_url import public_url
+
+    if not isinstance(meaning, dict):
+        return ""
+
+    def url(raw: Any) -> str:
+        return display_safe(mask_code_like(public_url(str(raw or ""))), 200)
+
+    target = str(meaning.get("target") or "")
+    suffix = f" (새 창/프레임: {display_safe(target, 40)})" if target and target != "_self" else ""
+    if meaning.get("href"):
+        return url(meaning["href"]) + suffix
+    if meaning.get("action"):
+        method = display_safe(str(meaning.get("method") or "get"), 10).upper()
+        return f"{method} {url(meaning['action'])}" + suffix
+    return ""
 
 
 class ElicitMixin:
@@ -177,6 +206,38 @@ class ElicitMixin:
 
     _policy_store: Any = None
 
+    # -- R2 B4: 승인 실행 구간 직렬화 -------------------------------------------------------------------------
+    # 승인(정책·elicitation·승인 증표)으로 연 호출의 '재확인 → 실제 입력 → 효과 판정' 을 서버 단위 asyncio 락으로 한
+    # 호출씩. 디스패처는 dispatch 마다 비우는 인스턴스 기록(이동 대기·다이얼로그·팝업·최상위 기록기)을 쓰고 실제 입력도
+    # 공유 Chromium 이라, 동시 두 승인 호출이 겹치면 한쪽 입력이 사라지고도 둘 다 성공으로 보고됐다(검증 BLOCKING-4).
+    # 사람 응답 대기(elicitation)는 락 밖이다. 잡은 호출 표시는 호출 문맥(_EXEC_HELD) — 같은 호출 안 중첩(헤드리스
+    # 재시도 등)은 다시 잡지 않는다. 푸는 곳은 _call_tool 의 finally 한 곳(_release_approval_exec).
+    # 병합 메모: WS-57 의 같은 작업 공간 dispatch 직렬화 락이 들어오면 그 락으로 통일한다.
+
+    def _approval_exec_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_approval_exec_lock_obj", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._approval_exec_lock_obj = lock
+        return lock
+
+    def _approval_exec_held(self) -> bool:
+        """이 호출 문맥이 승인 실행 구간 락을 잡고 있는가."""
+        return _EXEC_HELD.get()
+
+    async def _hold_approval_exec(self) -> None:
+        """이 호출이 승인 실행 구간 락을 잡는다(이미 잡았으면 그대로)."""
+        if _EXEC_HELD.get():
+            return
+        await self._approval_exec_lock().acquire()
+        _EXEC_HELD.set(True)
+
+    def _release_approval_exec(self) -> None:
+        """이 호출이 잡은 승인 실행 구간 락을 푼다(안 잡았으면 아무것도 안 함)."""
+        if _EXEC_HELD.get():
+            _EXEC_HELD.set(False)
+            self._approval_exec_lock().release()
+
     def _approval_policies(self) -> Any:
         """serve --profile 로 잡은 프로필의 정책 저장소. 프로필이 없으면 None(정책 없음)."""
         from pathlib import Path
@@ -197,6 +258,8 @@ class ElicitMixin:
         self._oob_note = None
         refused = self._policy_pass(action, ctx)
         if refused is True:
+            # R2 B4: 정책으로 연 호출도 실제 입력~효과 판정을 다른 승인 호출과 겹치지 않게(서버 단위 직렬화).
+            await self._hold_approval_exec()
             if report_basis:
                 self._pending_gate_basis = dict(decision.basis)
             return True
@@ -205,14 +268,20 @@ class ElicitMixin:
             return None
         components = self._approval_components(action, params, dict(decision.basis))
         # B1: 사람에게 묻는 지금의 실제 노드를 잡는다 — 못 잡으면 결속할 수 없으니 묻지 않는다(기존 경로).
+        # R2 B2: 좌표(hit-test 노드)·키(포커스 노드)도 같은 규칙.
         pinned = await self._pin_approval_target(params)
         if pinned is False:
             return None
         message = elicitation_message(action, ctx.element_name or ctx.selector, components["origin"],
-                                      components["tab_id"], decision.reason, secrets.token_hex(3))
+                                      components["tab_id"], decision.reason, secrets.token_hex(3),
+                                      destination=getattr(pinned, "meaning", None))
         self._approval_pin = pinned
         try:
             answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
+            if answer == "accept":
+                # R2 B4: 사람 응답 대기는 락 밖 — 응답 뒤 재확인·실제 입력·효과 판정은 서버 단위로 한 호출씩.
+                # (락은 _call_tool 끝에서 푼다 — _release_approval_exec.)
+                await self._hold_approval_exec()
             checked = (await self._recheck_after_accept(action, params, components)
                        if answer == "accept" else None)
         except BaseException:

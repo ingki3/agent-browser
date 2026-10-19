@@ -317,7 +317,12 @@ async def test_concurrent_accepts_keep_their_own_heal_ban_and_targets(site):
                         if params.get("element_id") == a_id:
                             out["a_heal_before"] = disp.heal_disabled
                             a_in_dispatch.set()
-                            await b_done.wait()  # B 가 끝날 때까지 A 를 디스패처 안에 붙잡는다
+                            # WS-56 R2 B4: 승인 실행 구간은 서버 단위 직렬화 — B 는 승인(accept)돼도 A 가 끝날 때까지
+                            # 재확인·실행에 들어오지 못한다(예전: B 가 끝날 때까지 A 를 붙잡음 → 이제는 교착).
+                            # A 를 디스패처 안에 잠시 붙잡아 B 가 accept 뒤 락을 기다리게 하고, 그동안 B 가 끝나지 않았고
+                            # A 의 치유 금지가 그대로인지 본다.
+                            await asyncio.sleep(0.8)
+                            out["b_done_while_a_in_dispatch"] = b_done.is_set()
                             out["a_heal_after_b"] = disp.heal_disabled
                         return await real_fresh(action, handle, params)
 
@@ -344,6 +349,7 @@ async def test_concurrent_accepts_keep_their_own_heal_ban_and_targets(site):
         backend.hub.close()
 
     assert out["a_heal_before"] is True and out["a_heal_after_b"] is True, out
+    assert out["b_done_while_a_in_dispatch"] is False, out  # R2 B4: 승인 실행 구간 직렬화
     a, b = out["a"], out["b"]
     assert b["success"] is True and b["data"]["approval"]["via"] == "elicitation", b
     assert a["success"] is False and not a.get("healed"), a
