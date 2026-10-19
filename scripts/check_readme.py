@@ -14,11 +14,64 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
+DOCS = ROOT / "docs"
+
+
+def doc_files() -> list[Path]:
+    """검사 대상 문서 — README + docs/**/*.md(WS-53: 상세를 docs/ 로 옮겨도 명령·주장을 계속 검증)."""
+    return [README] + sorted(DOCS.rglob("*.md"))
+
+
+def all_docs_text() -> str:
+    return "\n".join(p.read_text(encoding="utf-8") for p in doc_files())
+
+
+def github_slug(heading: str) -> str:
+    """GitHub 제목 앵커 — 소문자, 글자·숫자·공백·-·_ 외 제거, 공백은 -."""
+    s = heading.strip().lower()
+    s = re.sub(r"[^\w\- ]", "", s)
+    return s.replace(" ", "-")
+
+
+def anchors_of(path: Path) -> set[str]:
+    seen: dict[str, int] = {}
+    out: set[str] = set()
+    fence = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("```"):
+            fence = not fence
+            continue
+        m = None if fence else re.match(r"^#{1,6} (.+)$", line)
+        if not m:
+            continue
+        slug = github_slug(m.group(1))
+        n = seen.get(slug, 0)
+        seen[slug] = n + 1
+        out.add(slug if n == 0 else f"{slug}-{n}")
+    return out
+
+
+def broken_links() -> list[str]:
+    """README·docs 의 상대 링크(파일·#앵커)가 가리키는 대상이 실제로 있는지. 외부 URL 은 보지 않는다."""
+    bad: list[str] = []
+    for path in doc_files():
+        text = re.sub(r"```.*?```", "", path.read_text(encoding="utf-8"), flags=re.S)
+        for target in re.findall(r"\]\(([^)\s]+)\)", text):
+            if re.match(r"^[a-z]+:", target):
+                continue
+            file_part, _, anchor = target.partition("#")
+            dest = (path.parent / file_part).resolve() if file_part else path
+            rel = path.relative_to(ROOT)
+            if not dest.exists():
+                bad.append(f"{rel}: {target} — 파일 없음")
+            elif anchor and dest.suffix == ".md" and anchor not in anchors_of(dest):
+                bad.append(f"{rel}: {target} — 앵커 없음")
+    return bad
 
 
 def extract_commands() -> list[str]:
-    """README의 bash 블록에서 실행 가능한 명령을 뽑는다."""
-    text = README.read_text(encoding="utf-8")
+    """README·docs 의 bash 블록에서 실행 가능한 명령을 뽑는다."""
+    text = all_docs_text()
     blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
     cmds = []
     for block in blocks:
@@ -76,7 +129,7 @@ def pytest_passed_count() -> tuple[int, str]:
 def main() -> int:
     failures: list[str] = []
 
-    print("=== 1. README에 적힌 명령 존재 여부 ===")
+    print("=== 1. README·docs 에 적힌 명령 존재 여부 ===")
     cmds = extract_commands()
     print(f"  추출된 명령 {len(cmds)}개")
 
@@ -121,8 +174,9 @@ def main() -> int:
             failures.append(f"agent-browser {sub} — exit {code}")
         print(f"  [{'OK' if ok else 'FAIL'}] agent-browser {sub}")
 
-    print("\n=== 4. README 주장 검증 ===")
+    print("\n=== 4. README·docs 주장 검증 ===")
     text = README.read_text(encoding="utf-8")
+    docs_text = all_docs_text()
 
     # 툴 개수 — 문서에 등장하는 모든 'N종' 표기를 실제와 대조한다.
     # 문자열 존재 여부만 보면 다른 위치의 숫자가 틀려도 통과한다.
@@ -130,7 +184,7 @@ def main() -> int:
     m = re.search(r"노출 툴 (\d+)종", out)
     actual_tools = int(m.group(1)) if m else -1
     claimed_all = {
-        int(n) for n in re.findall(r"(\d+)종 (?:툴|액션|전수|디스패처)", text)
+        int(n) for n in re.findall(r"(\d+)종 (?:툴|액션|전수|디스패처)", docs_text)
     }
     ok = bool(claimed_all) and claimed_all == {actual_tools}
     if not ok:
@@ -142,7 +196,7 @@ def main() -> int:
         f"= 실제 {actual_tools}"
     )
 
-    # 테스트 개수 — '통과'는 passed 수를 뜻한다. collected에는 skipped가
+    # 테스트 개수(README 의 문장만) — '통과'는 passed 수를 뜻한다. collected에는 skipped가
     # 포함되므로 그대로 비교하면 어긋난다(실제로 427 vs 428로 틀렸다).
     m = re.search(r"(\d+)개가 통과", text)
     claimed_tests = int(m.group(1)) if m else -1
@@ -194,13 +248,20 @@ def main() -> int:
     # 대신 커밋 전에 `git status`로 uv.lock 변경 여부를 확인하십시오.
     # 버전을 올린 커밋에 lock이 빠져 있으면 그 자체가 신호다.
 
+    print("\n=== 5. 문서 상대 링크·앵커 ===")
+    bad = broken_links()
+    for b in bad:
+        failures.append(f"깨진 링크 {b}")
+        print(f"  [FAIL] {b}")
+    print(f"  [{'OK' if not bad else 'FAIL'}] 문서 {len(doc_files())}개, 깨진 링크 {len(bad)}건")
+
     print("\n" + "=" * 50)
     if failures:
         print(f"[FAIL] {len(failures)}건")
         for f in failures:
             print(f"  - {f}")
         return 2
-    print("[SUCCESS] README의 모든 명령과 주장이 실제와 일치합니다.")
+    print("[SUCCESS] README·docs 의 모든 명령과 주장이 실제와 일치합니다.")
     return 0
 
 

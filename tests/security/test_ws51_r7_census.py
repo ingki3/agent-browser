@@ -52,6 +52,7 @@ NOT_OUT_FILES = {
     "interface/observability.py": "run CLI 관측 기록",
     "interface/session_cli.py": "session CLI stdout",
     "interface/profile_cli.py": "profile CLI stdout",
+    "browser/chrome_cookies.py": "WS-59 profile import-cookies 전용(사람 CLI — MCP·서버 도구에서 import 하지 않음)",
     "interface/login_cli.py": "login CLI",
     "interface/cli.py": "CLI 진입점",
     "interface/server_schema.py": "도구 스키마(정적 — 응답 data 아님, WS-48 골든 고정)",
@@ -69,6 +70,8 @@ TABLES = {
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
     ("security/hitl.py", "ICON_CLASS_RISK"): (NOT_OUT, "아이콘 class → 위험 키워드 조회표(판정 입력)"),
     ("security/robots_signal.py", "_SCOPE_NOTES"): (FREE, "data.robots.note 고정 문장(키는 scope 어휘)"),
+    ("security/robots_signal.py", "_USER_REQUEST_NOTES"): (FREE, "WS-54 data.robots.user_request 고정 문장"
+                                                                 "(키는 scope 어휘)"),
     ("vision/grounder.py", "GROUND_REASONING"): (NOT_OUT, "VLM 요청 설정"),
     ("vision/overlay.py", "_INJECT_SCRIPT"): (NOT_OUT, "페이지 주입 JS 의 % 치환"),
     ("vision/overlay.py", "_REMOVE_SCRIPT"): (NOT_OUT, "페이지 주입 JS 의 % 치환"),

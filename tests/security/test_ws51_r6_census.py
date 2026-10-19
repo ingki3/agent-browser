@@ -85,6 +85,8 @@ CANDIDATES = {
                                                        "출구 아님(출력은 handler_format 이 가림)", None, None),
     ("interface/attach.py", "f'attach-{self._seq}'"): ("WS-57 붙은 연결 기본 작업 공간 이름(악수 IPC, 응답은 "
                                                         "window.tabs[].workspace FREE 칸) — 면제하지 않음", None, None),
+    ("browser/chrome_cookies.py", "'Cookies' + suffix"): ("WS-59 Chrome 쿠키 DB 곁 파일(-journal·-wal) 사본 이름(경로 "
+                                                           "조립) — 값 생산 아님", None, None),
     ("security/hitl.py", "key + '-'"): ("아이콘 클래스 접두 비교용 조각 — 값 생산 아님", None, None),
     ("security/public_url.py", "'#' + _public_fragment(fragment, depth, sink)"): ("주소 fragment 조립(이미 가린 값) — "
                                                                                   "식별자 아님", None, None),
