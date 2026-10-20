@@ -84,7 +84,7 @@ agent-browser control release
 
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 
-**조작권 구간의 로그인 기록(WS-58).** 사람이 조작권을 가진 동안(take~release) 그 브라우저의 POST/PUT 요청(Network 계층, 메서드·origin 만 — 본문 미열람)·쿠키 추가·값 변경·비밀번호 칸 제출·`secret_wanted` 인계는 그 origin 을 로그인 기록(`human_control`)에 남겨, 이후 그 사이트에서는 헤드리스 이름 재시도를 하지 않습니다. 요청 감시는 조작권이 넘어간 그 동기 구간에서 먼저 붙고(설치 중 요청도 기록), 설치가 실패하면 그 구간에 방문한 origin 전부를 기록합니다(fail-closed). 규칙과 한계는 [헤드리스 이름 재시도](headless-retry.md)에 있습니다.
+**조작권 구간의 로그인 기록(WS-58).** 사람이 조작권을 가진 동안(take~release) 그 브라우저(모든 작업 공간의 탭·새 탭 — 사람 조작권은 브라우저 전체, WS-57)의 POST/PUT 요청(Network 계층, 메서드·origin 만 — 본문 미열람)·쿠키 추가·값 변경·비밀번호 칸 제출·`secret_wanted` 인계는 그 origin 을 로그인 기록(`human_control`)에 남겨, 이후 그 사이트에서는 헤드리스 이름 재시도를 하지 않습니다. 요청 감시는 조작권이 넘어간 그 동기 구간에서 먼저 붙고(설치 중 요청도 기록), 설치가 실패하면 그 구간에 방문한 origin 전부를 기록합니다(fail-closed). 규칙과 한계는 [헤드리스 이름 재시도](headless-retry.md)에 있습니다.
 
 **결제 버튼 예시(승인 증표).** 창이 보이는 서버(`--browser human`·`user-chrome`)와 `--browser on-demand` 서버(코드는 별도 작은 창 — 아래 '필요할 때만 창' 절)에서 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, expires_at, how_to_approve}`가 붙습니다. 서버는 이 증표를 행동 내용의 해시(액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거 `gate_basis` + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256)에 묶어 두고, 해시는 사람 CLI 만 상태 파일에서 읽습니다(에이전트 응답에는 싣지 않음). **headless 서버는 승인 증표를 발급하지 않습니다** — 사람이 볼 창이 없어 확인 코드를 띄울 곳이 없기 때문입니다. 그때는 기존처럼 `--pre-approve`·`--mode interactive` 안내만 나가며, 대화형 모드의 확인도 같은 이유로 창(확인 코드)이 있어야 완료할 수 있습니다.
 
@@ -120,7 +120,7 @@ agent-browser serve --profile work
 - **이름**: 영문 소문자·숫자·하이픈 1~32자(`[a-z0-9-]`). 경로 문자(`/`·`..`)는 거부합니다.
 - **보관 위치**: `~/.agent-browser/profiles/serve-NAME/`(폴더 권한 700). 루트 폴더는 우리가 새로 만들 때만 700 으로 만들고, 이미 있는 루트(예: `AGENT_BROWSER_PROFILE_ROOT=$HOME`)의 권한은 바꾸지 않습니다. 사이트별 프로필 폴더와 같은 루트이며 `serve-` 앞머리로 구분합니다. 루트는 환경변수 `AGENT_BROWSER_PROFILE_ROOT`로 바꿀 수 있습니다(테스트는 임시 폴더를 씁니다). 평소 Chrome 프로필 아래와 user-chrome 전용 폴더(`~/.agent-browser/chrome-profile`) 아래는 거부합니다.
 - **보안 정책은 그대로**: Egress 검증 프록시(사설망 기본 차단·CONNECT 만·fail-closed), QUIC 끔, WebRTC 비프록시 UDP 차단, route 가드, 문서 상태·차단 신호, HITL·승인 증표·조작권·안내 띠가 영속 모드에서도 같은 경로로 설치됩니다.
-- **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다.
+- **동시 사용 거부**: 한 프로필은 한 서버만 씁니다. 다른 serve 가 쓰는 중이면 시작하자마자 `프로필 'work' 를 서버 <server_id> 가 쓰는 중` 한 줄과 종료 코드 2 로 끝납니다(잠금은 프로세스가 죽으면 OS 가 풉니다). 우리 잠금 밖의 Chromium 이 그 폴더를 쓰는 중이어도(SingletonLock) 거부합니다. 두 serve 가 `--attach` 이면 거부 대신 붙습니다(아래 '함께 쓰기' 절).
 - **잠금 파일을 직접 지우지 마십시오**: 프로필 폴더 안 `.agent-browser-serve.lock` 을 지우면 같은 프로필의 동시 사용을 막지 못할 수 있습니다(잠금은 파일 단위라, 지운 뒤 새로 만든 파일은 다른 서버의 잠금과 별개가 됩니다). 서버가 죽으면 잠금은 OS 가 풀어 주므로 지울 필요가 없습니다. 폴더를 없애려면 `agent-browser profile remove` 를 쓰십시오.
 - **`--browser user-chrome`과 함께 쓸 수 없습니다** — user-chrome 은 이미 전용 영속 프로필(`--chrome-profile`)을 씁니다.
 - **에이전트에게 보이는 것**: `browser_control_status`의 `data.profile = {name, persistent: true}`(경로는 싣지 않음). headless + `--profile` 서버에서 로그인이 필요해 `browser_control_request`를 부르면 "창 없음" 안내에 `--browser human --profile NAME`으로 한 번 로그인하라는 문구가 붙습니다.
@@ -132,6 +132,25 @@ agent-browser profile remove work     # 확인 프롬프트(사용 중이면 거
 ```
 
 **한계.** ① **쿠키는 평문**입니다 — Playwright Chromium 프로필은 OS 키체인 암호화를 쓰지 않아 폴더 권한 700 으로만 보호됩니다. 같은 OS 사용자로 도는 프로그램은 읽을 수 있습니다. ② **사이트가 세션 쿠키(만료 없음)만 주면 유지되지 않습니다** — Chromium 은 재시작 때 세션 쿠키를 버립니다(실측: Mock 사이트의 영속 쿠키는 남고 세션 쿠키는 사라짐). 로그인할 때 '로그인 상태 유지'를 체크하십시오. 쿠키 수명을 늘리거나 바꾸는 조작은 하지 않습니다(사이트가 준 그대로). ③ 서버를 SIGTERM·SIGINT·stdin 종료로 끝내면 브라우저를 닫아 쿠키를 디스크에 씁니다. SIGKILL 같은 강제 종료는 직전 변경이 남지 않을 수 있습니다. ④ 영속 프로필에는 캐시·서비스워커 등록도 남습니다(서비스워커 요청도 검증 프록시를 거칩니다).
+
+## 대화와 정기 작업이 같은 프로필을 함께 쓰기 (`serve --attach`, 작업 공간)
+
+같은 serve 를 대화와 정기 작업(cron 감시 등)이 동시에 쓰면 예전에는 활성 탭·`snapshot_epoch`·탭 닫기가 서로에게 샜습니다(실사용: 감시 작업이 대화가 사람에게 열어 준 창의 마지막 탭을 닫음). 이제 호출자마다 **작업 공간**(자기 탭 묶음·자기 활성 탭·자기 관찰 epoch·자기 레시피 궤적)을 갖고, 로그인(쿠키)은 같은 영속 컨텍스트라 공유합니다.
+
+- **연결 단위(권장)**: 같은 `--profile` 의 serve 를 둘 띄우되 둘 다 `--attach` 를 붙입니다. 먼저 뜬 쪽이 브라우저를 띄우고, 나중 쪽은 잠금 오류 대신 그 serve 에 붙습니다(프로필 폴더 안 0700 디렉터리의 0600 소켓, 같은 OS 사용자만 — 연결마다 상대 uid 확인, 심볼릭 링크 거부). `--workspace NAME` 이 그 연결의 기본 작업 공간입니다(없으면 첫 serve 는 `default`, 붙은 쪽은 `attach-N`). 첫 serve 가 끝나면 붙은 serve 는 stderr 한 줄 + 종료 코드 3 으로 끝납니다(클라이언트가 다시 띄우면 새로 붙거나 직접 브라우저를 띄움). 붙은 serve 의 브라우저 옵션은 쓰이지 않습니다(첫 serve 것).
+
+```text
+agent-browser serve --profile private --browser on-demand --attach                      # 대화
+agent-browser serve --profile private --browser on-demand --attach --workspace watch    # 감시(cron)
+```
+
+- **호출 단위**: 한 연결을 여럿이 나눠 쓰면 도구 인자 `workspace`(영문 소문자·숫자·하이픈 1~32자, 계약 밖 서버 메타)를 매 호출에 붙입니다. 연결 기본값보다 우선합니다. 규칙 위반 이름은 `E_TAB_NOT_FOUND` 로 거부(브라우저 무접촉).
+- **따로인 것**: `browser_tab_control` list/switch/close(남의 탭은 `E_TAB_NOT_FOUND`, list 는 남의 탭을 `data.other_workspace_tabs` 개수로만), navigate·관찰 대상 탭, epoch, 레시피 궤적, 호출별 승인·판정 근거 상태. 마지막 자기 탭을 닫으면 빈 탭으로 바뀝니다(WS-50 규칙, 남의 탭에 영향 없음).
+- **함께인 것**: 쿠키·로그인, Egress 가드, 탭 상한(전체 10개), 창(on-demand 창 전환은 브라우저 재기동 — 모든 작업 공간 탭을 주인째 복원하고 각 epoch 를 올림), 사람 조작권(브라우저 전체), 승인 정책, 레시피 저장소.
+- 한 작업 공간만 쓰면(기존 설정) 동작·응답은 예전 그대로입니다(`other_workspace_tabs` 없음). 도구 스키마는 그대로입니다 — `workspace` 인자는 서버 instructions 한 줄로만 알립니다(스키마에 넣으면 tools/list 토큰 예산 2500 을 넘음, 실측 2654).
+- **브라우저 전체 사건의 보고·무효화(WS-57 R1)**: 창 전환(재기동) 보고 `data.window.tabs`(도구 결과·`control_wait`·`control_request`)는 부른 작업 공간의 탭만 싣고 다른 작업 공간은 `other_workspace_tabs` 개수로만 — 작업 공간마다 한 번씩 듣습니다. 사람이 닫은 탭 알림 `tab_closed_by_human` 은 그 탭 주인에게만. 사람 조작권 반납·사람이 창을 닫음·창 재기동은 **모든** 작업 공간의 epoch 를 올려 반납 전 `element_id`·승인 증표를 어디서도 다시 쓰지 못합니다. 클릭의 '새 탭' 효과는 자기 작업 공간 탭만 셉니다(남의 탭 생성은 효과가 아님). 자기 탭이 사람·사이트에 닫혔으면 남의 탭이 살아 있어도 다음 호출이 자기 새 탭으로 복구합니다(기본 작업 공간 포함). 승인 증표 호출의 치유 끄기는 호출 문맥 단위입니다(같은 작업 공간의 동시 호출이 서로 풀지 않음).
+- **같은 작업 공간은 한 번에 하나(WS-57 R2)**: 같은 작업 공간의 액션 도구 19종(관찰·추출·스크린샷·`wait_for` 포함)과 `browser_recipe` 는 작업 공간 락으로 차례로 돕니다 — 한 호출의 사후조건 대기 중에 다른 호출이 연 alert·이동·새 탭이 그 호출의 효과(성공·레시피 궤적)로 읽히지 않게. 다른 작업 공간끼리는 지금처럼 동시입니다. 긴 `wait_for` 는 같은 작업 공간의 다음 호출을 그 시간만큼 기다리게 합니다. 사람을 기다리는 서버 도구(`control_wait`·`approval_wait`·`control_request`)는 락을 쥐지 않습니다. Egress 차단·업스트림 실패 이유(`data.egress`)는 그 요청을 낸 탭의 작업 공간 호출에만, 이동 대상(또는 그 리다이렉트 앞 홉) 호스트가 맞을 때만 붙습니다 — 다른 작업 공간이 막힌 호스트가 내 이동 오류로 복사되지 않고, 탭이 없는 요청(서비스 워커 등)의 차단은 어느 오류에도 붙지 않습니다. 그 탭 **메인 프레임 문서 이동(과 그 리다이렉트 체인)** 의 차단만 이동 오류가 됩니다(WS-57 R3) — 정상 문서 안 이미지·스크립트·fetch·iframe 하위 문서가 비허용 주소로 리다이렉트돼 막혀도 navigate 는 성공 그대로이고, 막힌 기록이 있어도 탭이 지금 주소로 200 문서를 받았으면 성공입니다.
+- **시작·붙기 수명(WS-57 R1)**: 첫 동시 호출들은 브라우저·검증 프록시 시작 하나를 함께 기다립니다(단일 비행, 종료 때 진행 중 시작도 정리). 붙은 연결의 요청 취소·연결 종료는 그 시작을 멈추지 않고 primary 의 프로필 잠금을 풀지 않습니다(잠금은 primary 수명 소유 — 시작 실패 되감기도 시작이 잡은 잠금만 풂). 붙기 통로의 MCP 줄에는 길이 상한이 없습니다(stdio 와 같음, 악수 줄만 1KiB).
 
 ## 필요할 때만 창 (`serve --browser on-demand`)
 

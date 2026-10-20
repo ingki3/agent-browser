@@ -59,7 +59,7 @@ class HandoffMixin:
             # await(쿠키 사이트 응답·안내 띠)보다 먼저.
             self._login_watch_begin()
         if events and self._recipes is not None and ("taken" in events or "released" in events):
-            self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
+            self._reset_all_recipes("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38, 모든 작업 공간 WS-57)
         for event in events:
             if event == "cookie_sites":
                 from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
@@ -84,9 +84,9 @@ class HandoffMixin:
                 self._spawn_login()
             if event == "released":
                 self._release_unreported = True
-                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
-                if self._engine is not None:
-                    self._engine.bump_epoch("control_release")
+                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로. WS-57 R1(R3): 모든 작업 공간 —
+                # 반납을 어느 작업 공간 문맥이 먼저 집어도 반납 전 관찰·승인 근거는 어디서도 다시 쓰이지 않는다.
+                self._bump_all_epochs("control_release")
                 # WS-58: 조작권 구간의 로그인 사건을 기록하는 동안 새 도구 호출(관문)을 세운다 — 기록 전에
                 # 이름 재시도가 그 사이트로 가지 않게.
                 self._hold_gate()
@@ -265,7 +265,7 @@ class HandoffMixin:
                 self.hub.secret_wanted = True  # Human login contents stay out of observations.
                 self.hub._write_control()
                 if self._recipes is not None:
-                    self._recipes.reset("human_control")
+                    self._reset_all_recipes("human_control")
                 if not await self._drain_calls():
                     raise ValueError("진행 중인 도구 호출이 끝나지 않았습니다.")
                 if self.hub.login is not job:
@@ -362,7 +362,7 @@ class HandoffMixin:
                         + ("브라우저를 닫았습니다 — 다음 도구 호출 때 headless 로 다시 엽니다. "
                            if self._window.state == "failed" else "")
                         + "잠시 뒤 다시 요청하거나 운영자에게 알리세요."),
-                    "data": {"window": window_out.get("window") or self._window.info()},
+                    "data": {"window": self._window_view(window_out.get("window") or self._window.info())},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
         out["login_hint"] = self._login_hint()
@@ -380,7 +380,7 @@ class HandoffMixin:
         _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         if window_out is not None:
-            out = dict(out, window=window_out["window"])
+            out = dict(out, window=self._window_view(window_out["window"]))
         return {"success": True, "data": out}
 
     async def _open_window_for_request(self) -> Dict[str, Any]:
@@ -390,7 +390,9 @@ class HandoffMixin:
         w = self._window
         assert w is not None
         w.take_sticky_for_request()
-        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in self._core.tabs()] \
+        from interface.server_window import _all_tabs
+
+        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in _all_tabs(self._core)] \
             if self._core is not None else []
         if w.state == "headed":
             self._sync_window()
@@ -480,7 +482,7 @@ class HandoffMixin:
             self._window_unreported = False
             out = dict(self._last_window_result)
             out.update(self._window.info())
-            return out
+            return self._window_view(out)  # WS-57 R1: 이 작업 공간 탭만(다른 작업 공간은 개수만)
         return dict(self._window.info(), reopened=False)
 
     async def _approval_wait(self, approval_id: str, timeout: float) -> Dict[str, Any]:

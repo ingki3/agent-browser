@@ -15,6 +15,7 @@ from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
 from interface.server_envelope import cap_result_size
+from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
 
@@ -61,8 +62,14 @@ class ToolsMixin:
         from security.public_url import public_payload
 
         with self.tool_entry(name):
-            await self._retry_settled()
-            return public_payload(await self._server_tool_payload(name, arguments))
+            try:
+                # WS-57: 작업 공간 인자(계약 밖) — 레시피만 쓰고, 조작권 도구는 브라우저 전체 단위라 무시한다.
+                arguments, workspace = pop_workspace_arg(arguments)
+            except WorkspaceNameError as exc:
+                return {"success": False, "error_code": ErrorCode.TAB_NOT_FOUND.value, "error_message": str(exc)}
+            with self._call_scope(workspace):
+                await self._retry_settled()
+                return public_payload(await self._server_tool_payload(name, arguments))
 
     async def _server_tool_payload(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """call_server_tool 본문(가리기 전 원문 응답)."""
@@ -71,7 +78,12 @@ class ToolsMixin:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
         if name == RECIPE_TOOL:
-            return await self._recipe_tool(args)
+            # WS-57 R2(B1): 레시피 재생은 이 작업 공간의 액션 여러 개 — 단계 사이에 같은 작업 공간의 다른 호출이 끼지 않게
+            # 재생 전체를 직렬화 구간으로(안쪽 call_tool 은 같은 흐름이라 다시 잡지 않는다).
+            async with self._dispatch_serial():
+                if self._started:
+                    await self._ensure_workspace()
+                return await self._recipe_tool(args)
         if name == YOUTUBE_TOOL:
             return await self._youtube_tool(args)
         if not self.hub.opened:
@@ -176,8 +188,14 @@ class ToolsMixin:
         # WS-52 R1: anything that may change the page (login included) closes the settle tail
         # synchronously, before the first await (tool_entry).
         with self.tool_entry(name):
-            await self._retry_settled()
-            return await self._route_tool_call(name, arguments)
+            try:
+                # WS-57: 작업 공간 인자(계약 밖 서버 메타) — 계약 입력 검증 전에 떼어 낸다.
+                arguments, workspace = pop_workspace_arg(arguments)
+            except WorkspaceNameError as exc:
+                return self._workspace_error(action_from_tool(name) or ActionType.OBSERVE_PAGE, exc)
+            with self._call_scope(workspace):
+                await self._retry_settled()
+                return await self._route_tool_call(name, arguments)
 
     async def _route_tool_call(self, name: str, arguments: Dict[str, Any]) -> ActionResult:
         from interface.on_demand import SWITCH_WAIT_S
@@ -203,6 +221,8 @@ class ToolsMixin:
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
             action = action_from_tool(name)
+            if action is ActionType.TAB_CONTROL and result.success and "tabs" in result.data:
+                self._note_other_workspaces(result)  # WS-57: 다른 작업 공간 탭은 개수만
             if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
                 result.data["login_hint"] = self._login_hint()
             if action is not None:
@@ -288,6 +308,7 @@ class ToolsMixin:
 
         if not self._started:
             await self.start()
+        await self._ensure_workspace()  # WS-57: 기본 외 작업 공간은 자기 탭·엔진·디스패처
 
         params: Dict[str, Any] = dict(arguments or {})
         # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
@@ -300,15 +321,27 @@ class ToolsMixin:
             return checked
         params = checked
 
-        self._observation_state()
+        # WS-57 R2(B1): 같은 작업 공간의 게이트·디스패치는 한 번에 하나 — 디스패처가 호출 임시 상태(_dialogs·_nav_info·
+        # _opened_pages·_top_attribution)를 인스턴스에 두고 dispatch 입구에서 초기화하므로, 겹치면 남의 alert·이동이 내
+        # 효과로 읽혔다. 다른 작업 공간끼리는 동시. 조작권·확인 코드 거부는 위에서 기다리지 않고 바로 돌려준다
+        # (캡처는 이미 등록돼 코드 표시가 기다린다). 기다렸다면 그사이 사람이 조작권을 잡았을 수 있어 다시 본다.
+        serial = self._dispatch_serial()
+        async with serial:
+            if serial.waited:
+                if self.hub.opened:
+                    await self._poll_handoff()
+                refused = self._control_refusal(action, params)
+                if refused is not None:
+                    return refused
+            self._observation_state()
 
-        # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
-        self._pending_gate_basis = None
-        self._used_approval = None
-        blocked = await self._check_hitl(action, params, approval_id=approval_id)
-        if blocked is not None:
-            return blocked
-        return await self._run_gated_action(name, arguments, action, params)
+            # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
+            self._pending_gate_basis = None
+            self._used_approval = None
+            blocked = await self._check_hitl(action, params, approval_id=approval_id)
+            if blocked is not None:
+                return blocked
+            return await self._run_gated_action(name, arguments, action, params)
 
     async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
                                         capture: Dict[str, Any]) -> Optional[ActionResult]:
@@ -316,18 +349,9 @@ class ToolsMixin:
         # WS-29: 사람이 조작권을 가진 동안(또는 비밀 입력 요청 중) 에이전트 액션 거부.
         if self.hub.opened:
             await self._poll_handoff()
-        control = self.hub.control_blocks(action, params)
-        if control is not None:
-            if self._recipes is not None:
-                self._recipes.reset("human_control")
-            what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
-            return self._error_result(
-                action,
-                ErrorCode.HITL_UNATTENDED_BLOCKED,
-                f"사람이 브라우저를 다루는 중이라 {what}을 거부했습니다({control['reason']}). "
-                "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
-                data={"control": control},
-            )
+        refused = self._control_refusal(action, params)
+        if refused is not None:
+            return refused
         if action is ActionType.TAKE_SCREENSHOT:
             if self._pixels_blocked():
                 # WS-29 R1: 사람용 확인 코드가 창 오버레이에 떠 있다(또는 띄울 예정). headed 창에서는
@@ -338,6 +362,22 @@ class ToolsMixin:
             self._captures_inflight += 1
             capture["gen"] = self._pixel_gen
         return None
+
+    def _control_refusal(self, action: ActionType, params: Dict[str, Any]) -> Optional[ActionResult]:
+        """사람이 조작권을 가진 동안(또는 비밀 입력 요청 중) 에이전트 액션 거부 결과. 막지 않으면 None."""
+        control = self.hub.control_blocks(action, params)
+        if control is None:
+            return None
+        if self._recipes is not None:
+            self._recipes.reset("human_control")
+        what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
+        return self._error_result(
+            action,
+            ErrorCode.HITL_UNATTENDED_BLOCKED,
+            f"사람이 브라우저를 다루는 중이라 {what}을 거부했습니다({control['reason']}). "
+            "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
+            data={"control": control},
+        )
 
     def _validated_params(self, action: ActionType, params: Dict[str, Any]) -> Any:
         """계약 입력 검증 + 디스패처 키 정규화. 반환: 검증된 params(dict) 또는 실패 ActionResult."""
@@ -423,23 +463,42 @@ class ToolsMixin:
     async def _dispatch_with_approval(self, action: ActionType, params: Dict[str, Any],
                                       used: Optional[str]) -> tuple:
         """디스패처 실행(승인 증표 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
-        if used is not None:
-            # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다.
-            self._dispatcher.heal_disabled = True
+        # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다. WS-57 R1(R2): 호출 문맥 단위
+        # (heal_disabled_scope) — 같은 디스패처의 다른 동시 호출이 끝나며 이 호출의 금지를 풀지 않는다.
+        heal_guard = self._heal_guard(used is not None)
         try:
-            scope = self._navigation_scope.get()
-            remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
-                          if scope is not None else None)
-            result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
-                                             self._egress_proxy, self._robots, self.max_result_chars)
+            with heal_guard:
+                scope = self._navigation_scope.get()
+                remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
+                              if scope is not None else None)
+                result = await self._pdf.dispatch(self._dispatcher, action, params, self._egress,
+                                                 self._egress_proxy, self._robots, self.max_result_chars)
         except BaseException:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
-        finally:
-            if used is not None:
-                self._dispatcher.heal_disabled = False
         return result, remembered
+
+    def _heal_guard(self, on: bool) -> Any:
+        """승인 증표 호출 동안 자가 치유 끄기(WS-57 R1 R2: 호출 문맥 단위). 디스패처가 scope 를 모르면 예전 방식."""
+        import contextlib
+
+        disp = self._dispatcher
+        if not on or disp is None:
+            return contextlib.nullcontext()
+        scope = getattr(disp, "heal_disabled_scope", None)
+        if callable(scope):
+            return scope()
+
+        @contextlib.contextmanager
+        def legacy() -> Any:
+            disp.heal_disabled = True
+            try:
+                yield
+            finally:
+                disp.heal_disabled = False
+
+        return legacy()
 
     def _error_result(
         self,

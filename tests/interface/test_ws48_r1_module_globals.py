@@ -40,6 +40,7 @@ SPLIT_MODULES = (
     "interface.server_signals",
     "interface.server_tools",
     "interface.server_window",
+    "interface.server_workspace",  # WS-57
 )
 
 #: 옮긴 함수(믹스인 메서드 포함)가 런타임에 조회하는 모듈 전역 이름 — 전부 '보존'(보고서 R1 표).
@@ -54,6 +55,12 @@ PRESERVED = (
     "blocked_hint_text", "build_all_tools", "build_server_tools", "build_tool_schema", "cap_result_size",
     "code_overlay_text", "compact_schema", "envelope_dict", "envelope_json", "logger", "os",
     "pre_approve_hint", "time", "tool_name", "unicodedata",
+    # WS-57 작업 공간
+    "DEFAULT_WORKSPACE", "WORKSPACE_ARG", "WorkspaceNameError", "WorkspaceRuntime", "_CALL_STATE", "_CallScope",
+    "_all_tabs", "_closed", "_snapshot_tabs", "current_workspace", "pop_workspace_arg", "validate_workspace",
+    "workspace_scope",
+    # WS-57 R2 작업 공간 직렬화
+    "_SERIAL_HELD", "_WorkspaceSerial",
 )
 
 

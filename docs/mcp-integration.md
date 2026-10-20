@@ -2,7 +2,7 @@
 
 [← 문서 목차](README.md)
 
-기본 설정(Claude Desktop 예시·설정 파일 위치)은 [README의 MCP 클라이언트 연동](../README.md#mcp-클라이언트-연동)을 보십시오. 차단·주입·robots 신호는 [signals.md](signals.md), 사람 인계·로그인 유지·필요할 때만 창은 [human-handoff.md](human-handoff.md)에 있습니다.
+기본 설정(Claude Desktop 예시·설정 파일 위치)은 [README의 MCP 클라이언트 연동](../README.md#mcp-클라이언트-연동)을 보십시오. 차단·주입·robots 신호는 [signals.md](signals.md), 사람 인계·로그인 유지·필요할 때만 창은 [human-handoff.md](human-handoff.md)에 있습니다. 대화와 정기 작업이 한 브라우저를 나눠 쓰는 작업 공간·`serve --attach` 는 [human-handoff.md의 함께 쓰기 절](human-handoff.md#대화와-정기-작업이-같은-프로필을-함께-쓰기-serve---attach-작업-공간)에 있습니다.
 
 ## 브라우저 방식 (`serve --browser`)
 

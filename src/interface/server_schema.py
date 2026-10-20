@@ -193,6 +193,14 @@ YOUTUBE_INSTRUCTIONS = (
 )
 
 
+#: MCP initialize 의 서버 instructions 한 줄(WS-57 작업 공간). 도구 스키마에는 넣지 않는다 — 20개 도구에
+#: 속성을 더하면 tools/list 토큰 예산(WS-30b, 2500)을 넘는다(실측 2654). 인자는 서버가 계약 검증 전에 뗀다.
+WORKSPACE_INSTRUCTIONS = (
+    "workspace: 같은 브라우저를 다른 작업(정기 작업 등)과 함께 쓰면 모든 browser_* 호출에 같은 workspace "
+    "이름(영문 소문자·숫자·하이픈)을 붙이세요 — 자기 탭·관찰만 보이고 로그인은 공유됩니다. 생략=연결 기본."
+)
+
+
 OBSERVE_INSTRUCTIONS = (
     "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다"
 )

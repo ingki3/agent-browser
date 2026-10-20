@@ -406,7 +406,8 @@ def _upstream_server(status: Any):
     srv._egress = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
     before = srv._egress.upstream_total
     srv._egress.record_upstream_failure(
-        UpstreamFailure(host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080))
+        UpstreamFailure(host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080,
+                        page=page))  # WS-57 R2: 이 호출 탭에 귀속된 기록(브라우저 응답 이벤트가 붙인다)
     return srv, before
 
 
@@ -436,6 +437,23 @@ def test_upstream_failure_of_subrequest_keeps_successful_document(status):
     r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
                                      _ok(ActionType.NAVIGATE), before)
     assert r.success is True and "egress" not in r.data
+
+
+def test_upstream_failure_without_tab_attribution_is_not_attached():
+    """WS-57 R2(B2): 귀속되지 않은 기록(서비스 워커 등)·다른 Page 의 기록은 이동 대상이 같아도 붙이지 않는다."""
+    from types import SimpleNamespace
+
+    from contracts import ActionType
+    from security.egress import UpstreamFailure
+
+    for page in (None, SimpleNamespace(url="http://svc.test:8080/x")):
+        srv, before = _upstream_server(502)
+        srv._egress.record_upstream_failure(UpstreamFailure(
+            host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080, page=page))
+        before = srv._egress.upstream_total - 1
+        r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
+                                         _ok(ActionType.NAVIGATE), before)
+        assert r.success is True and "egress" not in r.data
 
 
 def test_upstream_failure_other_port_is_not_attached():
