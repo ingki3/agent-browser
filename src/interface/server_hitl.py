@@ -74,6 +74,10 @@ _UNCERTAIN_CODES = frozenset({
 class HitlMixin:
     """BrowserMCPServer 의 HITL 승인 게이트·승인 증표 사용·대상 판정(WS-29·30·31·39) (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
 
+    #: WS-56 R1 B1: 증표별로 잡아 둔 대상 노드 장부 상한(서버 메모리 — 넘치면 오래된 것부터 놓는다).
+    #: (클래스 속성 — WS-48 분리 모듈의 함수는 mcp_server 전역으로 돌아 모듈 전역을 새로 둘 수 없다.)
+    _PIN_BOOK_CAP = 32
+
     def _current_origin(self) -> str:
         from urllib.parse import urlsplit
 
@@ -119,6 +123,7 @@ class HitlMixin:
         ok, why, reason_code = self.hub.check_approval(approval_id, components)
         if not ok:
             return {"approval_id": approval_id, "reason": why, "reason_code": reason_code}
+        # WS-56 R2 B4 → R4: 재확인~실제 입력~효과 판정은 _call_tool 이 쥔 작업 공간 직렬화 구간 안(다른 호출과 겹치지 않음).
         check = getattr(self._dispatcher, "approval_target_check", None)
         if check is None:
             target = {"fresh": False, "detail": "대상 확인 불가"}  # fail-closed
@@ -127,6 +132,9 @@ class HitlMixin:
                 target = await check(params)
             except Exception as exc:  # noqa: BLE001
                 target = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
+        if target.get("fresh"):
+            # WS-56 R1 B1: 이름·role·css 가 같아도 증표 발급(승인 요청) 때 잡은 그 노드여야 한다.
+            target = await self._pinned_check(self._approval_pins().get(approval_id), params)
         if not target.get("fresh"):
             return self._error_result(
                 action,
@@ -141,35 +149,52 @@ class HitlMixin:
         if not ok:  # 그사이 다른 호출이 썼다
             return {"approval_id": approval_id, "reason": why, "reason_code": "used"}
         self._used_approval = approval_id
+        # 증표는 한 번 쓴다 — 잡은 노드는 이번 호출의 실행 대상으로 넘기고(디스패처가 그 노드에만) 장부에서 뺀다.
+        self._approval_pin = self._approval_pins().pop(approval_id, None)
         return True
+
+    def _approval_pins(self) -> Dict[str, Any]:
+        """승인 증표 id → 발급(승인 요청) 때 잡은 대상 노드(WS-56 R1 B1). 서버 메모리, 지연 생성."""
+        return self.__dict__.setdefault("_approval_pin_book", {})
+
+    async def _pin_for_token(self, approval_id: str, params: Dict[str, Any]) -> None:
+        """증표 발급 때 대상 노드를 잡아 둔다. 못 잡으면 장부에 없음 → 사용 때 대상 바뀜으로 거부(fail-closed)."""
+        from interface.server_elicit import _release
+
+        pinned = await self._pin_approval_target(params)
+        if not pinned:
+            return
+        book = self._approval_pins()
+        book[approval_id] = pinned
+        while len(book) > self._PIN_BOOK_CAP:  # 오래된 것부터 놓는다(증표 상한과 같은 취지)
+            oldest = next(iter(book))
+            await _release(self._dispatcher, book.pop(oldest))
 
     async def _check_hitl(
         self, action: ActionType, params: Dict[str, Any], approval_id: Any = None
     ) -> Optional[ActionResult]:
         """고위험 액션 승인 게이트. 차단 시 ActionResult를 반환한다."""
-        from security import ActionContext
-
         target = await self._gate_target(action, params)
         if isinstance(target, ActionResult):
             return target
         element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis = target
 
-        decision = self._hitl.evaluate(
-            ActionContext(
-                action=action,
-                element_name=element_name,
-                selector=selector,
-                domain=self._current_domain(),
-                submits_form=submits_form,
-                unresolved_target=unresolved,
-                signals=signals,
-                basis_extra=basis_extra,
-            )
-        )
+        gate_ctx = self._gate_context(action, target)
+        decision = self._hitl.evaluate(gate_ctx)
         if decision.allowed:
             if report_basis:
                 self._pending_gate_basis = dict(decision.basis)
             return None
+
+        # WS-56: approval_id 없는 호출은 먼저 대역 밖 승인 — 사람 CLI 정책, 그다음 클라이언트 elicitation(사람 버튼).
+        # 둘 다 아니면(거절·시간 초과·미지원) 아래 기존 경로 그대로.
+        self._oob_note = None
+        if not approval_id:
+            oob = await self._out_of_band(action, params, decision, gate_ctx, report_basis)
+            if oob is True:
+                return None
+            if isinstance(oob, ActionResult):
+                return oob
 
         # WS-29: 승인 증표 — 사람이 대역 밖(`agent-browser approve` + 창의 확인 코드)에서 승인한
         # 바로 그 행동만 통과. R1: 사람이 볼 창이 없으면(headless) 증표를 발급하지 않는다 —
@@ -184,7 +209,24 @@ class HitlMixin:
             ap, approval, rejected = issued
         else:
             rejected = None
-        return self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected)
+        return self._attach_oob_note(
+            self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected))
+
+    def _gate_context(self, action: ActionType, target: tuple) -> Any:
+        """_gate_target 해석 결과 → 게이트 판정 입력(ActionContext)."""
+        from security import ActionContext
+
+        element_name, selector, submits_form, unresolved, signals, basis_extra, _report = target
+        return ActionContext(
+            action=action,
+            element_name=element_name,
+            selector=selector,
+            domain=self._current_domain(),
+            submits_form=submits_form,
+            unresolved_target=unresolved,
+            signals=signals,
+            basis_extra=basis_extra,
+        )
 
     async def _gate_target(self, action: ActionType, params: Dict[str, Any]) -> Any:
         """게이트가 판정할 대상 해석. 반환: (이름, selector, 폼 제출, 판정 불가 사유, 문맥 신호,
@@ -275,6 +317,7 @@ class HitlMixin:
             "reason": decision.reason,
             "domain": self._current_domain(),
         })
+        await self._pin_for_token(ap.approval_id, params)
         # NB-7: action_digest 는 싣지 않는다 — 사람 CLI 가 상태 파일에서 읽는다.
         approval = {
             "approval_id": ap.approval_id,

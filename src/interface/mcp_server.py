@@ -131,6 +131,15 @@ from interface.server_lifecycle import (  # noqa: E402,F401
 from interface.server_tools import (  # noqa: E402,F401
     ToolsMixin,
 )
+# WS-56: 새 모듈(분리 모듈 아님 — 전역 이전 대상이 아니다). 이름은 여기서도 재수출한다.
+from interface.server_elicit import (  # noqa: E402,F401
+    CURRENT_ELICITOR,
+    ELICIT_TIMEOUT_S,
+    ElicitMixin,
+    Elicitor,
+    elicit_timeout,
+    elicitation_message,
+)
 from browser.workspace import (  # noqa: E402,F401
     DEFAULT_WORKSPACE,
     WorkspaceNameError,
@@ -147,6 +156,8 @@ from interface.server_workspace import (  # noqa: E402,F401
     _CallScope,
     _PER_CALL,
     _SERIAL_HELD,
+    _SERIAL_STACK,
+    _SerialPause,
     _WorkspaceSerial,
     _call_field,
     _closed,
@@ -168,8 +179,8 @@ CAPTURE_DRAIN_TIMEOUT_S = 5.0
 RELEASE_RECOVERY_WAIT_S = 10.0
 
 
-class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, SignalsMixin, DisplayMixin, HandoffMixin, WindowMixin,
-                       LifecycleMixin):
+class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin,
+                       WindowMixin, LifecycleMixin):
     """19종 툴을 노출하는 MCP 서버.
 
     실제 MCP SDK 바인딩은 `create_server()`에서 수행하고, 본 클래스는
@@ -502,7 +513,21 @@ def create_server(
             server = Server("agent-browser")
             server.instructions = instructions  # type: ignore[attr-defined]
         server.list_tools()(_list_tools_impl)  # type: ignore[attr-defined]
-        server.call_tool()(_call_tool_impl)  # type: ignore[attr-defined]
+
+        async def _call_tool_v1(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+            # WS-56: 이 호출을 보낸 클라이언트 세션(elicitation 요청 통로) — 1.x 는 request_context.
+            try:
+                rc = server.request_context
+                elicitor = Elicitor(rc.session, getattr(rc, "request_id", None))
+            except (LookupError, AttributeError):
+                elicitor = None
+            token = CURRENT_ELICITOR.set(elicitor)
+            try:
+                return await _call_tool_impl(name, arguments)
+            finally:
+                CURRENT_ELICITOR.reset(token)
+
+        server.call_tool()(_call_tool_v1)  # type: ignore[attr-defined]
         return server, backend
 
     # mcp 2.x — 생성자 콜백 등록
@@ -512,7 +537,14 @@ def create_server(
         return mcp_types.ListToolsResult(tools=_build_tools())
 
     async def _on_call_tool(ctx: Any, params: Any) -> Any:
-        content = await _call_tool_impl(params.name, params.arguments or {})
+        # WS-56: 이 호출을 보낸 클라이언트 세션 — 고위험 게이트가 같은 호출 안에서 elicitation 을 보낸다.
+        session = getattr(ctx, "session", None)
+        token = CURRENT_ELICITOR.set(
+            Elicitor(session, getattr(ctx, "request_id", None)) if session is not None else None)
+        try:
+            content = await _call_tool_impl(params.name, params.arguments or {})
+        finally:
+            CURRENT_ELICITOR.reset(token)
         return mcp_types.CallToolResult(content=list(content))
 
     server = Server(

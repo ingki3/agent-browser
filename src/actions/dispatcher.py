@@ -847,6 +847,180 @@ def _normalize_key(key: str) -> str:
     return _KEY_ALIASES.get(raw.lower(), raw)
 
 
+@dataclass
+class PinnedTarget:
+    """사람 승인(elicitation·승인 증표)을 요청한 그 시점의 대상 **노드 정체** (WS-56 R1 B1).
+
+    이름·role·css 일치는 노드 정체가 아니다 — 페이지가 같은 id·이름·자리의 새 노드로 바꾸면 모두 맞는다.
+    그래서 승인 요청 때 실제 노드의 JS 핸들(Playwright ElementHandle)을 잡아 두고, 실행 직전 지금 대상이 그
+    노드(=== · 연결됨 · 같은 프레임 · 같은 문서)인지 본다. 문서가 바뀌면 핸들의 실행 문맥이 사라져 확인이
+    예외 → 불일치(fail-closed). 실행도 이 핸들로만 한다(로케이터 재해석 금지).
+    """
+
+    #: Playwright ElementHandle — 승인 요청 때 그 노드.
+    node: Any
+    #: 잡을 때의 활성 문맥(Page 또는 switch_frame 한 Frame) — 다른 프레임이면 불일치.
+    frame: Any
+    #: 무엇으로 지목했나("element_id:@e3" / "selector:#pay" / "point:70,100" / "focus:Enter") — 다른 대상 호출에
+    #: 쓰지 않는다.
+    key: str
+    #: WS-56 R2 B3: 승인 시점 실행 의미(a[href]·form action/formaction·method·target 절대값). 실행 직전 같아야 한다.
+    meaning: Optional[Dict[str, str]] = None
+
+
+#: 지금 대상이 잡아 둔 그 노드인가(같은 문맥에서 === , 연결됨, 같은 문서).
+_PIN_SAME_JS = "(el, pinned) => el === pinned && el.isConnected && el.ownerDocument === document"
+
+#: WS-56 R2 B3: 노드의 실행 의미 — 링크 목적지(a/area href, 절대), 폼 제출 목적지(form action 또는 제출 버튼의
+#: formaction, 절대)·method·target. 프로토타입 getter 로 읽는다(폼 안 name=action 입력칸이 form.action 을 가리는
+#: 이름 덮어쓰기 회피). 다른 realm(같은 출처 iframe)의 노드도 같은 getter 로 읽힌다.
+_MEANING_JS = """
+(el) => {
+  const out = {href: '', action: '', method: '', target: ''};
+  if (!el || el.nodeType !== 1 || !el.closest) return out;
+  const get = (proto, name, obj) => {
+    try { const d = Object.getOwnPropertyDescriptor(proto, name); return d && d.get ? d.get.call(obj) : null; }
+    catch (e) { return null; }
+  };
+  const str = (v) => (v === null || v === undefined) ? '' : String(v);
+  const a = el.closest('a[href], area[href]');
+  if (a) {
+    out.href = str(get(a.tagName === 'AREA' ? HTMLAreaElement.prototype : HTMLAnchorElement.prototype, 'href', a));
+    out.target = str(a.getAttribute('target'));
+  }
+  const ctl = el.closest('button, input, select, textarea');
+  const protoOf = (n) => n.tagName === 'BUTTON' ? HTMLButtonElement.prototype
+    : n.tagName === 'INPUT' ? HTMLInputElement.prototype
+    : n.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLTextAreaElement.prototype;
+  const form = (ctl && get(protoOf(ctl), 'form', ctl)) || el.closest('form');
+  if (form) {
+    const F = HTMLFormElement.prototype;
+    out.action = str(get(F, 'action', form));
+    out.method = str(get(F, 'method', form));
+    out.target = str(get(F, 'target', form)) || out.target;
+    const isSubmitter = (n) => {
+      if (!n || !n.tagName) return false;
+      if (n.tagName === 'BUTTON') return str(get(HTMLButtonElement.prototype, 'type', n)) === 'submit';
+      if (n.tagName === 'INPUT') {
+        const t = str(get(HTMLInputElement.prototype, 'type', n));
+        return t === 'submit' || t === 'image';
+      }
+      return false;
+    };
+    // R3 B2 → R5: 제출 버튼 자신이 아니면(입력칸에서 Enter = 암묵 제출) 폼의 기본 제출 버튼 — 폼 소유 요소 트리 순서의
+    // 첫 submit(button·input submit·**input image**; form 속성으로 폼 밖에 연결된 것 포함) — 이 실제 제출자다. form.elements
+    // 는 image 를 빼므로 쓰지 않는다. 소유 폼은 네이티브 getter 로 확인하고, 확인할 수 없으면 예외(호출자: 결속 불가).
+    const strictForm = (n) => {
+      const d = Object.getOwnPropertyDescriptor(protoOf(n), 'form');
+      if (!d || !d.get) throw new Error('default-submitter-undetermined');
+      return d.get.call(n);
+    };
+    const defaultSubmitter = () => {
+      const root = form.getRootNode();
+      if (!root || typeof root.querySelectorAll !== 'function') throw new Error('default-submitter-undetermined');
+      const owned = [];
+      const add = (list) => {
+        for (const n of list) if (!owned.includes(n) && isSubmitter(n) && strictForm(n) === form) owned.push(n);
+      };
+      add(form.querySelectorAll('button, input'));
+      add(root.querySelectorAll('button[form], input[form]'));
+      // 문서(트리) 순서 — 4 = DOCUMENT_POSITION_FOLLOWING.
+      owned.sort((a, b) => (a === b ? 0 : (a.compareDocumentPosition(b) & 4 ? -1 : 1)));
+      return owned.length ? owned[0] : null;
+    };
+    let submitter = isSubmitter(ctl) ? ctl : null;
+    if (!submitter) {
+      submitter = defaultSubmitter();
+      if (submitter && submitter.matches(':disabled')) {
+        // 기본 제출자가 비활성이면 암묵 제출이 없다(뒤 버튼으로 넘어가지 않음) — 목적지 없음. 대기 중 켜지면 의미가 바뀜.
+        out.action = ''; out.method = ''; out.target = '';
+        return out;
+      }
+    }
+    if (submitter) {
+      const P = protoOf(submitter);
+      if (submitter.hasAttribute('formaction')) out.action = str(get(P, 'formAction', submitter));
+      if (submitter.hasAttribute('formmethod')) out.method = str(get(P, 'formMethod', submitter));
+      if (submitter.hasAttribute('formtarget')) out.target = str(submitter.getAttribute('formtarget'));
+    }
+  }
+  return out;
+}
+"""
+
+#: R3 B2: 포커스 노드가 사용자 정의 요소(폼 연계 요소·closed shadow host)면 Enter 의 실제 제출 의미를 판별할 수 없다.
+_FOCUS_OPAQUE_JS = "(el) => !!(el && el.tagName && el.tagName.includes('-'))"
+
+#: R3 B1: 좌표 승인 실행 — 이동(hover 적용) 뒤 실제 눌림 이벤트가 승인 노드(또는 그 자손)로 가는지 감시한다. 승인 노드
+#: 문서의 창과 최상위 창의 capture 단계에서 보고, 다른 대상으로 가는 눌림 계열 이벤트는 막는다(전파 중지·기본 동작 취소).
+#: 상태는 클로저에만(페이지 전역에 두지 않음) — 핸들로 돌려받아 읽는다.
+_POINT_GUARD_ARM_JS = """
+(pinned) => {
+  const wins = [];
+  const add = (w) => { if (w && !wins.includes(w)) wins.push(w); };
+  try { add(pinned.ownerDocument.defaultView); } catch (e) {}
+  try { add(window.top); } catch (e) {}
+  const rec = {ok: [], bad: []};
+  const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'auxclick', 'dblclick', 'contextmenu'];
+  const h = (e) => {
+    let path = [];
+    try { path = e.composedPath(); } catch (x) { path = []; }
+    if (path.includes(pinned)) { rec.ok.push(e.type); return; }
+    rec.bad.push(e.type + ':' + String((e.target && e.target.tagName) || '').toLowerCase());
+    e.stopImmediatePropagation();
+    e.preventDefault();
+  };
+  for (const w of wins) for (const t of types) w.addEventListener(t, h, true);
+  const off = () => { for (const w of wins) for (const t of types) w.removeEventListener(t, h, true); };
+  return {rec, off};
+}
+"""
+_POINT_GUARD_READ_JS = "(g) => { g.off(); return {ok: g.rec.ok.slice(0, 20), bad: g.rec.bad.slice(0, 20)}; }"
+#: 이동 뒤 hover·레이아웃이 반영될 때까지(두 프레임, 백그라운드 탭이면 상한 150ms).
+_SETTLE_FRAMES_JS = ("() => new Promise((r) => { const t = setTimeout(() => r(true), 150); "
+                     "requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(true); })); })")
+
+#: WS-56 R2 B2: 키 입력을 받을 노드 자체(document.activeElement 를 같은 출처 iframe·open shadow 따라 내려감).
+#: 다른 출처 iframe 이면 'opaque', 없으면 'none' — 결속 불가(fail-closed).
+_FOCUS_NODE_JS = """
+() => {
+  let el = document.activeElement;
+  for (let i = 0; el && i < 12; i++) {
+    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      let d = null;
+      try { d = el.contentDocument; } catch (e) { d = null; }
+      if (!d) return 'opaque';
+      el = d.activeElement;
+      continue;
+    }
+    if (el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; continue; }
+    break;
+  }
+  return el || 'none';
+}
+"""
+
+_MEANING_KEYS = ("href", "action", "method", "target")
+
+#: WS-56 R2 B1: 보호 폴더(프로필·서버 상태) 저장 거부 문구.
+_PROTECTED_SAVE_MESSAGE = (
+    "save_dir(또는 최종 저장 경로)가 agent-browser 프로필·상태 폴더 안이라 저장하지 않습니다 — "
+    "승인 정책·승인 상태 파일을 바꿀 수 있는 위치입니다. 다른 폴더를 지정하세요."
+)
+
+
+class _ProtectedSaveRefused(Exception):
+    """다운로드 최종 경로가 보호 폴더 안이라 저장을 거부함(WS-56 R2 B1)."""
+
+#: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
+_POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
+_POINT_SAME_JS = ("([x, y, pinned]) => { const el = (" + _POINT_TARGET_JS.strip()
+                  + ")(x, y); return !!pinned && el === pinned && pinned.isConnected; }")
+#: R2 B2: 지금 포커스 노드가 잡아 둔 노드인가.
+_FOCUS_SAME_JS = ("(pinned) => { const el = (" + _FOCUS_NODE_JS.strip()
+                  + ")(); return !!pinned && el === pinned && pinned.isConnected; }")
+
+
 class ActionDispatcher:
     """19종 액션 실행기."""
 
@@ -869,9 +1043,11 @@ class ActionDispatcher:
         self._top_attribution: Optional[Dict[str, Any]] = None
         #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
         #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
-        #: WS-57 R1(R2): 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는 동시 호출 하나가 끝나며
-        #: 다른 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로 두고, 켜고 끄기는 heal_disabled_scope().
+        #: WS-57 R1(R2)·WS-56 R1 B2: 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는 동시 호출 하나가
+        #: 끝나며 다른 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로 두고, 켜고 끄기는 heal_disabled_scope().
         self._heal_off: ContextVar[bool] = ContextVar(f"heal_disabled@{id(self):x}", default=False)
+        #: WS-56 R1 B1: 사람 승인 때 잡아 둔 대상 노드(PinnedTarget) — 이 호출 문맥에서만. pinned_scope().
+        self._pinned: ContextVar[Optional["PinnedTarget"]] = ContextVar("agent_browser_approved_node", default=None)
 
     @property
     def heal_disabled(self) -> bool:
@@ -892,6 +1068,20 @@ class ActionDispatcher:
             yield
         finally:
             self._heal_off.reset(token)
+
+    def _current_pin(self) -> Optional["PinnedTarget"]:
+        """이 호출 문맥에서 잡아 둔 승인 대상 노드(없으면 None). __init__ 없이 만든 가짜 디스패처도 None."""
+        cv = self.__dict__.get("_pinned")
+        return cv.get() if cv is not None else None
+
+    @contextlib.contextmanager
+    def pinned_scope(self, pin: Optional["PinnedTarget"]) -> Any:
+        """이 블록 동안 요소 액션은 잡아 둔 그 노드에만(WS-56 R1 B1) — 호출 문맥 단위."""
+        token = self._pinned.set(pin)
+        try:
+            yield
+        finally:
+            self._pinned.reset(token)
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -1125,6 +1315,182 @@ class ActionDispatcher:
         except Exception as exc:  # noqa: BLE001
             return {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
         return {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
+
+    # -- WS-56 R1 B1: 승인 대상 노드 결속 ---------------------------------------
+
+    @staticmethod
+    def pin_key(params: Dict[str, Any]) -> Optional[str]:
+        """노드를 잡을 대상의 키. element_id·selector(요소), x·y(좌표 hit-test 노드, R2 B2), key(포커스 노드, R2 B2).
+        그 밖(요소·좌표·키 없음)은 None."""
+        if params.get("element_id"):
+            return f"element_id:{params['element_id']}"
+        if params.get("selector"):
+            return f"selector:{params['selector']}"
+        if params.get("x") is not None and params.get("y") is not None:
+            try:
+                return f"point:{int(params['x'])},{int(params['y'])}"
+            except (TypeError, ValueError):
+                return "point:?"
+        if params.get("key"):
+            return f"focus:{params['key']}"
+        return None
+
+    async def _pin_locator(self, params: Dict[str, Any]) -> Tuple[Any, str]:
+        """디스패처가 실행 때 지목할 바로 그 로케이터(element_id → _locator_for, selector → 정확히 1개)."""
+        element_id = params.get("element_id")
+        if element_id:
+            handle = self.ctx.engine.get_handle(element_id)
+            if handle is None:
+                return None, "요소 핸들 없음"
+            return self._locator_for(handle), ""
+        selector = params.get("selector")
+        if selector:
+            locator = self.ctx.page.locator(selector)
+            count = await locator.count()
+            if count != 1:
+                return None, f"selector 가 {count}개 요소에 맞음"
+            return locator.first, ""
+        return None, "요소 대상 아님"
+
+    async def pin_target(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """사람 승인을 요청하는 지금, 대상의 실제 노드를 잡는다. {"pin": PinnedTarget} 또는 {"unresolved": 사유}.
+
+        R2 B2: 좌표는 그 지점의 hit-test 노드(같은 출처 iframe·open shadow 따라), 키는 지금 포커스 노드. R2 B3: 그
+        노드의 실행 의미(목적지·method·target)도 함께 잡는다. 어느 하나라도 못 하면 결속 불가(fail-closed).
+        """
+        key = self.pin_key(params)
+        if key is None:
+            return {"unresolved": "요소 대상 아님"}
+        try:
+            if key.startswith(("point:", "focus:")):
+                node, why = await (self._point_node(params) if key.startswith("point:") else self._focus_node())
+                frame = self._top_page()
+            else:
+                locator, why = await self._pin_locator(params)
+                if locator is None:
+                    return {"unresolved": why}
+                node = await locator.element_handle(timeout=2000)
+                why = "대상 노드 없음"
+                frame = self.ctx.page
+            if node is None:
+                return {"unresolved": why}
+            if key.startswith("focus:") and await node.evaluate(_FOCUS_OPAQUE_JS):
+                # R3 B2: 판별 불가 포커스 — 결속하지 않는다(버튼 승인·정책 제외, 증표는 사용 때 거부).
+                return {"unresolved": "포커스가 사용자 정의 요소 위(키 입력의 실제 동작 판별 불가)"}
+            meaning = await node.evaluate(_MEANING_JS)
+        except Exception as exc:  # noqa: BLE001 — 못 잡으면 결속할 수 없다(fail-closed)
+            return {"unresolved": f"대상 노드 확인 실패: {type(exc).__name__}"}
+        if not isinstance(meaning, dict):
+            return {"unresolved": "대상 실행 의미를 읽을 수 없음"}
+        return {"pin": PinnedTarget(node=node, frame=frame, key=key,
+                                    meaning={k: str(meaning.get(k) or "") for k in _MEANING_KEYS})}
+
+    async def _point_node(self, params: Dict[str, Any]) -> Tuple[Any, str]:
+        """좌표의 hit-test 노드(ElementHandle, 최상위 문맥). 판정 불가 지점(다른 출처 iframe·closed shadow·요소
+        없음)이면 (None, 사유) — describe_point 와 같은 판정."""
+        x, y = int(params["x"]), int(params["y"])
+        seen = await self.describe_point(x, y)
+        if seen.get("unresolved"):
+            return None, str(seen["unresolved"])
+        handle = await self._top_page().evaluate_handle(_POINT_NODE_JS, [x, y])
+        node = handle.as_element()
+        if node is None:
+            await handle.dispose()
+            return None, "좌표에 요소 없음"
+        return node, ""
+
+    async def _focus_node(self) -> Tuple[Any, str]:
+        """지금 키를 받을 노드(ElementHandle, 최상위 문맥). 다른 출처 iframe 안·없음이면 (None, 사유)."""
+        handle = await self._top_page().evaluate_handle(_FOCUS_NODE_JS)
+        node = handle.as_element()
+        if node is None:
+            await handle.dispose()
+            return None, "포커스 노드를 결속할 수 없음(다른 출처 프레임 안이거나 없음)"
+        return node, ""
+
+    async def _meaning_mismatch(self, pin: PinnedTarget) -> Optional[str]:
+        """R2 B3: 같은 노드라도 실행 의미(목적지·method·target)가 승인 때와 다르면 사유."""
+        if pin.meaning is None:
+            return None
+        try:
+            now = await pin.node.evaluate(_MEANING_JS)
+        except Exception as exc:  # noqa: BLE001
+            return f"승인한 노드의 목적지 확인 실패: {type(exc).__name__}"
+        if not isinstance(now, dict):
+            return "승인한 노드의 목적지를 읽을 수 없음"
+        changed = [k for k in _MEANING_KEYS if str(now.get(k) or "") != pin.meaning.get(k, "")]
+        if changed:
+            return "승인 때와 목적지·동작이 바뀜(" + ", ".join(changed) + ")"
+        return None
+
+    async def _pin_mismatch(self, pin: PinnedTarget, locator: Any) -> Optional[str]:
+        """지금 locator 가 가리키는 노드가 잡아 둔 그 노드가 아니면 사유, 같으면 None."""
+        if self.ctx.page is not pin.frame:
+            return "승인 때와 다른 프레임"
+        try:
+            same = await locator.evaluate(_PIN_SAME_JS, pin.node, timeout=2000)
+        except Exception as exc:  # noqa: BLE001 — 문서 교체(핸들 문맥 사라짐)·노드 없음 = 같은 노드 아님
+            return f"승인한 노드 확인 실패: {type(exc).__name__}"
+        if same is not True:
+            return "승인한 노드가 아님(같은 이름·css 의 다른 노드로 바뀜)"
+        return await self._meaning_mismatch(pin)
+
+    async def _pin_mismatch_for(self, pin: Any, params: Dict[str, Any]) -> Optional[str]:
+        """이 호출 대상(params)이 잡아 둔 그 노드·그 의미인가 — 요소·좌표·포커스 공통. 같으면 None."""
+        if not isinstance(pin, PinnedTarget) or pin.key != self.pin_key(params):
+            return "승인 때 잡은 대상 노드 없음"
+        if pin.key.startswith(("point:", "focus:")):
+            top = self._top_page()
+            if top is not pin.frame:
+                return "승인 때와 다른 페이지"
+            try:
+                if pin.key.startswith("point:"):
+                    same = await top.evaluate(_POINT_SAME_JS, [int(params["x"]), int(params["y"]), pin.node])
+                else:
+                    same = await top.evaluate(_FOCUS_SAME_JS, pin.node)
+            except Exception as exc:  # noqa: BLE001 — 문서 교체 등 = 같은 노드 아님
+                return f"승인한 노드 확인 실패: {type(exc).__name__}"
+            if same is not True:
+                what = "좌표 위" if pin.key.startswith("point:") else "포커스된"
+                return f"승인한 노드가 아님({what} 노드가 바뀜)"
+            return await self._meaning_mismatch(pin)
+        try:
+            locator, why = await self._pin_locator(params)
+        except Exception as exc:  # noqa: BLE001
+            return f"대상 확인 실패: {type(exc).__name__}"
+        if locator is None:
+            return why
+        return await self._pin_mismatch(pin, locator)
+
+    async def pinned_target_check(self, pin: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+        """실행 직전: 지금 대상이 승인 요청 때 잡은 그 노드(그 의미)인가. {"fresh": bool, "detail": str}."""
+        mismatch = await self._pin_mismatch_for(pin, params)
+        return {"fresh": mismatch is None, "detail": mismatch or ""}
+
+    def _elementless_pin_refusal(self, action: ActionType, pin: Any, mismatch: Optional[str]) -> Optional[ActionResult]:
+        if pin is None or mismatch is None:
+            return None
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,  # 발송 전
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=f"승인한 대상이 바뀌어 실행하지 않았습니다({mismatch}). 다시 관찰하세요.",
+            reobserve_required=True,
+        )
+
+    @staticmethod
+    async def release_pin(pin: Any) -> None:
+        """잡아 둔 노드 핸들을 놓는다(브라우저 쪽 참조 해제). 실패는 무해(문서·세션이 이미 바뀜)."""
+        node = getattr(pin, "node", None)
+        dispose = getattr(node, "dispose", None)
+        if dispose is None:
+            return
+        try:
+            await dispose()
+        except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 핸들 해제 실패는 무해하다(문서·세션이 이미 바뀜).
+            pass
 
     async def describe_element_for_gate(self, element_id: str) -> Dict[str, Any]:
         """element_id 클릭의 게이트 판정용 DOM 정보 (WS-31 문맥 신호).
@@ -1530,7 +1896,20 @@ class ActionDispatcher:
                     "(상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없습니다)."
                 ),
             )
-        return dict(params, save_dir=os.path.realpath(save_dir))
+        real_dir = os.path.realpath(save_dir)
+        from security.approve_policy import is_protected_path
+
+        if is_protected_path(real_dir):
+            # WS-56 R2 B1: agent-browser 프로필(승인 정책 파일)·서버 상태(승인 증표) 폴더에는 쓰지 않는다 — 사이트가
+            # 내려준 파일로 정책·승인을 바꾸는 통로(검증 BLOCKING-1). canonical 경로(symlink 해석 후)로 판정.
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,  # 발송 전
+                error_code=ErrorCode.DOWNLOAD_FAILED,
+                error_message=_PROTECTED_SAVE_MESSAGE,
+            )
+        return dict(params, save_dir=real_dir)
 
     async def _dispatch_without_element_id(
         self, action: ActionType, params: Dict[str, Any]
@@ -1863,6 +2242,19 @@ class ActionDispatcher:
         healed_flag: bool,
     ) -> ActionResult:
         """[2] 이벤트 발송 → [3] 사후조건 검증."""
+        pin = self._current_pin()
+        if pin is not None:
+            # WS-56 R1 B1: 사람이 승인한 그 노드가 아니면(같은 이름·id·css 의 새 노드 포함) 누르지 않는다.
+            mismatch = await self._pin_mismatch(pin, self._locator_for(handle))
+            if mismatch is not None:
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,  # 발송 전
+                    error_code=ErrorCode.TOCTOU_MISMATCH,
+                    error_message=f"승인한 대상이 바뀌어 실행하지 않았습니다({mismatch}). 다시 관찰하세요.",
+                    reobserve_required=True,
+                )
         sent = await self._send_element_event(action, handle, params, healed_flag)
         if isinstance(sent, ActionResult):
             return sent
@@ -1934,6 +2326,19 @@ class ActionDispatcher:
         )
         try:
             await self._execute_element_action(action, handle, params)
+        except _ProtectedSaveRefused as exc:
+            # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=False,  # 다운로드 요청은 이미 나갔다
+                error_code=ErrorCode.DOWNLOAD_FAILED,
+                error_message=str(exc),
+                healed=healed_flag,
+            )
         except Exception as exc:  # noqa: BLE001
             # 발송 자체가 실패했으므로 부작용이 없다 -> 재시도 안전
             self._off_popup(_on_popup)
@@ -2268,7 +2673,10 @@ class ActionDispatcher:
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]
     ) -> None:
         """요소 대상 액션을 실제로 발송한다."""
-        target = self._locator_for(handle)
+        pin = self._current_pin()
+        # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
+        # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
+        target = pin.node if pin is not None else self._locator_for(handle)
 
         if action is ActionType.CLICK:
             await target.click(button=params.get("button", "left"), timeout=5000)
@@ -2325,6 +2733,16 @@ class ActionDispatcher:
             register_url(getattr(download, "url", ""))
             # save_dir 는 _dispatch_inner 에서 절대 경로로 정규화됐다(R1 NB-5).
             save_path = os.path.join(params["save_dir"], download.suggested_filename)
+            from security.approve_policy import is_protected_path
+
+            if is_protected_path(save_path):
+                # WS-56 R2 B1: 최종 경로(save_dir 안 같은 이름 symlink 등) 기준으로도 보호 폴더면 저장하지 않는다.
+                try:
+                    await download.delete()
+                except Exception:  # noqa: BLE001
+                    # 의도된 fail-safe: 임시 파일 정리 실패는 무해하다(Playwright 가 컨텍스트 종료 때 지운다).
+                    pass
+                raise _ProtectedSaveRefused(_PROTECTED_SAVE_MESSAGE)
             await download.save_as(save_path)
             params["_downloaded_path"] = save_path
 
@@ -2510,6 +2928,12 @@ class ActionDispatcher:
         # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
         top = self._top_page()
         frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
+        # WS-56 R2 B2: 사람 승인으로 연 키 입력 — 키를 받을 포커스 노드가 승인 때 잡은 그 노드(그 목적지)여야 한다.
+        pin = self._current_pin()
+        refused = self._elementless_pin_refusal(
+            action, pin, await self._pin_mismatch_for(pin, params) if pin is not None else None)
+        if refused is not None:
+            return refused
         watch = None
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
@@ -2630,10 +3054,27 @@ class ActionDispatcher:
                 error_message=f"좌표 ({x}, {y})가 뷰포트 {vw}x{vh} 밖입니다.",
             )
 
+        # WS-56 R2 B2: 사람 승인으로 연 좌표 클릭 — 그 지점의 노드가 승인 때 잡은 그 노드(그 목적지)여야 한다.
+        pin = self._current_pin()
+        refused = self._elementless_pin_refusal(
+            action, pin, await self._pin_mismatch_for(pin, params) if pin is not None else None)
+        if refused is not None:
+            return refused
+
         before = await self._capture_state(page)
+        button = params.get("button", "left")
+        if pin is not None:
+            # R3 B1: 이동(hover)이 대상을 바꿀 수 있다 — 먼저 옮기고 반영된 뒤 그 지점 노드를 다시 본다(아직 안 누름).
+            refused = self._elementless_pin_refusal(action, pin, await self._pin_after_move(page, pin, params))
+            if refused is not None:
+                return refused
         watch = _NavWatch(page) if self.ctx.nav_settle else None
+        stray: Optional[str] = None
         try:
-            await page.mouse.click(x, y, button=params.get("button", "left"))
+            if pin is None:
+                await page.mouse.click(x, y, button=button)
+            else:
+                stray = await self._pinned_press(page, pin, button)
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
@@ -2643,6 +3084,18 @@ class ActionDispatcher:
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
                 error_message=f"좌표 클릭 발송 실패: {exc}",
+            )
+        if stray is not None:
+            if watch is not None:
+                watch.close()
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=False,  # 눌림 이벤트는 이미 나갔다(승인 노드 밖으로 가는 것은 막음)
+                error_code=ErrorCode.TOCTOU_MISMATCH,
+                error_message=(f"승인한 대상이 바뀌어 실행하지 않았습니다({stray}). 자동으로 다시 시도하지 말고 "
+                               "다시 관찰해 화면을 확인하세요."),
+                reobserve_required=True,
             )
         # WS-25: 좌표 클릭(mouse.click)은 이동을 기다리지 않는다 — 여기서 기다린다.
         if watch is not None:
@@ -2671,6 +3124,48 @@ class ActionDispatcher:
                 "silent": not post.satisfied,
             },
         )
+
+    async def _pin_after_move(self, page: Any, pin: Any, params: Dict[str, Any]) -> Optional[str]:
+        """R3 B1: 좌표로 마우스를 옮기고(hover 적용) 반영된 뒤 그 지점 노드가 승인 노드인가. 다르면 사유(누르지 않음)."""
+        try:
+            await page.mouse.move(int(params["x"]), int(params["y"]))
+            await page.evaluate(_SETTLE_FRAMES_JS)
+        except Exception as exc:  # noqa: BLE001 — 옮기지 못하면 누르지 않는다
+            return f"좌표 이동 실패: {type(exc).__name__}"
+        mismatch = await self._pin_mismatch_for(pin, params)
+        return f"마우스 이동 뒤 {mismatch}" if mismatch else None
+
+    @staticmethod
+    async def _pinned_press(page: Any, pin: Any, button: str) -> Optional[str]:
+        """R3 B1: 승인 노드 감시를 건 채 누르고 뗀다. 실제 눌림 이벤트가 다른 노드로 갔으면(막았음) 또는 승인 노드에
+        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None."""
+        try:
+            guard = await pin.node.evaluate_handle(_POINT_GUARD_ARM_JS)
+        except Exception as exc:  # noqa: BLE001 — 감시를 걸 수 없으면 누르지 않는다
+            return f"실제 눌림 대상 감시 실패: {type(exc).__name__}"
+        seen: Any = None
+        try:
+            await page.mouse.down(button=button)
+            await page.mouse.up(button=button)
+        finally:
+            try:
+                seen = await guard.evaluate(_POINT_GUARD_READ_JS)
+            except Exception:  # noqa: BLE001 — 문서가 바뀌었으면(이동) 기록을 못 읽는다
+                seen = None
+            try:
+                await guard.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+        if not isinstance(seen, dict):
+            # 눌림으로 문서가 이동해 기록이 사라짐 — 승인 노드 밖 이벤트는 감시가 막았으므로 이동은 승인 노드의 것.
+            return None
+        bad = [str(b) for b in seen.get("bad") or []]
+        if bad:
+            return "실제 눌림 대상이 승인한 노드가 아님: " + ", ".join(bad[:4])
+        ok = set(str(o) for o in seen.get("ok") or [])
+        if not ok & {"pointerdown", "mousedown"} or not ok & {"pointerup", "mouseup"}:
+            return "실제 눌림이 승인한 노드에 닿았는지 확인하지 못함"
+        return None
 
     async def _dispatch_tab_control(
         self, action: ActionType, params: Dict[str, Any]

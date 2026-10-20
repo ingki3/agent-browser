@@ -338,8 +338,14 @@ class ToolsMixin:
             # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
             self._pending_gate_basis = None
             self._used_approval = None
+            self._approval_via = None
+            self._approval_pin = None
+            # WS-56 R4(WS-56 R2 B4·R3 B6 를 이 구간으로 통일): 승인 증표·정책·elicitation 으로 연 호출과 일반 호출 모두
+            # 재확인 → 실제 입력 → 효과 판정을 이 작업 공간 직렬화 구간 안에서 한다(서버 단위 별도 락 없음). 사람 응답
+            # 대기(elicitation)만 구간 밖 — _out_of_band 가 잠시 놓았다가(_SerialPause) 응답 뒤 다시 잡고 재판정한다.
             blocked = await self._check_hitl(action, params, approval_id=approval_id)
             if blocked is not None:
+                await self._drop_approval_pin()
                 return blocked
             return await self._run_gated_action(name, arguments, action, params)
 
@@ -425,10 +431,12 @@ class ToolsMixin:
         # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
         target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
+        # WS-56: 정책·elicitation 으로 연 호출도 승인한 그 요소만 — 치유 끔, 결과에 via·outcome.
+        via, self._approval_via = self._approval_via, None
         # WS-58 R1 B2: 입력 대상 문서(활성 frame)의 주소를 실행 전에 잡는다 — 디스패처가 비밀 치환을 허용한 문서.
         input_url = (self._agent_input_url() if action is ActionType.TYPE_TEXT and hasattr(self, "_agent_input_url")
                      else "")
-        result, remembered = await self._dispatch_with_approval(action, params, used)
+        result, remembered = await self._dispatch_with_approval(action, params, used, heal_off=via is not None)
         if (action is ActionType.TYPE_TEXT and result.success and result.data.get("secret_resolved") is True
                 and hasattr(self, "_record_login")):
             # WS-58: 자격증명 채우기(디스패처가 키를 값으로 치환해 입력함)는 도구가 아는 로그인 사건.
@@ -437,6 +445,8 @@ class ToolsMixin:
             self._record_login(input_url or self._agent_input_url() or self._agent_page_url(), SOURCE_LOGIN_FLOW)
         if used is not None:
             self._attach_approval_outcome(used, result)
+        elif via is not None:
+            self._attach_via_outcome(via, result)
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
@@ -454,20 +464,24 @@ class ToolsMixin:
             if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
                 self._recipes.reset("navigation_blocked")
             else:
-                self._recipes.post(action, params, recipe_pre, result, used is not None)
+                self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
             if action is ActionType.OBSERVE_PAGE:
                 await self._recipes.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 
     async def _dispatch_with_approval(self, action: ActionType, params: Dict[str, Any],
-                                      used: Optional[str]) -> tuple:
-        """디스패처 실행(승인 증표 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
-        # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다. WS-57 R1(R2): 호출 문맥 단위
+                                      used: Optional[str], heal_off: bool = False) -> tuple:
+        """디스패처 실행(승인 증표·정책·elicitation 호출이면 치유 끔). 반환: (결과, 기억된 이름 재시도 시도 또는 None)."""
+        no_heal = used is not None or heal_off
+        # NB-1: 승인한 그 요소만 — 자가 치유(유사 이름 대체)를 이 호출 동안 끈다. WS-56 R1 B2: 호출 문맥 단위
         # (heal_disabled_scope) — 같은 디스패처의 다른 동시 호출이 끝나며 이 호출의 금지를 풀지 않는다.
-        heal_guard = self._heal_guard(used is not None)
+        # B1: 사람 승인 때 잡은 그 노드에만 동작(pinned_scope) — 같은 css 의 새 노드로 바뀌면 디스패처가 거부.
+        heal_guard = self._heal_guard(no_heal)
+        pin = self._approval_pin if no_heal else None
+        pin_guard = self._pin_guard(pin)
         try:
-            with heal_guard:
+            with heal_guard, pin_guard:
                 scope = self._navigation_scope.get()
                 remembered = (await scope.enter_async_context(self._present_remembered_navigation(action, params))
                               if scope is not None else None)
@@ -477,10 +491,12 @@ class ToolsMixin:
             if used is not None:
                 self.hub.set_outcome(used, "outcome_unknown")
             raise
+        finally:
+            await self._drop_approval_pin()
         return result, remembered
 
     def _heal_guard(self, on: bool) -> Any:
-        """승인 증표 호출 동안 자가 치유 끄기(WS-57 R1 R2: 호출 문맥 단위). 디스패처가 scope 를 모르면 예전 방식."""
+        """승인 호출 동안 자가 치유 끄기(호출 문맥 단위, WS-57 R1 R2 와 같은 모양). 디스패처가 scope 를 모르면 예전 방식."""
         import contextlib
 
         disp = self._dispatcher
@@ -499,6 +515,15 @@ class ToolsMixin:
                 disp.heal_disabled = False
 
         return legacy()
+
+    def _pin_guard(self, pin: Any) -> Any:
+        """승인 때 잡은 노드로 디스패처 실행을 묶는다(WS-56 R1 B1). 잡은 노드가 없거나 디스패처가 모르면 그대로."""
+        import contextlib
+
+        scope = getattr(self._dispatcher, "pinned_scope", None)
+        if pin is None or not callable(scope):
+            return contextlib.nullcontext()
+        return scope(pin)
 
     def _error_result(
         self,

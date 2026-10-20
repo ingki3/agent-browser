@@ -89,6 +89,8 @@ CANDIDATES = {
     ("browser/chrome_cookies.py", "'Cookies' + suffix"): ("WS-59 Chrome 쿠키 DB 곁 파일(-journal·-wal) 사본 이름(경로 "
                                                            "조립) — 값 생산 아님", None, None),
     ("security/hitl.py", "key + '-'"): ("아이콘 클래스 접두 비교용 조각 — 값 생산 아님", None, None),
+    ("security/approve_policy.py", "key + '-'"): ("WS-56 아이콘 클래스 접두 비교용 조각(정책 최고위험 판정) — 값 생산 아님",
+                                                   None, None),
     ("security/public_url.py", "'#' + _public_fragment(fragment, depth, sink)"): ("주소 fragment 조립(이미 가린 값) — "
                                                                                   "식별자 아님", None, None),
 }
