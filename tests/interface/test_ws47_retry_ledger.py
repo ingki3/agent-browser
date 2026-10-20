@@ -22,7 +22,12 @@ ROBOTS = b"User-agent: *\nAllow: /\n"
 VISITOR = "visitor-WS47-value-7f3a9c"
 
 NOTES = {
-    "cookies_present": "이 사이트에 로그인 등 기존 쿠키가 있어 이름을 바꾸지 않았습니다",
+    # WS-58: cookies_present was split by reason (login record / new server-only cookie / unreadable).
+    "login_recorded": "이 사이트는 도구가 아는 로그인 기록이 있어(로그인 흐름·사람 조작·가져온 쿠키) 이름을 바꾸지 않았습니다",
+    "new_server_cookie": "도구가 모르는 서버 전용(HttpOnly) 쿠키가 있어(로그인 세션 가능성) 이름을 바꾸지 않았습니다",
+    "login_ledger_unreadable": ("로그인 기록 파일을 읽지 못해(손상) 안전을 위해 이름을 바꾸지 않았습니다 — "
+                                "운영자에게 이 프로필의 로그인 기록 확인을 요청하세요"),
+    "cookies_unreadable": "이 사이트의 쿠키를 확인하지 못해 안전을 위해 이름을 바꾸지 않았습니다",
     "already_failed": "앞서 일반 Chrome 이름으로도 막혀 다시 시도하지 않았습니다",
     "robots_not_confirmed": "robots.txt 가 일반 접근 허용을 확정해 주지 않아 이름을 바꾸지 않았습니다",
     "vendor_challenge": "보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다",
@@ -42,6 +47,8 @@ class Site:
     auth_challenge: str = ""
     body: bytes = b"Forbidden"
     cookie: str = VISITOR
+    #: extra Set-Cookie attributes of the visitor cookie (WS-58: "; HttpOnly" makes it a server-only cookie).
+    cookie_attrs: str = ""
     success_body: bytes = b"<!doctype html><title>Read</title>"
     headers: dict = field(default_factory=dict)
     requests: list = field(default_factory=list)
@@ -79,7 +86,7 @@ def visitor_site():
             self.send_header("Content-Length", str(len(data)))
             if status == 200 and self.path != "/robots.txt" and state.cookie:
                 # A persistent visitor cookie, like the real site that triggered WS-47.
-                self.send_header("Set-Cookie", f"visitor={state.cookie}; Path=/; Max-Age=31536000")
+                self.send_header("Set-Cookie", f"visitor={state.cookie}; Path=/; Max-Age=31536000{state.cookie_attrs}")
             if self.path != "/robots.txt":
                 for key, value in state.headers.items():
                     self.send_header(key, value)
@@ -117,10 +124,10 @@ def ledger_path(profile_root, name):
     return profile_dir(name, root=profile_root) / "headless_retry.json"
 
 
-#: WS-52: cookies_present carries which kind of cookie change blocked the rename.
+#: WS-52: new_server_cookie (WS-58; was cookies_present) carries which kind of HttpOnly key blocked the rename.
 CHANGE_NOTES = {
-    "new_cookie": "도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
-    "known_value_changed": ("도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 "
+    "new_cookie": "도구가 남기지 않은 새 서버 전용(HttpOnly) 쿠키 키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
+    "known_value_changed": ("도구가 사이트 스크립트 쿠키로 남긴 키가 서버 전용(HttpOnly)으로 바뀌어(로그인 가능성) "
                             "이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요"),
 }
 
@@ -170,11 +177,15 @@ async def test_visitor_cookie_ledger_survives_restart(site, _isolated_profile_ro
 
 
 @requires_chromium
-@pytest.mark.parametrize("change", ["new_session_cookie", "visitor_value_changed"])
+@pytest.mark.parametrize("change", ["new_session_cookie", "new_script_cookie", "visitor_value_changed"])
 async def test_login_like_cookie_change_restores_native_name(site, change):
+    # WS-58 (intended change): only a new server-only (HttpOnly) key keeps the native name; a new
+    # non-HttpOnly cookie or another value of the ledgered visitor cookie no longer does.
     async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
         assert (await navigate(server, site.url + "/one")).data["last_http_status"] == 200
         if change == "new_session_cookie":
+            cookie = {"name": "session", "value": "logged-in", "url": site.url, "httpOnly": True}
+        elif change == "new_script_cookie":
             cookie = {"name": "session", "value": "logged-in", "url": site.url}
         else:
             cookie = {"name": "visitor", "value": "another-value", "url": site.url}
@@ -182,25 +193,36 @@ async def test_login_like_cookie_change_restores_native_name(site, change):
         server._headless_retry.cancel_tail()
         await server._page.context.add_cookies([cookie])
         result = await navigate(server, site.url + "/after-login")
-        assert result.data["last_http_status"] == 403
-        assert "identity" not in result.data
-        assert result.data["retry_skipped"] == skipped(
-            "cookies_present", "new_cookie" if change == "new_session_cookie" else "known_value_changed")
-    assert len(site.received("/after-login")) == 1 and site.headless("/after-login")
+        if change == "new_session_cookie":
+            assert result.data["last_http_status"] == 403
+            assert "identity" not in result.data
+            assert result.data["retry_skipped"] == skipped("new_server_cookie", "new_cookie")
+        else:
+            assert result.data["last_http_status"] == 200 and result.data["identity"]["remembered"] is True
+    assert len(site.received("/after-login")) == 1
+    assert site.headless("/after-login") is (change == "new_session_cookie")
 
 
 @requires_chromium
 async def test_preexisting_cookie_before_ledger_means_zero_retries(site):
+    # WS-58 (intended change): a pre-existing server-only cookie still means zero retries; a
+    # pre-existing non-HttpOnly one (analytics) no longer does.
     async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
-        await server._page.context.add_cookies([{"name": "visitor", "value": VISITOR, "url": site.url}])
+        await server._page.context.add_cookies([{"name": "visitor", "value": VISITOR, "url": site.url,
+                                                 "httpOnly": True}])
         result = await navigate(server, site.url + "/one")
-        assert result.data["retry_skipped"] == skipped("cookies_present", "new_cookie")
+        assert result.data["retry_skipped"] == skipped("new_server_cookie", "new_cookie")
         assert not server._headless_retry.attempted
     assert len(site.received("/one")) == 1
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        await server._page.context.add_cookies([{"name": "_ga", "value": "GA1.1.47", "url": site.url}])
+        result = await navigate(server, site.url + "/two")
+        assert result.data["identity"]["original_status"] == 403 and "retry_skipped" not in result.data
 
 
 @requires_chromium
 async def test_cookie_created_during_retry_keeps_native_name_for_rest_of_navigate(site, monkeypatch):
+    site.cookie_attrs = "; HttpOnly"  # WS-58: the per-request check now concerns server-only cookies
     site.success_body = b"<!doctype html><title>Read</title><img src='/inline.png'>"
     async with BrowserMCPServer(recipes=False) as server:
         hook = server._attach_block_hint
@@ -250,9 +272,9 @@ async def test_failed_state_persists_with_profile(site, _isolated_profile_root):
 # -- 2. unit: ledger, digest, bounds, expiry, persistence --------------------
 
 
-def _cookie(name, value, domain="example.test", path="/"):
+def _cookie(name, value, domain="example.test", path="/", http_only=False):
     return {"name": name, "value": value, "domain": domain, "path": path,
-            "expires": -1, "secure": False, "httpOnly": False, "sameSite": "Lax"}
+            "expires": -1, "secure": False, "httpOnly": http_only, "sameSite": "Lax"}
 
 
 class FakeContext:
@@ -264,19 +286,23 @@ class FakeContext:
 
 
 async def test_ledger_compares_value_fingerprint_not_just_name(tmp_path):
+    # WS-58 (intended change): the judgment is per key (name/domain/path) for HttpOnly cookies;
+    # non-HttpOnly cookies never block. The ledger still stores keyed value digests.
     from browser.headless_retry import HeadlessRetry
 
     retry = HeadlessRetry()
     retry.load(tmp_path / "headless_retry.json")
     origin = "http://example.test"
     before = await retry.snapshot(FakeContext([]), origin + "/")
-    after = await retry.snapshot(FakeContext([_cookie("visitor", "v1")]), origin + "/")
+    after = await retry.snapshot(FakeContext([_cookie("visitor", "v1", http_only=True)]), origin + "/")
     retry.commit_success(origin, before, after)
-    assert await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1")]), origin + "/x")
-    assert not await retry.cookies_cleared(FakeContext([_cookie("visitor", "v2")]), origin + "/x")
-    assert not await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1"), _cookie("session", "s")]),
-                                           origin + "/x")
-    assert not await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1", path="/account")]),
+    assert await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1", http_only=True)]), origin + "/x")
+    assert await retry.cookies_cleared(FakeContext([_cookie("visitor", "v2", http_only=True)]), origin + "/x")
+    assert await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1"), _cookie("session", "s")]),
+                                       origin + "/x")
+    assert not await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1"),
+                                                        _cookie("session", "s", http_only=True)]), origin + "/x")
+    assert not await retry.cookies_cleared(FakeContext([_cookie("visitor", "v1", path="/account", http_only=True)]),
                                            origin + "/x")
     # Unrelated origins' cookies are irrelevant; failure to read cookies is not "cleared".
     assert await retry.cookies_cleared(FakeContext([_cookie("x", "y", domain="other.test")]), origin + "/")
@@ -290,8 +316,9 @@ async def test_ledger_compares_value_fingerprint_not_just_name(tmp_path):
     again = HeadlessRetry()
     again.load(tmp_path / "headless_retry.json")
     assert again.state(origin) == "succeeded"
-    assert await again.cookies_cleared(FakeContext([_cookie("visitor", "v1")]), origin + "/x")
-    assert not await again.cookies_cleared(FakeContext([_cookie("visitor", "v2")]), origin + "/x")
+    assert await again.cookies_cleared(FakeContext([_cookie("visitor", "v2", http_only=True)]), origin + "/x")
+    assert not await again.cookies_cleared(FakeContext([_cookie("visitor", "v1", path="/a", http_only=True)]),
+                                           origin + "/x")
 
 
 async def test_digest_is_keyed_hmac_and_file_is_private(tmp_path, monkeypatch):

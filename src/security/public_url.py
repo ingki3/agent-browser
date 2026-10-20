@@ -642,7 +642,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "holder": frozenset({"agent", "human"}),  # handoff.HOLDER_AGENT·HOLDER_HUMAN
     "reason": frozenset(_REPLAY_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
         "headless_ua_blocked",  # server_signals identity
-        "cookies_present", "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
+        "login_recorded", "new_server_cookie", "login_ledger_unreadable", "cookies_unreadable",  # WS-58
+        "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
         "browser_recovered", "request_expired", "window_closed",  # server_window notice
         "control_request", "recover", "taken",  # server_window _switch_window 전환 사유(R7 census)
         "capture_busy", "target_changed",  # server_display·server_hitl

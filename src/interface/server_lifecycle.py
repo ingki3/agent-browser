@@ -61,6 +61,8 @@ class LifecycleMixin:
             from browser.headless_retry import LEDGER_FILE
 
             self._headless_retry.load(Path(persistent) / LEDGER_FILE)
+            # WS-58: 로그인 기록(login_ledger.json)도 같은 프로필 폴더 — 판정 때마다 파일을 읽는다.
+            self._headless_retry.logins.attach(Path(persistent))
         # WS-29b: 브라우저보다 검증 프록시를 먼저 띄운다 — 브라우저는 프록시로만 나간다.
         runtime = EgressRuntime(
             allowed_domains=self.allowed_domains,

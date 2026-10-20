@@ -572,11 +572,9 @@ async def test_bot_order_with_beacons_keeps_late_script_cookies(delay):
         async with BrowserMCPServer(recipes=False) as server:  # nav_settle on, as the bot runs
             second = await _bot_order(server, site, delay + 0.7)
             assert sum(p.startswith("/beacon") for p, _ in site.requests) >= 3  # the beacons really ran
-            if delay < 10:
-                assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
-            else:  # outside the 10 s maximum: honestly refused
-                assert second.data["last_http_status"] == 403
-                assert second.data["retry_skipped"]["cookie_change"] == "known_value_changed"
+            # WS-58 (intended change): outside the 10 s maximum the rewrite is not merged, but a
+            # non-HttpOnly value change no longer keeps the native name (r1 symptom test checks the ledger).
+            assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
 
 
 @requires_chromium

@@ -206,7 +206,9 @@ class WindowMixin:
         # 가진 세션 쿠키만 그대로 다시 넣는다(사이트가 준 값 그대로, 수명·값을 바꾸지 않음).
         session_cookies = await self._session_cookies()
         await core.close_persistent()
-        await core.open_persistent(headless=headless)
+        reopened = await core.open_persistent(headless=headless)
+        # WS-58 R2 NB1: 사람 조작권 중 창을 연 경우 새 컨텍스트에도 요청 감시를 탭 복원(await) 전에 붙인다.
+        self._login_watch_arm(reopened)
         return await self._wire_session(restore=snapshot, cookies=session_cookies)
 
     def _on_demand_released(self) -> None:

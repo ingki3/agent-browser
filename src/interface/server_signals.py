@@ -210,7 +210,9 @@ class SignalsMixin:
         """WS-44: short generic 403, confirmed REP Allow, empty-cookie origin, once.
 
         WS-47: "empty-cookie" means no cookie, or only cookies our earlier
-        successful retries caused (exact ledger match). A 403 challenge that is
+        successful retries caused (exact ledger match). WS-58: instead, no login
+        record for the host and no unknown HttpOnly cookie key (``block_reason``).
+        A 403 challenge that is
         not retried gets data.retry_skipped with a fixed reason code + note, so
         the caller does not explain it as a temporary block.
         """
@@ -249,10 +251,11 @@ class SignalsMixin:
             return skip("robots_not_confirmed")
         if self._headless_retry.state(origin) == "failed":
             return skip("already_failed")
-        if not await self._headless_retry.cookies_cleared(page.context, page.url):
-            # WS-52: say whether an unknown cookie (maybe a login) or only a known value changed.
-            result.data["retry_skipped"] = skip_reason(
-                "cookies_present", await self._headless_retry.cookie_change(page.context, page.url))
+        blocked = await self._headless_retry.block_reason(page.context, page.url)
+        if blocked is not None:
+            # WS-58: a login record (or an unreadable one) or a new server-only cookie key;
+            # WS-52 cookie_change says which kind of HttpOnly key blocked.
+            result.data["retry_skipped"] = skip_reason(*blocked)
             return None
         if self._headless_retry.state(origin) is not None:
             return None  # remembered success that did not apply to this navigate
