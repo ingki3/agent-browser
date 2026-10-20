@@ -29,6 +29,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
 from contracts import ActionResult, ActionType, ErrorCode
+from interface.server_workspace import _call_field
 
 logger = logging.getLogger("interface.mcp_server")
 
@@ -38,19 +39,6 @@ ELICIT_TIMEOUT_S = 120.0
 #: 이 도구 호출을 보낸 MCP 클라이언트 세션(create_server 의 도구 처리기가 호출마다 설정). 직접 call_tool(테스트·
 #: 하네스) 에는 없다 → elicitation 없음.
 CURRENT_ELICITOR: ContextVar[Optional["Elicitor"]] = ContextVar("agent_browser_elicitor", default=None)
-#: 호출별 상태(ElicitMixin 속성의 저장소) — 이번 호출의 실행 근거 · 폴백 결과 표지.
-_APPROVAL_VIA: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_approval_via", default=None)
-_OOB_NOTE: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_oob_note", default=None)
-#: WS-56 R1 B2: 승인 증표 호출 표지·통과 근거도 호출 문맥에 — 인스턴스 속성이면 동시 호출 하나가 call 입구에서
-#: None 으로 지워(다른 호출의 치유 금지·증표 결과가 사라짐) 섞였다. (WS-57 의 _CALL_STATE 와 병합 때 맞출 것.)
-_USED_APPROVAL: ContextVar[Optional[str]] = ContextVar("agent_browser_used_approval", default=None)
-_PENDING_GATE_BASIS: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_pending_gate_basis",
-                                                                        default=None)
-#: WS-56 R1 B1: 이번 호출이 사람 승인으로 열렸을 때 승인 요청 시점에 잡은 대상 노드(디스패처 PinnedTarget).
-_APPROVAL_PIN: ContextVar[Any] = ContextVar("agent_browser_approval_pin", default=None)
-#: WS-56 R2 B4: 이 호출이 승인 실행 구간 락(ElicitMixin._approval_exec_lock)을 잡았는가.
-_EXEC_HELD: ContextVar[bool] = ContextVar("agent_browser_approval_exec_held", default=False)
-
 #: 응답 action → data.elicitation.answer
 _STATUS = {"decline": "declined", "cancel": "cancelled", "timeout": "timeout", "error": "error"}
 
@@ -159,88 +147,24 @@ def destination_text(meaning: Any) -> str:
 class ElicitMixin:
     """BrowserMCPServer 의 대역 밖 승인(WS-56) — 상태: `_approval_via`(이번 호출 실행 근거), `_policy_store`.
 
-    호출별 상태(`_approval_via`·`_oob_note`)는 인스턴스가 아니라 **호출 문맥(contextvar)** 에 둔다 — elicitation 이
-    최대 120초 기다리는 동안 같은 서버의 다른 도구 호출이 그 값을 지우거나 가져가지 않게(SDK 는 요청마다 다른 태스크).
+    호출별 상태(`_approval_via`·`_oob_note`·`_approval_pin`, 그리고 WorkspaceMixin 의 `_used_approval`·
+    `_pending_gate_basis`)는 인스턴스가 아니라 **호출별 묶음(WS-57 `_CALL_STATE`, `_call_field`)** 에 둔다 — elicitation
+    이 최대 120초 기다리는 동안 같은 서버의 다른 도구 호출이 그 값을 지우거나 가져가지 않게(SDK 는 요청마다 다른
+    태스크). WS-56 R4: 예전 호출별 ContextVar 5개를 WS-57 체계 하나로 합쳤다.
+
+    실행 직렬화(WS-56 R2 B4·R3 B6 → R4 통일): 재확인 → 실제 입력 → 효과 판정은 `_call_tool` 이 쥔 **작업 공간 직렬화
+    구간**(WS-57 `_dispatch_serial`) 안이다 — 서버 단위 별도 락은 없다. 사람 응답 대기(elicitation)만 그 구간을 잠시
+    놓고(`_serial_pause`) 응답 뒤 다시 잡은 다음 대상·문맥·의미를 다시 판정한다(R3 B3).
     """
 
-    @property
-    def _approval_via(self) -> Optional[Dict[str, Any]]:
-        """이번 호출이 정책·elicitation 으로 열렸으면 결과에 실을 data.approval 원본(_run_gated_action 이 꺼낸다)."""
-        return _APPROVAL_VIA.get()
-
-    @_approval_via.setter
-    def _approval_via(self, value: Optional[Dict[str, Any]]) -> None:
-        _APPROVAL_VIA.set(value)
-
-    @property
-    def _oob_note(self) -> Optional[Dict[str, Any]]:
-        """차단 결과에 덧붙일 정보(policy_refused·elicitation 응답) — 이번 호출에서만."""
-        return _OOB_NOTE.get()
-
-    @_oob_note.setter
-    def _oob_note(self, value: Optional[Dict[str, Any]]) -> None:
-        _OOB_NOTE.set(value)
-
-    @property
-    def _used_approval(self) -> Optional[str]:
-        """이번 호출이 쓴 승인 증표 id(_use_approval 이 통과시킴) — 호출 문맥 단위(B2)."""
-        return _USED_APPROVAL.get()
-
-    @_used_approval.setter
-    def _used_approval(self, value: Optional[str]) -> None:
-        _USED_APPROVAL.set(value)
-
-    @property
-    def _pending_gate_basis(self) -> Optional[Dict[str, Any]]:
-        """통과한 게이트 근거(좌표 클릭 등) — 결과에 싣는다. 호출 문맥 단위(B2)."""
-        return _PENDING_GATE_BASIS.get()
-
-    @_pending_gate_basis.setter
-    def _pending_gate_basis(self, value: Optional[Dict[str, Any]]) -> None:
-        _PENDING_GATE_BASIS.set(value)
-
-    @property
-    def _approval_pin(self) -> Any:
-        """이번 호출을 연 사람 승인의 대상 노드(승인 요청 때 잡음) — 디스패처는 이 노드에만 동작한다(B1)."""
-        return _APPROVAL_PIN.get()
-
-    @_approval_pin.setter
-    def _approval_pin(self, value: Any) -> None:
-        _APPROVAL_PIN.set(value)
+    #: 이번 호출이 정책·elicitation 으로 열렸으면 결과에 실을 data.approval 원본(_run_gated_action 이 꺼낸다).
+    _approval_via = _call_field("_approval_via")
+    #: 차단 결과에 덧붙일 정보(policy_refused·elicitation 응답) — 이번 호출에서만.
+    _oob_note = _call_field("_oob_note")
+    #: 이번 호출을 연 사람 승인의 대상 노드(승인 요청 때 잡음) — 디스패처는 이 노드에만 동작한다(B1).
+    _approval_pin = _call_field("_approval_pin")
 
     _policy_store: Any = None
-
-    # -- R2 B4: 승인 실행 구간 직렬화 -------------------------------------------------------------------------
-    # 승인(정책·elicitation·승인 증표)으로 연 호출의 '재확인 → 실제 입력 → 효과 판정' 을 서버 단위 asyncio 락으로 한
-    # 호출씩. 디스패처는 dispatch 마다 비우는 인스턴스 기록(이동 대기·다이얼로그·팝업·최상위 기록기)을 쓰고 실제 입력도
-    # 공유 Chromium 이라, 동시 두 승인 호출이 겹치면 한쪽 입력이 사라지고도 둘 다 성공으로 보고됐다(검증 BLOCKING-4).
-    # 사람 응답 대기(elicitation)는 락 밖이다. 잡은 호출 표시는 호출 문맥(_EXEC_HELD) — 같은 호출 안 중첩(헤드리스
-    # 재시도 등)은 다시 잡지 않는다. 푸는 곳은 _call_tool 의 finally 한 곳(_release_approval_exec).
-    # 병합 메모: WS-57 의 같은 작업 공간 dispatch 직렬화 락이 들어오면 그 락으로 통일한다.
-
-    def _approval_exec_lock(self) -> asyncio.Lock:
-        lock = getattr(self, "_approval_exec_lock_obj", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._approval_exec_lock_obj = lock
-        return lock
-
-    def _approval_exec_held(self) -> bool:
-        """이 호출 문맥이 승인 실행 구간 락을 잡고 있는가."""
-        return _EXEC_HELD.get()
-
-    async def _hold_approval_exec(self) -> None:
-        """이 호출이 승인 실행 구간 락을 잡는다(이미 잡았으면 그대로)."""
-        if _EXEC_HELD.get():
-            return
-        await self._approval_exec_lock().acquire()
-        _EXEC_HELD.set(True)
-
-    def _release_approval_exec(self) -> None:
-        """이 호출이 잡은 승인 실행 구간 락을 푼다(안 잡았으면 아무것도 안 함)."""
-        if _EXEC_HELD.get():
-            _EXEC_HELD.set(False)
-            self._approval_exec_lock().release()
 
     def _approval_policies(self) -> Any:
         """serve --profile 로 잡은 프로필의 정책 저장소. 프로필이 없으면 None(정책 없음)."""
@@ -280,11 +204,10 @@ class ElicitMixin:
                                       destination=getattr(pinned, "meaning", None))
         self._approval_pin = pinned
         try:
-            answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
-            if answer == "accept":
-                # R2 B4: 사람 응답 대기는 락 밖 — 응답 뒤 재확인·실제 입력·효과 판정은 서버 단위로 한 호출씩.
-                # (락은 _call_tool 끝에서 푼다 — _release_approval_exec.) R3 B3: 재확인은 락을 잡은 **뒤**.
-                await self._hold_approval_exec()
+            # 사람 응답 대기는 작업 공간 직렬화 구간 밖(WS-56 R4) — 그동안 같은 작업 공간의 다른 호출이 돈다. 구간을
+            # 다시 잡은 **뒤** 재확인(R3 B3: 그사이 바뀐 대상·목적지·조작권)·실제 입력·효과 판정.
+            async with self._serial_pause():
+                answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
             checked = (await self._recheck_after_accept(action, params, components)
                        if answer == "accept" else None)
         except BaseException:
@@ -317,9 +240,9 @@ class ElicitMixin:
 
     async def _policy_run(self, action: ActionType, params: Dict[str, Any], decision: Any,
                           report_basis: bool) -> Any:
-        """정책 일치 → 대상 노드를 잡고, 실행 락을 잡은 **뒤** 대상·문맥·실행 의미·정책·금지 범주를 다시 판정(R3 B3).
+        """정책 일치 → 대상 노드를 잡고, 대상·문맥·실행 의미·정책·금지 범주를 다시 판정(R3 B3).
 
-        락을 기다리는 동안 앞선 호출(타이머·이동)이 대상을 바꿀 수 있다 — 정책 통과는 락 획득 시점의 판정만 믿는다.
+        R4: 이 판정은 작업 공간 직렬화 구간 안에서 한다 — 앞선 호출(타이머·이동)은 이미 끝났고 다른 호출은 끼지 않는다.
         결속 불가(노드를 못 잡음)면 정책으로 열지 않는다(None — 기존 경로).
         """
         via = self._approval_via
@@ -330,7 +253,8 @@ class ElicitMixin:
             return None
         self._approval_pin = pinned
         try:
-            await self._hold_approval_exec()
+            # R3 B3 → R4: 정책 판정 자체가 작업 공간 직렬화 구간 안(_call_tool)이라 판정과 실행 사이에 락 대기가 없다.
+            # 노드를 잡은 지금 대상·문맥·의미·정책·금지 범주를 한 번 더 판정한다(같은 구간 안 — 다른 호출이 끼지 않음).
             checked, now_ctx = await self._recheck_target(action, params, components, "policy")
             if checked is None:
                 self._oob_note = None
@@ -370,12 +294,12 @@ class ElicitMixin:
 
     async def _recheck_after_accept(self, action: ActionType, params: Dict[str, Any],
                                     components: Dict[str, Any]) -> Optional[ActionResult]:
-        """사람이 승인한 그 대상인가 — 승인 증표 실행 경로(_use_approval)와 같은 재확인. 실행 락을 잡은 뒤 부른다."""
+        """사람이 승인한 그 대상인가 — 승인 증표 실행 경로(_use_approval)와 같은 재확인. 직렬화 구간을 다시 잡은 뒤 부른다."""
         return (await self._recheck_target(action, params, components, "elicitation"))[0]
 
     async def _recheck_target(self, action: ActionType, params: Dict[str, Any], components: Dict[str, Any],
                               via: str) -> tuple:
-        """락 획득 뒤 재확인. 반환: (거부 ActionResult 또는 None, 지금 대상의 게이트 문맥 또는 None)."""
+        """직렬화 구간 안 재확인. 반환: (거부 ActionResult 또는 None, 지금 대상의 게이트 문맥 또는 None)."""
         from interface.handoff import DIGEST_KEYS, action_digest, normalize_components
 
         # 기다리는 동안 사람이 조작권을 가져갔으면 실행하지 않는다.
@@ -406,7 +330,7 @@ class ElicitMixin:
         same = await self._pinned_check(self._approval_pin, params)
         if not same.get("fresh"):
             return self._oob_toctou(action, str(same.get("detail") or ""), via=via), None
-        return None, gate_ctx  # R3 B3: 정책 재판정은 이 (락 획득 뒤) 문맥으로
+        return None, gate_ctx  # R3 B3: 정책 재판정은 이 (구간 안) 문맥으로
 
     async def _pin_approval_target(self, params: Dict[str, Any]) -> Any:
         """사람 승인을 요청하는 지금 대상 노드를 잡는다(B1). None = 요소 대상 아님(좌표·키 — 결속 대상 없음),

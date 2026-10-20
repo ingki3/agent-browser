@@ -54,8 +54,12 @@ class HandoffMixin:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if "taken" in events:
+            # WS-58 R2 NB1: poll 이 holder 를 human 으로 바꾼 그 동기 구간에서 요청 감시를 붙인다 — 아래 어떤
+            # await(쿠키 사이트 응답·안내 띠)보다 먼저.
+            self._login_watch_begin()
         if events and self._recipes is not None and ("taken" in events or "released" in events):
-            self._recipes.reset("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38)
+            self._reset_all_recipes("human_control")  # 사람 조작 구간에서 궤적을 끊는다(WS-38, 모든 작업 공간 WS-57)
         for event in events:
             if event == "cookie_sites":
                 from browser.serve_profile import bound_cookie_sites, cookie_sites, summarize_cookie_sites
@@ -80,18 +84,29 @@ class HandoffMixin:
                 self._spawn_login()
             if event == "released":
                 self._release_unreported = True
-                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로.
-                if self._engine is not None:
-                    self._engine.bump_epoch("control_release")
-                if self._window is not None:
-                    # WS-34 D2: 창을 닫고 headless 로 다시 연다(sticky 면 창 유지). 탭은 다시 열려
-                    # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
-                    self._on_demand_released()
-                else:
-                    await self._recover_closed_tab_serialized()
+                # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로. WS-57 R1(R3): 모든 작업 공간 —
+                # 반납을 어느 작업 공간 문맥이 먼저 집어도 반납 전 관찰·승인 근거는 어디서도 다시 쓰이지 않는다.
+                self._bump_all_epochs("control_release")
+                # WS-58: 조작권 구간의 로그인 사건을 기록하는 동안 새 도구 호출(관문)을 세운다 — 기록 전에
+                # 이름 재시도가 그 사이트로 가지 않게.
+                self._hold_gate()
+                try:
+                    if self._window is not None:
+                        # 창 전환이 창 컨텍스트를 닫기 전에(쿠키를 읽을 수 있을 때) 기록한다.
+                        await self._login_watch_finish()
+                        # WS-34 D2: 창을 닫고 headless 로 다시 연다(sticky 면 창 유지). 탭은 다시 열려
+                        # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
+                        self._on_demand_released()
+                    else:
+                        # 복구 Future 는 poll 과 같은 동기 구간에서 만들어야 한다(WS-37) — 기록은 그 뒤.
+                        await self._recover_closed_tab_serialized()
+                        await self._login_watch_finish()
+                finally:
+                    self._release_gate()
                 await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
+                self._login_watch_begin()
                 if self._window is not None:
                     self._window.opened_for_request = None
                     if self._window.state == "headless" and self._started:
@@ -100,6 +115,7 @@ class HandoffMixin:
                 await self._show_control_banner(
                     "사람이 조작 중 — 끝나면 `agent-browser control release`")
                 _stderr_line("agent-browser serve: 조작권을 사람이 가져감")
+        await self._login_watch_tick()
         if self._window is not None:
             await self._watch_window()
         await self._sync_code_overlay()
@@ -107,6 +123,98 @@ class HandoffMixin:
         # 이 함수가 돌아온 뒤 호출자가 보는 상태(반납·탭 알림)가 어긋나지 않게.
         await self._await_release_recovery()
         return events
+
+    # -- WS-58: 도구가 아는 로그인 사건 → 로그인 기록(헤드리스 이름 재시도 판정) -------------------
+
+    def _record_login(self, url: str, source: str) -> None:
+        """그 origin 을 로그인 기록에 남긴다(값·이름 없음). 실패는 판정이 fail-closed 로 다룬다."""
+        retry = getattr(self, "_headless_retry", None)
+        if retry is not None and url:
+            retry.logins.record(url, source)
+
+    def _login_watch_begin(self) -> None:
+        """조작권 구간 시작 — 감시를 만들고 요청 감시를 **이 동기 구간에서** 붙인다(WS-58 R2 NB1: holder 가
+        human 이 된 뒤 첫 await 전에). 쿠키 기준점·탭별 설치는 다음 tick(컨텍스트가 정해진 뒤)."""
+        from browser.login_watch import ControlLoginWatch
+
+        if self._login_watch is None:
+            self._login_watch = ControlLoginWatch()
+        self._login_watch_arm()
+
+    def _login_watch_arm(self, context: Any = None) -> None:
+        """현재(또는 주어진 — on-demand 창 전환 직후 새) 컨텍스트에 요청 감시를 await 없이 붙인다."""
+        watch = self._login_watch
+        if watch is None or self._core is None or (context is None and not self._started):
+            return
+        try:
+            watch.arm(context if context is not None else self._core.context_for("mcp-session"))
+        except Exception:  # noqa: BLE001 - 붙일 수 없음: 반납 때 방문 origin 전부 기록(fail-closed)
+            watch.mark_degraded()
+
+    def _agent_page_url(self) -> str:
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+        return str(getattr(page, "url", "") or "")
+
+    def _agent_input_url(self) -> str:
+        """입력 사건(자격증명 치환·secret_wanted)의 대상 문서 — 에이전트의 *활성 frame*(switch_frame 뒤면 그 iframe).
+
+        디스패처가 비밀 치환 허용을 판단하는 문서(``ctx.page``)와 같다. ``_agent_page_url`` 의 root 우선 의미는
+        그대로 둔다(WS-58 R1 B2)."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        page = getattr(ctx, "page", None) or getattr(ctx, "root_page", None) or self._page
+        try:
+            return str(getattr(page, "url", "") or "")
+        except Exception:  # noqa: BLE001 - 떨어진 frame
+            return ""
+
+    async def _login_watch_tick(self) -> None:
+        """사람이 조작 중이면 현재 컨텍스트의 모든 탭에 감시를 건다(on-demand 창 전환 뒤 새 컨텍스트 포함)."""
+        from interface.handoff import HOLDER_HUMAN
+
+        watch = self._login_watch
+        if watch is not None and self.hub.holder != HOLDER_HUMAN:
+            # 'released' 사건 없이 끝난 구간(사람이 창을 닫아 서버가 반납 등)도 마무리한다.
+            await self._login_watch_finish()
+            return
+        if watch is None and self.hub.holder == HOLDER_HUMAN:
+            self._login_watch_begin()  # take 를 다른 경로(로그인 작업·직접 _apply)로 받은 경우
+            watch = self._login_watch
+        if watch is None or self.hub.holder != HOLDER_HUMAN or not self._started or self._core is None:
+            return
+        if self.hub.secret_wanted:
+            watch.note_secret(self._agent_input_url())
+        watch.note_visited(self._agent_page_url())
+        watch.note_visited(self._agent_input_url())
+        try:
+            await watch.ensure(self._core.context_for("mcp-session"))
+        except Exception:  # noqa: BLE001 - 감시를 걸 수 없음: 조작권 흐름은 그대로, 반납 때 방문 origin 전부 기록
+            watch.mark_degraded()
+            logger.debug("조작권 로그인 감시 실패", exc_info=True)
+
+    async def _login_watch_finish(self) -> None:
+        """조작권 반납 — 감시 결과·로그인 작업(agent-browser login)을 로그인 기록에 남긴다."""
+        from browser.login_ledger import SOURCE_HUMAN_CONTROL, SOURCE_LOGIN_FLOW
+
+        watch, self._login_watch = self._login_watch, None
+        job_url, self._login_job_url = self._login_job_url, None
+        if job_url:
+            self._record_login(job_url, SOURCE_LOGIN_FLOW)
+        if watch is None:
+            return
+        context = None
+        try:
+            if self._started and self._core is not None:
+                context = self._core.context_for("mcp-session")
+        except Exception:  # noqa: BLE001
+            context = None
+        try:
+            found = await watch.finish(context)
+        except Exception:  # noqa: BLE001
+            logger.debug("조작권 로그인 감시 정리 실패", exc_info=True)
+            return
+        for origin in found:
+            self._record_login(origin, SOURCE_HUMAN_CONTROL)
 
     def _login_hint(self) -> str:
         if self.profile is None:
@@ -153,10 +261,11 @@ class HandoffMixin:
                 if not self._human_can_see() or not display_available():
                     raise ValueError("창 없는 환경(headless 전용 또는 DISPLAY 없음). 맥 앞에서 실행하세요.")
                 self.hub._apply({"op": "take"})
+                self._login_watch_begin()  # WS-58: 이 take 는 poll 사건으로 오지 않는다
                 self.hub.secret_wanted = True  # Human login contents stay out of observations.
                 self.hub._write_control()
                 if self._recipes is not None:
-                    self._recipes.reset("human_control")
+                    self._reset_all_recipes("human_control")
                 if not await self._drain_calls():
                     raise ValueError("진행 중인 도구 호출이 끝나지 않았습니다.")
                 if self.hub.login is not job:
@@ -191,6 +300,9 @@ class HandoffMixin:
                         if self._core.get_tab(active) is not None:
                             self._core.set_active_tab(active)
                 job.status = "ready"
+                # WS-58: 사람이 이 작업을 끝내면(반납) 그 origin 을 login_flow 로 기록한다.
+                self._login_job_url = job.url
+                await self._login_watch_tick()
                 page.on("close", lambda: write_command(self.hub.root, self.hub.server_id,
                         "login_finish", login_id=job.login_id) if self.hub.opened and self.hub.login is job else None)
                 self.hub._write_control()
@@ -250,7 +362,7 @@ class HandoffMixin:
                         + ("브라우저를 닫았습니다 — 다음 도구 호출 때 headless 로 다시 엽니다. "
                            if self._window.state == "failed" else "")
                         + "잠시 뒤 다시 요청하거나 운영자에게 알리세요."),
-                    "data": {"window": window_out.get("window") or self._window.info()},
+                    "data": {"window": self._window_view(window_out.get("window") or self._window.info())},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
         out["login_hint"] = self._login_hint()
@@ -268,7 +380,7 @@ class HandoffMixin:
         _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         if window_out is not None:
-            out = dict(out, window=window_out["window"])
+            out = dict(out, window=self._window_view(window_out["window"]))
         return {"success": True, "data": out}
 
     async def _open_window_for_request(self) -> Dict[str, Any]:
@@ -278,7 +390,9 @@ class HandoffMixin:
         w = self._window
         assert w is not None
         w.take_sticky_for_request()
-        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in self._core.tabs()] \
+        from interface.server_window import _all_tabs
+
+        self._request_urls = [str(getattr(t.page, "url", "") or "") for t in _all_tabs(self._core)] \
             if self._core is not None else []
         if w.state == "headed":
             self._sync_window()
@@ -368,7 +482,7 @@ class HandoffMixin:
             self._window_unreported = False
             out = dict(self._last_window_result)
             out.update(self._window.info())
-            return out
+            return self._window_view(out)  # WS-57 R1: 이 작업 공간 탭만(다른 작업 공간은 개수만)
         return dict(self._window.info(), reopened=False)
 
     async def _approval_wait(self, approval_id: str, timeout: float) -> Dict[str, Any]:

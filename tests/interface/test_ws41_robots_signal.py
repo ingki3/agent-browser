@@ -120,9 +120,9 @@ async def test_disallow_signal_navigate_observe_cache_and_browser_ua(site):
     assert site.requests["/robots.txt"] == 1
     assert site.requests["/a"] == site.requests["/b"] == 1
     assert site.user_agents["/robots.txt"] == site.user_agents["/a"]
-    # Preserve the WS-41 size bound; WS-44/46 add separate bounded fields.
+    # Preserve the WS-41 size bound; WS-44/46/54 add separate bounded (fixed-text) fields.
     legacy = {key: value for key, value in first.data["robots"].items()
-              if key not in {"user_fetch_agents_allowed", "content_signal", "scope", "note"}}
+              if key not in {"user_fetch_agents_allowed", "content_signal", "scope", "note", "user_request"}}
     assert len(json.dumps(legacy, separators=(",", ":"))) < 300
     assert first.data["robots"]["user_fetch_agents_allowed"] == []
     assert first.data["robots"]["content_signal"] == ""

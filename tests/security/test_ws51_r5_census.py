@@ -131,6 +131,12 @@ REVIEWED = {
     ("code", "interface/server_display.py", "job.code"): NOT_OUT + " (확인 코드 창 표시 인자)",
     ("scope", "security/robots_signal.py", "scope"): "RobotsScope — all_bots·named_ai·all_bots_and_named_ai·none (R7)",
     ("source", "browser/site_session.py", "source"): NOT_OUT + " (로그인 추적 이벤트 — interface 가 쓰지 않음)",
+    ("source", "browser/login_ledger.py", "source"): NOT_OUT + " (WS-59 로그인 기록 파일 login_ledger.json 의 source 칸 — 응답 출구 아님)",
+    ("source", "browser/login_ledger.py", "_check_source(entry['source'])"): NOT_OUT + " (WS-59 로그인 기록 파일 읽기 검증 "
+                                                                         "— 알려진 어휘만)",
+    ("source", "browser/login_records.py", "source"): NOT_OUT + " (WS-58 로그인 기록 사건 종류 — login_ledger 파일·메모리)",
+    ("source", "browser/login_watch.py", "source"): NOT_OUT + " (WS-58 조작권 감시 CDP 스크립트 본문 — 응답 출구 아님)",
+    ("reason", "browser/chrome_cookies.py", "reason"): NOT_OUT + " (WS-59 _Skip 예외 속성 — 사람 CLI 가 SKIP_LABELS 고정 문구로 개수만 출력)",
     ("source", "security/hitl.py", "source"): "gate_basis.source — 판정 출처·문맥 신호 원천(TEXT·PATH·TOKEN_SOURCES) (R7)",
     # R8 — 속성 전달값 census(test_ws51_r8_census.py)로 어휘에 들어온 키의 동적 생산자.
     ("vendor", "interface/server_signals.py", "found.vendor"): "browser.challenge Challenge.vendor — generic·hcaptcha·"
@@ -244,6 +250,13 @@ ID_PRODUCERS = {
     # WS-56 R2 B1
     ("security/approve_policy.py", "secrets.token_hex(_KEY_BYTES)"): ("정책 서명 HMAC 키(서버 상태 폴더 0600 파일) — 출구 아님",
                                                                       None, None),
+    # WS-57: 붙은 연결의 기본 작업 공간 이름(악수 IPC). 응답에는 window.tabs[].workspace 로만(FREE — 면제 없음).
+    ("interface/attach.py", "f'attach-{self._seq}'"): ("WS-57 작업 공간 이름 — 면제하지 않음(FREE 칸)", None, None),
+    ("browser/login_ledger.py", "secrets.token_hex(6)"): ("WS-59 로그인 기록 임시 파일 이름 — 출구 아님", None, None),
+    ("browser/login_watch.py", "secrets.token_hex(6)"): ("WS-58 조작권 감시 격리 world 이름(CDP 내부) — 출구 아님", None, None),
+    ("browser/login_watch.py", "secrets.token_hex(8)"): ("WS-58 조작권 감시 바인딩 이름(CDP 내부) — 출구 아님", None, None),
+    ("interface/profile_cli.py", "secrets.token_hex(4)"): ("WS-59 import-cookies 프로필 잠금 server_id(잠금 파일·사람 CLI "
+                                                          "stderr) — 출구 아님", None, None),
 }
 
 

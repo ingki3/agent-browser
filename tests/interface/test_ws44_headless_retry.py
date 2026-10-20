@@ -193,7 +193,8 @@ async def test_each_exclusion_sends_zero_retries(sites, condition):
     opts = {"headless_retry": False} if condition == "disabled" else {}
     async with BrowserMCPServer(nav_settle=False, recipes=False, **opts) as server:
         if condition in {"cookie", "path_cookie"}:
-            await server._page.context.add_cookies([{"name": "synthetic", "value": "fixture",
+            # WS-58: only a server-only (HttpOnly) cookie key — or a login record — keeps the native name.
+            await server._page.context.add_cookies([{"name": "synthetic", "value": "fixture", "httpOnly": True,
                 "domain": "127.0.0.1", "path": "/" if condition == "cookie" else "/account"}])
         result = await navigate(server, site.url + "/read")
         assert "identity" not in result.data
@@ -477,8 +478,8 @@ async def test_remembered_origin_rechecks_conditions_and_retains_memory(sites, c
         if condition == "cookie":
             # WS-52: a login needs an agent action or a handoff, and either ends the settle tail first.
             server._headless_retry.cancel_tail()
-            await server._page.context.add_cookies([
-                {"name": "synthetic", "value": "local-mock", "url": site.url}])
+            await server._page.context.add_cookies([  # WS-58: HttpOnly (a server session) blocks
+                {"name": "synthetic", "value": "local-mock", "url": site.url, "httpOnly": True}])
         if condition == "disabled":
             server.headless_retry = False
         if condition == "headed":

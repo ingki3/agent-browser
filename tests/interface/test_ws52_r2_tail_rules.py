@@ -86,7 +86,12 @@ async def test_real_saved_recipe_overlapping_a_navigate_starts_no_tail(monkeypat
                 return await real_run(*args, **kwargs)
 
             monkeypatch.setattr(service, "run_recipe", scheduled_recipe)
-            other = asyncio.create_task(server.call_server_tool("browser_recipe", {"op": "run", "id": recipe_id}))
+            # WS-57 R2: 같은 작업 공간의 호출은 이제 직렬화돼 겹치지 못한다 — 겹침은 다른 작업 공간(같은 컨텍스트·쿠키)의
+            # 요청으로만 생긴다. 그 작업 공간 탭을 같은 페이지로 열어 둔 뒤 거기서 저장 레시피를 돌린다.
+            opened = await server.call_tool("browser_navigate", {"url": site.url + "/one", "workspace": "watch"})
+            assert opened.success, opened
+            other = asyncio.create_task(server.call_server_tool(
+                "browser_recipe", {"op": "run", "id": recipe_id, "workspace": "watch"}))
             await recipe_ready.wait()
             original = retry.snapshot
 
@@ -567,11 +572,9 @@ async def test_bot_order_with_beacons_keeps_late_script_cookies(delay):
         async with BrowserMCPServer(recipes=False) as server:  # nav_settle on, as the bot runs
             second = await _bot_order(server, site, delay + 0.7)
             assert sum(p.startswith("/beacon") for p, _ in site.requests) >= 3  # the beacons really ran
-            if delay < 10:
-                assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
-            else:  # outside the 10 s maximum: honestly refused
-                assert second.data["last_http_status"] == 403
-                assert second.data["retry_skipped"]["cookie_change"] == "known_value_changed"
+            # WS-58 (intended change): outside the 10 s maximum the rewrite is not merged, but a
+            # non-HttpOnly value change no longer keeps the native name (r1 symptom test checks the ledger).
+            assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
 
 
 @requires_chromium

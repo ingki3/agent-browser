@@ -1020,9 +1020,8 @@ class ActionDispatcher:
         self._top_attribution: Optional[Dict[str, Any]] = None
         #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
         #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
-        #: WS-56 R1 B2(WS-57 R1 R2 와 같은 모양): 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는
-        #: 동시 호출 하나가 끝나며 다른 승인 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로, 켜고 끄기는
-        #: heal_disabled_scope().
+        #: WS-57 R1(R2)·WS-56 R1 B2: 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는 동시 호출 하나가
+        #: 끝나며 다른 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로 두고, 켜고 끄기는 heal_disabled_scope().
         self._heal_off: ContextVar[bool] = ContextVar(f"heal_disabled@{id(self):x}", default=False)
         #: WS-56 R1 B1: 사람 승인 때 잡아 둔 대상 노드(PinnedTarget) — 이 호출 문맥에서만. pinned_scope().
         self._pinned: ContextVar[Optional["PinnedTarget"]] = ContextVar("agent_browser_approved_node", default=None)
@@ -1078,6 +1077,22 @@ class ActionDispatcher:
         return self._healing_successes / self._healing_attempts
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
+
+    async def _capture_state(self, page: Any, handle: Optional[ElementHandle] = None) -> Any:
+        """capture_state + 탭 수는 이 호출의 작업 공간 몫만(WS-57 R1 R4) — 같은 컨텍스트를 쓰는 다른 작업 공간이
+        그 사이 연 탭을 이 액션의 '새 탭' 효과로 세지 않는다. 작업 공간을 모르는 코어·탭 수를 못 읽은 경우는 그대로."""
+        state = await (capture_state(page, handle) if handle is not None else capture_state(page))
+        if not state.page_count:
+            return state
+        counter = getattr(getattr(self.ctx, "core", None), "workspace_page_count", None)
+        if callable(counter):
+            try:
+                n = counter(list(page.context.pages))
+            except Exception:  # noqa: BLE001 — 가짜 페이지/컨텍스트 없음: 예전 값
+                n = None
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                state.page_count = n
+        return state
 
     def _set_active_page(self, page: Any, tab_id: str) -> None:
         """탭 전환·생성·종료로 활성 페이지를 바꾼다 (WS-26b, 검증 NB-4).
@@ -1683,6 +1698,9 @@ class ActionDispatcher:
         # WS-30: 계약 키(trigger_element_id 등)를 디스패처 키로 맞춘다.
         params = normalize_action_params(action, params)
         params, secret_resolved = self._resolve_secret(action, params)
+        if action is ActionType.TYPE_TEXT and secret_resolved is not True:
+            # WS-55 R2: 입력 중 민감 판정 표시(_CONCEAL_KEY)를 사본에만 붙인다 — 호출자 params(트레이스)엔 남기지 않는다.
+            params = dict(params)
         if secret_resolved is True and not self._secret_allowed_here():
             # 도메인에 묶인 자격증명(credentials.BoundSecrets)을 다른 사이트에서
             # 쓰려 함 — 값도 키 이름도 입력하지 않고 실패한다.
@@ -1789,6 +1807,11 @@ class ActionDispatcher:
             looks_like_key = bool(SECRET_KEY_PATTERN.match(text))
             return params, (False if looks_like_key else None)
 
+        # WS-55 R1 B1: 해석한 실제 값은 도구가 비밀로 아는 값이다 — 페이지가 그 값을 주소(허용 목록 키 `?sortKey=` 포함)·
+        # 제목에 반사해도 응답에서 가려지게 입력 전에 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([resolution.value])
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
         # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
@@ -2063,7 +2086,7 @@ class ActionDispatcher:
         if root is None:
             return None
         try:
-            state = await capture_state(root)
+            state = await self._capture_state(root)
         except Exception as exc:  # noqa: BLE001 — 문서 교체 중 등
             logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return None
@@ -2255,7 +2278,7 @@ class ActionDispatcher:
     ) -> Any:
         """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
-        before = await capture_state(self.ctx.page, handle)
+        before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
         # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
@@ -2323,7 +2346,7 @@ class ActionDispatcher:
         """[3] 사후 상태 읽기·늦은 효과 유예·팝업 반영(WS-48 분해). 반환: (후 상태, 최상위 후 상태) 또는 결과."""
         # --- [3] 사후조건 검증 ------------------------------------------------
         try:
-            after = await capture_state(self.ctx.page, handle)
+            after = await self._capture_state(self.ctx.page, handle)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise
@@ -2350,7 +2373,7 @@ class ActionDispatcher:
             ):
                 try:
                     await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     if root_before is not None:
                         root_after = await self._capture_root()
                 except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
@@ -2397,7 +2420,7 @@ class ActionDispatcher:
             if not top_weak_ok and self._top_attribution is not None:
                 # 관찰 창이 유예 대기를 겸했다 — 대상 문서의 늦은 효과를 다시 본다.
                 try:
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     post = verify_post_condition(
                         before,
                         after,
@@ -2453,7 +2476,7 @@ class ActionDispatcher:
                 healed=healed_flag,
             )
 
-        retry_after = await capture_state(self.ctx.page, handle)
+        retry_after = await self._capture_state(self.ctx.page, handle)
         retry_post = verify_post_condition(
             before,
             retry_after,
@@ -2576,6 +2599,24 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _mark_sensitive_input(
+        self, handle: ElementHandle, params: Dict[str, Any], text: str
+    ) -> None:
+        """입력 액션의 한 시점에서 민감 칸을 판정하고, 민감이면 친 값을 등록한다(WS-55 R2).
+
+        이미 민감으로 판정됐거나(sticky) SecretStore 해석 값(_CONCEAL_KEY)이면 다시 보지 않는다. 민감이면
+        params 에 _CONCEAL_KEY 를 붙여 액션 끝까지(사후조건·재시도 신호) 값을 싣지 않게 한다 — params 는
+        dispatch() 가 만든 사본이라 호출자 트레이스에는 나타나지 않는다.
+        """
+        if params.get(_CONCEAL_KEY):
+            return
+        if not await self.is_sensitive_field(handle):
+            return
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([text])
+        params[_CONCEAL_KEY] = True
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 
@@ -2618,10 +2659,20 @@ class ActionDispatcher:
             await target.click(button=params.get("button", "left"), timeout=5000)
 
         elif action is ActionType.TYPE_TEXT:
+            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
+            text = params.get("text", "")
+            # WS-55 R2(검증 B1-R1): 민감 칸 판정은 이 액션의 **첫 부작용 전**(clear·focus·첫 input 이벤트 이전, 대상
+            # 해석 직후)에 한다. clear 도 input 이벤트를 일으키므로 그 사이 페이지가 type 을 바꾸거나 노드를 교체하면
+            # 최초의 password 정보가 사라진다. 한 번이라도 민감이면 액션 끝까지 유지(sticky)하고, 보수적으로
+            # clear 후·입력 후에도 다시 보아 새로 민감해진 칸도 등록한다(OR). SecretStore 해석 값은 _resolve_secret
+            # 에서 이미 등록했다. 일반 칸의 값(검색어)은 에이전트가 자기 호출 인자로 이미 아는 값이라 등록하지 않는다
+            # (과잉 가림 방지, 결정 A).
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
-            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
-            await target.type(params.get("text", ""), timeout=5000)
+                await self._mark_sensitive_input(handle, params, text)
+            await target.type(text, timeout=5000)
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
                 await target.press("Enter", timeout=5000)
 
@@ -2987,7 +3038,7 @@ class ActionDispatcher:
         if refused is not None:
             return refused
 
-        before = await capture_state(page)
+        before = await self._capture_state(page)
         button = params.get("button", "left")
         if pin is not None:
             # R3 B1: 이동(hover)이 대상을 바꿀 수 있다 — 먼저 옮기고 반영된 뒤 그 지점 노드를 다시 본다(아직 안 누름).
@@ -3027,7 +3078,7 @@ class ActionDispatcher:
         if watch is not None:
             self._nav_info = await watch.settle()
         try:
-            after = await capture_state(page)
+            after = await self._capture_state(page)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise

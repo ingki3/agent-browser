@@ -67,6 +67,7 @@ from interface.server_schema import (  # noqa: E402,F401
     RECIPE_TOOL,
     SERVER_TOOLS,
     TOOL_PREFIX,
+    WORKSPACE_INSTRUCTIONS,
     YOUTUBE_INSTRUCTIONS,
     YOUTUBE_TOOL,
     _DESCRIPTIONS,
@@ -121,6 +122,8 @@ from interface.server_handoff import (  # noqa: E402,F401
 )
 from interface.server_window import (  # noqa: E402,F401
     WindowMixin,
+    _all_tabs,
+    _snapshot_tabs,
 )
 from interface.server_lifecycle import (  # noqa: E402,F401
     LifecycleMixin,
@@ -137,6 +140,30 @@ from interface.server_elicit import (  # noqa: E402,F401
     elicit_timeout,
     elicitation_message,
 )
+from browser.workspace import (  # noqa: E402,F401
+    DEFAULT_WORKSPACE,
+    WorkspaceNameError,
+    current_workspace,
+    validate_workspace,
+    workspace_scope,
+)
+from interface.server_workspace import (  # noqa: E402,F401
+    WORKSPACE_ARG,
+    WORKSPACE_SERVER_TOOLS,
+    WorkspaceMixin,
+    WorkspaceRuntime,
+    _CALL_STATE,
+    _CallScope,
+    _PER_CALL,
+    _SERIAL_HELD,
+    _SERIAL_STACK,
+    _SerialPause,
+    _WorkspaceSerial,
+    _call_field,
+    _closed,
+    _runtime_field,
+    pop_workspace_arg,
+)
 #: 분리 전 모듈 __annotations__ 를 그대로 둔다(값 바인딩 없는 주석 — SERVER_TOOLS 는 위 재수출).
 SERVER_TOOLS: Dict[str, Dict[str, Any]]
 
@@ -152,7 +179,8 @@ CAPTURE_DRAIN_TIMEOUT_S = 5.0
 RELEASE_RECOVERY_WAIT_S = 10.0
 
 
-class BrowserMCPServer(ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin, WindowMixin, LifecycleMixin):
+class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin,
+                       WindowMixin, LifecycleMixin):
     """19종 툴을 노출하는 MCP 서버.
 
     실제 MCP SDK 바인딩은 `create_server()`에서 수행하고, 본 클래스는
@@ -225,6 +253,9 @@ class BrowserMCPServer(ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, Display
         from browser.headless_retry import HeadlessRetry
 
         self._headless_retry = HeadlessRetry()
+        #: WS-58: 조작권 구간 로그인 감시(browser.login_watch)·진행 중인 로그인 작업 주소.
+        self._login_watch: Any = None
+        self._login_job_url: Optional[str] = None
         self._retry_recipe_boundary: ContextVar[bool] = ContextVar("headless_retry_recipe_boundary", default=False)
         self._navigation_scope: ContextVar[AsyncExitStack | None] = ContextVar("headless_navigation_scope", default=None)
         #: 브라우저 방식 (WS-27): headless / human / user-chrome. 가드·문서 상태·HITL 은
@@ -534,7 +565,7 @@ def _server_instructions(recipes: bool) -> str:
 
     return ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
             + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS
-            + "\n" + YOUTUBE_INSTRUCTIONS)
+            + "\n" + YOUTUBE_INSTRUCTIONS + "\n" + WORKSPACE_INSTRUCTIONS)
 
 
 async def run_stdio(
@@ -555,6 +586,8 @@ async def run_stdio(
     profile: Optional[str] = None,
     recipes: bool = True,
     headless_retry: bool = True,
+    attach: bool = False,
+    workspace: Optional[str] = None,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -602,11 +635,37 @@ async def run_stdio(
     _announce_serve(mode, browser_mode, chrome_profile, keep_open, profile, recipes,
                     allow_private_network, block_loopback, server_id)
 
+    async def _serve_attached(reader: Any, writer: Any, name: str) -> None:
+        """WS-57: 붙은 serve 의 연결 하나 = MCP 세션 하나, 기본 작업 공간 name(로그인 공유·탭 따로)."""
+        from interface.attach import StreamLines, StreamText
+
+        with workspace_scope(name):
+            async with stdio_server(stdin=StreamLines(reader), stdout=StreamText(writer)) as (rs, ws):
+                await server.run(rs, ws, server.create_initialization_options())
+
     async def _serve() -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream, server.create_initialization_options()
-            )
+        listener = None
+        if attach and profile is not None:
+            # WS-57: 같은 프로필의 다른 serve --attach 가 이 serve 의 브라우저에 붙는 통로(같은 사용자만).
+            from interface.attach import AttachError, AttachListener
+
+            lock = getattr(backend, "_profile_lock", None)
+            listener = AttachListener(Path(lock.path), _serve_attached, server_id=server_id or "")
+            try:
+                await listener.start()
+            except (AttachError, OSError) as exc:
+                _stderr_line(f"agent-browser serve: 붙기 통로를 열지 못했습니다(이 serve 만 씁니다): "
+                             f"{exc if isinstance(exc, AttachError) else type(exc).__name__}")
+                listener = None
+        try:
+            with workspace_scope(workspace or DEFAULT_WORKSPACE):
+                async with stdio_server() as (read_stream, write_stream):
+                    await server.run(
+                        read_stream, write_stream, server.create_initialization_options()
+                    )
+        finally:
+            if listener is not None:
+                await listener.close()
 
     restore_log = install_public_log_filter()  # WS-51: 로그 줄의 페이지 주소 비밀 값 가리기
     try:
@@ -1205,6 +1264,7 @@ _SPLIT_MODULES = (
     "interface.server_signals",
     "interface.server_tools",
     "interface.server_window",
+    "interface.server_workspace",
 )
 
 

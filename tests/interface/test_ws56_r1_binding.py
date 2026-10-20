@@ -423,21 +423,30 @@ async def test_token_without_pinned_node_is_refused(fake_pair):
 
 
 async def test_per_call_state_is_not_shared_between_concurrent_calls():
-    """B2: 승인 증표 표지·게이트 근거·잡은 노드는 호출(태스크) 문맥 단위 — 다른 호출이 지우거나 가져가지 않는다."""
+    """B2: 승인 증표 표지·게이트 근거·잡은 노드는 호출 단위 — 다른 호출이 지우거나 가져가지 않는다.
+
+    WS-56 R4: 호출 단위 저장소는 WS-57 의 호출별 묶음(_call_scope → _CALL_STATE, call_tool 입구가 연다) 하나다 — 각
+    호출을 그 범위로 감싼다. 정책·elicitation 표지(_approval_via·_oob_note)도 같은 묶음."""
     srv = BrowserMCPServer()
     a_set, b_cleared = asyncio.Event(), asyncio.Event()
     seen: Dict[str, Any] = {}
+    fields = ("_used_approval", "_pending_gate_basis", "_approval_pin", "_approval_via", "_oob_note")
+    mine = ("ap_a", {"name": "a"}, "pin-a", {"via": "elicitation"}, {"elicitation": {"answer": "declined"}})
 
     async def call_a() -> None:
-        srv._used_approval, srv._pending_gate_basis, srv._approval_pin = "ap_a", {"name": "a"}, "pin-a"
-        a_set.set()
-        await b_cleared.wait()
-        seen["a"] = (srv._used_approval, srv._pending_gate_basis, srv._approval_pin)
+        with srv._call_scope(None):
+            for f, v in zip(fields, mine):
+                setattr(srv, f, v)
+            a_set.set()
+            await b_cleared.wait()
+            seen["a"] = tuple(getattr(srv, f) for f in fields)
 
     async def call_b() -> None:
-        await a_set.wait()
-        srv._used_approval = srv._pending_gate_basis = srv._approval_pin = None  # call 입구의 초기화
-        b_cleared.set()
+        with srv._call_scope(None):
+            await a_set.wait()
+            for f in fields:
+                setattr(srv, f, None)  # call 입구의 초기화
+            b_cleared.set()
 
     await asyncio.gather(call_a(), call_b())
-    assert seen["a"] == ("ap_a", {"name": "a"}, "pin-a")
+    assert seen["a"] == mine

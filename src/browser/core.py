@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from contracts import ErrorCode, thresholds
 
 from browser.session_store import SessionStore
+from browser.workspace import DEFAULT_WORKSPACE, PENDING_WORKSPACE, current_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class ManagedTab:
     tab_id: str
     page: Any  # playwright.async_api.Page
     profile_name: str
+    #: WS-57: 이 탭의 주인 작업 공간. 탭 목록·활성 탭·닫기는 주인 작업 공간 안에서만 보인다.
+    workspace: str = DEFAULT_WORKSPACE
 
 
 @dataclass
@@ -175,8 +178,13 @@ class BrowserCore:
         self._browser: Any = None
         self._contexts: Dict[str, ManagedContext] = {}
         self._tab_index: Dict[str, ManagedTab] = {}
-        self._active_tab_id: Optional[str] = None
+        #: WS-57: 작업 공간 → 활성 탭 id. `_active_tab_id` 는 현재 작업 공간(ContextVar)의 값이다.
+        self._active_by_ws: Dict[str, Optional[str]] = {}
         self._tab_counter = 0
+        #: WS-57 R1(R4): new_tab 이 새 페이지를 기다리는 중인 수 — 그 사이 context 'page' 이벤트로 먼저 들어온 탭은
+        #: 아직 주인이 정해지지 않은 탭(PENDING_WORKSPACE, 어느 작업 공간 목록에도 안 보임)이고 new_tab(부른 쪽)·
+        #: opener 의 'popup' 이벤트(연 탭의 주인)가 주인을 정한다 — 남의 새 탭이 잠깐 기본 작업 공간 탭으로 세지 않게.
+        self._creating_tabs = 0
         #: user-chrome: 우리가 띄운 Chrome(UserChrome)과 아직 탭으로 채택하지 않은 첫 페이지
         self._user_chrome: Any = None
         self._adoptable_page: Any = None
@@ -289,7 +297,7 @@ class BrowserCore:
         self._emptied_by_close_tab = False
         self._contexts.clear()
         self._tab_index.clear()
-        self._active_tab_id = None
+        self._active_by_ws.clear()
         self._adoptable_page = None
         if ctx is not None:
             try:
@@ -357,7 +365,7 @@ class BrowserCore:
                 logger.debug("컨텍스트 종료 실패 (%s): %s", managed.profile_name, exc)
         self._contexts.clear()
         self._tab_index.clear()
-        self._active_tab_id = None
+        self._active_by_ws.clear()
         self._adoptable_page = None
 
         if self._browser:
@@ -529,7 +537,11 @@ class BrowserCore:
 
         def _on_page(page: Any) -> None:
             try:
-                self._register_page(profile_name, page, popup=True)
+                # WS-57: 이벤트 문맥의 작업 공간은 믿을 수 없다(Playwright 연결 태스크의 문맥) — 일단 기본 작업
+                # 공간으로 두고, new_tab(부른 쪽)·opener 의 'popup' 이벤트(연 탭의 주인)가 바로잡는다.
+                # WS-57 R1: new_tab 이 새 페이지를 기다리는 중이면 주인 미정(어느 작업 공간에도 안 보임)으로.
+                owner = PENDING_WORKSPACE if self._creating_tabs else DEFAULT_WORKSPACE
+                self._register_page(profile_name, page, popup=True, owner=owner)
             except Exception:  # noqa: BLE001 - 등록 실패로 브라우저 이벤트 처리를 막지 않는다
                 logger.warning("새 페이지 탭 등록 실패", exc_info=True)
 
@@ -542,7 +554,7 @@ class BrowserCore:
         return None
 
     def _register_page(
-        self, profile_name: str, page: Any, *, popup: bool
+        self, profile_name: str, page: Any, *, popup: bool, owner: Optional[str] = None
     ) -> Optional[ManagedTab]:
         """page 를 관리 탭으로 등록한다. 이미 등록돼 있으면 그 탭을 돌려준다.
 
@@ -571,14 +583,30 @@ class BrowserCore:
         self._emptied_by_close_tab = False
         self._tab_counter += 1
         tab_id = f"tab-{self._tab_counter}"
-        tab = ManagedTab(tab_id=tab_id, page=page, profile_name=profile_name)
+        tab = ManagedTab(tab_id=tab_id, page=page, profile_name=profile_name,
+                         workspace=owner if owner is not None else current_workspace())
         managed.tabs[tab_id] = tab
         self._tab_index[tab_id] = tab
         try:
             page.on("close", lambda _p=None, _id=tab_id: self._on_page_closed(_id))
         except Exception:  # noqa: BLE001 - 가짜 페이지
             pass
+        try:
+            # WS-57: 이 탭이 연 팝업은 이 탭의 작업 공간 소유(주인을 그때 읽는다 — new_tab 이 바꿀 수 있다).
+            page.on("popup", lambda popup_page, _t=tab: self._adopt_popup(_t, popup_page))
+        except Exception:  # noqa: BLE001 - 가짜 페이지
+            pass
         return tab
+
+    def _adopt_popup(self, opener: ManagedTab, page: Any) -> None:
+        """opener 가 연 팝업을 opener 의 작업 공간 탭으로(아직 등록 전이면 등록한다)."""
+        try:
+            tab = self._find_tab_by_page(page) or self._register_page(
+                opener.profile_name, page, popup=True, owner=opener.workspace)
+            if tab is not None:
+                tab.workspace = opener.workspace
+        except Exception:  # noqa: BLE001 - 이벤트 처리 중 — 받을 사람이 없다
+            logger.warning("팝업 탭 주인 지정 실패", exc_info=True)
 
     def _forget_tab(self, tab_id: str) -> Optional[ManagedTab]:
         """탭 목록에서 뺀다. 활성 탭이었으면 남은 첫 탭으로(close_tab 과 같은 규칙)."""
@@ -588,8 +616,11 @@ class BrowserCore:
         managed = self._contexts.get(tab.profile_name)
         if managed:
             managed.tabs.pop(tab_id, None)
-        if self._active_tab_id == tab_id:
-            self._active_tab_id = next(iter(self._tab_index), None)
+        owner = tab.workspace
+        if self._active_by_ws.get(owner) == tab_id:
+            # 같은 작업 공간의 남은 첫 탭으로 — 다른 작업 공간의 탭으로 새지 않는다(WS-57).
+            self._active_by_ws[owner] = next(
+                (tid for tid, t in self._tab_index.items() if t.workspace == owner), None)
         return tab
 
     def _on_page_closed(self, tab_id: str) -> None:
@@ -620,11 +651,23 @@ class BrowserCore:
             adopt = self.is_user_chrome or self.is_persistent
             page = self._take_adoptable_page() if adopt else None
             if page is None:
-                page = await managed.context.new_page()
+                self._creating_tabs += 1
+                try:
+                    page = await managed.context.new_page()
+                finally:
+                    self._creating_tabs -= 1
+                    if not self._creating_tabs:
+                        # 기다리는 동안 들어온 새 페이지는 예전처럼 기본 작업 공간으로(await 없이 아래에서 이 호출의
+                        # 페이지는 부른 쪽 주인으로 바뀐다) — 팝업이면 opener 의 'popup' 이벤트가 그 주인으로 바꾼다.
+                        for other in self._tab_index.values():
+                            if other.workspace == PENDING_WORKSPACE:
+                                other.workspace = DEFAULT_WORKSPACE
 
         # context 'page' 이벤트가 먼저 등록했으면 그 탭을 그대로 쓴다(이중 등록 없음).
         tab = self._register_page(profile_name, page, popup=False)
         assert tab is not None
+        # WS-57: 'page' 이벤트가 먼저 (기본 작업 공간으로) 등록했어도 부른 쪽 작업 공간의 탭이다.
+        tab.workspace = current_workspace()
         self._active_tab_id = tab.tab_id
 
         if url:
@@ -636,7 +679,7 @@ class BrowserCore:
         target_id = tab_id or self._active_tab_id
         if target_id is None:
             raise BrowserCoreError(ErrorCode.TAB_NOT_FOUND, "활성 탭이 없습니다.")
-        tab = self._tab_index.get(target_id)
+        tab = self.get_tab(target_id)
         if tab is None:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {target_id}"
@@ -644,7 +687,7 @@ class BrowserCore:
         return tab.page
 
     async def close_tab(self, tab_id: str) -> None:
-        tab = self._forget_tab(tab_id)
+        tab = self._forget_tab(tab_id) if self.get_tab(tab_id) is not None else None
         if tab is None:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}"
@@ -654,7 +697,7 @@ class BrowserCore:
         await tab.page.close()
 
     def switch_tab(self, tab_id: str) -> None:
-        if tab_id not in self._tab_index:
+        if self.get_tab(tab_id) is None:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}"
             )
@@ -665,22 +708,62 @@ class BrowserCore:
         self.switch_tab(tab_id)
 
     def list_tabs(self) -> Dict[str, str]:
-        """tab_id → profile_name 매핑을 반환한다."""
-        return {tid: tab.profile_name for tid, tab in self._tab_index.items()}
+        """tab_id → profile_name 매핑을 반환한다(현재 작업 공간의 탭만)."""
+        return {tab.tab_id: tab.profile_name for tab in self.tabs()}
 
     def get_tab(self, tab_id: Optional[str]) -> Optional["ManagedTab"]:
-        """tab_id로 관리 탭을 조회한다. 없으면 None."""
+        """tab_id로 관리 탭을 조회한다. 없거나 다른 작업 공간의 탭이면 None(WS-57)."""
         if not tab_id:
             return None
-        return self._tab_index.get(tab_id)
+        tab = self._tab_index.get(tab_id)
+        if tab is None or tab.workspace != current_workspace():
+            return None
+        return tab
 
     def tab_for_page(self, page: Any) -> Optional["ManagedTab"]:
         """Page 로 관리 탭을 조회한다. 등록되지 않았으면 None."""
         return self._find_tab_by_page(page)
 
     def tabs(self) -> List["ManagedTab"]:
-        """생성 순서대로 관리 탭 목록을 반환한다."""
+        """생성 순서대로 관리 탭 목록을 반환한다(현재 작업 공간의 탭만, WS-57)."""
+        ws = current_workspace()
+        return [t for t in self._tab_index.values() if t.workspace == ws]
+
+    # -- 작업 공간(WS-57) ----------------------------------------------------
+
+    def all_tabs(self) -> List["ManagedTab"]:
+        """모든 작업 공간의 관리 탭(창 전환 복원·창 감시처럼 브라우저 전체를 보는 곳만 쓴다)."""
         return list(self._tab_index.values())
+
+    def tab_workspace(self, tab_id: str) -> Optional[str]:
+        tab = self._tab_index.get(tab_id)
+        return tab.workspace if tab is not None else None
+
+    def foreign_tab_count(self) -> int:
+        """다른 작업 공간의 탭 수(목록에는 개수만 알린다 — 주소는 비노출)."""
+        ws = current_workspace()
+        return sum(1 for t in self._tab_index.values() if t.workspace != ws)
+
+    def workspace_page_count(self, pages: Any) -> int:
+        """pages(컨텍스트의 Page 들) 중 현재 작업 공간 몫의 수 — 다른 작업 공간·주인 미정 탭은 빼고, 관리 탭이
+        아닌 Page 는 센다(예전 len(context.pages) 와 같은 기준). 클릭 사후조건의 '새 탭' 신호가 남의 탭 생성을 내
+        효과로 세지 않게(WS-57 R1 R4)."""
+        ws = current_workspace()
+        n = 0
+        for page in pages:
+            tab = self._find_tab_by_page(page)
+            if tab is None or tab.workspace == ws:
+                n += 1
+        return n
+
+    def workspace_active_tab(self, workspace: str) -> Optional[str]:
+        return self._active_by_ws.get(workspace)
+
+    def set_workspace_active_tab(self, workspace: str, tab_id: Optional[str]) -> None:
+        """창 전환 복원용: 그 작업 공간의 활성 탭을 정한다(탭 주인이 그 작업 공간이어야 한다)."""
+        if tab_id is not None and self.tab_workspace(tab_id) != workspace:
+            raise BrowserCoreError(ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {tab_id}")
+        self._active_by_ws[workspace] = tab_id
 
     @property
     def active_profile(self) -> Optional[str]:
@@ -695,7 +778,7 @@ class BrowserCore:
         target_id = tab_id or self._active_tab_id
         if target_id is None:
             raise BrowserCoreError(ErrorCode.TAB_NOT_FOUND, "활성 탭이 없습니다.")
-        tab = self._tab_index.get(target_id)
+        tab = self.get_tab(target_id)
         if tab is None:
             raise BrowserCoreError(
                 ErrorCode.TAB_NOT_FOUND, f"탭을 찾을 수 없습니다: {target_id}"
@@ -716,6 +799,15 @@ class BrowserCore:
     @property
     def active_tab_id(self) -> Optional[str]:
         return self._active_tab_id
+
+    @property
+    def _active_tab_id(self) -> Optional[str]:
+        """현재 작업 공간의 활성 탭 id(WS-57 — 예전의 단일 속성 자리)."""
+        return self._active_by_ws.get(current_workspace())
+
+    @_active_tab_id.setter
+    def _active_tab_id(self, tab_id: Optional[str]) -> None:
+        self._active_by_ws[current_workspace()] = tab_id
 
     def context_for(self, profile_name: str) -> Optional[Any]:
         managed = self._contexts.get(profile_name)

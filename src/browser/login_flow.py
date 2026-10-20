@@ -23,6 +23,7 @@ AI(LLM)를 쓰지 않는다. 실측(2026-09-23 네이버) — 에이전트가 �
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from urllib.parse import urlparse
 
 from security.credentials import Credential, _host, _matches
 
+logger = logging.getLogger(__name__)
 
 class LoginState(str, Enum):
     LOGGED_IN = "logged_in"
@@ -142,6 +144,11 @@ async def fill_login_fields(page: Any, cred: Credential, *, only_empty: bool = F
             f"현재 페이지가 {cred.domain} 도메인이 아니라 자격증명을 입력하지 않습니다."
         )
     found = await page.evaluate(_MARK_FIELDS_JS)
+    # WS-55 R1 B1: 채울 자격증명(아이디·비밀번호)은 도구가 비밀로 아는 값 — 페이지가 주소·제목에 반사해도 응답에서
+    # 가려지게 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+    from security.secret_registry import register_secret_values
+
+    register_secret_values([cred.username, cred.password])
 
     async def fill(role: str, value: str) -> bool:
         sel = f"[data-ab-login={role}]"
@@ -173,10 +180,21 @@ async def login_with_handoff(
     human_timeout_s: float = 300,
     poll_ms: int = 1000,
     on_handoff: Optional[Callable[[HandoffInfo], Any]] = None,
+    ledger_profile: Optional[Any] = None,
 ) -> LoginOutcome:
+    """ledger_profile(WS-58): 봇 프로필 폴더를 주면 로그인 상태로 끝날 때 그 페이지 origin 을
+    로그인 기록(login_ledger.json, source ``login_flow``)에 남긴다 — 헤드리스 이름 재시도가 그 사이트에서
+    이름을 바꾸지 않게. 기록 실패는 로그인 결과를 바꾸지 않는다(판정 쪽이 손상 파일에 fail-closed)."""
     started = time.monotonic()
 
     def done(method: str, state: LoginState, reason: str, info=None) -> LoginOutcome:
+        if state is LoginState.LOGGED_IN and ledger_profile is not None:
+            from browser import login_ledger
+
+            try:
+                login_ledger.record(ledger_profile, [page.url], source=login_ledger.SOURCE_LOGIN_FLOW)
+            except login_ledger.LedgerError:
+                logger.warning("로그인 기록에 쓰지 못했습니다(login_flow)")
         return LoginOutcome(method=method, state=state, reason=reason,
                             elapsed_s=time.monotonic() - started, handoff=info)
 

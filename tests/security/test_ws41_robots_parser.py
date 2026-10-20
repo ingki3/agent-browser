@@ -118,6 +118,10 @@ def test_ai_specific_ban_and_bounded_signal():
         "user_fetch_agents_allowed": [], "content_signal": "",
         "scope": "named_ai",
         "note": "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다.",
+        # WS-54: 금지 신호에 고정 안내 추가(의도된 변경).
+        "user_request": "사용자가 이 주소를 직접 주거나 이 페이지를 콕 집어 요청한 한 페이지 읽기는 사람이 브라우저로 여는 것과 "
+                        "같은 성격이라 진행해도 됩니다 — 결과에 robots 신호(note)를 한 줄로 알리세요. "
+                        "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
     }
     assert parsed.signal("/public", "http://local/robots.txt") is None
     all_banned = RobotsRules.parse(b"User-agent: *\nDisallow: /").signal("/", "http://local/robots.txt")

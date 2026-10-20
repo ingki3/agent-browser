@@ -5,7 +5,7 @@ B1: 순수 CSS hover(·pointermove·pointer-events) 오버레이가 좌표 클�
     실제 눌림 대상(이벤트)도 감시해 승인 노드가 아니면 실행하지 않는다.
 B2: Enter 암묵 제출 — 포커스 입력칸 폼의 기본 제출 버튼(첫 submit) formaction/formtarget/formmethod 도 실행 의미.
 B3: 정책 통과 뒤 실행 락을 기다리는 동안 대상이 바뀌면 — 락 획득 뒤 대상·문맥·의미·정책·금지 범주를 다시 판정.
-B6: 일반(비승인) 액션도 같은 서버 입력/효과 락에 참여 — 승인된 무반응 클릭이 동시 일반 클릭의 alert 로 성공 오보고 안 함.
+B6: 일반(비승인) 액션도 같은 입력/효과 락에 참여(R4: 작업 공간 직렬화 구간 하나로 통일) — 승인된 무반응 클릭이 동시 일반 클릭의 alert 로 성공 오보고 안 함.
 
 원 재현: .hermes/verify/ws56-r2/binding/test_natural.py · policy/test_policy_wait_uninstrumented.py ·
 concurrency/test_dialog_attribution.py.
@@ -163,8 +163,11 @@ async def _policy_server(site: Dict[str, Any], tmp_path: Any, monkeypatch: Any, 
 
 
 async def _while_lock_held(b: Any, call: Any, during: Any) -> Any:
-    """다른 호출이 실행 락을 쥔 동안 call 이 락을 기다리게 하고, 그사이 during(페이지·정책 변경) 뒤 락을 놓는다."""
-    lock = b._approval_exec_lock()
+    """다른 호출이 실행 락을 쥔 동안 call 이 락을 기다리게 하고, 그사이 during(페이지·정책 변경) 뒤 락을 놓는다.
+
+    WS-56 R4: 실행 락 = 작업 공간 직렬화 구간(WS-57 _dispatch_lock) 하나 — 서버 단위 별도 락은 없다. 정책 판정이 구간
+    안이라 이 표본은 '락을 기다린 뒤의 정책 판정'이 바뀐 대상을 본다는 것을 확인한다."""
+    lock = b._dispatch_lock("default")
     await lock.acquire()
     try:
         task = asyncio.create_task(call())
@@ -214,11 +217,15 @@ async def test_elicitation_accept_is_rechecked_after_lock_wait(site, tmp_path, m
     site["html"] = _WAIT_PAGE
     b = create_server(recipes=False)[1]
 
+    asked, answer = asyncio.Event(), asyncio.Event()
+
     class Accept:
         def supported(self) -> bool:
             return True
 
         async def ask(self, *a: Any) -> str:
+            asked.set()
+            await answer.wait()
             return "accept"
 
     try:
@@ -231,10 +238,23 @@ async def test_elicitation_accept_is_rechecked_after_lock_wait(site, tmp_path, m
             finally:
                 CURRENT_ELICITOR.reset(tok)
 
-        async def during() -> None:
+        # WS-56 R4: 사람 응답 대기는 구간 밖 — 대기 중 다른 호출이 구간을 잡을 수 있고(여기서는 테스트가 잡음), accept
+        # 뒤 호출은 구간을 다시 기다린다. 그사이 목적지가 바뀌면 다시 잡은 뒤의 재확인이 막는다.
+        lock = b._dispatch_lock("default")
+        task = asyncio.create_task(call())
+        with anyio.fail_after(20):
+            await asked.wait()
+            await lock.acquire()  # 대기 중이면 구간이 비어 있다(잡혀 있으면 여기서 멈춤 → 시간 초과)
+        try:
+            answer.set()
+            with anyio.fail_after(20):
+                while not getattr(lock, "_waiters", None):
+                    assert not task.done(), "accept 뒤 구간을 다시 기다리지 않고 끝남"
+                    await asyncio.sleep(0.005)
             await b._page.evaluate("document.querySelector('#b').href='/clicked?b=transfer'")
-
-        r = await _while_lock_held(b, call, during)
+        finally:
+            lock.release()
+        r = await task
         await b._page.wait_for_timeout(300)
     finally:
         await b.close()

@@ -58,10 +58,13 @@ async def open_logged_in(
     settle_ms: int = 3000,
     human_timeout_s: float = 300,
     poll_ms: int = 1000,
+    ledger_profile: Optional[Any] = None,
 ) -> LoggedIn:
     """로그인된 컨텍스트와 페이지(check_url 위)를 돌려준다.
 
     context_setup: 새 컨텍스트마다 호출(테스트의 route 설치 등).
+    ledger_profile(WS-58): 봇 프로필 폴더 — 로그인에 성공하면 login_with_handoff 가 로그인 기록(login_ledger.json)에
+    남긴다(헤드리스 이름 재시도가 그 사이트에서 이름을 바꾸지 않게).
     """
     kw = dict(context_kwargs or {})
     note = ""
@@ -90,7 +93,7 @@ async def open_logged_in(
     await page.goto(login_url, wait_until="domcontentloaded")
     outcome = await login_with_handoff(
         page, cred, settle_ms=settle_ms, human_timeout_s=human_timeout_s,
-        poll_ms=poll_ms, on_handoff=on_handoff,
+        poll_ms=poll_ms, on_handoff=on_handoff, ledger_profile=ledger_profile,
     )
     if outcome.state is not LoginState.LOGGED_IN:
         return LoggedIn("failed", outcome.state, ctx, page,

@@ -18,8 +18,12 @@
          assertion·nonce·authorization)이 들어 있거나(`gatetoken`·`GaTeToKeN`·`JSESSIONID`),
       ② 정규화한 키를 영문/숫자 덩어리로 쪼갠 낱말이 짧은 낱말(key·sid·sig·otp·pwd·jwt·code·auth·sess·saml)
          이나 붙여 쓴 흔한 이름(apikey·phpsessid·passcode …) 과 **통째로** 같거나(`sId`·`API_KEY`),
-      ③ 원래 키의 camelCase 낱말이 그렇다(`sortKey`·`promoCode` — 기존 낱말 분해 규칙).
+      ③ 원래 키의 camelCase 낱말이 그렇다(`promoCode`·`pageKey` — 기존 낱말 분해 규칙).
       짧은 낱말을 부분 일치로 보지 않아 `keyword`·`monkey`·`codec`·`zipcode`·`author` 는 남는다.
+      ⓪ (WS-55, ①~③ 보다 먼저) 정규화한 키에서 `_`·`-` 를 뺀 정규형이 **비밀 아닌 복합어** 허용 목록
+      (`_NOT_SECRET_KEYS` — sortkey·countrycode·productcode·statuscode …)과 정확히 같으면 비밀 키가 아니다
+      (`sortKey`·`sort_key`·`SORTKEY` 같은 판정). 같은 정규형이 `_COMPOUNDS`(promocode·couponcode …)면 비밀 키.
+      허용 목록 키도 값 판정 (b) 와 레지스트리 가림은 그대로 받는다.
       ①② 는 casefold 만 보므로 어떤 대소문자 조합도 같은 판정이다. ③ 은 그 위에 더하는 규칙이다.
   (b) 값 자체가 비밀처럼 보임(`_secret_value`): JWT(`eyJ….….…`), 또는 길이 ≥ 24 의 base64/hex/url-safe
       문자열 중 ① 16진수만 ② 대문자·소문자·숫자가 모두 섞임 ③ 구분자 없는 24자 이상 덩어리에 글자와
@@ -115,7 +119,31 @@ _SHORT_WORDS = frozenset({"key", "sid", "sig", "otp", "pwd", "jwt", "code", "aut
 _COMPOUNDS = frozenset({
     "apikey", "accesskey", "privatekey", "authkey", "sessid", "phpsessid",
     "authcode", "passcode", "otpcode", "samlresponse", "samlrequest",
+    # WS-55: 개인 1회용일 수 있는 할인 코드 — 소문자 붙여쓰기도 camelCase(`promoCode`)와 같은 판정(가림).
+    "promocode", "couponcode",
+    # WS-55 R1 B3: 커서·페이지 토큰(다음 페이지를 여는 불투명 값 — 세션·계정에 묶이기도 한다). camelCase(`pageKey`)는 ③,
+    # `page_key` 는 ② 로 이미 가렸고 소문자·대문자 붙여쓰기(`pagekey`·`PAGEKEY`)만 공개되던 철자 차이를 정규형으로 없앤다.
+    # `*token` 꼴(pagetoken·continuationtoken)은 ① 이 낱말 사이 구분자 없는 철자를 이미 가리고, 글자마다 `_`·`-` 를 끼운
+    # 철자(`p_a_g_e_t_o_k_e_n`)까지 같은 판정이 되게 정규형 정확 일치로도 둔다(① 을 정규형으로 넓히면 `auto_kenya` 같은
+    # 키가 `token` 을 품게 되어 과잉 가림 — 정확 일치만).
+    "pagekey", "nextpagekey", "cursorkey", "nextkey", "pagingkey", "continuationkey", "resumekey",
+    "startkey", "exclusivestartkey", "lastevaluatedkey",
+    "pagetoken", "nextpagetoken", "continuationtoken", "cursortoken", "nexttoken", "pagingtoken",
 })
+#: 비밀이 아닌 붙여 쓴 키 이름(WS-55 — WS-51 NB-2 과잉 가림). 정규형(`_secret_key`: 퍼센트 디코딩·NFKC·casefold 뒤 `_`·`-` 제거)의
+#: **정확 일치**만 — 낱말 휴리스틱(②③)보다 먼저 본다. 정렬·국가/지역·우편·상태/오류·언어·통화·상품 분류 같은
+#: 공개 열거 값의 이름이다. 커서일 수 있는 `pagekey`, 개인 코드일 수 있는 `promocode`·`couponcode`, OAuth `code`,
+#: `token_type` 은 넣지 않는다. 키가 허용 목록이어도 값 판정(`_secret_value` — JWT·고엔트로피)과 레지스트리
+#: 등록 값 가림은 그대로다(`_public_param`·`_registered_in_url`). 근거 표: .hermes/state/ws55/report.md.
+_NOT_SECRET_KEYS = frozenset({
+    "sortkey", "sortorder", "orderby",
+    "countrycode", "zipcode", "postcode", "postalcode", "regioncode", "areacode", "citycode", "statecode",
+    "airportcode", "stationcode",
+    "statuscode", "errorcode", "keycode",
+    "languagecode", "langcode", "currencycode",
+    "productcode", "itemcode", "categorycode", "colorcode", "stylecode", "sizecode",
+})
+_KEY_JOINERS = re.compile(r"[_\-]")
 
 _KEY_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 _KEY_SEGMENT = re.compile(r"[a-z]+|\d+")
@@ -164,6 +192,11 @@ def _secret_key(raw_key: str) -> bool:
         key = decoded
     key = unicodedata.normalize("NFKC", key)
     low = key.casefold()
+    compact = _KEY_JOINERS.sub("", low)  # WS-55: sortKey·sort_key·sort-key·SORTKEY 는 같은 키
+    if compact in _NOT_SECRET_KEYS:
+        return False
+    if compact in _COMPOUNDS:
+        return True
     if any(word in low for word in _LONG_WORDS):
         return True
     for seg in _KEY_SEGMENT.findall(low):
@@ -306,6 +339,26 @@ def _public_fragment(fragment: str, depth: int, sink: _Sink = None) -> str:
     return fragment
 
 
+def _public_matrix(prefix: str, has_netloc: bool, depth: int, sink: _Sink = None) -> str:
+    """경로 matrix 매개변수(`/p;jsessionid=…;v=2/q;sortKey=…`, WS-55 R1 B2) — 세그먼트마다 첫 `;` 뒤 조각을 쿼리와
+    같은 `_public_param` 으로 판정·등록한다(같은 함수라 secret_values·주소 칸·자유 문장·로그가 갈라지지 않는다).
+    세그먼트 이름(첫 `;` 앞)·호스트·구분자는 그대로. 호스트가 있으면 그 뒤 첫 `/` 부터가 경로다."""
+    start = 0
+    if has_netloc:
+        auth = prefix.find("//")
+        start = prefix.find("/", auth + 2) if auth >= 0 else -1
+        if start < 0:
+            return prefix  # 경로 없음(`https://h;x=1` — 호스트 쪽은 판정하지 않는다)
+    head, path = prefix[:start], prefix[start:]
+    segments = path.split("/")
+    for i, seg in enumerate(segments):
+        if ";" not in seg:
+            continue
+        pieces = seg.split(";")
+        segments[i] = ";".join([pieces[0]] + [_public_param(p, depth, sink) for p in pieces[1:]])
+    return head + "/".join(segments)
+
+
 def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
     if len(url) > MAX_URL_CHARS:
         return URL_MASK
@@ -323,6 +376,8 @@ def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
             user, _, password = netloc.rsplit("@", 1)[0].partition(":")
             sink.append(password or user)
         prefix = prefix.replace("//" + netloc, "//" + netloc.rsplit("@", 1)[1], 1)
+    if ";" in prefix:
+        prefix = _public_matrix(prefix, bool(netloc), depth, sink)
     out = prefix
     if has_query:
         out += "?" + _public_query(query, depth, sink)
@@ -587,7 +642,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "holder": frozenset({"agent", "human"}),  # handoff.HOLDER_AGENT·HOLDER_HUMAN
     "reason": frozenset(_REPLAY_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
         "headless_ua_blocked",  # server_signals identity
-        "cookies_present", "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
+        "login_recorded", "new_server_cookie", "login_ledger_unreadable", "cookies_unreadable",  # WS-58
+        "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES
         "browser_recovered", "request_expired", "window_closed",  # server_window notice
         "control_request", "recover", "taken",  # server_window _switch_window 전환 사유(R7 census)
         "capture_busy", "target_changed",  # server_display·server_hitl
@@ -635,7 +691,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                          "name", "text", "aria", "title", "child_title", "alt", "svg_title", "child_aria", "value",
                          "pseudo", "selector", "detail", "href", "formaction", "form_action",
                          "class", "id", "name_attr", "testid",
-                         "keyring", "prompt", "ci_env"}),  # browser.session_store KeyResolution.source(응답 출구 아님)
+                         "keyring", "prompt", "ci_env",  # browser.session_store KeyResolution.source(응답 출구 아님)
+                         "chrome_import", "login_flow", "human_control"}),  # browser.login_ledger SOURCE_*(WS-59, 기록 파일)
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge

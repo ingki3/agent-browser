@@ -85,7 +85,8 @@ CASES = [
     ("https://a.test/?keyword=tent&monkey=1&codec=h264", "https://a.test/?keyword=tent&monkey=1&codec=h264"),
     ("https://a.test/?zipcode=06236&author=kim&authuser=0", "https://a.test/?zipcode=06236&author=kim&authuser=0"),
     ("https://a.test/?signin=1&design=a&passage=3", "https://a.test/?signin=1&design=a&passage=3"),
-    ("https://a.test/?sortKey=date&promoCode=SUMMER", f"https://a.test/?sortKey={R}&promoCode={R}"),  # 낱말 key·code — 과다(의도)
+    # WS-55: sortKey 는 비밀 아닌 복합어 허용 목록(보존), promoCode 는 개인 1회용일 수 있어 가림 유지.
+    ("https://a.test/?sortKey=date&promoCode=SUMMER", f"https://a.test/?sortKey=date&promoCode={R}"),
     ("https://a.test/?sessions=3", f"https://a.test/?sessions={R}"),  # 긴 낱말 부분 일치 — 과다(의도)
 ]
 

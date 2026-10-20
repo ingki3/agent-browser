@@ -123,8 +123,7 @@ class HitlMixin:
         ok, why, reason_code = self.hub.check_approval(approval_id, components)
         if not ok:
             return {"approval_id": approval_id, "reason": why, "reason_code": reason_code}
-        # WS-56 R2 B4: 재확인~실제 입력~효과 판정은 다른 승인 호출과 겹치지 않게(서버 단위 락, _call_tool 끝에서 풂).
-        await self._hold_approval_exec()
+        # WS-56 R2 B4 → R4: 재확인~실제 입력~효과 판정은 _call_tool 이 쥔 작업 공간 직렬화 구간 안(다른 호출과 겹치지 않음).
         check = getattr(self._dispatcher, "approval_target_check", None)
         if check is None:
             target = {"fresh": False, "detail": "대상 확인 불가"}  # fail-closed

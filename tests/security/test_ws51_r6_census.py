@@ -70,6 +70,7 @@ CANDIDATES = {
     ("browser/serve_profile.py", "f'{DIR_PREFIX}{name}'"): (NOT_OUT + " (디스크 프로필 디렉터리 이름)", None, None),
     ("browser/serve_profile.py", "f'{EPHEMERAL_PREFIX}{server_id}'"): (NOT_OUT + " (디스크 임시 프로필 디렉터리 이름)",
                                                                        None, None),
+    ("browser/login_watch.py", "'abw' + secrets.token_hex(8)"): (NOT_OUT + " (WS-58 조작권 감시 CDP 바인딩 이름)", None, None),
     ("interface/profile_cli.py", "f'{n}B'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.0f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.1f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
@@ -83,6 +84,10 @@ CANDIDATES = {
                                                                "식별자 아님", None, None),
     ("interface/mcp_server.py", "f'{safe_key}#{n}'"): ("로그 레코드 속성 이름 충돌 꼬리(가린 비문자열 extra 키, R6 F1) — "
                                                        "출구 아님(출력은 handler_format 이 가림)", None, None),
+    ("interface/attach.py", "f'attach-{self._seq}'"): ("WS-57 붙은 연결 기본 작업 공간 이름(악수 IPC, 응답은 "
+                                                        "window.tabs[].workspace FREE 칸) — 면제하지 않음", None, None),
+    ("browser/chrome_cookies.py", "'Cookies' + suffix"): ("WS-59 Chrome 쿠키 DB 곁 파일(-journal·-wal) 사본 이름(경로 "
+                                                           "조립) — 값 생산 아님", None, None),
     ("security/hitl.py", "key + '-'"): ("아이콘 클래스 접두 비교용 조각 — 값 생산 아님", None, None),
     ("security/approve_policy.py", "key + '-'"): ("WS-56 아이콘 클래스 접두 비교용 조각(정책 최고위험 판정) — 값 생산 아님",
                                                    None, None),
