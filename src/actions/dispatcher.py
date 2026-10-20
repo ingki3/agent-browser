@@ -898,18 +898,64 @@ _MEANING_JS = """
     out.action = str(get(F, 'action', form));
     out.method = str(get(F, 'method', form));
     out.target = str(get(F, 'target', form)) || out.target;
-    const type = ctl ? str(get(protoOf(ctl), 'type', ctl)) : '';
-    const submitter = ctl && ((ctl.tagName === 'BUTTON' && type === 'submit')
-      || (ctl.tagName === 'INPUT' && (type === 'submit' || type === 'image')));
+    const isSubmitter = (n) => {
+      if (!n || !n.tagName) return false;
+      if (n.tagName === 'BUTTON') return str(get(HTMLButtonElement.prototype, 'type', n)) === 'submit';
+      if (n.tagName === 'INPUT') {
+        const t = str(get(HTMLInputElement.prototype, 'type', n));
+        return t === 'submit' || t === 'image';
+      }
+      return false;
+    };
+    // R3 B2: 제출 버튼 자신이 아니면(입력칸에서 Enter = 암묵 제출) 폼의 기본 제출 버튼(form.elements 트리 순서의 첫
+    // submit)이 실제 제출자다 — 그 formaction/formmethod/formtarget 이 실제 목적지.
+    let submitter = isSubmitter(ctl) ? ctl : null;
+    if (!submitter) {
+      const els = get(F, 'elements', form) || [];
+      for (let i = 0; i < els.length; i++) { if (isSubmitter(els[i])) { submitter = els[i]; break; } }
+    }
     if (submitter) {
-      if (ctl.hasAttribute('formaction')) out.action = str(get(protoOf(ctl), 'formAction', ctl));
-      if (ctl.hasAttribute('formmethod')) out.method = str(get(protoOf(ctl), 'formMethod', ctl));
-      if (ctl.hasAttribute('formtarget')) out.target = str(ctl.getAttribute('formtarget'));
+      const P = protoOf(submitter);
+      if (submitter.hasAttribute('formaction')) out.action = str(get(P, 'formAction', submitter));
+      if (submitter.hasAttribute('formmethod')) out.method = str(get(P, 'formMethod', submitter));
+      if (submitter.hasAttribute('formtarget')) out.target = str(submitter.getAttribute('formtarget'));
     }
   }
   return out;
 }
 """
+
+#: R3 B2: 포커스 노드가 사용자 정의 요소(폼 연계 요소·closed shadow host)면 Enter 의 실제 제출 의미를 판별할 수 없다.
+_FOCUS_OPAQUE_JS = "(el) => !!(el && el.tagName && el.tagName.includes('-'))"
+
+#: R3 B1: 좌표 승인 실행 — 이동(hover 적용) 뒤 실제 눌림 이벤트가 승인 노드(또는 그 자손)로 가는지 감시한다. 승인 노드
+#: 문서의 창과 최상위 창의 capture 단계에서 보고, 다른 대상으로 가는 눌림 계열 이벤트는 막는다(전파 중지·기본 동작 취소).
+#: 상태는 클로저에만(페이지 전역에 두지 않음) — 핸들로 돌려받아 읽는다.
+_POINT_GUARD_ARM_JS = """
+(pinned) => {
+  const wins = [];
+  const add = (w) => { if (w && !wins.includes(w)) wins.push(w); };
+  try { add(pinned.ownerDocument.defaultView); } catch (e) {}
+  try { add(window.top); } catch (e) {}
+  const rec = {ok: [], bad: []};
+  const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'auxclick', 'dblclick', 'contextmenu'];
+  const h = (e) => {
+    let path = [];
+    try { path = e.composedPath(); } catch (x) { path = []; }
+    if (path.includes(pinned)) { rec.ok.push(e.type); return; }
+    rec.bad.push(e.type + ':' + String((e.target && e.target.tagName) || '').toLowerCase());
+    e.stopImmediatePropagation();
+    e.preventDefault();
+  };
+  for (const w of wins) for (const t of types) w.addEventListener(t, h, true);
+  const off = () => { for (const w of wins) for (const t of types) w.removeEventListener(t, h, true); };
+  return {rec, off};
+}
+"""
+_POINT_GUARD_READ_JS = "(g) => { g.off(); return {ok: g.rec.ok.slice(0, 20), bad: g.rec.bad.slice(0, 20)}; }"
+#: 이동 뒤 hover·레이아웃이 반영될 때까지(두 프레임, 백그라운드 탭이면 상한 150ms).
+_SETTLE_FRAMES_JS = ("() => new Promise((r) => { const t = setTimeout(() => r(true), 150); "
+                     "requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(true); })); })")
 
 #: WS-56 R2 B2: 키 입력을 받을 노드 자체(document.activeElement 를 같은 출처 iframe·open shadow 따라 내려감).
 #: 다른 출처 iframe 이면 'opaque', 없으면 'none' — 결속 불가(fail-closed).
@@ -1290,6 +1336,9 @@ class ActionDispatcher:
                 frame = self.ctx.page
             if node is None:
                 return {"unresolved": why}
+            if key.startswith("focus:") and await node.evaluate(_FOCUS_OPAQUE_JS):
+                # R3 B2: 판별 불가 포커스 — 결속하지 않는다(버튼 승인·정책 제외, 증표는 사용 때 거부).
+                return {"unresolved": "포커스가 사용자 정의 요소 위(키 입력의 실제 동작 판별 불가)"}
             meaning = await node.evaluate(_MEANING_JS)
         except Exception as exc:  # noqa: BLE001 — 못 잡으면 결속할 수 없다(fail-closed)
             return {"unresolved": f"대상 노드 확인 실패: {type(exc).__name__}"}
@@ -2939,9 +2988,19 @@ class ActionDispatcher:
             return refused
 
         before = await capture_state(page)
+        button = params.get("button", "left")
+        if pin is not None:
+            # R3 B1: 이동(hover)이 대상을 바꿀 수 있다 — 먼저 옮기고 반영된 뒤 그 지점 노드를 다시 본다(아직 안 누름).
+            refused = self._elementless_pin_refusal(action, pin, await self._pin_after_move(page, pin, params))
+            if refused is not None:
+                return refused
         watch = _NavWatch(page) if self.ctx.nav_settle else None
+        stray: Optional[str] = None
         try:
-            await page.mouse.click(x, y, button=params.get("button", "left"))
+            if pin is None:
+                await page.mouse.click(x, y, button=button)
+            else:
+                stray = await self._pinned_press(page, pin, button)
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
@@ -2951,6 +3010,18 @@ class ActionDispatcher:
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
                 error_message=f"좌표 클릭 발송 실패: {exc}",
+            )
+        if stray is not None:
+            if watch is not None:
+                watch.close()
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=False,  # 눌림 이벤트는 이미 나갔다(승인 노드 밖으로 가는 것은 막음)
+                error_code=ErrorCode.TOCTOU_MISMATCH,
+                error_message=(f"승인한 대상이 바뀌어 실행하지 않았습니다({stray}). 자동으로 다시 시도하지 말고 "
+                               "다시 관찰해 화면을 확인하세요."),
+                reobserve_required=True,
             )
         # WS-25: 좌표 클릭(mouse.click)은 이동을 기다리지 않는다 — 여기서 기다린다.
         if watch is not None:
@@ -2979,6 +3050,48 @@ class ActionDispatcher:
                 "silent": not post.satisfied,
             },
         )
+
+    async def _pin_after_move(self, page: Any, pin: Any, params: Dict[str, Any]) -> Optional[str]:
+        """R3 B1: 좌표로 마우스를 옮기고(hover 적용) 반영된 뒤 그 지점 노드가 승인 노드인가. 다르면 사유(누르지 않음)."""
+        try:
+            await page.mouse.move(int(params["x"]), int(params["y"]))
+            await page.evaluate(_SETTLE_FRAMES_JS)
+        except Exception as exc:  # noqa: BLE001 — 옮기지 못하면 누르지 않는다
+            return f"좌표 이동 실패: {type(exc).__name__}"
+        mismatch = await self._pin_mismatch_for(pin, params)
+        return f"마우스 이동 뒤 {mismatch}" if mismatch else None
+
+    @staticmethod
+    async def _pinned_press(page: Any, pin: Any, button: str) -> Optional[str]:
+        """R3 B1: 승인 노드 감시를 건 채 누르고 뗀다. 실제 눌림 이벤트가 다른 노드로 갔으면(막았음) 또는 승인 노드에
+        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None."""
+        try:
+            guard = await pin.node.evaluate_handle(_POINT_GUARD_ARM_JS)
+        except Exception as exc:  # noqa: BLE001 — 감시를 걸 수 없으면 누르지 않는다
+            return f"실제 눌림 대상 감시 실패: {type(exc).__name__}"
+        seen: Any = None
+        try:
+            await page.mouse.down(button=button)
+            await page.mouse.up(button=button)
+        finally:
+            try:
+                seen = await guard.evaluate(_POINT_GUARD_READ_JS)
+            except Exception:  # noqa: BLE001 — 문서가 바뀌었으면(이동) 기록을 못 읽는다
+                seen = None
+            try:
+                await guard.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+        if not isinstance(seen, dict):
+            # 눌림으로 문서가 이동해 기록이 사라짐 — 승인 노드 밖 이벤트는 감시가 막았으므로 이동은 승인 노드의 것.
+            return None
+        bad = [str(b) for b in seen.get("bad") or []]
+        if bad:
+            return "실제 눌림 대상이 승인한 노드가 아님: " + ", ".join(bad[:4])
+        ok = set(str(o) for o in seen.get("ok") or [])
+        if not ok & {"pointerdown", "mousedown"} or not ok & {"pointerup", "mouseup"}:
+            return "실제 눌림이 승인한 노드에 닿았는지 확인하지 못함"
+        return None
 
     async def _dispatch_tab_control(
         self, action: ActionType, params: Dict[str, Any]

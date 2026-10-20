@@ -155,7 +155,18 @@ async def test_replaced_node_is_not_run(site, mode, token):
     out = await _run(site, mode, _swap, token=token)
     assert not out["hits"], out
     assert out["env"]["success"] is False, out
+    if _xy_not_elicited(mode, token, out):
+        return
     assert out["env"]["error_code"] == "E_TOCTOU_MISMATCH", out
+
+
+def _xy_not_elicited(mode: str, token: bool, out: Dict[str, Any]) -> bool:
+    """WS-56 R3 B1: 고위험 좌표 클릭은 버튼 승인(elicitation) 대상이 아니다 — 묻지도 실행하지도 않는다(터미널 승인만)."""
+    if mode != "xy" or token:
+        return False
+    assert out["messages"] == [], out
+    assert out["env"]["success"] is False and not out["hits"], out
+    return True
 
 
 @pytest.mark.parametrize("mode", ["xy", "key"])
@@ -163,6 +174,8 @@ async def test_replaced_node_is_not_run(site, mode, token):
 async def test_unchanged_point_and_focus_still_run(site, mode, token):
     """대조: 노드가 그대로면 승인한 좌표 클릭·Enter 는 실제로 실행된다(과차단 아님)."""
     out = await _run(site, mode, None, token=token)
+    if _xy_not_elicited(mode, token, out):
+        return
     assert out["env"]["success"] is True, out
     assert [h.split("b=")[1].split("&")[0] for h in out["hits"]] == ["original"], out
 
@@ -210,6 +223,8 @@ async def test_change_after_server_recheck_is_caught_by_dispatcher(site, mode, t
     else:
         expr, run_mode = "swap()", mode
     out = await _run(site, run_mode, None, token=token, prepare=_change_after_server_check(expr, token))
+    if _xy_not_elicited(run_mode, token, out):
+        return
     assert out["env"]["success"] is False, out
     assert out["env"]["error_code"] == "E_TOCTOU_MISMATCH", out
     assert not out["hits"], out

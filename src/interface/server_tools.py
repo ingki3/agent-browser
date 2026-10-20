@@ -315,6 +315,11 @@ class ToolsMixin:
             if blocked is not None:
                 await self._drop_approval_pin()
                 return blocked
+            # WS-56 R3 B6: 일반(비승인) 실행도 같은 서버 입력/효과 락에 참여한다 — 승인 실행과 겹쳐 효과 기록
+            # (다이얼로그·이동·팝업)이 남의 호출로 귀속되지 않게. 승인 호출은 이미 잡았다(이 호출 문맥이면 그대로).
+            # 사람 응답 대기(elicitation·조작권·승인 대기 서버 도구)는 이 락 밖이다.
+            # 병합 메모: WS-57 의 작업 공간 dispatch 직렬화 락과 통일할 자리(이 줄 + ElicitMixin._hold_approval_exec).
+            await self._hold_approval_exec()
             return await self._run_gated_action(name, arguments, action, params)
         finally:
             if not held_outside:

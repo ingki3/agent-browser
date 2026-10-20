@@ -134,7 +134,7 @@ def elicitation_message(action: ActionType, element_name: str, origin: str, tab_
 def destination_text(meaning: Any) -> str:
     """승인 대상의 목적지 한 줄(표시용, 가림 적용). 링크면 href, 폼 제출이면 'METHOD action'. 없으면 ''."""
     from interface.handoff import display_safe, mask_code_like
-    from security.public_url import public_url
+    from security.public_url import public_text, public_url
 
     if not isinstance(meaning, dict):
         return ""
@@ -142,12 +142,16 @@ def destination_text(meaning: Any) -> str:
     def url(raw: Any) -> str:
         return display_safe(mask_code_like(public_url(str(raw or ""))), 200)
 
+    def page_text(raw: Any, limit: int) -> str:
+        # R3 B5: 주소 밖 페이지 유래 문자열(target 창 이름·method)도 WS-51 레지스트리 가림 → 코드 흉내 가림 → 표시 살균.
+        return display_safe(mask_code_like(public_text(str(raw or ""))), limit)
+
     target = str(meaning.get("target") or "")
-    suffix = f" (새 창/프레임: {display_safe(target, 40)})" if target and target != "_self" else ""
+    suffix = f" (새 창/프레임: {page_text(target, 40)})" if target and target != "_self" else ""
     if meaning.get("href"):
         return url(meaning["href"]) + suffix
     if meaning.get("action"):
-        method = display_safe(str(meaning.get("method") or "get"), 10).upper()
+        method = page_text(meaning.get("method") or "get", 10).upper()
         return f"{method} {url(meaning['action'])}" + suffix
     return ""
 
@@ -256,13 +260,12 @@ class ElicitMixin:
                            report_basis: bool) -> Any:
         """True = 실행(정책·elicitation 승인), ActionResult = 그 결과로 끝(대상 바뀜 등), None = 기존 경로."""
         self._oob_note = None
-        refused = self._policy_pass(action, ctx)
-        if refused is True:
-            # R2 B4: 정책으로 연 호출도 실제 입력~효과 판정을 다른 승인 호출과 겹치지 않게(서버 단위 직렬화).
-            await self._hold_approval_exec()
-            if report_basis:
-                self._pending_gate_basis = dict(decision.basis)
-            return True
+        if not self._oob_bindable(action, params):
+            # R3 B1: 고위험 좌표 클릭은 버튼 승인·정책으로 열지 않는다 — 이동(hover) 뒤 실제 눌림 대상을 신뢰 이벤트
+            # 전달 전에 끝까지 증명할 수 없다(페이지의 먼저 등록된 capture 리스너). 터미널 승인(증표+확인 코드)만.
+            return None
+        if self._policy_pass(action, ctx) is True:
+            return await self._policy_run(action, params, decision, report_basis)
         elicitor = CURRENT_ELICITOR.get()
         if elicitor is None or not elicitor.supported():
             return None
@@ -280,7 +283,7 @@ class ElicitMixin:
             answer = await elicitor.ask(message, elicit_timeout(self.hub.approval_ttl_s))
             if answer == "accept":
                 # R2 B4: 사람 응답 대기는 락 밖 — 응답 뒤 재확인·실제 입력·효과 판정은 서버 단위로 한 호출씩.
-                # (락은 _call_tool 끝에서 푼다 — _release_approval_exec.)
+                # (락은 _call_tool 끝에서 푼다 — _release_approval_exec.) R3 B3: 재확인은 락을 잡은 **뒤**.
                 await self._hold_approval_exec()
             checked = (await self._recheck_after_accept(action, params, components)
                        if answer == "accept" else None)
@@ -299,6 +302,49 @@ class ElicitMixin:
         via: Dict[str, Any] = {"via": "elicitation"}
         if self._oob_note and "policy_refused" in self._oob_note:
             via["policy_refused"] = self._oob_note["policy_refused"]
+        self._approval_via = via
+        if report_basis:
+            self._pending_gate_basis = dict(decision.basis)
+        return True
+
+    @staticmethod
+    def _oob_bindable(action: ActionType, params: Dict[str, Any]) -> bool:
+        """대역 밖 승인(정책·elicitation) 대상인가. 요소(element_id·selector) 없는 좌표 클릭은 아니다(R3 B1)."""
+        if action is ActionType.CLICK and not params.get("element_id") and not params.get("selector") \
+                and params.get("x") is not None:
+            return False
+        return True
+
+    async def _policy_run(self, action: ActionType, params: Dict[str, Any], decision: Any,
+                          report_basis: bool) -> Any:
+        """정책 일치 → 대상 노드를 잡고, 실행 락을 잡은 **뒤** 대상·문맥·실행 의미·정책·금지 범주를 다시 판정(R3 B3).
+
+        락을 기다리는 동안 앞선 호출(타이머·이동)이 대상을 바꿀 수 있다 — 정책 통과는 락 획득 시점의 판정만 믿는다.
+        결속 불가(노드를 못 잡음)면 정책으로 열지 않는다(None — 기존 경로).
+        """
+        via = self._approval_via
+        components = self._approval_components(action, params, dict(decision.basis))
+        pinned = await self._pin_approval_target(params)
+        if pinned is False:
+            self._approval_via = None
+            return None
+        self._approval_pin = pinned
+        try:
+            await self._hold_approval_exec()
+            checked, now_ctx = await self._recheck_target(action, params, components, "policy")
+            if checked is None:
+                self._oob_note = None
+                if self._policy_pass(action, now_ctx) is not True:
+                    checked = self._oob_toctou(action, "정책 다시 판정: 지금 대상은 정책으로 열 수 없음",
+                                               via="policy", extra=self._oob_note)
+        except BaseException:
+            self._approval_via = None
+            await self._drop_approval_pin()
+            raise
+        if checked is not None:
+            self._approval_via = None
+            await self._drop_approval_pin()
+            return checked
         self._approval_via = via
         if report_basis:
             self._pending_gate_basis = dict(decision.basis)
@@ -324,22 +370,28 @@ class ElicitMixin:
 
     async def _recheck_after_accept(self, action: ActionType, params: Dict[str, Any],
                                     components: Dict[str, Any]) -> Optional[ActionResult]:
-        """사람이 승인한 그 대상인가 — 승인 증표 실행 경로(_use_approval)와 같은 재확인."""
+        """사람이 승인한 그 대상인가 — 승인 증표 실행 경로(_use_approval)와 같은 재확인. 실행 락을 잡은 뒤 부른다."""
+        return (await self._recheck_target(action, params, components, "elicitation"))[0]
+
+    async def _recheck_target(self, action: ActionType, params: Dict[str, Any], components: Dict[str, Any],
+                              via: str) -> tuple:
+        """락 획득 뒤 재확인. 반환: (거부 ActionResult 또는 None, 지금 대상의 게이트 문맥 또는 None)."""
         from interface.handoff import DIGEST_KEYS, action_digest, normalize_components
 
         # 기다리는 동안 사람이 조작권을 가져갔으면 실행하지 않는다.
         refused = await self._refuse_before_validation(action, params, {})
         if refused is not None:
-            return refused
+            return refused, None
         target = await self._gate_target(action, params)
         if isinstance(target, ActionResult):
-            return target
-        decision = self._hitl.evaluate(self._gate_context(action, target))
+            return target, None
+        gate_ctx = self._gate_context(action, target)
+        decision = self._hitl.evaluate(gate_ctx)
         now = self._approval_components(action, params, dict(decision.basis))
         if action_digest(now) != action_digest(components):
             before, after = normalize_components(components), normalize_components(now)
             diff = ", ".join(k for k in DIGEST_KEYS if before.get(k) != after.get(k)) or "내용"
-            return self._elicitation_toctou(action, f"승인 뒤 바뀜: {diff}")
+            return self._oob_toctou(action, f"승인 뒤 바뀜: {diff}", via=via), None
         check = getattr(self._dispatcher, "approval_target_check", None)
         if check is None:
             fresh = {"fresh": False, "detail": "대상 확인 불가"}  # fail-closed
@@ -349,12 +401,12 @@ class ElicitMixin:
             except Exception as exc:  # noqa: BLE001
                 fresh = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
         if not fresh.get("fresh"):
-            return self._elicitation_toctou(action, str(fresh.get("detail") or ""))
+            return self._oob_toctou(action, str(fresh.get("detail") or ""), via=via), None
         # B1: 이름·role·css 가 같아도 승인 요청 때 그 노드가 아니면(새 노드로 교체) 실행하지 않는다.
         same = await self._pinned_check(self._approval_pin, params)
         if not same.get("fresh"):
-            return self._elicitation_toctou(action, str(same.get("detail") or ""))
-        return None
+            return self._oob_toctou(action, str(same.get("detail") or ""), via=via), None
+        return None, gate_ctx  # R3 B3: 정책 재판정은 이 (락 획득 뒤) 문맥으로
 
     async def _pin_approval_target(self, params: Dict[str, Any]) -> Any:
         """사람 승인을 요청하는 지금 대상 노드를 잡는다(B1). None = 요소 대상 아님(좌표·키 — 결속 대상 없음),
@@ -393,13 +445,20 @@ class ElicitMixin:
         await _release(self._dispatcher, pin)
 
     def _elicitation_toctou(self, action: ActionType, detail: str) -> ActionResult:
+        return self._oob_toctou(action, detail)
+
+    def _oob_toctou(self, action: ActionType, detail: str, via: str = "elicitation",
+                    extra: Optional[Dict[str, Any]] = None) -> ActionResult:
+        approval: Dict[str, Any] = {"via": via, "reason": "target_changed", "detail": detail}
+        if extra and "policy_refused" in extra:
+            approval["policy_refused"] = extra["policy_refused"]
+        what = "승인한" if via == "elicitation" else "정책으로 연"
         return self._error_result(
             action,
             ErrorCode.TOCTOU_MISMATCH,
-            "승인한 대상이 바뀌어 실행하지 않았습니다(" + detail + "). 다시 관찰한 뒤 호출하세요 — "
+            f"{what} 대상이 바뀌어 실행하지 않았습니다(" + detail + "). 다시 관찰한 뒤 호출하세요 — "
             "다시 승인을 묻습니다.",
-            data={"approval": {"via": "elicitation", "reason": "target_changed",
-                               "detail": detail}},
+            data={"approval": approval},
         )
 
     def _attach_oob_note(self, result: ActionResult) -> ActionResult:

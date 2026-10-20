@@ -40,6 +40,7 @@ from security.hitl import (
     PATH_SOURCES,
     TOKEN_SOURCES,
     ActionContext,
+    account_termination,
     class_tokens,
     normalize_gate_text,
     path_tokens,
@@ -64,22 +65,11 @@ FORBIDDEN_ACTIONS: Dict[ActionType, str] = {ActionType.UPLOAD_FILE: "upload_file
 
 _KEYWORD_CATEGORY: Dict[str, str] = {kw: cat for cat, kws in FORBIDDEN_KEYWORDS.items() for kw in kws}
 
-#: WS-56 R2 B5: 계정 단위 삭제·비활성화(조합) → account_termination. 한쪽만으로는 범주가 아니다 — '메일 삭제'·
-#: 'Remove from cart'(일반 데이터 삭제)·'My account'(계정 화면 열기)는 정책으로 열 수 있다. 공백을 뺀 정규형에서
-#: 부분 문자열로 본다('계정삭제'·'deleteAccount'·'delete-account' 모두).
-ACCOUNT_NOUNS: Tuple[str, ...] = ("계정", "회원", "프로필", "account", "profile")
-ACCOUNT_REMOVAL_VERBS: Tuple[str, ...] = ("삭제", "비활성", "delete", "deletion", "remove", "removal",
-                                          "close", "closure", "erase")
+#: WS-56 R2 B5 · R3 B4/B8: 계정 '자체' 종료(계정 명사와 삭제·비활성화·닫기 동사가 붙은 구 — 'Close account'·'계정 비활성화')
+#: → account_termination. 판정은 게이트 위험 판정(security.hitl.account_termination)과 같은 함수 — 게이트가 HIGH 로
+#: 올려야 이 관문까지 온다. 계정 안 항목 삭제('Delete email from my account'·'계정에서 메일 삭제'·'Remove profile photo')와
+#: 한쪽만 있는 일반 동작('메일 삭제'·'My account')은 범주가 아니다.
 CATEGORY_ACCOUNT = "account_termination"
-
-
-def _account_removal(compact: str) -> bool:
-    """공백·구두점 사이 없이 붙인 정규 문자열에 계정 명사와 삭제·비활성화 동사가 함께 있는가."""
-    return any(n in compact for n in ACCOUNT_NOUNS) and any(v in compact for v in ACCOUNT_REMOVAL_VERBS)
-
-
-def _compact(text: str) -> str:
-    return "".join(ch for ch in normalize_gate_text(text) if ch.isalnum())
 
 
 class PolicyError(ValueError):
@@ -94,8 +84,6 @@ def _text_category(text: str) -> Optional[str]:
     norm = normalize_gate_text(text)
     if not norm:
         return None
-    if _account_removal(_compact(norm)):
-        return CATEGORY_ACCOUNT
     for cat, kws in FORBIDDEN_KEYWORDS.items():
         for kw in kws:
             if kw.lower() in norm:
@@ -105,8 +93,6 @@ def _text_category(text: str) -> Optional[str]:
 
 def _token_category(tokens: List[str]) -> Optional[str]:
     present = set(tokens)
-    if _account_removal("".join(tokens)):
-        return CATEGORY_ACCOUNT
     for cat, kws in FORBIDDEN_KEYWORDS.items():
         for kw in kws:
             if kw.isascii() and " " not in kw and kw in present:
@@ -129,6 +115,8 @@ def _icon_keyword(cls: str) -> Optional[str]:
 def _source_category(source: str, text: str) -> Optional[str]:
     if not text or source in META_SOURCES:
         return None
+    if account_termination(source, text):
+        return CATEGORY_ACCOUNT
     if source in PATH_SOURCES:
         try:
             decoded = unquote_plus(text)
@@ -282,6 +270,9 @@ def read_policies(path: Path) -> List[Dict[str, Any]]:
 #: 서버 상태 폴더 안 키 파일 이름.
 KEY_FILE = "approve_policy.key"
 _KEY_BYTES = 32
+#: HMAC-SHA256 hexdigest 형식(소문자 16진 64자).
+_MAC_HEX_LEN = 64
+_MAC_HEX = frozenset("0123456789abcdef")
 
 
 def policy_key_path() -> Path:
@@ -336,8 +327,18 @@ def _verify_mac(path: Path, data: Dict[str, Any]) -> None:
     mac = data.get("mac")
     if not isinstance(mac, str) or not mac:
         raise PolicyError("정책 파일에 사람 CLI 서명이 없습니다(직접 쓰거나 다른 경로로 바뀐 파일)")
-    want = _mac(_read_key(create=False), path, data["policies"])
-    if not hmac.compare_digest(mac, want):
+    # R3 B7: 형식(소문자 16진 64자 — hexdigest) 먼저. 비ASCII 문자열은 compare_digest 가 TypeError 를 내 PolicyError 밖으로
+    # 새고 캐시가 남았다. 비교·서명 계산의 어떤 예외도 PolicyError(fail-closed).
+    if len(mac) != _MAC_HEX_LEN or any(ch not in _MAC_HEX for ch in mac):
+        raise PolicyError("정책 파일 서명 형식이 아닙니다(손상)")
+    try:
+        want = _mac(_read_key(create=False), path, data["policies"])
+        same = hmac.compare_digest(mac.encode("ascii"), want.encode("ascii"))
+    except PolicyError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 서명 계산·비교 실패 = 서명 불일치
+        raise PolicyError(f"정책 파일 서명을 확인할 수 없습니다({type(exc).__name__})") from None
+    if not same:
         raise PolicyError("정책 파일 서명이 맞지 않습니다(사람 CLI 밖에서 바뀌었거나 다른 프로필에서 옮겨 옴)")
 
 
@@ -471,14 +472,17 @@ class PolicyStore:
         sig = self._signature()
         if sig == self._sig:
             return
+        # R3 B7: 다시 읽기 전에 캐시를 먼저 비운다 — 읽기가 어떤 예외로 끝나도 이전 정책을 쓰지 않는다.
+        self.rows = []
         self._sig = sig
         try:
-            self.rows = read_policies(self.path)
-            self.error = ""
-        except PolicyError as exc:
-            self.rows = []
-            self.error = str(exc)
-            logger.warning("approve-policy 파일을 쓰지 않습니다(fail-closed): %s", exc)
+            rows = read_policies(self.path)
+        except Exception as exc:  # noqa: BLE001 - PolicyError 밖의 예외도 fail-closed(정책 없음)
+            self.error = str(exc) or type(exc).__name__
+            logger.warning("approve-policy 파일을 쓰지 않습니다(fail-closed): %s", self.error)
+            return
+        self.rows = rows
+        self.error = ""
 
     def match(self, origin: str, action: ActionType, element_name: str) -> Optional[Dict[str, Any]]:
         self.refresh()
