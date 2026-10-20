@@ -206,6 +206,36 @@ async def test_other_user_peer_is_refused(short_root, monkeypatch):
         await listener.close()
 
 
+@pytest.mark.parametrize("where", ["sendall", "recv"])
+async def test_peer_reset_during_handshake_is_attach_error(short_root, monkeypatch, where):
+    """첫 serve 가 거부하며 끊을 때 Linux 는 EOF 대신 ECONNRESET·EPIPE 를 준다(CI 실측) — 원시 OSError 가 아니라
+    AttachError 여야 부르는 쪽이 원래 잠금 오류를 알린다. macOS 에서도 재현되게 소켓 메서드를 바꿔 끼운다."""
+    prof = _profile_dir(short_root)
+    seen: list = []
+    listener = await _echo_listener(prof, seen)
+    real_socket = socket.socket
+
+    class ResettingSocket(real_socket):
+        def sendall(self, *a, **k):  # noqa: D401
+            if where == "sendall":
+                raise BrokenPipeError(32, "Broken pipe")
+            return super().sendall(*a, **k)
+
+        def recv(self, *a, **k):
+            if where == "recv":
+                raise ConnectionResetError(104, "Connection reset by peer")
+            return super().recv(*a, **k)
+
+    monkeypatch.setattr(attach.socket, "socket", ResettingSocket)
+    try:
+        t, out = _in_thread(attach.connect, prof, "watch")
+        await _join(t)
+        assert isinstance(out.get("error"), attach.AttachError), out
+    finally:
+        monkeypatch.setattr(attach.socket, "socket", real_socket)
+        await listener.close()
+
+
 async def test_relay_exit_codes(short_root):
     """클라이언트(stdin)가 먼저 끝나면 0, 첫 serve 가 먼저 끝나면 stderr 한 줄 + 3."""
     import io
