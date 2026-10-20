@@ -907,12 +907,35 @@ _MEANING_JS = """
       }
       return false;
     };
-    // R3 B2: 제출 버튼 자신이 아니면(입력칸에서 Enter = 암묵 제출) 폼의 기본 제출 버튼(form.elements 트리 순서의 첫
-    // submit)이 실제 제출자다 — 그 formaction/formmethod/formtarget 이 실제 목적지.
+    // R3 B2 → R5: 제출 버튼 자신이 아니면(입력칸에서 Enter = 암묵 제출) 폼의 기본 제출 버튼 — 폼 소유 요소 트리 순서의
+    // 첫 submit(button·input submit·**input image**; form 속성으로 폼 밖에 연결된 것 포함) — 이 실제 제출자다. form.elements
+    // 는 image 를 빼므로 쓰지 않는다. 소유 폼은 네이티브 getter 로 확인하고, 확인할 수 없으면 예외(호출자: 결속 불가).
+    const strictForm = (n) => {
+      const d = Object.getOwnPropertyDescriptor(protoOf(n), 'form');
+      if (!d || !d.get) throw new Error('default-submitter-undetermined');
+      return d.get.call(n);
+    };
+    const defaultSubmitter = () => {
+      const root = form.getRootNode();
+      if (!root || typeof root.querySelectorAll !== 'function') throw new Error('default-submitter-undetermined');
+      const owned = [];
+      const add = (list) => {
+        for (const n of list) if (!owned.includes(n) && isSubmitter(n) && strictForm(n) === form) owned.push(n);
+      };
+      add(form.querySelectorAll('button, input'));
+      add(root.querySelectorAll('button[form], input[form]'));
+      // 문서(트리) 순서 — 4 = DOCUMENT_POSITION_FOLLOWING.
+      owned.sort((a, b) => (a === b ? 0 : (a.compareDocumentPosition(b) & 4 ? -1 : 1)));
+      return owned.length ? owned[0] : null;
+    };
     let submitter = isSubmitter(ctl) ? ctl : null;
     if (!submitter) {
-      const els = get(F, 'elements', form) || [];
-      for (let i = 0; i < els.length; i++) { if (isSubmitter(els[i])) { submitter = els[i]; break; } }
+      submitter = defaultSubmitter();
+      if (submitter && submitter.matches(':disabled')) {
+        // 기본 제출자가 비활성이면 암묵 제출이 없다(뒤 버튼으로 넘어가지 않음) — 목적지 없음. 대기 중 켜지면 의미가 바뀜.
+        out.action = ''; out.method = ''; out.target = '';
+        return out;
+      }
     }
     if (submitter) {
       const P = protoOf(submitter);
