@@ -16,6 +16,14 @@ difference, same-site execution context, non-HttpOnly, latest value, no
 Set-Cookie seen); only those are ledgered, marked ``js`` — and a ``js`` key may
 later change its value while it stays non-HttpOnly (D). R4: same origin only,
 the setter's receiver must be the installed Document, cookieStore not wrapped.
+
+WS-58: the rename is refused only when (a) the page's host is covered by a login
+record (browser.login_records: login_ledger.json + server memory — tool-known login
+events) or (b) a cookie sent to the origin is HttpOnly under a key (name/domain/path)
+the ledger does not hold as a server cookie (a new HttpOnly key, or a ``js`` key that
+turned HttpOnly — a possible server session). Non-HttpOnly cookies, and new values of
+ledgered HttpOnly keys (``__cf_bm``/``AWSALB`` rotation), no longer block. A login
+record file that cannot be read refuses (fail-closed, ``login_ledger_unreadable``).
 """
 from __future__ import annotations
 
@@ -41,6 +49,8 @@ from urllib.parse import urlsplit, urlunsplit
 from playwright.async_api import BrowserContext, Page
 
 from actions.pdf_document import cookie_matches
+from browser.login_ledger import LedgerError
+from browser.login_records import LoginRecords
 from security.egress import EgressGuard
 from security.egress_proxy import EgressProxy
 from security.robots_signal import RobotsSignals, _origin
@@ -84,7 +94,12 @@ REMEMBERED_NOTE = "이 사이트는 앞서 헤드리스 이름을 막아, 처음
 FAILED_NOTE = "일반 Chrome 이름으로도 막혔습니다 — 사이트가 자동화 접근을 막고 있습니다"
 #: data.retry_skipped.note — fixed text per reason code, never page-derived.
 SKIP_NOTES = {
-    "cookies_present": "이 사이트에 로그인 등 기존 쿠키가 있어 이름을 바꾸지 않았습니다",
+    # WS-58: 예전 cookies_present 를 이유별로 나눴다(로그인 기록 / 새 서버 전용 쿠키 / 읽기 실패).
+    "login_recorded": "이 사이트는 도구가 아는 로그인 기록이 있어(로그인 흐름·사람 조작·가져온 쿠키) 이름을 바꾸지 않았습니다",
+    "new_server_cookie": "도구가 모르는 서버 전용(HttpOnly) 쿠키가 있어(로그인 세션 가능성) 이름을 바꾸지 않았습니다",
+    "login_ledger_unreadable": ("로그인 기록 파일을 읽지 못해(손상) 안전을 위해 이름을 바꾸지 않았습니다 — "
+                                "운영자에게 이 프로필의 로그인 기록 확인을 요청하세요"),
+    "cookies_unreadable": "이 사이트의 쿠키를 확인하지 못해 안전을 위해 이름을 바꾸지 않았습니다",
     "already_failed": "앞서 일반 Chrome 이름으로도 막혀 다시 시도하지 않았습니다",
     "robots_not_confirmed": "robots.txt 가 일반 접근 허용을 확정해 주지 않아 이름을 바꾸지 않았습니다",
     "vendor_challenge": "보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다",
@@ -98,10 +113,11 @@ IDENTITY_INSTRUCTIONS = (
 )
 
 
-#: data.retry_skipped.cookie_change(_note) — WS-52 detail for cookies_present (fixed text; no names/values).
+#: data.retry_skipped.cookie_change(_note) — WS-52 detail, WS-58: only for new_server_cookie
+#: (fixed text; no names/values).
 COOKIE_CHANGE_NOTES = {
-    "new_cookie": "도구가 남기지 않은 새 쿠키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
-    "known_value_changed": ("도구가 앞서 남긴 쿠키의 값이 바뀌어(사이트 스크립트 또는 로그인) 로그인 여부를 확인할 수 없어 "
+    "new_cookie": "도구가 남기지 않은 새 서버 전용(HttpOnly) 쿠키 키가 있어(로그인 가능성) 이름을 바꾸지 않았습니다",
+    "known_value_changed": ("도구가 사이트 스크립트 쿠키로 남긴 키가 서버 전용(HttpOnly)으로 바뀌어(로그인 가능성) "
                             "이름을 바꾸지 않았습니다 — 로그인 없이 읽어야 하면 운영자에게 이 사이트 쿠키 정리를 요청하세요"),
 }
 
@@ -191,10 +207,11 @@ class HeadlessRetry:
     """Per-origin retry memory plus the ledger of cookies our successful retries caused.
 
     A cookie the site planted during a successful renamed navigate (a visitor
-    id) must not later count as "logged in": the origin is eligible when every
-    cookie it sends is exactly (name, domain, path, keyed value digest) one we
-    recorded (WS-52 R3: or a ``js`` key, any value, while not HttpOnly). A new
-    cookie or a changed value restores the native name. With
+    id) must not later count as "logged in". WS-58 (``block_reason``): the origin is
+    eligible unless a login record covers it or it sends an HttpOnly cookie whose key
+    (name, domain, path) is not ledgered as a server cookie — non-HttpOnly cookies and
+    new values of ledgered keys pass. The ledger keeps keyed value digests (WS-47
+    format) so a merge sees what changed; ledgered keys follow their latest value. With
     ``load(path)`` (serve --profile) the memory persists in a 0600 file; the
     value digest is HMAC-SHA256 keyed by a random per-profile key — no value or
     plain hash is ever stored.
@@ -208,6 +225,8 @@ class HeadlessRetry:
         self.path: Path | None = None
         self._key = secrets.token_bytes(32)
         self._clock = clock
+        #: WS-58: tool-known login events (login_ledger.json with a profile, else memory only).
+        self.logins = LoginRecords()
         self._tail: _Tail | None = None
         #: WS-52 R1: bumped synchronously when a tool call starts (``tool_call``) — refuses in-flight reads.
         self._tool_gen = 0
@@ -267,19 +286,17 @@ class HeadlessRetry:
         """Ledger what appeared/changed between two snapshots; True when the ledger changed.
 
         A cookie already present in ``before`` but never ledgered stays excluded. WS-52 R3 (D):
-        a ``js`` key keeps its mark and follows its current value (the value change was
-        allowed for that key anyway); every other entry is matched exactly, as before.
+        a ``js`` key keeps its mark and follows its current value. WS-58: every ledgered key
+        follows its current value (the judgment is per key now — a server that rotates a
+        ledgered HttpOnly value between visits must not make that key "new" later).
         """
         current = self.ledger.get(origin, [])
         prior = {_fp(e) for e in before}
         latest = {_key(e): e for e in after}
-        after_fps = {_fp(e) for e in after}
         kept = []
         for entry in current:
-            if _fp(entry) in after_fps:
-                kept.append(entry)
-            elif entry.get("js") and _key(entry) in latest:
-                kept.append({**latest[_key(entry)], "js": True})
+            if _key(entry) in latest:
+                kept.append({**latest[_key(entry)], "js": True} if entry.get("js") else latest[_key(entry)])
         known = {_fp(e) for e in kept}
         created = [e for e in after if _fp(e) not in prior and _fp(e) not in known
                    and _key(e) not in {_key(k) for k in kept}]
@@ -632,38 +649,48 @@ class HeadlessRetry:
 
     @staticmethod
     def _accepted(ledger: list[LedgerEntry], entry: LedgerEntry, http_only: bool) -> bool:
-        """Exact ledger match — or (WS-52 R3 D) a ``js`` key that is still not HttpOnly."""
+        """WS-58 rule (b): a non-HttpOnly cookie, or an HttpOnly one under a key the ledger holds
+        as a server cookie (any value). A ``js`` key (WS-52: a script wrote it) that is now
+        HttpOnly came from the server — not ledgered as a server cookie, so it is refused."""
+        if not http_only:
+            return True
         for known in ledger:
             if _key(known) == _key(entry):
-                if known.get("js"):
-                    return not http_only
-                return _fp(known) == _fp(entry)
+                return not known.get("js")
         return False
 
-    async def cookies_cleared(self, context: BrowserContext, url: str) -> bool:
-        """No cookie for the origin, or every one is accepted by the ledger (``_accepted``)."""
-        current = await self._cookies(context, url)
-        if current is None:
-            return False
-        ledger = self.ledger.get(_origin(url) or "", [])
-        return all(self._accepted(ledger, entry, http_only) for entry, http_only in current)
+    async def block_reason(self, context: BrowserContext, url: str) -> tuple[str, str | None] | None:
+        """WS-58: why the rename is refused for this url, or None when eligible.
 
-    async def cookie_change(self, context: BrowserContext, url: str) -> str | None:
-        """Why cookies are not cleared: "new_cookie" (an unledgered name/domain/path — maybe a
-        login) wins over "known_value_changed" (only ledgered cookies with other values, or a
-        ``js`` key that turned HttpOnly). None when cleared or unreadable. Never returns names
-        or values."""
+        ``(code, cookie_change)`` — code is a SKIP_NOTES key: ``login_ledger_unreadable`` (the
+        login record file is corrupt: fail-closed), ``login_recorded`` (rule a),
+        ``cookies_unreadable``, ``new_server_cookie`` (rule b, with ``new_cookie`` /
+        ``known_value_changed``). Never names or values.
+        """
+        try:
+            if self.logins.covers(url):
+                return ("login_recorded", None)
+        except LedgerError:
+            return ("login_ledger_unreadable", None)
         current = await self._cookies(context, url)
         if current is None:
-            return None
+            return ("cookies_unreadable", None)
         ledger = self.ledger.get(_origin(url) or "", [])
-        keys = {_key(e) for e in ledger}
         changed = [e for e, http_only in current if not self._accepted(ledger, e, http_only)]
         if not changed:
             return None
-        if any(_key(e) not in keys for e in changed):
-            return "new_cookie"
-        return "known_value_changed"
+        keys = {_key(e) for e in ledger}
+        return ("new_server_cookie", "new_cookie" if any(_key(e) not in keys for e in changed)
+                else "known_value_changed")
+
+    async def cookies_cleared(self, context: BrowserContext, url: str) -> bool:
+        """Eligible for the rename (``block_reason`` is None) — the per-request check too."""
+        return await self.block_reason(context, url) is None
+
+    async def cookie_change(self, context: BrowserContext, url: str) -> str | None:
+        """WS-52 detail of a ``new_server_cookie`` refusal; None otherwise."""
+        reason = await self.block_reason(context, url)
+        return reason[1] if reason is not None else None
 
     # -- persistence ---------------------------------------------------------
 

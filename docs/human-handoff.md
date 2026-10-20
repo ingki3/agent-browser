@@ -84,6 +84,8 @@ agent-browser control release
 
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 
+**조작권 구간의 로그인 기록(WS-58).** 사람이 조작권을 가진 동안(take~release) 그 브라우저의 POST/PUT 요청(Network 계층, 메서드·origin 만 — 본문 미열람)·쿠키 추가·값 변경·비밀번호 칸 제출·`secret_wanted` 인계는 그 origin 을 로그인 기록(`human_control`)에 남겨, 이후 그 사이트에서는 헤드리스 이름 재시도를 하지 않습니다. 요청 감시는 조작권이 넘어간 그 동기 구간에서 먼저 붙고(설치 중 요청도 기록), 설치가 실패하면 그 구간에 방문한 origin 전부를 기록합니다(fail-closed). 규칙과 한계는 [헤드리스 이름 재시도](headless-retry.md)에 있습니다.
+
 **결제 버튼 예시(승인 증표).** 창이 보이는 서버(`--browser human`·`user-chrome`)와 `--browser on-demand` 서버(코드는 별도 작은 창 — 아래 '필요할 때만 창' 절)에서 고위험 액션이 막히면(무인 차단·대화형 확인 필요 모두) `data.approval = {approval_id, expires_at, how_to_approve}`가 붙습니다. 서버는 이 증표를 행동 내용의 해시(액션 종류 + 정규화한 파라미터 + 대상 요소 판정 근거 `gate_basis` + 탭 id + 현재 문서 origin + `snapshot_epoch`의 SHA-256)에 묶어 두고, 해시는 사람 CLI 만 상태 파일에서 읽습니다(에이전트 응답에는 싣지 않음). **headless 서버는 승인 증표를 발급하지 않습니다** — 사람이 볼 창이 없어 확인 코드를 띄울 곳이 없기 때문입니다. 그때는 기존처럼 `--pre-approve`·`--mode interactive` 안내만 나가며, 대화형 모드의 확인도 같은 이유로 창(확인 코드)이 있어야 완료할 수 있습니다.
 
 1. 에이전트: `browser_click(element_id="@e5", epoch=3)` → 차단, `approval_id=ap_…`. 메시지는 "사람에게 `agent-browser approve ap_…` 실행을 요청"하라고 안내합니다.

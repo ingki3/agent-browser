@@ -65,12 +65,14 @@ async def test_original_symptom_boundaries(delay):
             first = await navigate(server, site.url + "/one")
             assert first.data["last_http_status"] == 200
             await asyncio.sleep(delay + 0.7)
+            from ws58_helpers import strict_drift
+
+            drift, _ = await strict_drift(server, site.url)
+            # outside the 10 s maximum the rewrite is honestly not merged (WS-52 invariant) …
+            assert drift == (None if delay < 10 else "known_value_changed")
             second = await navigate(server, site.url + "/two")
-            if delay < 10:
-                assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
-            else:  # outside the 10 s maximum: honestly refused
-                assert second.data["last_http_status"] == 403
-                assert second.data["retry_skipped"]["cookie_change"] == "known_value_changed"
+            # … but WS-58 (intended change): a non-HttpOnly value change no longer keeps the native name.
+            assert second.data["last_http_status"] == 200, second.data.get("retry_skipped")
 
 
 # -- B1: server tools (and the SDK entry) end the tail ---------------------------

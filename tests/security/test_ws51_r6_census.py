@@ -70,6 +70,7 @@ CANDIDATES = {
     ("browser/serve_profile.py", "f'{DIR_PREFIX}{name}'"): (NOT_OUT + " (디스크 프로필 디렉터리 이름)", None, None),
     ("browser/serve_profile.py", "f'{EPHEMERAL_PREFIX}{server_id}'"): (NOT_OUT + " (디스크 임시 프로필 디렉터리 이름)",
                                                                        None, None),
+    ("browser/login_watch.py", "'abw' + secrets.token_hex(8)"): (NOT_OUT + " (WS-58 조작권 감시 CDP 바인딩 이름)", None, None),
     ("interface/profile_cli.py", "f'{n}B'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.0f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.1f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),

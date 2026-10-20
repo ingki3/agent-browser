@@ -385,7 +385,16 @@ class ToolsMixin:
         # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
         target_href = self._handle_href(params)
         used, self._used_approval = self._used_approval, None
+        # WS-58 R1 B2: 입력 대상 문서(활성 frame)의 주소를 실행 전에 잡는다 — 디스패처가 비밀 치환을 허용한 문서.
+        input_url = (self._agent_input_url() if action is ActionType.TYPE_TEXT and hasattr(self, "_agent_input_url")
+                     else "")
         result, remembered = await self._dispatch_with_approval(action, params, used)
+        if (action is ActionType.TYPE_TEXT and result.success and result.data.get("secret_resolved") is True
+                and hasattr(self, "_record_login")):
+            # WS-58: 자격증명 채우기(디스패처가 키를 값으로 치환해 입력함)는 도구가 아는 로그인 사건.
+            from browser.login_ledger import SOURCE_LOGIN_FLOW
+
+            self._record_login(input_url or self._agent_input_url() or self._agent_page_url(), SOURCE_LOGIN_FLOW)
         if used is not None:
             self._attach_approval_outcome(used, result)
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)

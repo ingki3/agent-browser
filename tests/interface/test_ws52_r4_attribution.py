@@ -142,13 +142,19 @@ async def _frame_trial(parent: str, child: str, child_js: str, server_cookie: st
 
 
 @requires_chromium
+@pytest.mark.parametrize("http_only", [False, True], ids=["script_visible", "http_only"])
 @pytest.mark.parametrize("parent,child", [("github.io", "evil.github.io"), ("co.uk", "evil.co.uk")])
-async def test_b3_public_suffix_child_frame_is_cross_site(parent, child):
-    cookie = "sid=LOGIN1; Path=/; Secure; SameSite=None"
+async def test_b3_public_suffix_child_frame_is_cross_site(parent, child, http_only):
+    cookie = "sid=LOGIN1; Path=/; Secure; SameSite=None" + ("; HttpOnly" if http_only else "")
     result = await _frame_trial(parent, child, "document.cookie = " + json.dumps(cookie), cookie)
     assert "sid" in result["jar"], ("the server cookie never arrived (invalid trial)", result)
     print("B3=" + json.dumps({"parent": parent, "eligible": result["eligible"], "status": result["status"]}))
-    assert result["eligible"] is False and result["status"] == 403, result
+    assert result["ledger"] is None, result  # WS-52 invariant: the cross-site write is never merged
+    if http_only:
+        assert result["eligible"] is False and result["status"] == 403, result
+    else:
+        # WS-58 (intended change): a non-HttpOnly cookie no longer keeps the native name.
+        assert result["eligible"] is True and result["status"] == 200, result
 
 
 @requires_chromium
@@ -158,7 +164,9 @@ async def test_same_site_sub_domain_frame_write_is_no_longer_merged():
     result = await _frame_trial("example.test", "sub.example.test",
                                 "document.cookie = 'pref=dark; Domain=example.test; Path=/; Secure'", None)
     assert "pref" in result["jar"], ("the sub-domain frame did not write (invalid trial)", result)
-    assert result["eligible"] is False and result["status"] == 403, result
+    assert result["ledger"] is None, result  # WS-52 R4 invariant: not merged
+    # WS-58 (intended change): the non-HttpOnly cookie no longer keeps the native name.
+    assert result["eligible"] is True and result["status"] == 200, result
 
 
 @requires_chromium
