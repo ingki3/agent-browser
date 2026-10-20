@@ -297,15 +297,19 @@ def connect(profile_dir: Path, workspace: Optional[str], *, timeout: float = HAN
             raise AttachError(f"첫 serve 에 붙지 못했습니다: {type(exc).__name__}") from None
         if not _same_user(sock):
             raise AttachError("붙기 상대가 같은 사용자인지 확인하지 못했습니다(거부).")
-        sock.sendall(_encode({HANDSHAKE_KEY: 1, "workspace": workspace}))
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = sock.recv(HANDSHAKE_MAX)
-            if not chunk:
-                raise AttachError("첫 serve 가 붙기 요청에 답하지 않고 끊었습니다.")
-            buf += chunk
-            if len(buf) > HANDSHAKE_MAX:
-                raise AttachError("첫 serve 의 응답이 너무 깁니다.")
+        try:
+            sock.sendall(_encode({HANDSHAKE_KEY: 1, "workspace": workspace}))
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(HANDSHAKE_MAX)
+                if not chunk:
+                    raise AttachError("첫 serve 가 붙기 요청에 답하지 않고 끊었습니다.")
+                buf += chunk
+                if len(buf) > HANDSHAKE_MAX:
+                    raise AttachError("첫 serve 의 응답이 너무 깁니다.")
+        except OSError as exc:
+            # 첫 serve 가 거부하며 끊으면 Linux 는 EOF 대신 ECONNRESET·EPIPE 를 준다 — 같은 거부로 본다.
+            raise AttachError(f"첫 serve 가 붙기 요청 중 연결을 끊었습니다: {type(exc).__name__}") from None
         try:
             reply = json.loads(buf.decode("utf-8"))
         except ValueError:
