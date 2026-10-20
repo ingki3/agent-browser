@@ -4,6 +4,7 @@
                           [--browser {headless,human,user-chrome,on-demand}] [--chrome-profile] [--keep-open]
                           [--nav-settle {on,off}] [--max-result-chars N]
                           [--allow-private-network] [--block-loopback] [--profile NAME] [--no-recipes]
+                          [--attach] [--workspace NAME]  # WS-57 같은 프로필 serve 끼리 브라우저 공유
     agent-browser tui     [--mode]                     # Textual 대시보드
     agent-browser tools                                # 노출 툴 목록 확인
     agent-browser session login <프로파일> --url <주소>  # 사람이 직접 로그인
@@ -158,6 +159,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "이름 붙인 영속 프로필로 시작(로그인 유지, WS-32). 폴더 ~/.agent-browser/profiles/"
             "serve-NAME(권한 700). NAME 은 영문 소문자·숫자·하이픈 1~32자. 미지정 시 매번 빈 브라우저. "
             "맥에서 agent-browser login URL --profile NAME 으로 미리 로그인하면 이후 headless 에서도 유지."
+        ),
+    )
+
+    serve.add_argument(
+        "--attach",
+        action="store_true",
+        help=(
+            "같은 --profile 의 serve 끼리 브라우저 하나를 함께 쓰기(WS-57): 먼저 뜬 쪽이 브라우저를 띄우고, "
+            "나중 쪽은 잠금 오류 대신 그 serve 에 붙는다(프로필 폴더 안 0600 소켓, 같은 사용자만). "
+            "로그인은 공유, 탭·관찰은 연결마다 따로. 함께 쓸 serve 모두에 붙인다."
+        ),
+    )
+    serve.add_argument(
+        "--workspace",
+        default=None,
+        metavar="NAME",
+        help=(
+            "이 연결의 기본 작업 공간 이름(WS-57, 영문 소문자·숫자·하이픈 1~32자). 도구 인자 workspace 가 "
+            "있으면 그쪽이 우선. 미지정: 첫 serve 는 default, 붙은 serve 는 attach-N."
         ),
     )
 
@@ -356,11 +376,26 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 profile=args.profile,
                 **({} if getattr(args, "recipes", True) else {"recipes": False}),
                 **({} if getattr(args, "headless_retry", True) else {"headless_retry": False}),
+                **({"attach": True} if getattr(args, "attach", False) else {}),
+                **({"workspace": args.workspace} if getattr(args, "workspace", None) else {}),
             )
         )
     except KeyboardInterrupt:
         return 130
-    except (ProfileInUseError, ProfileError) as exc:
+    except ProfileInUseError as exc:
+        if getattr(args, "attach", False) and args.profile is not None:
+            # WS-57: 같은 프로필을 쓰는 첫 serve 에 붙는다(바이트 중계만). 붙을 수 없으면 원래 잠금 오류.
+            from browser.serve_profile import profile_dir
+            from interface.attach import AttachError, run_relay
+
+            try:
+                return run_relay(profile_dir(args.profile), getattr(args, "workspace", None))
+            except AttachError as attach_exc:
+                print(f"agent-browser serve: 오류: {exc} (붙기 실패: {attach_exc})", file=sys.stderr)
+                return 2
+        print(f"agent-browser serve: 오류: {exc}", file=sys.stderr)
+        return 2
+    except ProfileError as exc:
         # R1 NB-2: 폴더·잠금 준비 실패(심볼릭 링크·권한 등)도 traceback 대신 한 줄 + exit 2.
         # 잠금을 못 잡았으니 서버는 뜨지 않았다(fail-closed).
         print(f"agent-browser serve: 오류: {exc}", file=sys.stderr)
@@ -437,6 +472,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                if args.chrome_profile else DEFAULT_PROFILE_DIR)
             except ValueError as exc:
                 parser.exit(2, f"agent-browser serve: 오류: {exc}\n")
+        if getattr(args, "workspace", None) is not None:
+            from browser.workspace import WorkspaceNameError, validate_workspace
+
+            try:
+                validate_workspace(args.workspace)
+            except WorkspaceNameError as exc:
+                parser.exit(2, f"agent-browser serve: 오류: --workspace: {exc}\n")
+        if getattr(args, "attach", False) and args.profile is None:
+            parser.exit(2, "agent-browser serve: 오류: --attach 는 --profile NAME 과 함께 씁니다(같은 프로필끼리 붙는다).\n")
         if args.profile is not None:
             if args.browser == "user-chrome":
                 parser.exit(2, "agent-browser serve: 오류: --profile 과 --browser user-chrome 은 "

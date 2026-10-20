@@ -89,7 +89,8 @@ async def test_persistent_gets_egress_proxy_and_flags(fake_pw, tmp_path):
         await rt.close()
     call = fake_pw.chromium.persistent_calls[-1]
     assert call["proxy"]["server"].startswith("http://127.0.0.1:")
-    assert call["proxy"]["username"] and call["proxy"]["password"]
+    # WS-47 R3: 영속 프로필도 자격 없는 프록시(Playwright 가 자격을 사이트 401 에 보내지 않게)
+    assert set(call["proxy"]) == {"server"}, call["proxy"]
     assert "--disable-quic" in call["args"]
     assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in call["args"]
 

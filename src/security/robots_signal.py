@@ -9,12 +9,13 @@ sharing the Playwright command pipe or browser cookies/authentication.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Optional, TypedDict
+from typing import Callable, Literal, NotRequired, Optional, TypedDict
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from weakref import WeakKeyDictionary
 
@@ -23,7 +24,9 @@ from playwright.async_api import BrowserContext, Page
 
 from contracts import ActionResult
 from security.egress import EgressGuard
-from security.egress_proxy import EgressProxy, PROXY_USER
+from security.egress_proxy import EgressProxy
+
+logger = logging.getLogger(__name__)
 
 MAX_ROBOTS_BYTES = 500 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024
@@ -44,9 +47,33 @@ USER_FETCH_AGENTS = (
 ROBOTS_INSTRUCTIONS = (
     "결과의 data.robots 는 그 사이트의 자동 접근 의사 표시입니다 — "
     "계속할지는 사용자 뜻에 따라 판단하세요. "
+    "사용자에게 robots 를 설명할 때 note 를 그대로 쓰세요. "
+    "ai_agents_disallowed 는 이름으로 지정된 것만입니다. "
     "ai_agents_disallowed 는 주로 학습·수집 봇 목록이며 사용자가 요청한 읽기 자체를 막는 뜻은 "
-    "아닙니다(기존 목록에는 사용자 요청 봇도 포함) — disallowed·user_fetch_agents_allowed·content_signal 을 참고하세요."
+    "아닙니다(기존 목록에는 사용자 요청 봇도 포함) — disallowed·user_fetch_agents_allowed·content_signal 을 참고하세요. "
+    "data.robots.user_request 가 있으면 따르세요: 사용자가 직접 준 주소·콕 집은 한 페이지 읽기는 named_ai 금지여도 "
+    "진행하고 robots 신호를 한 줄로 알리되, 같은 사이트 여러 페이지 수집·반복 크롤은 하지 마세요. "
+    "all_bots(`User-agent: *` 금지)는 사용자 확인 뒤에만 진행하세요."
 )
+RobotsScope = Literal["all_bots", "named_ai", "all_bots_and_named_ai", "none"]
+_SCOPE_NOTES = {
+    "all_bots": "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다.",
+    "named_ai": "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다.",
+    "all_bots_and_named_ai": "이 경로는 robots.txt 가 모든 봇에 대해 금지하고, AI 봇 일부도 이름으로 따로 금지합니다.",
+}
+#: WS-54: data.robots.user_request 고정 문장 — 금지 신호(scope != none)가 있을 때만 싣는다(허용·none·미확인은 생략).
+#: 키는 scope 어휘. named_ai 만 '사용자가 직접 요청한 한 페이지 읽기는 진행', `*` 금지는 사용자 확인 뒤.
+_USER_REQUEST_NOTES = {
+    "named_ai": "사용자가 이 주소를 직접 주거나 이 페이지를 콕 집어 요청한 한 페이지 읽기는 사람이 브라우저로 여는 것과 "
+                "같은 성격이라 진행해도 됩니다 — 결과에 robots 신호(note)를 한 줄로 알리세요. "
+                "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
+    "all_bots": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 줬더라도 "
+                "robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. "
+                "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
+    "all_bots_and_named_ai": "이 경로는 robots.txt 가 `User-agent: *` 로 모든 봇을 막았습니다 — 사용자가 이 주소를 직접 "
+                             "줬더라도 robots 신호(note)를 알리고 사용자 확인을 받기 전에는 진행하지 마세요. "
+                             "같은 사이트의 여러 페이지를 스스로 돌며 모으는 수집·반복 크롤은 하지 마세요.",
+}
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
 _AGENT = re.compile(r"[A-Za-z_-]+|\*(?=\s|$)")
 _ESCAPE = re.compile(r"%([0-9a-f]{2})", re.IGNORECASE)
@@ -59,6 +86,9 @@ class RobotsSignal(TypedDict):
     robots_url: str
     user_fetch_agents_allowed: list[str]
     content_signal: str
+    scope: RobotsScope
+    note: NotRequired[str]
+    user_request: NotRequired[str]
 
 
 def _octets(value: str) -> str:
@@ -177,20 +207,32 @@ class RobotsRules:
 
     def signal(self, path: str, robots_url: str) -> Optional[RobotsSignal]:
         wildcard = self.match(path, "*")
-        blocked = [(agent, self.match(path, agent)) for agent in AI_USER_AGENTS]
+        # Signal named bans only; match() retains '*' fallback for general policy checks.
+        blocked = [(agent, self.match(path, agent)) for agent in AI_USER_AGENTS
+                   if agent.lower() in self.groups]
         blocked = [(agent, match) for agent, match in blocked if match.disallowed][:10]
         allowed = [agent for agent in USER_FETCH_AGENTS if agent.lower() in self.groups
                    and (match := self.match(path, agent)).rule.startswith("Allow:") and not match.disallowed]
         if not wildcard.disallowed and not blocked and not allowed and not self.content_signal:
             return None
-        return {
+        scope: RobotsScope
+        if wildcard.disallowed:
+            scope = "all_bots_and_named_ai" if blocked else "all_bots"
+        else:
+            scope = "named_ai" if blocked else "none"
+        signal: RobotsSignal = {
             "disallowed": wildcard.disallowed,
             "ai_agents_disallowed": [agent for agent, _ in blocked],
             "rule": wildcard.rule if wildcard.disallowed else blocked[0][1].rule if blocked else wildcard.rule,
             "robots_url": robots_url,
             "user_fetch_agents_allowed": allowed,
             "content_signal": self.content_signal,
+            "scope": scope,
         }
+        if scope != "none":
+            signal["note"] = _SCOPE_NOTES[scope]
+            signal["user_request"] = _USER_REQUEST_NOTES[scope]
+        return signal
 
 
 WAIT_TIMEOUT_S = 1.5
@@ -298,7 +340,8 @@ class RobotsSignals:
         rules: Optional[RobotsRules] = None
         try:
             rules = await asyncio.wait_for(self._fetch(context, origin, guard, proxy), timeout=BACKGROUND_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 - diagnostic failures never change the action result
+        except Exception as exc:  # noqa: BLE001 - diagnostic failures never change the action result
+            logger.debug("robots.txt 백그라운드 조회 실패 — 판정 불가로 캐시 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             pass
         finally:
             self._pending.pop(origin, None)
@@ -323,7 +366,7 @@ class RobotsSignals:
         try:
             if proxy is None or not proxy.running:
                 return None
-            transport_proxy = httpx.Proxy(proxy.server_url, auth=(PROXY_USER, proxy.token) if proxy.token else None)
+            transport_proxy = httpx.Proxy(proxy.server_url)
             async with httpx.AsyncClient(proxy=transport_proxy, trust_env=False, follow_redirects=False,
                                          timeout=BACKGROUND_TIMEOUT_S,
                                          headers={"User-Agent": user_agent, "Accept-Encoding": "identity"}) as client:
@@ -429,5 +472,6 @@ async def attach_robots_signal(service: RobotsSignals, result: ActionResult,
         signal = await service.signal(page.context, page.url, guard, proxy)
         if signal is not None:
             result.data["robots"] = signal
-    except Exception:  # noqa: BLE001 - a diagnostic must not fail navigation/observation
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail navigation/observation
+        logger.debug("robots 신호 부착 실패 — 신호 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
         pass

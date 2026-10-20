@@ -24,9 +24,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -101,6 +103,17 @@ SCROLL_NO_EFFECT_HINT = (
     "스크롤 위치가 바뀌지 않았습니다(이미 끝이거나 이 페이지는 창 스크롤이 없음). "
     "새 항목이 필요하면 '더 보기' 버튼 등을 observe_page 로 찾으세요."
 )
+#: WS-50: 마지막 탭을 닫으면 브라우저가 꺼지므로 빈 탭으로 바꿔 둔다 — 그 사실을 알리는 한 줄.
+LAST_TAB_REPLACED_HINT = (
+    "마지막 탭이라 빈 탭(about:blank)을 먼저 열고 닫았습니다(브라우저 유지) — 다음은 navigate 로 이동하세요."
+)
+#: WS-50: Playwright 가 닫힌 페이지·컨텍스트·브라우저에 대해 내는 오류 문구(TargetClosedError).
+_TARGET_CLOSED = "has been closed"
+
+
+def _is_target_closed(exc: BaseException) -> bool:
+    """닫힌 페이지·컨텍스트·브라우저로 인한 실패인가(TargetClosedError 또는 같은 문구)."""
+    return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 #: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
 #: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
@@ -183,6 +196,7 @@ class _NavWatch:
             status = response.status
             disposition = (response.headers or {}).get("content-disposition", "")
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 응답 객체를 읽지 못하면(닫힌 요청 등) 이 응답은 무시한다 — 이동 감시는 다른 신호·상한으로 끝난다.
             return
         if status in _NO_DOCUMENT_STATUS:
             self.aborted = f"status_{status}"
@@ -273,6 +287,7 @@ class _NavWatch:
             try:
                 self.page.remove_listener(name, fn)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 이미 닫힌 페이지에서 리스너 떼기 실패는 무해하다.
                 pass
         self._handlers = []
         self.active = False
@@ -854,7 +869,29 @@ class ActionDispatcher:
         self._top_attribution: Optional[Dict[str, Any]] = None
         #: WS-29 R1 NB-1: 사람 승인 증표로 실행하는 호출은 자가 치유(유사 이름 대체)를 끈다 —
         #: 승인한 그 요소가 아니면 실행하지 않는다. MCP 서버가 그 호출 동안만 켠다.
-        self.heal_disabled = False
+        #: WS-57 R1(R2): 호출 단위 상태 — 인스턴스 boolean 이면 같은 디스패처를 쓰는 동시 호출 하나가 끝나며
+        #: 다른 호출의 금지를 풀었다. 호출(태스크) 문맥마다 따로 두고, 켜고 끄기는 heal_disabled_scope().
+        self._heal_off: ContextVar[bool] = ContextVar(f"heal_disabled@{id(self):x}", default=False)
+
+    @property
+    def heal_disabled(self) -> bool:
+        """이 호출(태스크 문맥)에서 자가 치유가 꺼져 있는가."""
+        return self._heal_off.get()
+
+    @heal_disabled.setter
+    def heal_disabled(self, value: bool) -> None:
+        # 이 호출 문맥에만 적용된다(다른 동시 호출에는 보이지 않는다).
+        self._heal_off.set(bool(value))
+
+    @contextlib.contextmanager
+    def heal_disabled_scope(self) -> Any:
+        """이 블록(과 그 안에서 만든 하위 태스크) 동안 자가 치유를 끈다. 끝나면 들어오기 전 값으로 —
+        중첩(레시피 재생 안의 승인 호출)에서도 바깥 금지를 풀지 않는다."""
+        token = self._heal_off.set(True)
+        try:
+            yield
+        finally:
+            self._heal_off.reset(token)
 
     # -- 통계 (하네스가 성공률 측정에 사용) ----------------------------------
 
@@ -873,6 +910,22 @@ class ActionDispatcher:
         return self._healing_successes / self._healing_attempts
 
     # -- 계약 필수 필드 채우기 -----------------------------------------------
+
+    async def _capture_state(self, page: Any, handle: Optional[ElementHandle] = None) -> Any:
+        """capture_state + 탭 수는 이 호출의 작업 공간 몫만(WS-57 R1 R4) — 같은 컨텍스트를 쓰는 다른 작업 공간이
+        그 사이 연 탭을 이 액션의 '새 탭' 효과로 세지 않는다. 작업 공간을 모르는 코어·탭 수를 못 읽은 경우는 그대로."""
+        state = await (capture_state(page, handle) if handle is not None else capture_state(page))
+        if not state.page_count:
+            return state
+        counter = getattr(getattr(self.ctx, "core", None), "workspace_page_count", None)
+        if callable(counter):
+            try:
+                n = counter(list(page.context.pages))
+            except Exception:  # noqa: BLE001 — 가짜 페이지/컨텍스트 없음: 예전 값
+                n = None
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                state.page_count = n
+        return state
 
     def _set_active_page(self, page: Any, tab_id: str) -> None:
         """탭 전환·생성·종료로 활성 페이지를 바꾼다 (WS-26b, 검증 NB-4).
@@ -977,6 +1030,7 @@ class ActionDispatcher:
                 path.append(cur.url)
                 cur = cur.parent_frame
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 분리된 프레임이면 지금까지 모은 경로만 보고한다(진단 정보).
             pass
         path.reverse()
         return len(path), path
@@ -995,6 +1049,7 @@ class ActionDispatcher:
                 element = await child.frame_element()
                 hint = await element.evaluate(_FRAME_HINT_JS)
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 선택자 힌트는 보조 정보 — 못 읽으면 빈 힌트로 둔다.
                 pass
             out.append({"selector_hint": hint, "url": child.url})
         return out
@@ -1050,6 +1105,7 @@ class ActionDispatcher:
         try:
             return await self._locator_for(handle).evaluate(_TARGET_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 읽기 실패 = 대상 판정 불가(None) — 게이트가 판정 불가로 막는다(fail-closed).
             return None
 
     async def approval_target_check(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1158,6 +1214,7 @@ class ActionDispatcher:
                 try:
                     await cdp.send("Runtime.releaseObject", {"objectId": object_id})
                 except Exception:  # noqa: BLE001
+                    # 의도된 fail-safe(WS-48 점검): CDP 객체 해제 실패는 무해하다(세션·문서가 이미 바뀜).
                     pass
             if called.get("exceptionDetails"):
                 return {"unresolved": "좌표 대상 읽기 예외"}
@@ -1184,6 +1241,7 @@ class ActionDispatcher:
         try:
             info = await top.evaluate(_FOCUS_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
         if isinstance(info, dict) and info.get("opaque"):
             deeper = await self._focus_in_focused_frame(top)
@@ -1219,6 +1277,7 @@ class ActionDispatcher:
         try:
             info = await deepest.evaluate(_FOCUS_INFO_JS)
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
         if not isinstance(info, dict) or info.get("opaque"):
             return None
@@ -1252,6 +1311,7 @@ class ActionDispatcher:
         try:
             return self.ctx.page.url or ""
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): 닫힌·가짜 페이지는 빈 URL 로 본다.
             return ""
 
     def _result(
@@ -1295,6 +1355,9 @@ class ActionDispatcher:
         # WS-30: 계약 키(trigger_element_id 등)를 디스패처 키로 맞춘다.
         params = normalize_action_params(action, params)
         params, secret_resolved = self._resolve_secret(action, params)
+        if action is ActionType.TYPE_TEXT and secret_resolved is not True:
+            # WS-55 R2: 입력 중 민감 판정 표시(_CONCEAL_KEY)를 사본에만 붙인다 — 호출자 params(트레이스)엔 남기지 않는다.
+            params = dict(params)
         if secret_resolved is True and not self._secret_allowed_here():
             # 도메인에 묶인 자격증명(credentials.BoundSecrets)을 다른 사이트에서
             # 쓰려 함 — 값도 키 이름도 입력하지 않고 실패한다.
@@ -1367,6 +1430,7 @@ class ActionDispatcher:
         try:
             url = self.ctx.page.url
         except Exception:  # noqa: BLE001
+            # 의도된 fail-safe(WS-48 점검): URL 을 못 읽으면 비밀 치환을 허용하지 않는다(fail-closed).
             return False
         return bool(check(url))
 
@@ -1400,6 +1464,11 @@ class ActionDispatcher:
             looks_like_key = bool(SECRET_KEY_PATTERN.match(text))
             return params, (False if looks_like_key else None)
 
+        # WS-55 R1 B1: 해석한 실제 값은 도구가 비밀로 아는 값이다 — 페이지가 그 값을 주소(허용 목록 키 `?sortKey=` 포함)·
+        # 제목에 반사해도 응답에서 가려지게 입력 전에 레지스트리에 등록한다(값은 메모리에만, 예외 없음).
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([resolution.value])
         resolved_params = dict(params)
         resolved_params["text"] = resolution.value
         # 사후조건 검증이 값을 결과에 싣지 않도록 표시한다. 사본에만 붙으므로
@@ -1415,40 +1484,14 @@ class ActionDispatcher:
             return await self._execute_elementless(action, params)
 
         if action is ActionType.DOWNLOAD_FILE:
-            # R1 NB-5: 상대 경로는 서버 프로세스 cwd 기준이라 호출자가 모르는 곳에 조용히 썼다
-            # (검증: `reldir` → 저장소 루트, `sub/../../escape` → 정규화 없이 저장). 누르기 전에
-            # 거부하고, 절대 경로는 정규화(`..`·심볼릭 링크 해소)한 경로에 저장한다.
-            save_dir = str(params.get("save_dir") or "")
-            if not os.path.isabs(save_dir):
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,  # 발송 전
-                    error_code=ErrorCode.DOWNLOAD_FAILED,
-                    error_message=(
-                        f"save_dir 는 절대 경로여야 합니다: {save_dir!r} "
-                        "(상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없습니다)."
-                    ),
-                )
-            params = dict(params, save_dir=os.path.realpath(save_dir))
+            checked = self._download_params(action, params)
+            if isinstance(checked, ActionResult):
+                return checked
+            params = checked
 
         element_id = params.get("element_id")
-        if not element_id and action is ActionType.CLICK and params.get("x") is not None:
-            return await self._click_coordinates(action, params)
-        if not element_id and action is ActionType.CLICK and params.get("selector"):
-            # WS-30 추가 A: 계약이 허용하는 selector 클릭. 정확히 1개에 맞을 때만 실행한다.
-            handle_or_error = await self._handle_for_selector(action, params["selector"])
-            if isinstance(handle_or_error, ActionResult):
-                return handle_or_error
-            return await self._run_element_action(action, handle_or_error, params, False)
         if not element_id:
-            return self._result(
-                success=False,
-                action=action,
-                retry_safe=True,  # 발송 전이므로 안전
-                error_code=ErrorCode.ELEMENT_NOT_FOUND,
-                error_message="element_id가 필요합니다.",
-            )
+            return await self._dispatch_without_element_id(action, params)
 
         handle = self.ctx.engine.get_handle(element_id)
         if handle is None:
@@ -1461,6 +1504,56 @@ class ActionDispatcher:
                 reobserve_required=True,
             )
 
+        epoch_error = self._claimed_epoch_error(action, params)
+        if epoch_error is not None:
+            return epoch_error
+        resolved = await self._fresh_or_healed_handle(action, handle, params)
+        if isinstance(resolved, ActionResult):
+            return resolved
+        handle, healed_flag = resolved
+        return await self._run_element_action(action, handle, params, healed_flag)
+
+    def _download_params(self, action: ActionType, params: Dict[str, Any]) -> Any:
+        """download_file 의 save_dir 검사(WS-48 분해). 반환: 정규화한 params 또는 실패 결과."""
+        # R1 NB-5: 상대 경로는 서버 프로세스 cwd 기준이라 호출자가 모르는 곳에 조용히 썼다
+        # (검증: `reldir` → 저장소 루트, `sub/../../escape` → 정규화 없이 저장). 누르기 전에
+        # 거부하고, 절대 경로는 정규화(`..`·심볼릭 링크 해소)한 경로에 저장한다.
+        save_dir = str(params.get("save_dir") or "")
+        if not os.path.isabs(save_dir):
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,  # 발송 전
+                error_code=ErrorCode.DOWNLOAD_FAILED,
+                error_message=(
+                    f"save_dir 는 절대 경로여야 합니다: {save_dir!r} "
+                    "(상대 경로는 서버 작업 폴더 기준이 되어 저장 위치를 알 수 없습니다)."
+                ),
+            )
+        return dict(params, save_dir=os.path.realpath(save_dir))
+
+    async def _dispatch_without_element_id(
+        self, action: ActionType, params: Dict[str, Any]
+    ) -> ActionResult:
+        """element_id 없는 요소 액션(WS-48 분해): 좌표 클릭·selector 클릭, 그 밖은 element_id 필요."""
+        if action is ActionType.CLICK and params.get("x") is not None:
+            return await self._click_coordinates(action, params)
+        if action is ActionType.CLICK and params.get("selector"):
+            # WS-30 추가 A: 계약이 허용하는 selector 클릭. 정확히 1개에 맞을 때만 실행한다.
+            handle_or_error = await self._handle_for_selector(action, params["selector"])
+            if isinstance(handle_or_error, ActionResult):
+                return handle_or_error
+            return await self._run_element_action(action, handle_or_error, params, False)
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,  # 발송 전이므로 안전
+            error_code=ErrorCode.ELEMENT_NOT_FOUND,
+            error_message="element_id가 필요합니다.",
+        )
+
+    def _claimed_epoch_error(self, action: ActionType, params: Dict[str, Any]) -> Optional[ActionResult]:
+        """[0] 호출자가 명시한 epoch 검증(WS-48 분해). 어긋나면 실패 결과, 맞거나 없으면 None."""
         # --- [0] 호출자가 명시한 epoch 검증 --------------------------------
         # 계약상 필수 입력인데 검증하지 않으면, 클라이언트가 임의의 값을
         # 보내도 통과한다. element_id 무효화만으로 보호되므로 실제 사고로는
@@ -1495,7 +1588,12 @@ class ActionDispatcher:
                     ),
                     reobserve_required=True,
                 )
+        return None
 
+    async def _fresh_or_healed_handle(
+        self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]
+    ) -> Any:
+        """[1] Staleness 검증과 자가 치유(WS-48 분해). 반환: (핸들, 치유 여부) 또는 실패 결과."""
         # --- [1] dispatch 이전 Staleness 검증 -------------------------------
         staleness = await verify_staleness(
             self.ctx.page,
@@ -1576,8 +1674,7 @@ class ActionDispatcher:
                 )
             handle = new_handle
             healed_flag = True
-
-        return await self._run_element_action(action, handle, params, healed_flag)
+        return handle, healed_flag
 
     async def _handle_for_selector(self, action: ActionType, selector: str) -> Any:
         """selector 로 대상 요소 핸들을 만든다. 0개·여러 개면 실패 결과를 돌려준다."""
@@ -1633,8 +1730,9 @@ class ActionDispatcher:
         if root is None:
             return None
         try:
-            state = await capture_state(root)
-        except Exception:  # noqa: BLE001 — 문서 교체 중 등
+            state = await self._capture_state(root)
+        except Exception as exc:  # noqa: BLE001 — 문서 교체 중 등
+            logger.debug("최상위 상태 캡처 실패 — 최상위 효과 판정 없이 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return None
         if mark_start:
             self._top_start = None
@@ -1646,6 +1744,7 @@ class ActionDispatcher:
                     await root.evaluate(_TOP_RECORDER_ARM_JS)
                 self._top_start = started
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): 기록기 장착 실패 = 기준선 없이 사후 창만으로 판정한다(위 주석과 같은 경로).
                 pass
         return state
 
@@ -1713,7 +1812,8 @@ class ActionDispatcher:
                 # 시간) 그 안에 한 번도 안 바뀐 노드는 주기 ≤ 창인 자발 변화가 아니다 — 대기 없음.
                 await root.wait_for_timeout(TOP_SPONTANEOUS_WINDOW_MS)
                 read = await root.evaluate(_TOP_RECORDER_READ_JS, args)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("최상위 변화 귀속 판정 실패 — 귀속 안 됨(False)으로 진행 (%s)", type(exc).__name__)  # WS-48: 흐름 불변, 진단용
             return False
         self._top_attribution = read if isinstance(read, dict) else None
         if not isinstance(read, dict) or read.get("overflow"):
@@ -1763,8 +1863,53 @@ class ActionDispatcher:
         healed_flag: bool,
     ) -> ActionResult:
         """[2] 이벤트 발송 → [3] 사후조건 검증."""
+        sent = await self._send_element_event(action, handle, params, healed_flag)
+        if isinstance(sent, ActionResult):
+            return sent
+        before, root_before, popups, _on_popup = sent
+        observed = await self._observe_element_effect(
+            action, handle, healed_flag, before, root_before, popups, _on_popup
+        )
+        if isinstance(observed, ActionResult):
+            return observed
+        after, root_after = observed
+
+        # 다운로드는 파일 저장 자체가 효과다 — 페이지는 바뀌지 않는다.
+        downloaded = params.pop("_downloaded_path", None)
+        if downloaded:
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                healed=healed_flag,
+                downloaded_path=downloaded,
+                data={
+                    "signals": [f"file_saved: {downloaded}"],
+                    "element_id": handle.element_id,
+                },
+            )
+
+        post = await self._element_post_condition(
+            action, handle, params, before, after, root_before, root_after
+        )
+
+        if post.satisfied:
+            return self._result(
+                success=True,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                healed=healed_flag,
+                data={"signals": post.signals, "element_id": handle.element_id},
+            )
+
+        return await self._retry_unsatisfied(action, handle, params, healed_flag, before, post)
+
+    async def _send_element_event(
+        self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], healed_flag: bool
+    ) -> Any:
+        """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
-        before = await capture_state(self.ctx.page, handle)
+        before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
         # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
@@ -1804,10 +1949,22 @@ class ActionDispatcher:
             )
         if watch is not None:
             self._nav_info = await watch.settle()
+        return before, root_before, popups, _on_popup
 
+    async def _observe_element_effect(
+        self,
+        action: ActionType,
+        handle: ElementHandle,
+        healed_flag: bool,
+        before: Any,
+        root_before: Any,
+        popups: List[Any],
+        _on_popup: Any,
+    ) -> Any:
+        """[3] 사후 상태 읽기·늦은 효과 유예·팝업 반영(WS-48 분해). 반환: (후 상태, 최상위 후 상태) 또는 결과."""
         # --- [3] 사후조건 검증 ------------------------------------------------
         try:
-            after = await capture_state(self.ctx.page, handle)
+            after = await self._capture_state(self.ctx.page, handle)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise
@@ -1834,7 +1991,7 @@ class ActionDispatcher:
             ):
                 try:
                     await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     if root_before is not None:
                         root_after = await self._capture_root()
                 except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
@@ -1846,22 +2003,19 @@ class ActionDispatcher:
             # 팝업 이벤트가 곧 증거다. 스냅샷 탭 수가 아직 안 늘었어도 반영한다.
             before.page_count = before.page_count or 1
             after.page_count = max(after.page_count, before.page_count + len(popups))
+        return after, root_after
 
-        # 다운로드는 파일 저장 자체가 효과다 — 페이지는 바뀌지 않는다.
-        downloaded = params.pop("_downloaded_path", None)
-        if downloaded:
-            return self._result(
-                success=True,
-                action=action,
-                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
-                healed=healed_flag,
-                downloaded_path=downloaded,
-                data={
-                    "signals": [f"file_saved: {downloaded}"],
-                    "element_id": handle.element_id,
-                },
-            )
-
+    async def _element_post_condition(
+        self,
+        action: ActionType,
+        handle: ElementHandle,
+        params: Dict[str, Any],
+        before: Any,
+        after: Any,
+        root_before: Any,
+        root_after: Any,
+    ) -> PostConditionResult:
+        """[3] 사후조건 판정 — 대상 문서·최상위 귀속·바깥 효과(WS-48 분해)."""
         post = verify_post_condition(
             before,
             after,
@@ -1884,7 +2038,7 @@ class ActionDispatcher:
             if not top_weak_ok and self._top_attribution is not None:
                 # 관찰 창이 유예 대기를 겸했다 — 대상 문서의 늦은 효과를 다시 본다.
                 try:
-                    after = await capture_state(self.ctx.page, handle)
+                    after = await self._capture_state(self.ctx.page, handle)
                     post = verify_post_condition(
                         before,
                         after,
@@ -1897,16 +2051,18 @@ class ActionDispatcher:
         post = self._with_outside_effects(
             action, params, post, root_before, root_after, top_weak_ok
         )
+        return post
 
-        if post.satisfied:
-            return self._result(
-                success=True,
-                action=action,
-                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
-                healed=healed_flag,
-                data={"signals": post.signals, "element_id": handle.element_id},
-            )
-
+    async def _retry_unsatisfied(
+        self,
+        action: ActionType,
+        handle: ElementHandle,
+        params: Dict[str, Any],
+        healed_flag: bool,
+        before: Any,
+        post: PostConditionResult,
+    ) -> ActionResult:
+        """사후조건 미충족(Silent Failure): 부작용 액션은 중단, 멱등 액션만 1회 재시도(WS-48 분해)."""
         # 사후조건 미충족 (Silent Failure)
         post_retry_safe = is_retry_safe(action, FailurePhase.POST_DISPATCH)
         if not post_retry_safe:
@@ -1938,7 +2094,7 @@ class ActionDispatcher:
                 healed=healed_flag,
             )
 
-        retry_after = await capture_state(self.ctx.page, handle)
+        retry_after = await self._capture_state(self.ctx.page, handle)
         retry_post = verify_post_condition(
             before,
             retry_after,
@@ -2061,6 +2217,24 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _mark_sensitive_input(
+        self, handle: ElementHandle, params: Dict[str, Any], text: str
+    ) -> None:
+        """입력 액션의 한 시점에서 민감 칸을 판정하고, 민감이면 친 값을 등록한다(WS-55 R2).
+
+        이미 민감으로 판정됐거나(sticky) SecretStore 해석 값(_CONCEAL_KEY)이면 다시 보지 않는다. 민감이면
+        params 에 _CONCEAL_KEY 를 붙여 액션 끝까지(사후조건·재시도 신호) 값을 싣지 않게 한다 — params 는
+        dispatch() 가 만든 사본이라 호출자 트레이스에는 나타나지 않는다.
+        """
+        if params.get(_CONCEAL_KEY):
+            return
+        if not await self.is_sensitive_field(handle):
+            return
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([text])
+        params[_CONCEAL_KEY] = True
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 
@@ -2085,6 +2259,7 @@ class ActionDispatcher:
                     loc = page.get_by_text(handle.name, exact=True)
                 return loc.first
             except Exception:  # noqa: BLE001
+                # 의도된 fail-safe(WS-48 점검): role/text 로케이터를 못 만들면 아래 CSS 경로로 내려간다.
                 pass
 
         return page.locator(selector).first
@@ -2099,10 +2274,20 @@ class ActionDispatcher:
             await target.click(button=params.get("button", "left"), timeout=5000)
 
         elif action is ActionType.TYPE_TEXT:
+            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
+            text = params.get("text", "")
+            # WS-55 R2(검증 B1-R1): 민감 칸 판정은 이 액션의 **첫 부작용 전**(clear·focus·첫 input 이벤트 이전, 대상
+            # 해석 직후)에 한다. clear 도 input 이벤트를 일으키므로 그 사이 페이지가 type 을 바꾸거나 노드를 교체하면
+            # 최초의 password 정보가 사라진다. 한 번이라도 민감이면 액션 끝까지 유지(sticky)하고, 보수적으로
+            # clear 후·입력 후에도 다시 보아 새로 민감해진 칸도 등록한다(OR). SecretStore 해석 값은 _resolve_secret
+            # 에서 이미 등록했다. 일반 칸의 값(검색어)은 에이전트가 자기 호출 인자로 이미 아는 값이라 등록하지 않는다
+            # (과잉 가림 방지, 결정 A).
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
-            # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
-            await target.type(params.get("text", ""), timeout=5000)
+                await self._mark_sensitive_input(handle, params, text)
+            await target.type(text, timeout=5000)
+            await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
                 await target.press("Enter", timeout=5000)
 
@@ -2134,6 +2319,10 @@ class ActionDispatcher:
             ) as dl:
                 await target.click(timeout=5000)
             download = await dl.value
+            # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
+            from security.secret_registry import register_url
+
+            register_url(getattr(download, "url", ""))
             # save_dir 는 _dispatch_inner 에서 절대 경로로 정규화됐다(R1 NB-5).
             save_path = os.path.join(params["save_dir"], download.suggested_filename)
             await download.save_as(save_path)
@@ -2149,54 +2338,13 @@ class ActionDispatcher:
         page = self.ctx.page
 
         if action is ActionType.OBSERVE_PAGE:
-            observed = await self.ctx.engine.observe_page(
-                prune_top_n=params.get("prune_top_n", 20),
-                force_full_tree=params.get("force_full_tree", False),
-                page=page,
-                cdp=self.ctx.cdp,
-            )
-            return self._result(
-                success=True,
-                action=action,
-                retry_safe=True,
-                data={"observation": observed.model_dump(mode="json")},
-            )
+            return await self._elementless_observe(action, params, page)
 
         if action is ActionType.NAVIGATE:
-            try:
-                await page.goto(
-                    params["url"],
-                    wait_until=params.get("wait_until", "domcontentloaded"),
-                    timeout=params.get("timeout_ms", 30000),
-                )
-            except Exception as exc:  # noqa: BLE001
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,
-                    error_code=(ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
-                                else ErrorCode.NAVIGATE_TIMEOUT),
-                    error_message=str(exc),
-                )
-            self.ctx.engine.bump_epoch("navigate")
-            return self._result(
-                success=True, action=action, retry_safe=True, data={"url": page.url}
-            )
+            return await self._elementless_navigate(action, params, page)
 
         if action is ActionType.GO_BACK:
-            response = await page.go_back(timeout=params.get("timeout_ms", 10000))
-            if response is None:
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,
-                    error_code=ErrorCode.NO_HISTORY,
-                    error_message="이전 히스토리가 없습니다.",
-                )
-            self.ctx.engine.bump_epoch("go_back")
-            return self._result(
-                success=True, action=action, retry_safe=True, data={"url": page.url}
-            )
+            return await self._elementless_go_back(action, params, page)
 
         if action is ActionType.RELOAD:
             await page.reload(timeout=params.get("timeout_ms", 30000))
@@ -2206,71 +2354,10 @@ class ActionDispatcher:
             )
 
         if action is ActionType.SCROLL:
-            distance = params.get("distance", 500)
-            delta = distance if params.get("direction", "down") == "down" else -distance
-            try:
-                changed, moved = await self._scroll_once(page, delta)
-            except Exception as exc:  # noqa: BLE001
-                # WS-24 F1: 검색 제출 직후처럼 스크롤 중 문서가 바뀌면 Playwright 가
-                # "Execution context was destroyed" 를 던진다(로컬 재현). 이 경우만
-                # 새 문서 로드를 짧게 기다려 1회 재시도하고, 재관찰을 요구한다.
-                # 다른 예외는 삼키지 않는다(dispatch 의 PAGE_CRASHED 로 간다).
-                if _CONTEXT_DESTROYED not in str(exc):
-                    raise
-                try:
-                    await page.wait_for_load_state(
-                        "domcontentloaded", timeout=_SCROLL_RELOAD_WAIT_MS
-                    )
-                except Exception:  # noqa: BLE001 - 대기 실패는 재시도 결과로 판정
-                    pass
-                _, moved = await self._scroll_once(page, delta)
-                changed = True
-            data: Dict[str, Any] = {"scrolled": delta}
-            if moved is not None:
-                data["scrolled_px"] = moved
-            if moved == 0:
-                # WS-30b: 정보만 추가 — 성공 판정·reobserve_required 규칙은 그대로다.
-                data["no_effect"] = True
-                data["hint"] = SCROLL_NO_EFFECT_HINT
-            return self._result(
-                success=True,
-                action=action,
-                retry_safe=True,
-                data=data,
-                # 동적 노드가 로드되었거나 문서가 바뀌었으면 재관찰이 필요하다.
-                reobserve_required=changed,
-            )
+            return await self._elementless_scroll(action, params, page)
 
         if action is ActionType.PRESS_KEY:
-            raw_key = str(params.get("key", ""))
-            key = _normalize_key(raw_key)
-            # 키보드·문서 이동은 최상위 Page 의 것이다 — 프레임 안이어도 포커스된 요소가
-            # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
-            top = self._top_page()
-            frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
-            watch = None
-            if self.ctx.nav_settle:
-                # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
-                watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
-            try:
-                await top.keyboard.press(key)
-            except Exception as exc:  # noqa: BLE001
-                if watch is not None:
-                    watch.close()
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=False,  # 키 입력은 발송 후 재시도 위험
-                    error_code=ErrorCode.KEY_PRESS_FAILED,
-                    error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
-                )
-            # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
-            # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
-            if watch is not None:
-                self._nav_info = await watch.settle()
-            return self._result(
-                success=True, action=action, retry_safe=False, data={"key": key}
-            )
+            return await self._elementless_press_key(action, params)
 
         if action is ActionType.WAIT_FOR:
             return await self._wait_for(params)
@@ -2279,56 +2366,7 @@ class ActionDispatcher:
             return await self._extract(params)
 
         if action is ActionType.TAKE_SCREENSHOT:
-            if params.get("annotate_som"):
-                if not self.ctx.som_enabled:
-                    # PRD §8-2: 게이트 OFF면 레거시 클라이언트 보호를 위해
-                    # 미구현 코드를 그대로 반환한다(actions_test/mcp_smoke 의존).
-                    return self._result(
-                        success=False,
-                        action=action,
-                        retry_safe=True,
-                        error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
-                        error_message="SoM 주석은 som_enabled 게이트가 꺼져 있어 비활성입니다.",
-                    )
-                if self.ctx.root_page is not None:
-                    # SoM 좌표는 최상위 뷰포트 기준인데 프레임 안 후보는 프레임 기준이다.
-                    return self._result(
-                        success=False,
-                        action=action,
-                        retry_safe=True,
-                        error_code=ErrorCode.SCREENSHOT_FAILED,
-                        error_message=(
-                            "프레임 안에서는 SoM 주석 스크린샷을 지원하지 않습니다. "
-                            "switch_frame(to_main=true) 로 최상위 문서로 돌아간 뒤 시도하십시오."
-                        ),
-                    )
-                return await self._screenshot_som(action)
-            # WS-30: 프레임에는 screenshot 이 없다('Frame' object has no attribute ...) —
-            # 프레임 안이면 최상위 페이지를 찍고 프레임 영역을 data 로 알린다.
-            shot_page = self._top_page()
-            extra: Dict[str, Any] = {}
-            try:
-                shot = await shot_page.screenshot(full_page=params.get("full_page", False))
-                if self.ctx.root_page is not None:
-                    extra["captured"] = "root_page"
-                    extra["frame_url"] = page.url
-                    try:
-                        box = await (await page.frame_element()).bounding_box()
-                    except Exception:  # noqa: BLE001
-                        box = None
-                    extra["frame_bbox"] = box
-            except Exception as exc:  # noqa: BLE001
-                return self._result(
-                    success=False,
-                    action=action,
-                    retry_safe=True,
-                    error_code=ErrorCode.SCREENSHOT_FAILED,
-                    error_message=f"스크린샷 실패: {type(exc).__name__}",
-                )
-            return self._result(
-                success=True, action=action, retry_safe=True,
-                data={"bytes": len(shot), **extra},
-            )
+            return await self._elementless_screenshot(action, params, page)
 
         if action is ActionType.SWITCH_FRAME:
             return await self._switch_frame(params)
@@ -2345,6 +2383,209 @@ class ActionDispatcher:
 
         if action is ActionType.TAB_CONTROL:
             return await self._dispatch_tab_control(action, params)
+
+    async def _elementless_observe(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
+        """observe_page(WS-48 분해)."""
+        observed = await self.ctx.engine.observe_page(
+            prune_top_n=params.get("prune_top_n", 20),
+            force_full_tree=params.get("force_full_tree", False),
+            page=page,
+            cdp=self.ctx.cdp,
+        )
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=True,
+            data={"observation": observed.model_dump(mode="json")},
+        )
+
+    async def _elementless_navigate(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
+        """navigate(WS-48 분해)."""
+        refused = self._refuse_redacted_url(action, params.get("url"))
+        if refused is not None:
+            return refused
+        try:
+            await page.goto(
+                params["url"],
+                wait_until=params.get("wait_until", "domcontentloaded"),
+                timeout=params.get("timeout_ms", 30000),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=(ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
+                            # WS-50: 닫힌 페이지·컨텍스트·브라우저는 이동 시간 초과가 아니다.
+                            else ErrorCode.PAGE_CRASHED if _is_target_closed(exc)
+                            else ErrorCode.NAVIGATE_TIMEOUT),
+                error_message=str(exc),
+            )
+        self.ctx.engine.bump_epoch("navigate")
+        return self._result(
+            success=True, action=action, retry_safe=True, data={"url": page.url}
+        )
+
+    def _refuse_redacted_url(self, action: ActionType, url: Any) -> Optional[ActionResult]:
+        """WS-51: 결과에서 가린 주소(`[REDACTED]` 표지)를 그대로 넘기면 이동하지 않고 E_INVALID_URL.
+
+        표지 문자열로 사이트에 요청이 나가면 토큰이 필요한 페이지가 깨지고(대기열 이탈 등) 의미 없는 요청이
+        남는다. 원문은 서버 안에만 있으니 reload·go_back·탭 전환이나 링크 재추출로 가게 안내한다.
+        """
+        from security.public_url import REDACTED_NAVIGATE_HINT, has_redaction_mark
+
+        if not has_redaction_mark(url):
+            # WS-51 R3 등록 지점 (b): 이동 대상(navigate·tab create)의 비밀 값을 goto 전에 레지스트리에 — 이동이
+            # 실패해 오류 문구(`Page.goto: … navigating to "URL"`)에 실려도 그 값은 가려진다. 예외를 내지 않는다.
+            from security.secret_registry import register_url
+
+            register_url(url)
+            return None
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.INVALID_URL,
+            error_message=REDACTED_NAVIGATE_HINT,
+        )
+
+    async def _elementless_go_back(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
+        """go_back(WS-48 분해)."""
+        response = await page.go_back(timeout=params.get("timeout_ms", 10000))
+        if response is None:
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.NO_HISTORY,
+                error_message="이전 히스토리가 없습니다.",
+            )
+        self.ctx.engine.bump_epoch("go_back")
+        return self._result(
+            success=True, action=action, retry_safe=True, data={"url": page.url}
+        )
+
+    async def _elementless_scroll(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
+        """scroll(WS-48 분해)."""
+        distance = params.get("distance", 500)
+        delta = distance if params.get("direction", "down") == "down" else -distance
+        try:
+            changed, moved = await self._scroll_once(page, delta)
+        except Exception as exc:  # noqa: BLE001
+            # WS-24 F1: 검색 제출 직후처럼 스크롤 중 문서가 바뀌면 Playwright 가
+            # "Execution context was destroyed" 를 던진다(로컬 재현). 이 경우만
+            # 새 문서 로드를 짧게 기다려 1회 재시도하고, 재관찰을 요구한다.
+            # 다른 예외는 삼키지 않는다(dispatch 의 PAGE_CRASHED 로 간다).
+            if _CONTEXT_DESTROYED not in str(exc):
+                raise
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=_SCROLL_RELOAD_WAIT_MS
+                )
+            except Exception:  # noqa: BLE001 - 대기 실패는 재시도 결과로 판정
+                pass
+            _, moved = await self._scroll_once(page, delta)
+            changed = True
+        data: Dict[str, Any] = {"scrolled": delta}
+        if moved is not None:
+            data["scrolled_px"] = moved
+        if moved == 0:
+            # WS-30b: 정보만 추가 — 성공 판정·reobserve_required 규칙은 그대로다.
+            data["no_effect"] = True
+            data["hint"] = SCROLL_NO_EFFECT_HINT
+        return self._result(
+            success=True,
+            action=action,
+            retry_safe=True,
+            data=data,
+            # 동적 노드가 로드되었거나 문서가 바뀌었으면 재관찰이 필요하다.
+            reobserve_required=changed,
+        )
+
+    async def _elementless_press_key(self, action: ActionType, params: Dict[str, Any]) -> ActionResult:
+        """press_key(WS-48 분해)."""
+        raw_key = str(params.get("key", ""))
+        key = _normalize_key(raw_key)
+        # 키보드·문서 이동은 최상위 Page 의 것이다 — 프레임 안이어도 포커스된 요소가
+        # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
+        top = self._top_page()
+        frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
+        watch = None
+        if self.ctx.nav_settle:
+            # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
+            watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
+        try:
+            await top.keyboard.press(key)
+        except Exception as exc:  # noqa: BLE001
+            if watch is not None:
+                watch.close()
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=False,  # 키 입력은 발송 후 재시도 위험
+                error_code=ErrorCode.KEY_PRESS_FAILED,
+                error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
+            )
+        # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
+        # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
+        if watch is not None:
+            self._nav_info = await watch.settle()
+        return self._result(
+            success=True, action=action, retry_safe=False, data={"key": key}
+        )
+
+    async def _elementless_screenshot(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
+        """take_screenshot(WS-48 분해)."""
+        if params.get("annotate_som"):
+            if not self.ctx.som_enabled:
+                # PRD §8-2: 게이트 OFF면 레거시 클라이언트 보호를 위해
+                # 미구현 코드를 그대로 반환한다(actions_test/mcp_smoke 의존).
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,
+                    error_code=ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                    error_message="SoM 주석은 som_enabled 게이트가 꺼져 있어 비활성입니다.",
+                )
+            if self.ctx.root_page is not None:
+                # SoM 좌표는 최상위 뷰포트 기준인데 프레임 안 후보는 프레임 기준이다.
+                return self._result(
+                    success=False,
+                    action=action,
+                    retry_safe=True,
+                    error_code=ErrorCode.SCREENSHOT_FAILED,
+                    error_message=(
+                        "프레임 안에서는 SoM 주석 스크린샷을 지원하지 않습니다. "
+                        "switch_frame(to_main=true) 로 최상위 문서로 돌아간 뒤 시도하십시오."
+                    ),
+                )
+            return await self._screenshot_som(action)
+        # WS-30: 프레임에는 screenshot 이 없다('Frame' object has no attribute ...) —
+        # 프레임 안이면 최상위 페이지를 찍고 프레임 영역을 data 로 알린다.
+        shot_page = self._top_page()
+        extra: Dict[str, Any] = {}
+        try:
+            shot = await shot_page.screenshot(full_page=params.get("full_page", False))
+            if self.ctx.root_page is not None:
+                extra["captured"] = "root_page"
+                extra["frame_url"] = page.url
+                try:
+                    box = await (await page.frame_element()).bounding_box()
+                except Exception:  # noqa: BLE001
+                    box = None
+                extra["frame_bbox"] = box
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.SCREENSHOT_FAILED,
+                error_message=f"스크린샷 실패: {type(exc).__name__}",
+            )
+        return self._result(
+            success=True, action=action, retry_safe=True,
+            data={"bytes": len(shot), **extra},
+        )
 
     async def _click_coordinates(
         self, action: ActionType, params: Dict[str, Any]
@@ -2389,7 +2630,7 @@ class ActionDispatcher:
                 error_message=f"좌표 ({x}, {y})가 뷰포트 {vw}x{vh} 밖입니다.",
             )
 
-        before = await capture_state(page)
+        before = await self._capture_state(page)
         watch = _NavWatch(page) if self.ctx.nav_settle else None
         try:
             await page.mouse.click(x, y, button=params.get("button", "left"))
@@ -2407,7 +2648,7 @@ class ActionDispatcher:
         if watch is not None:
             self._nav_info = await watch.settle()
         try:
-            after = await capture_state(page)
+            after = await self._capture_state(page)
         except Exception:  # noqa: BLE001
             if not self._nav_info:
                 raise
@@ -2469,6 +2710,9 @@ class ActionDispatcher:
 
             if command in ("create", "new"):
                 # 계약(TabControlInput)은 "create", 내부 호출 호환용으로 "new" 도 받는다.
+                refused = self._refuse_redacted_url(action, params.get("url"))
+                if refused is not None:
+                    return refused
                 tab = await core.new_tab(
                     core.active_profile, url=params.get("url")
                 )
@@ -2516,18 +2760,31 @@ class ActionDispatcher:
                         error_code=ErrorCode.TAB_NOT_FOUND,
                         error_message=f"탭을 찾을 수 없습니다: {tab_id}",
                     )
+                closing = core.get_tab(tab_id)
+                replaced = False
+                if len(core.tabs()) == 1:
+                    # WS-50: 마지막 탭을 닫으면 브라우저(영속 컨텍스트)가 함께 꺼진다 — 빈 탭을 먼저 만들어
+                    # 활성으로 두고 닫는다(거부하지 않음: 습관적으로 닫는 에이전트가 실패 루프에 빠지지 않게).
+                    blank = await core.new_tab(closing.profile_name)
+                    core.set_active_tab(blank.tab_id)
+                    self._set_active_page(blank.page, blank.tab_id)
+                    replaced = True
                 await core.close_tab(tab_id)
                 remaining = core.tabs()
                 if remaining:
                     core.set_active_tab(remaining[0].tab_id)
                     self._set_active_page(remaining[0].page, remaining[0].tab_id)
                 self.ctx.engine.bump_epoch("tab_close")
+                data: Dict[str, Any] = {"closed": tab_id, "remaining": len(remaining)}
+                if replaced:
+                    data["replaced_with_blank"] = True
+                    data["hint"] = LAST_TAB_REPLACED_HINT
                 return self._result(
                     success=True,
                     action=action,
                     retry_safe=False,
                     reobserve_required=True,
-                    data={"closed": tab_id, "remaining": len(remaining)},
+                    data=data,
                 )
         except Exception as exc:  # noqa: BLE001
             return self._result(

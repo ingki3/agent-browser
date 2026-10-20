@@ -19,6 +19,11 @@ GEEK_ROBOTS = ("Content-Signal: ai-train=no, search=yes, ai-input=yes\n"
                "User-agent: *\nAllow: /\nUser-agent: GPTBot\nUser-agent: ClaudeBot\nDisallow: /\n" +
                "".join(f"User-agent: {agent}\nAllow: /\n" for agent in USER_FETCH)).encode()
 
+SUCCESS_NOTE = "이 사이트가 헤드리스 브라우저 이름을 막아, 같은 버전 일반 Chrome 이름으로 다시 열었습니다(위장 범위: 이름·Client Hints 만)"
+REMEMBERED_NOTE = "이 사이트는 앞서 헤드리스 이름을 막아, 처음부터 일반 Chrome 이름으로 열었습니다"
+FAILED_NOTE = "일반 Chrome 이름으로도 막혔습니다 — 사이트가 자동화 접근을 막고 있습니다"
+IDENTITY_GUIDANCE = "data.identity 가 있으면 사이트가 헤드리스 이름을 막아 도구가 이름만 바꿔 열었다는 뜻 — 사용자에게 설명할 때 note 를 그대로 쓸 것(일시적 차단 아님)"
+
 
 @dataclass
 class Site:
@@ -32,6 +37,7 @@ class Site:
     retry_after: str = ""
     block_headers: dict[str, str] = field(default_factory=dict)
     success_body: bytes = b"<!doctype html><title>Read</title><a href='/next'>Next</a>"
+    content_type: str = "text/html"
     max_documents: int = 8  # terminate deliberately sabotaged recursive retries
     requests: list[tuple[str, dict[str, str]]] = field(default_factory=list)
 
@@ -57,7 +63,7 @@ def local_site():
                                               if status == 200 else state.body)
             # Keep synthetic Server headers singular; send_response adds Python's own.
             self.send_response_only(302 if redirect else status)
-            self.send_header("Content-Type", "text/plain" if robots else "text/html")
+            self.send_header("Content-Type", "text/plain" if robots else state.content_type if status == 200 else "text/html")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Accept-CH", "Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, "
                              "Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Full-Version")
@@ -129,7 +135,8 @@ async def test_retry_success_wire_identity_and_native_client_hints(sites):
         assert result.success and result.data["challenge"] is None
         assert result.data["last_http_status"] == 200
         assert result.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "original_status": 403}
+                                           "original_status": 403, "note": SUCCESS_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
         assert await server._page.evaluate("navigator.webdriver") is True
         assert await server._page.evaluate("navigator.userAgent") == original
     headers = site.received()
@@ -186,7 +193,8 @@ async def test_each_exclusion_sends_zero_retries(sites, condition):
     opts = {"headless_retry": False} if condition == "disabled" else {}
     async with BrowserMCPServer(nav_settle=False, recipes=False, **opts) as server:
         if condition in {"cookie", "path_cookie"}:
-            await server._page.context.add_cookies([{"name": "synthetic", "value": "fixture",
+            # WS-58: only a server-only (HttpOnly) cookie key — or a login record — keeps the native name.
+            await server._page.context.add_cookies([{"name": "synthetic", "value": "fixture", "httpOnly": True,
                 "domain": "127.0.0.1", "path": "/" if condition == "cookie" else "/account"}])
         result = await navigate(server, site.url + "/read")
         assert "identity" not in result.data
@@ -245,6 +253,7 @@ async def test_failed_retry_is_only_once_per_origin_and_restored(sites):
         first = await navigate(server, site.url + "/read")
         assert first.data["challenge"]["kind"] == "blocked"
         assert first.data["identity"]["retry_failed"] is True
+        assert first.data["identity"]["note"] == FAILED_NOTE
         assert "robots 때문이 아님" in first.data["hint"]
         second = await navigate(server, site.url + "/read")
         assert "identity" not in second.data
@@ -379,7 +388,8 @@ async def test_fragment_retry_sends_document_request(sites):
         result = await navigate(server, site.url + "/read?x=1#frag")
         assert result.data["last_http_status"] == 200
         assert result.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "original_status": 403}
+                                           "original_status": 403, "note": SUCCESS_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
     assert len(site.received("/read?x=1")) == 2
 
 
@@ -438,7 +448,8 @@ async def test_remembered_origin_starts_with_headed_name_and_keeps_scope(sites):
         assert first.data["identity"]["original_status"] == 403
         assert second.data["last_http_status"] == 200
         assert second.data["identity"] == {"presented_as": "chrome", "reason": "headless_ua_blocked",
-                                           "remembered": True}
+                                           "remembered": True, "note": REMEMBERED_NOTE,
+                                           "cookie_write_observer": True}  # WS-52 R3 (disclosed)
         assert len(server._recipes.trajectory.entries) == 2
         assert "HeadlessChrome" in await server._page.evaluate("navigator.userAgent")
         await server._page.evaluate("fetch('/late')")
@@ -465,8 +476,10 @@ async def test_remembered_origin_rechecks_conditions_and_retains_memory(sites, c
             # Expire the existing REP cache to model newly fetched site policy.
             server._robots._cache.clear()
         if condition == "cookie":
-            await server._page.context.add_cookies([
-                {"name": "synthetic", "value": "local-mock", "url": site.url}])
+            # WS-52: a login needs an agent action or a handoff, and either ends the settle tail first.
+            server._headless_retry.cancel_tail()
+            await server._page.context.add_cookies([  # WS-58: HttpOnly (a server session) blocks
+                {"name": "synthetic", "value": "local-mock", "url": site.url, "httpOnly": True}])
         if condition == "disabled":
             server.headless_retry = False
         if condition == "headed":
@@ -498,6 +511,7 @@ async def test_remembered_403_becomes_failed_without_another_retry(sites):
         assert denied.data["last_http_status"] == 403
         assert denied.data["identity"]["remembered"] is True
         assert denied.data["identity"]["retry_failed"] is True
+        assert denied.data["identity"]["note"] == FAILED_NOTE
         site.retry_status = 200
         later = await navigate(server, site.url + "/later")
         assert later.data["last_http_status"] == 403 and "identity" not in later.data
@@ -518,3 +532,125 @@ async def test_robots_disallowed_subresources_keep_native_name_during_retry(site
     original = site.received()[0]["user-agent"]
     assert site.received("/private/image.png")[0]["user-agent"] == original
     assert "HeadlessChrome" not in site.received("/public.png")[0]["user-agent"]
+
+
+async def test_identity_instructions_reach_actual_sdk_initialize():
+    from harness.mcp_binding import _run_session
+
+    for recipes in (True, False):
+        sdk, _ = create_server(recipes=recipes)
+        assert IDENTITY_GUIDANCE in sdk.instructions
+    findings = await _run_session()
+    assert IDENTITY_GUIDANCE in findings["instructions"]
+
+
+@requires_chromium
+async def test_remembered_window_covers_entire_navigate_and_restores(sites, monkeypatch):
+    """Wire evidence at the same late MCP hook used by the first retry."""
+    site, other = sites
+    other.status = 200
+    async with BrowserMCPServer(recipes=False) as server:
+        original_hook = server._attach_block_hint
+
+        async def late_navigate_resources(result):
+            await original_hook(result)
+            if (result.data.get("last_http_status") == 200
+                    and "original_status" not in result.data.get("identity", {})):
+                await server._page.evaluate("""async other => {
+                    await fetch('/inside');
+                    await fetch(other + '/outside', {mode:'no-cors'});
+                }""", other.url)
+
+        monkeypatch.setattr(server, "_attach_block_hint", late_navigate_resources)
+        await navigate(server, site.url + "/read")
+        remembered = await navigate(server, site.url + "/next")
+        assert remembered.data["identity"]["note"] == REMEMBERED_NOTE
+        await server._page.evaluate("fetch('/after')")
+    original = site.received()[0]["user-agent"]
+    retry_inside, memory_inside = site.received("/inside")[:2]
+    assert "HeadlessChrome" not in retry_inside["user-agent"]
+    assert memory_inside["user-agent"] == retry_inside["user-agent"]
+    assert memory_inside["sec-ch-ua"] == retry_inside["sec-ch-ua"]
+    assert all(h["user-agent"] == original for h in other.received("/outside"))
+    assert site.received("/after")[0]["user-agent"] == original
+
+
+@requires_chromium
+async def test_remembered_inline_resources_match_first_retry(sites, monkeypatch):
+    site, other = sites
+    other.status = 200
+    site.success_body = (b"<title>read</title><img src='/inline.png'>"
+                         b"<script>fetch('/inline-xhr')</script><img src='" +
+                         other.url.encode() + b"/other.png'>")
+    async with BrowserMCPServer(recipes=False) as server:
+        original_hook = server._attach_block_hint
+
+        async def finish_inline_resources(result):
+            await original_hook(result)
+            await server._page.wait_for_load_state("load")
+
+        # Hold this navigate open until inline requests leave; scheduling after
+        # the returned result is outside the specified interception window.
+        monkeypatch.setattr(server, "_attach_block_hint", finish_inline_resources)
+        await navigate(server, site.url + "/read")
+        await server._page.wait_for_load_state("networkidle")
+        counts = {p: len(site.received(p)) for p in ("/inline.png", "/inline-xhr")}
+        await navigate(server, site.url + "/next")
+        await server._page.wait_for_load_state("networkidle")
+    original = site.received()[0]["user-agent"]
+    for path, count in counts.items():
+        first, second = site.received(path)[0], site.received(path)[count]
+        assert "HeadlessChrome" not in first["user-agent"]
+        assert second["user-agent"] == first["user-agent"]
+    assert all(h["user-agent"] == original for h in other.received("/other.png"))
+
+
+@requires_chromium
+@pytest.mark.parametrize("remembered", [True, False])
+async def test_pdf_result_omits_identity_for_native_auxiliary_fetch(sites, remembered):
+    from test_ws43_pdf import pdf_bytes
+
+    site, _ = sites
+    async with BrowserMCPServer(recipes=False) as server:
+        if remembered:
+            await navigate(server, site.url + "/read")
+        site.content_type = "application/pdf"
+        site.success_body = pdf_bytes(["Synthetic PDF"])
+        result = await navigate(server, site.url + "/doc.pdf")
+        assert "document" in result.data
+        assert result.data["document"]["reason"] == "http_403"
+        assert "identity" not in result.data
+    requests = site.received("/doc.pdf")
+    assert any("HeadlessChrome" not in h["user-agent"] for h in requests)
+    assert "HeadlessChrome" in requests[-1]["user-agent"]
+
+
+@requires_chromium
+@pytest.mark.parametrize("remembered,status", [(True, 200), (True, 403), (False, 200), (False, 403)])
+async def test_redirect_out_omits_identity_and_preserves_source_state(sites, remembered, status):
+    site, other = sites
+    other.status = status
+    other.retry_status = status
+    async with BrowserMCPServer(recipes=False) as server:
+        if remembered:
+            await navigate(server, site.url + "/read")
+        site.redirect = other.url + "/landing"
+        result = await navigate(server, site.url + "/go")
+        assert result.data["last_http_status"] == status
+        assert "identity" not in result.data
+        if remembered:
+            assert server._headless_retry.states[site.url] == "succeeded"
+        assert all("HeadlessChrome" in h["user-agent"] for h in other.received("/landing"))
+
+
+@requires_chromium
+async def test_remembered_fragment_makes_no_request_and_has_no_identity(sites):
+    site, _ = sites
+    async with BrowserMCPServer(recipes=False) as server:
+        await navigate(server, site.url + "/read")
+        await server._page.wait_for_load_state("networkidle")
+        count = len(site.requests)
+        result = await navigate(server, site.url + "/read#section")
+        assert result.success and "identity" not in result.data
+        assert len(site.requests) == count
+        assert server._headless_retry.states[site.url] == "succeeded"

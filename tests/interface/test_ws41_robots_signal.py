@@ -111,14 +111,18 @@ async def test_disallow_signal_navigate_observe_cache_and_browser_ua(site):
         assert result.success
         assert result.data["robots"]["disallowed"] is True
         assert result.data["robots"]["rule"] == "Disallow: /"
-        assert result.data["robots"]["ai_agents_disallowed"]
+        assert result.data["robots"]["ai_agents_disallowed"] == []
+        assert result.data["robots"]["scope"] == "all_bots"
+        assert result.data["robots"]["note"] == (
+            "이 경로는 robots.txt 가 모든 자동 접근(봇 전체)에 대해 금지합니다 — AI 만 골라 막은 것이 아닙니다."
+        )
         assert json.loads(envelope_json(result))["data"]["robots"] == result.data["robots"]
     assert site.requests["/robots.txt"] == 1
     assert site.requests["/a"] == site.requests["/b"] == 1
     assert site.user_agents["/robots.txt"] == site.user_agents["/a"]
-    # Preserve the WS-41 size bound for its existing fields; WS-44 adds bounded fields.
+    # Preserve the WS-41 size bound; WS-44/46/54 add separate bounded (fixed-text) fields.
     legacy = {key: value for key, value in first.data["robots"].items()
-              if key not in {"user_fetch_agents_allowed", "content_signal"}}
+              if key not in {"user_fetch_agents_allowed", "content_signal", "scope", "note", "user_request"}}
     assert len(json.dumps(legacy, separators=(",", ":"))) < 300
     assert first.data["robots"]["user_fetch_agents_allowed"] == []
     assert first.data["robots"]["content_signal"] == ""
@@ -146,6 +150,10 @@ async def test_final_url_and_ai_only_signal(site):
     assert result.success
     assert result.data["robots"]["disallowed"] is False
     assert result.data["robots"]["ai_agents_disallowed"] == ["GPTBot"]
+    assert result.data["robots"]["scope"] == "named_ai"
+    assert result.data["robots"]["note"] == (
+        "robots.txt 가 일부 AI 봇 이름(주로 학습·수집용)을 지정해 이 경로를 금지합니다 — 모든 봇 대상 금지는 아닙니다."
+    )
     assert "robots" not in allowed.data
 
 
@@ -391,6 +399,8 @@ async def test_initialize_instructions_always_describe_signal(recipes):
     try:
         instructions = sdk.create_initialization_options().instructions
         assert "data.robots" in instructions and "사용자 뜻" in instructions
+        assert "사용자에게 robots 를 설명할 때 note 를 그대로 쓰세요." in instructions
+        assert "ai_agents_disallowed 는 이름으로 지정된 것만입니다." in instructions
     finally:
         await backend.close()
 

@@ -1,0 +1,342 @@
+"""BrowserMCPServer 의 필요할 때만 창(WS-34): 전환 관문·창 전환·on-demand 진입.
+
+WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름은 mcp_server 가 재수출한다.
+"""
+
+from __future__ import annotations
+
+import logging
+import asyncio
+import time
+from typing import Any, Dict, List, Optional
+
+from contracts import ActionResult, ActionType, ErrorCode
+from interface.server_common import _stderr_line
+
+#: 분리 전과 같은 로거 이름을 쓴다(로그 레코드 불변).
+logger = logging.getLogger("interface.mcp_server")
+
+
+class WindowMixin:
+    """BrowserMCPServer 의 필요할 때만 창(WS-34): 전환 관문·창 전환·on-demand 진입 (WS-48 믹스인 — 상태는 BrowserMCPServer.__init__)."""
+
+    #: WS-50: 꺼진 브라우저 복구 알림 — reason 과 안내(클래스 속성: 믹스인 모듈에 새 모듈 수준 이름을 두지 않는다).
+    _BROWSER_RECOVERED = "browser_recovered"
+    _BROWSER_RECOVERED_HINT = ("브라우저가 꺼져 있어 headless 로 다시 열고 마지막 탭을 복원했습니다 — 다시 관찰하세요. "
+                               "이전 element_id·tab_id 는 무효.")
+
+    def _mark_browser_recovered(self, result: ActionResult) -> None:
+        """도구 결과에 꺼진 브라우저 복구 사실을 1회 싣는다(epoch 은 전환이 이미 올렸다 → 재관찰 요구)."""
+        window = result.data.get("window")
+        window = dict(window) if isinstance(window, dict) else {}
+        notice = {"reason": self._BROWSER_RECOVERED, "hint": self._BROWSER_RECOVERED_HINT}
+        window.update(recovered=True, notice=notice, hint=self._BROWSER_RECOVERED_HINT)
+        result.data["window"] = window
+        result.reobserve_required = True
+
+    def _sync_window(self) -> None:
+        """창 상태를 사람용 상태 파일(control.json — `agent-browser control status`)에도 싣는다."""
+        if self._window is not None:
+            self.hub.set_window(self._window.info())
+
+    def _hold_gate(self) -> None:
+        self._gate_holds += 1
+        self._gate.clear()
+
+    def _release_gate(self) -> None:
+        self._gate_holds = max(0, self._gate_holds - 1)
+        if self._gate_holds == 0:
+            self._gate.set()
+
+    async def _await_gate(self, timeout: Optional[float] = None) -> bool:
+        """창 전환이 끝날 때까지 기다린다. 상한 안에 끝나면 True."""
+        if self._gate.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._gate.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _drain_calls(self, timeout: Optional[float] = None) -> bool:
+        """진행 중인 도구 호출이 끝나길 기다린다(전환과 겹치지 않게). 상한 안에 끝나면 True."""
+        from interface import on_demand
+
+        limit = on_demand.DRAIN_TIMEOUT_S if timeout is None else timeout
+        deadline = time.monotonic() + limit
+        # R1 NB-5: wait_for 는 timeout_ms 상한이 없다 — 잠깐(WAIT_CANCEL_AFTER_S, 상한의 절반 이하) 기다려도
+        # 남아 있으면 멈춘다(E_TIMEOUT 결과로 돌아감). 다른 호출은 지금처럼 끝나길 기다린다.
+        cancel_at = time.monotonic() + min(on_demand.WAIT_CANCEL_AFTER_S, limit / 2)
+        while self._inflight > 0:
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            if now >= cancel_at:
+                for task in list(self._wait_calls):
+                    task.cancel()
+            await asyncio.sleep(0.01)
+        return True
+
+    def _spawn_switch(self, headed: bool, reason: str,
+                      snapshot: Optional[List[Dict[str, Any]]] = None) -> None:
+        """감시 경로(사건 처리)에서 전환을 시작한다. 관문은 **지금** 닫는다 — 이 뒤에 들어오는 도구
+        호출은 전환이 끝날 때까지 기다린다(태스크가 늦게 돌아도)."""
+        self._hold_gate()
+
+        async def _run() -> None:
+            try:
+                await self._switch_window(headed, reason, snapshot=snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 실패는 _switch_window 가 상태로 남긴다
+                logger.warning("창 전환 실패(%s)", reason, exc_info=True)
+            finally:
+                self._release_gate()
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            self._release_gate()
+            return
+        self._window_tasks.add(task)
+        task.add_done_callback(self._window_tasks.discard)
+
+    def _browser_dead(self) -> bool:
+        """WS-50: 영속 컨텍스트(브라우저)가 꺼졌거나 관리 탭이 0개인가 — 이대로는 어떤 도구도 실행되지 않는다."""
+        core = self._core
+        if core is None:
+            return False
+        if self._ctx_closed or getattr(core, "persistent_closed", False):
+            return True
+        return not _all_tabs(core)  # WS-57: 어느 작업 공간에도 탭이 없을 때만(남의 탭이 있으면 살아 있다)
+
+    def _note_tabs(self) -> None:
+        """WS-50: 살아 있는 탭 URL·활성 탭을 기록한다(headless 에서도) — 브라우저가 꺼지면 이것으로 복원한다."""
+        w = self._window
+        if w is None or w.state not in ("headless", "headed") or self._browser_dead():
+            return
+        w.last_tabs = self._tab_snapshot()
+        # WS-51 R3 등록 지점 (d): 서버가 보관하는 탭 원문 주소(복원에 쓰는 값) — 응답·문장에서는 가린다.
+        from security.secret_registry import register_urls
+
+        register_urls(t.get("url") for t in w.last_tabs)
+
+    def _tab_snapshot(self) -> List[Dict[str, Any]]:
+        core = self._core
+        tabs = _all_tabs(core) if core is not None else []
+        if not tabs:
+            return list(self._window.last_tabs) if self._window is not None else []
+        return _snapshot_tabs(core, tabs)
+
+    async def _switch_window(self, headed: bool, reason: str, *, force: bool = False,
+                             snapshot: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """같은 프로필을 닫고 headless=not headed 로 다시 연 뒤 서버 연결을 모두 다시 단다(WS-34).
+
+        순서: 관문 닫기(새 호출 대기) → 진행 중 호출 끝나길 대기 → 탭 URL·활성 탭 기록 → 영속 컨텍스트
+        닫기 → 같은 프로필로 다시 열기(검증 프록시 실행 인자 포함) → 연결 재설치(_wire_session: 문서 상태·
+        route 가드·탭·CDP·디스패처) → 탭 복원 → epoch 올림 → (창이면) 안내 띠. 프로필 잠금은 내내 유지.
+        실패하면 fail-closed: 브라우저를 닫고 state=failed — 다음 도구 호출이 headless 로 다시 연다.
+        반환: {ok, reopened, window, error?}.
+        """
+        from browser.serve_profile import safe_reason
+        from interface.on_demand import HEADED_HINT, HEADLESS_HINT
+
+        w = self._window
+        assert w is not None
+        target = "headed" if headed else "headless"
+        self._hold_gate()
+        try:
+            async with self._switch_lock:
+                if w.state == target and not force:
+                    return {"ok": True, "reopened": False, "window": dict(w.info(), reopened=False)}
+                if self._core is None:
+                    return {"ok": False, "reopened": False, "error": "브라우저가 시작되지 않음",
+                            "window": w.info()}
+                if not await self._drain_calls():
+                    return {"ok": False, "reopened": False,
+                            "error": "진행 중인 도구 호출이 끝나지 않아 창을 전환하지 못함",
+                            "window": w.info()}
+                snap = snapshot if snapshot is not None else self._tab_snapshot()
+                w.state = "switching"
+                self._sync_window()
+                t0 = time.perf_counter()
+                try:
+                    tabs_info, skipped = await self._reopen_browser(not headed, snap)
+                except BaseException as exc:
+                    await self._fail_closed(safe_reason(exc), snap)
+                    if not isinstance(exc, Exception):
+                        raise  # 취소(SIGTERM 등) — 정리했으니 그대로 올린다
+                    return {"ok": False, "reopened": False, "error": safe_reason(exc),
+                            "window": w.info()}
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                w.state = target
+                w.error = ""
+                w.last_tabs = [] if headed else w.last_tabs
+                self._bump_all_epochs("window_reopen")  # WS-57: 모든 작업 공간의 관찰이 낡았다
+                self._switch_seq += 1
+                info = dict(w.info(), reopened=True, reason=reason, switch_ms=ms,
+                            tabs=tabs_info, skipped=skipped,
+                            hint=HEADED_HINT if headed else HEADLESS_HINT)
+                if self._engine is not None:
+                    info["snapshot_epoch"] = self._engine.epoch
+                self._last_window_result = info  # 복원 전체 기록(서버 내부) — 호출자 보고는 _window_view 로 거른다
+                self._mark_window_unreported()  # WS-57 R1: 작업 공간마다 한 번씩 알린다
+                self._sync_window()
+                if headed and self._control_banner:
+                    await self._set_banner(self._control_banner)
+                _stderr_line(f"agent-browser serve: 창 {'열림' if headed else '닫힘(headless 복귀)'} "
+                             f"({reason}, {ms:g}ms, 탭 {len(tabs_info)}개 복원)")
+                return {"ok": True, "reopened": True, "window": info}
+        finally:
+            self._release_gate()
+
+    async def _reopen_browser(self, headless: bool, snapshot: List[Dict[str, Any]]) -> tuple:
+        core = self._core
+        # R1 NB-2: 다시 열 실행 인자를 먼저 만든다 — 검증 프록시가 실제로 듣고 있지 않으면 여기서
+        # 예외(전환하지 않음 → _switch_window 가 fail-closed: 브라우저 닫고 state=failed + 이유).
+        core._launch_kwargs()
+        # 창을 닫으면 그 창의 오버레이(확인 코드·안내 띠)도 함께 사라진다 — 창에 없는 코드는 무효.
+        self._banner = None
+        if self._code_where == "overlay":
+            self.hub.withdraw_codes()
+            self._code_on_overlay = False
+            self._code_where = None
+        self._ctx_closed = False
+        # 세션 쿠키(만료 없음)는 Chromium 이 브라우저를 다시 열 때 버린다(WS-32 실측) — 이 서버가 이미
+        # 가진 세션 쿠키만 그대로 다시 넣는다(사이트가 준 값 그대로, 수명·값을 바꾸지 않음).
+        session_cookies = await self._session_cookies()
+        await core.close_persistent()
+        reopened = await core.open_persistent(headless=headless)
+        # WS-58 R2 NB1: 사람 조작권 중 창을 연 경우 새 컨텍스트에도 요청 감시를 탭 복원(await) 전에 붙인다.
+        self._login_watch_arm(reopened)
+        return await self._wire_session(restore=snapshot, cookies=session_cookies)
+
+    def _on_demand_released(self) -> None:
+        """사람이 조작권을 돌려줬다(D2): 창에서 해결한 사이트를 기록하고, sticky 가 아니면 headless 로."""
+        w = self._window
+        assert w is not None
+        w.opened_for_request = None
+        if w.state not in ("headed", "switching"):
+            return
+        urls = [str(getattr(t.page, "url", "") or "") for t in _all_tabs(self._core)] \
+            if self._core is not None else []
+        w.note_solved(urls + list(self._request_urls))
+        if not w.keep_window_after_release():
+            self._spawn_switch(False, "released")
+        else:
+            self._sync_window()
+
+    async def _watch_window(self) -> None:
+        """창이 열린 동안: 마지막 탭 URL 기록, 사람이 창을 닫았는지, 요청 만료를 본다."""
+        from interface import on_demand
+
+        w = self._window
+        if w is None or w.state != "headed" or self._switch_lock.locked() or self._core is None:
+            return
+        if self._gate_holds > 0:
+            # R1 NB-5: 이미 시작한 전환(태스크가 아직 첫 틱 전)이 있다 — 다시 판정·spawn 하지 않는다.
+            return
+        tabs = _all_tabs(self._core)  # WS-57: 창 = 브라우저 전체(모든 작업 공간의 탭)
+        if not tabs and getattr(self._core, "tabs_emptied_by_close_tab", False):
+            # WS-50: 에이전트가 tab_control close 로 마지막 탭을 닫았다(코어의 결정적 표시) — 사람이 창을 닫은
+            # 것이 아니다. 조작권·창 상태는 그대로 두고, 다음 도구 호출 입구(_on_demand_enter)가 복구한다.
+            return
+        if tabs and not self._ctx_closed:
+            w.last_tabs = _snapshot_tabs(self._core, tabs)
+            opened = w.opened_for_request
+            st = self.hub.status()
+            if (opened is not None and st["holder"] == "agent" and st["requested"]
+                    and time.monotonic() - opened > on_demand.REQUEST_WINDOW_TTL_S):
+                # 사람이 take 하지 않았다 — 요청을 거두고 창도 닫는다.
+                w.opened_for_request = None
+                self.hub.cancel_request()
+                w.notice = {"reason": "request_expired",
+                            "hint": "사람이 조작권을 가져가지 않아 요청을 거두고 창을 닫았습니다."}
+                _stderr_line("agent-browser serve: 조작권 요청 만료 — 창을 닫습니다")
+                if not w.keep_window_after_release():
+                    self._spawn_switch(False, "request_expired")
+                else:
+                    self._sync_window()
+            return
+        # 사람이 창을 직접 닫았다(창의 탭이 모두 닫힘·브라우저 종료) — 창이 없으니 조작권을 돌리고
+        # headless 로 다시 열어 마지막 탭을 복원한다.
+        w.opened_for_request = None
+        w.notice = {"reason": "window_closed",
+                    "hint": ("사람이 창을 닫았습니다 — 조작권을 에이전트에게 돌리고 headless 로 다시 열어 "
+                             "마지막 탭을 복원했습니다. 다시 관찰하세요.")}
+        self.hub.release_by_server()
+        self._bump_all_epochs("window_closed_by_human")  # WS-57 R1: 창 = 브라우저 전체
+        self._control_banner = None
+        _stderr_line("agent-browser serve: 사람이 창을 닫음 — headless 로 돌아갑니다")
+        self._spawn_switch(False, "window_closed", snapshot=list(w.last_tabs))
+
+    async def _on_demand_enter(self, action: ActionType) -> Optional[ActionResult]:
+        """on-demand 도구 호출 입구: 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다."""
+        from interface import on_demand
+
+        w = self._window
+        assert w is not None
+        if self._started and self.hub.opened:
+            await self._poll_handoff()
+        if not await self._await_gate(on_demand.SWITCH_WAIT_S):
+            return self._error_result(
+                action, ErrorCode.TIMEOUT,
+                f"브라우저 창 전환 중이라 {int(on_demand.SWITCH_WAIT_S)}초 안에 실행하지 못했습니다 — "
+                "잠시 뒤 다시 호출하세요.",
+                data={"window": w.info()},
+            )
+        if self._started and w.state == "failed":
+            out = await self._switch_window(False, "recover", force=True)
+            if not out.get("ok"):
+                return self._error_result(
+                    action, ErrorCode.PAGE_CRASHED,
+                    "브라우저를 다시 열지 못했습니다(" + str(out.get("error") or "") + ") — "
+                    "운영자에게 serve 재시작을 요청하세요.",
+                    data={"window": w.info()},
+                )
+            self._recovered_notice = True
+        elif self._started and w.state in ("headless", "headed") and self._browser_dead():
+            # WS-50: 브라우저가 꺼졌다(마지막 탭 닫힘·컨텍스트/프로세스 종료) — 같은 전환 경로로 headless 로
+            # 다시 열고 마지막 탭을 복원한 뒤 이 호출을 실행한다. 사람이 조작권을 가진 동안에는 창을 바꾸지
+            # 않는다(그 사이 호출은 기존 관문이 거부·실패시킨다). 실패하면 state=failed — 다음 호출이 기존
+            # failed 규칙대로 한 번 더 시도한다(호출당 1회, 루프 없음).
+            from interface.handoff import HOLDER_HUMAN
+
+            if self.hub.holder == HOLDER_HUMAN:
+                return None
+            _stderr_line("agent-browser serve: 브라우저가 꺼져 있음 — headless 로 다시 엽니다")
+            out = await self._switch_window(False, "browser_recovered", force=True)
+            if not out.get("ok"):
+                return self._error_result(
+                    action, ErrorCode.PAGE_CRASHED,
+                    "브라우저를 다시 열지 못했습니다(" + str(out.get("error") or "") + ") — "
+                    "운영자에게 serve 재시작을 요청하세요.",
+                    data={"window": w.info()},
+                )
+            self._recovered_notice = self._BROWSER_RECOVERED
+        else:
+            self._note_tabs()
+        return None
+
+
+def _all_tabs(core: Any) -> List[Any]:
+    """WS-57: 모든 작업 공간의 탭(코어가 작업 공간을 모르면 예전 tabs())."""
+    every = getattr(core, "all_tabs", None)
+    return list(every()) if callable(every) else list(core.tabs())
+
+
+def _snapshot_tabs(core: Any, tabs: List[Any]) -> List[Dict[str, Any]]:
+    """창 전환 복원용 탭 기록. 활성 = 그 탭 주인 작업 공간의 활성 탭. 기본 외 작업 공간 탭만 workspace 를 적는다."""
+    from browser.workspace import DEFAULT_WORKSPACE
+
+    per_ws = getattr(core, "workspace_active_tab", None)
+    out: List[Dict[str, Any]] = []
+    for t in tabs:
+        ws = getattr(t, "workspace", DEFAULT_WORKSPACE)
+        active = per_ws(ws) if callable(per_ws) else core.active_tab_id
+        entry: Dict[str, Any] = {"tab_id": t.tab_id, "url": str(getattr(t.page, "url", "") or ""),
+                                 "active": t.tab_id == active}
+        if ws != DEFAULT_WORKSPACE:
+            entry["workspace"] = ws
+        out.append(entry)
+    return out

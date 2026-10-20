@@ -72,7 +72,7 @@ agent-browser/
 │   ├── perception/             # [WS-2] Computed Layout DOM 살균기, AxTree 파서, Prune4Web 스코어러
 │   ├── actions/                # [WS-3] 19종 액션 툴 전수 구현, Staleness 상태 검증, 단계인식 자가치유
 │   ├── security/               # [WS-4] 도메인 Allowlist, page.route 인터셉션, PII 마스킹, HITL 게이트
-│   ├── interface/              # [WS-5] Textual TUI 대시보드, ConfirmDialog 렌더러, FastMCP 서버 (mcp_server.py)
+│   ├── interface/              # [WS-5] Textual TUI 대시보드, ConfirmDialog 렌더러, FastMCP 서버 (mcp_server.py + server_*.py, WS-48)
 │   ├── harness/                # [WS-6] Mock 사이트 20종, Recall@20 벤치마크 러너, E2E 평가 스위트
 │   ├── vision/                 # [WS-v1.1] Tier-2 Set-of-Marks (SoM) 시각 그라운딩 엔진 (Stage 4)
 │   ├── cli.py                  # [통합/오케스트레이터 소유] 루트 CLI 명령어 진입점 (interface를 래핑)
@@ -1135,6 +1135,32 @@ href 가 완전히 같으면 자리표시자로 보고 준비 대기와 같은 �
 
 > **교훈**: 하네스의 '오클릭' 판정은 재생 엔진의 자기 보고가 아니라 Mock 서버 요청 기록(무엇이 열렸나)으로 한다 —
 > 엔진이 성공이라 해도 다른 기사를 열었으면 오클릭이다.
+
+#### MCP 서버 모듈 구조 (WS-48)
+
+`interface/mcp_server.py` 는 조립·SDK 바인딩·serve 수명만 남긴 얇은 껍데기다(`BrowserMCPServer.__init__`, `create_server`,
+`run_stdio`, 종료 신호). 메서드는 책임별 **믹스인**으로 옮겼다 — 테스트가 `BrowserMCPServer._x = fake` 처럼 클래스에
+갈아끼워도 `self._x` 호출이 MRO 로 그것을 쓰므로 협력 객체 대신 믹스인을 택했다.
+
+| 모듈 | 내용 |
+| :--- | :--- |
+| `server_tools.py` (`ToolsMixin`) | `call_tool`·`_call_tool`(검증 → HITL → `_run_gated_action`)·서버 도구·레시피 도구·`_error_result` |
+| `server_hitl.py` (`HitlMixin`) | `_check_hitl`(`_gate_target`·`_approval_or_pass`·`_hitl_blocked_result`)·승인 증표·모호한 selector·키/좌표 대상 |
+| `server_signals.py` (`SignalsMixin`) | 관찰 안내·robots·헤드리스 재시도·기억된 이름·차단/egress/업스트림/challenge 부착 |
+| `server_display.py` (`DisplayMixin`) | 확인 코드 오버레이·안내 띠·화면 캡처 차단 |
+| `server_handoff.py` (`HandoffMixin`) | 사람 인계 통로·로그인 안내·조작권 요청/대기·승인 대기 |
+| `server_window.py` (`WindowMixin`) | on-demand 창 전환 관문·전환 |
+| `server_lifecycle.py` (`LifecycleMixin`) | `start`/`close`·세션 연결·영속 프로필·닫힌 탭 복구 |
+| `server_schema.py` · `server_envelope.py` · `server_common.py` | 도구 스키마·이름 / 응답 봉투·크기 상한 / 시각·대기·stderr 보조 |
+
+규칙: 옮긴 모듈 수준 이름은 모두 `mcp_server` 가 재수출한다(`from interface.mcp_server import X` 유지). 테스트가
+`mcp_server` 모듈에서 바꿔 끼우는 이름(`run_stdio`·`create_server`·`CAPTURE_DRAIN_TIMEOUT_S`·`SHUTDOWN_*`)과 그것을 읽는
+코드는 `mcp_server.py` 에 둔다 — 다른 모듈로 옮기면 monkeypatch 가 효과를 잃는다. 믹스인 모듈의 로거 이름은
+`interface.mcp_server` 그대로다. 동작 불변 증거는 `tests/interface/test_ws48_characterization.py`(응답 봉투·도구 스키마
+골든, `WS48_UPDATE_GOLDEN=1` 은 의도된 동작 변경 때만)와 `.hermes/state/ws48/report.md`.
+
+> **교훈**: 소스 검사 테스트(`inspect.getsource(create_server)` 에 `Tool.model_fields`·`list_tools()` 문자열)가 있으면 그
+> 함수는 쪼개지 못한다 — 리팩터 전에 `getsource` 사용처부터 찾는다.
 
 #### 모호한 selector — 승인 대신 모호함 오류 (WS-39)
 

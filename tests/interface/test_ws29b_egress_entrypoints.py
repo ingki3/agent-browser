@@ -110,7 +110,7 @@ async def test_server_start_gives_core_an_egress_runtime(monkeypatch, tmp_path, 
     assert egress is not None
     assert egress.guard.allow_private_network is True
     assert egress.guard.allow_loopback is True
-    # user-chrome 은 Chrome 명령줄로 자격증명을 못 줘 토큰 없는 프록시
+    # tokenless 는 모드 표시만(WS-47 R3 부터 모든 모드의 프록시가 자격 없음)
     assert (egress.tokenless is True) == (mode == "user-chrome")
     # 시작 실패면 프록시도 닫는다(고아 리스너 없음)
     assert egress.proxy is None
@@ -171,7 +171,8 @@ async def test_core_launch_uses_proxy_and_flags(monkeypatch):
         await rt.close()
     kw = calls[-1]
     assert kw["proxy"]["server"].startswith("http://127.0.0.1:")
-    assert kw["proxy"]["username"] and kw["proxy"]["password"]
+    # WS-47 R3: 자격 없음 — Playwright 가 launch proxy 자격을 사이트 401 에도 보내던 누출을 막는다
+    assert set(kw["proxy"]) == {"server"}, kw["proxy"]
     assert "--disable-quic" in kw["args"]
     assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in kw["args"]
 
@@ -405,7 +406,8 @@ def _upstream_server(status: Any):
     srv._egress = EgressGuard(policy=EgressPolicy.OPEN_SANDBOX, allow_loopback=True)
     before = srv._egress.upstream_total
     srv._egress.record_upstream_failure(
-        UpstreamFailure(host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080))
+        UpstreamFailure(host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080,
+                        page=page))  # WS-57 R2: 이 호출 탭에 귀속된 기록(브라우저 응답 이벤트가 붙인다)
     return srv, before
 
 
@@ -435,6 +437,23 @@ def test_upstream_failure_of_subrequest_keeps_successful_document(status):
     r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
                                      _ok(ActionType.NAVIGATE), before)
     assert r.success is True and "egress" not in r.data
+
+
+def test_upstream_failure_without_tab_attribution_is_not_attached():
+    """WS-57 R2(B2): 귀속되지 않은 기록(서비스 워커 등)·다른 Page 의 기록은 이동 대상이 같아도 붙이지 않는다."""
+    from types import SimpleNamespace
+
+    from contracts import ActionType
+    from security.egress import UpstreamFailure
+
+    for page in (None, SimpleNamespace(url="http://svc.test:8080/x")):
+        srv, before = _upstream_server(502)
+        srv._egress.record_upstream_failure(UpstreamFailure(
+            host="svc.test", code="connect_failed", url="http://svc.test:8080/x", port=8080, page=page))
+        before = srv._egress.upstream_total - 1
+        r = srv._attach_upstream_failure(ActionType.NAVIGATE, {"url": "http://svc.test:8080/x"},
+                                         _ok(ActionType.NAVIGATE), before)
+        assert r.success is True and "egress" not in r.data
 
 
 def test_upstream_failure_other_port_is_not_attached():

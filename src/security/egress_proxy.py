@@ -13,8 +13,12 @@
 * HTTPS·WSS·ws 는 ``CONNECT`` 터널만 — TLS 를 열어 보지 않는다(MITM 없음).
 * 평문 HTTP 는 absolute-form 요청을 받아 origin-form 으로 바꿔 전달하고 연결은 요청
   하나로 닫는다(같은 연결로 다른 호스트 요청이 섞이지 않게).
-* 127.0.0.1 무작위 포트에만 바인드. ``token`` 을 주면 ``Proxy-Authorization: Basic``
-  이 일치하는 요청만 받는다(Playwright 가 launch(proxy=...) 자격증명으로 자동 응답).
+* 127.0.0.1 무작위 포트에만 바인드하고 **자격(Basic 인증)을 요구하지 않는다**(WS-47 R3). 브라우저에
+  프록시 자격을 주면 Playwright 가 그 자격을 origin 없는 httpCredentials 로 넣어 사이트의 401 에도
+  보냈다(실측) — 그래서 어느 브라우저 경로에도 자격을 주지 않는다. 한계: 같은 컴퓨터의 다른 프로세스가
+  포트를 찾으면 쓸 수 있다(가드가 허용한 목적지로만 중계). 접속 측 확인은 후속 과제.
+* 프록시가 브라우저에 407 을 보이는 일은 없다: 자기 챌린지가 없고, 상류(사이트)의 407 은 502 로 바꾸며
+  모든 상류 응답에서 Proxy-Authenticate 류 머리를 뺀다(WS-47 R3).
 * 판정 불가(머리 파싱 실패·해석 실패)는 막는다(fail-closed). 프록시가 죽으면 브라우저는
   직접 접속으로 빠지지 않고 실패한다(--proxy-server 고정, 실측).
 """
@@ -22,27 +26,32 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hmac
+import ipaddress
 import logging
-import secrets
+import re
+import socket
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from security.egress import (
+    CAT_LOOPBACK,
     UPSTREAM_CONNECT_FAILED,
     UPSTREAM_RESOLVE_FAILED,
     EgressDecision,
     EgressGuard,
+    IPAddress,
     UpstreamFailure,
+    _unwrap,
 )
 
 logger = logging.getLogger(__name__)
 
 #: 요청 머리 상한(바이트). 넘으면 판정 불가 → 차단.
 MAX_HEAD_BYTES = 64 * 1024
+#: 상류 응답 머리 상한(바이트, Chromium 과 같은 256KiB). 넘으면 502(판정 불가).
+MAX_UPSTREAM_HEAD_BYTES = 256 * 1024
 #: 업스트림 접속 대기 상한(초)
 CONNECT_TIMEOUT_S = 10.0
 #: 클라이언트가 머리를 보내기까지 기다리는 상한(초)
@@ -52,6 +61,10 @@ BLOCK_HEADER = "X-Agent-Browser-Egress"
 #: 프록시가 스스로 만든 업스트림 실패(502) 표시 머리 값의 접두. 사이트가 실제로 준 502 와
 #: 구별한다(가드의 업스트림 실패 기록과 함께, WS-29b R1).
 UPSTREAM_FAIL_MARK = "upstream-failed"
+#: 상류(사이트)가 407 을 줘서 프록시가 502 로 바꿨다는 표시(WS-47 R3). 가드 기록은 남기지 않는다.
+UPSTREAM_407_MARK = "upstream-407-replaced"
+#: 상류 응답 머리를 판정할 수 없어 502 로 막았다는 표시(WS-47 R3).
+UPSTREAM_BAD_RESPONSE_MARK = "upstream-bad-response"
 
 
 class UpstreamError(ConnectionError):
@@ -62,15 +75,20 @@ class UpstreamError(ConnectionError):
         self.code = code
 
 
+class SelfConnectRefused(Exception):
+    """연결하려는 해석된 IP·포트가 이 프록시 자신의 리스너 (WS-47 R2) — egress 차단으로 응답한다."""
+
+
 #: 업스트림에 넘기지 않는 hop-by-hop 머리
 _HOP_HEADERS = frozenset({
     "proxy-authorization", "proxy-connection", "connection", "keep-alive",
     "te", "trailer", "upgrade", "proxy-authenticate",
 })
 
-#: 프록시 자격증명 사용자 이름(비밀 아님, 토큰이 비밀)
-PROXY_USER = "agent-browser"
-
+#: 상류 응답에서 브라우저로 넘기지 않는 프록시 인증 계열 머리(WS-47 R3)
+_UPSTREAM_DROP_HEADERS = frozenset({
+    "proxy-authenticate", "proxy-authentication-info", "proxy-authorization", "proxy-connection",
+})
 
 def chromium_proxy_args() -> List[str]:
     """프록시를 쓸 때 Chromium 에 함께 주는 플래그.
@@ -89,8 +107,6 @@ class EgressProxy:
     guard: EgressGuard
     host: str = "127.0.0.1"
     port: int = 0
-    token: Optional[str] = field(default_factory=lambda: secrets.token_urlsafe(24))
-
     _server: Optional[asyncio.base_events.Server] = field(default=None, init=False, repr=False)
     _tasks: "set[asyncio.Task]" = field(default_factory=set, init=False, repr=False)
     #: 프록시가 처리한 연결 수(관측용)
@@ -130,18 +146,12 @@ class EgressProxy:
         return f"http://{self.host}:{self.port}"
 
     def playwright_proxy(self) -> Dict[str, str]:
-        """chromium.launch(proxy=...) 인자. Playwright 가 407 에 자격증명으로 자동 응답한다."""
-        out = {"server": self.server_url}
-        if self.token:
-            out.update(username=PROXY_USER, password=self.token)
-        return out
+        """chromium.launch(proxy=...) 인자 — 서버 주소만(자격 없음, WS-47 R3)."""
+        return {"server": self.server_url}
 
     def chrome_args(self) -> List[str]:
-        """Playwright 를 거치지 않고 띄우는 Chrome(user-chrome)용 인자.
+        """Playwright 를 거치지 않고 띄우는 Chrome(user-chrome)용 인자(Playwright 경로와 같은 무자격 프록시).
 
-        Chrome 은 명령줄로 프록시 자격증명을 받을 수 없다 — 이 경로의 프록시는 토큰 없이
-        (token=None) 띄워야 한다(한계: 같은 컴퓨터의 다른 프로세스도 이 포트를 쓸 수 있으나,
-        프록시는 가드가 허용한 목적지로만 중계하므로 그 프로세스가 원래 못 가는 곳은 못 간다).
         ``<-loopback>`` 은 루프백도 프록시를 거치게 한다(Chrome 기본은 루프백 직접 접속).
         """
         return [f"--proxy-server={self.server_url}", "--proxy-bypass-list=<-loopback>",
@@ -179,27 +189,37 @@ class EgressProxy:
             await self._reply(writer, 400, "Bad Request", "요청 머리를 판정할 수 없음")
             return
 
-        if not self._authorized(headers):
-            await self._reply(writer, 407, "Proxy Authentication Required", "",
-                              extra={"Proxy-Authenticate": 'Basic realm="agent-browser"'})
+        method_upper = method.upper()
+        if method_upper != "CONNECT" and request_target_form(method, target) != "absolute":
+            # 프록시 클라이언트는 absolute-form(또는 CONNECT authority-form)만 보낸다 — origin-form 등은
+            # 다른 경로로 중계돼 들어온 요청이라 400(RFC 9112 형식 파싱 — 쿼리 속 "://" 에 속지 않음).
+            # 자격·realm 이 없어진 뒤로는 비밀을 지키는 경계가 아니라 이른 거절(심층 방어)이다.
+            await self._reply(writer, 400, "Bad Request", "absolute-form http 요청만 받습니다")
             return
 
-        if method.upper() == "CONNECT":
+        if method_upper == "CONNECT":
             await self._connect(target, reader, writer)
             return
         await self._forward_http(method, target, version, headers, reader, writer)
 
-    def _authorized(self, headers: List[Tuple[str, str]]) -> bool:
-        if not self.token:
-            return True
-        expected = "Basic " + base64.b64encode(f"{PROXY_USER}:{self.token}".encode()).decode()
-        for name, value in headers:
-            if name.lower() == "proxy-authorization" and hmac.compare_digest(value.strip(), expected):
-                return True
-        return False
-
     def _is_self(self, host: str, port: int) -> bool:
         return port == self.port and host.strip("[]") in ("127.0.0.1", "localhost", "::1", self.host)
+
+    def _listeners(self) -> List[Tuple[str, int]]:
+        """이 프록시가 실제로 듣는 주소·포트 전부(바인드한 소켓 기준)."""
+        out: List[Tuple[str, int]] = []
+        server = self._server
+        for sock in (server.sockets if server is not None else ()):
+            with contextlib.suppress(OSError):
+                name = sock.getsockname()
+                out.append((str(name[0]), int(name[1])))
+        if not out:
+            out.append((self.host, self.port))
+        return out
+
+    def _self_blocked(self, decision: EgressDecision) -> EgressDecision:
+        return EgressDecision(False, decision.url, None, "프록시 자기 자신(해석된 IP·포트)",
+                              host=decision.host, category=CAT_LOOPBACK)
 
     async def _decide(self, url: str, host: str, port: int) -> EgressDecision:
         if self._is_self(host, port):
@@ -215,10 +235,15 @@ class EgressProxy:
         """검증한 IP 로만 접속한다. 검증한 IP 가 없으면(해석 실패) 접속하지 않는다."""
         if not decision.resolved:
             raise UpstreamError(f"업스트림 해석 실패: {decision.host}", UPSTREAM_RESOLVE_FAILED)
+        listeners = self._listeners()
+        # 해석된 IP 중 하나라도 이 프록시 리스너면 요청 전체를 막는다(다음 IP 로 넘어가지 않음).
+        if any(targets_listener(ip, port, listeners) for ip in decision.resolved):
+            raise SelfConnectRefused(decision.host)
         last: Optional[BaseException] = None
         for ip in decision.resolved:
             try:
-                return await asyncio.wait_for(asyncio.open_connection(ip, port), CONNECT_TIMEOUT_S)
+                return await asyncio.wait_for(asyncio.open_connection(ip, port, limit=MAX_UPSTREAM_HEAD_BYTES),
+                                              CONNECT_TIMEOUT_S)
             except (OSError, asyncio.TimeoutError) as exc:
                 last = exc
         raise UpstreamError(f"업스트림 접속 실패: {decision.host} ({type(last).__name__})",
@@ -238,6 +263,19 @@ class EgressProxy:
         await self._reply(writer, 502, "Bad Gateway", exc.code,
                           extra={BLOCK_HEADER: f"{UPSTREAM_FAIL_MARK}; code={exc.code}"})
 
+    async def _upstream_or_reply(self, writer, decision: EgressDecision, port: int):
+        """업스트림을 연다 — 못 열면 응답(자기 자신: egress 차단 403, 그 밖: 프록시 표시 502)하고 None."""
+        try:
+            return await self._open_upstream(decision, port)
+        except SelfConnectRefused:
+            blocked = self._self_blocked(decision)
+            logger.info("Egress 프록시 자기접속 차단: %s:%d", decision.host, port)
+            await self._reply(writer, 403, "Forbidden", "egress_blocked",
+                              extra={BLOCK_HEADER: f"blocked; category={blocked.category}"})
+        except UpstreamError as exc:
+            await self._reply_upstream_failure(writer, decision, port, exc)
+        return None
+
     async def _connect(self, target: str, reader, writer) -> None:
         host, port = _split_authority(target, default_port=443)
         if host is None:
@@ -249,11 +287,10 @@ class EgressProxy:
             await self._reply(writer, 403, "Forbidden", "egress_blocked",
                               extra={BLOCK_HEADER: f"blocked; category={decision.category}"})
             return
-        try:
-            up_reader, up_writer = await self._open_upstream(decision, port)
-        except UpstreamError as exc:
-            await self._reply_upstream_failure(writer, decision, port, exc)
+        upstream = await self._upstream_or_reply(writer, decision, port)
+        if upstream is None:
             return
+        up_reader, up_writer = upstream
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         await _pipe_both(reader, writer, up_reader, up_writer)
@@ -277,11 +314,10 @@ class EgressProxy:
             await self._reply(writer, 403, "Forbidden", "egress_blocked",
                               extra={BLOCK_HEADER: f"blocked; category={decision.category}"})
             return
-        try:
-            up_reader, up_writer = await self._open_upstream(decision, port)
-        except UpstreamError as exc:
-            await self._reply_upstream_failure(writer, decision, port, exc)
+        upstream = await self._upstream_or_reply(writer, decision, port)
+        if upstream is None:
             return
+        up_reader, up_writer = upstream
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -293,7 +329,52 @@ class EgressProxy:
         lines.append("Connection: close")
         up_writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
         await up_writer.drain()
-        await _pipe_both(reader, writer, up_reader, up_writer)
+        # 요청 본문은 계속 흘려보내되, 응답은 머리를 먼저 검사한다(상류 407 재작성·프록시 인증 머리 제거).
+        upload = asyncio.ensure_future(_pipe(reader, up_writer))
+        try:
+            if await self._relay_response_head(up_reader, writer):
+                await _pipe(up_reader, writer)
+                await upload
+        finally:
+            if not upload.done():
+                upload.cancel()
+                with contextlib.suppress(BaseException):
+                    await upload
+            with contextlib.suppress(Exception):
+                up_writer.close()
+
+    async def _relay_response_head(self, up_reader, writer) -> bool:
+        """상류 응답 머리를 검사해 넘긴다. False 면 이미 대신 답했다(연결을 닫을 것).
+
+        * 상류(사이트)의 407 은 브라우저에 중계하지 않는다 — 브라우저는 프록시 연결에서 받은 407 을
+          프록시의 챌린지로 처리한다(CDP 도 source=Proxy·우리 프록시 출처로 보고, Playwright 가 자격으로
+          답하려 든다). 프록시 표시 머리를 단 502 로 바꾸고 본문도 넘기지 않는다.
+        * 모든 상류 응답에서 Proxy-Authenticate·Proxy-Authentication-Info·Proxy-Authorization 류
+          머리를 뺀다(hop-by-hop, 사이트가 줄 이유가 없다).
+        * 1xx(101 제외)는 머리를 넘기고 다음 머리를 다시 검사한다. 판정 불가 머리는 502(fail-closed).
+        """
+        while True:
+            try:
+                head = await up_reader.readuntil(b"\r\n\r\n")
+                lines = head.decode("latin-1").split("\r\n")
+                status_line = lines[0]
+                version, status, _reason = (status_line.split(" ", 2) + [""])[:3]
+                if not version.startswith("HTTP/1.") or not status.isdigit() or len(status) != 3:
+                    raise ValueError("응답 상태 줄 형식 오류")
+                code = int(status)
+            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, ValueError):
+                await self._reply(writer, 502, "Bad Gateway", "upstream_bad_response",
+                                  extra={BLOCK_HEADER: UPSTREAM_BAD_RESPONSE_MARK})
+                return False
+            if code == 407:
+                logger.info("Egress 프록시: 상류 407 을 502 로 바꿈(브라우저에 프록시 챌린지로 보이지 않게)")
+                await self._reply(writer, 502, "Bad Gateway", "upstream_407",
+                                  extra={BLOCK_HEADER: UPSTREAM_407_MARK})
+                return False
+            writer.write("\r\n".join([status_line, *_without_proxy_auth(lines[1:])]).encode("latin-1"))
+            await writer.drain()
+            if not (100 <= code < 200) or code == 101:
+                return True
 
     @staticmethod
     async def _reply(writer, code: int, reason: str, body: str, extra: Optional[Dict[str, str]] = None) -> None:
@@ -305,6 +386,97 @@ class EgressProxy:
         writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + data)
         with contextlib.suppress(Exception):
             await writer.drain()
+
+
+def _plain_ip(text: str) -> Optional[IPAddress]:
+    """접속에 쓰일 IP 문자열 → 주소(IPv4-mapped 등 안의 IPv4 는 꺼냄). 판정 불가면 None."""
+    try:
+        addr = ipaddress.ip_address(str(text).strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    return _unwrap(addr)
+
+
+def _is_local_address(addr: IPAddress) -> bool:
+    """이 컴퓨터의 주소인가 — 루프백·미지정이거나 실제로 bind 할 수 있으면(로컬 인터페이스)."""
+    if addr.is_loopback or addr.is_unspecified:
+        return True
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind((str(addr), 0))
+        return True
+    except OSError:
+        return False
+
+
+def targets_listener(ip: str, port: int, listeners: Sequence[Tuple[str, int]]) -> bool:
+    """``ip:port`` 로 접속하면 ``listeners`` 중 하나(이 프록시 자신)에 닿는가 (WS-47 R2).
+
+    호스트 문자열이 아니라 실제로 연결할 IP 로 판정한다 — DNS 별칭·재해석·``localhost.``·
+    10진/8진 표기·IPv4-mapped IPv6 와 무관하다. 판정 불가 IP 는 자기 자신으로 본다(fail-closed).
+    * 정확히 같은 주소·포트 → 자기 자신.
+    * 목적지가 미지정 주소(0.0.0.0·::) → 같은 포트의 로컬 리스너에 닿는다(흔한 스택 동작).
+    * 리스너가 0.0.0.0/:: 바인드 → 같은 포트의 모든 로컬 주소가 자기 자신.
+    다른 포트, 또는 같은 포트라도 리스너가 받지 않는 다른 IP(예: 127.0.0.1 리스너와 ::1)는 아니다.
+    """
+    target = _plain_ip(ip)
+    for host, lport in listeners:
+        if int(lport) != int(port):
+            continue
+        if target is None:
+            return True
+        bound = _plain_ip(host)
+        if bound is None:
+            return True
+        if bound.is_unspecified:
+            if _is_local_address(target):
+                return True
+            continue
+        if target.is_unspecified or target == bound:
+            return True
+    return False
+
+
+_ABSOLUTE_FORM = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def request_target_form(method: str, target: str) -> str:
+    """요청 대상의 형식(RFC 9112 §3.2): origin | absolute | authority | asterisk | invalid.
+
+    부분문자열 검색이 아니라 시작 형식으로 판정한다 — ``/probe?next=http://x`` 는 origin-form.
+    * origin-form: ``/`` 로 시작(absolute-path [ "?" query ]).
+    * absolute-form: ``scheme://`` 로 시작(scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )).
+    * authority-form: CONNECT 의 ``host:port``.
+    * asterisk-form: OPTIONS 의 ``*``.
+    """
+    if method.upper() == "CONNECT":
+        return "authority" if target and not target.startswith("/") and "/" not in target else "invalid"
+    if target.startswith("/"):
+        return "origin"
+    if _ABSOLUTE_FORM.match(target):
+        return "absolute"
+    if target == "*":
+        return "asterisk"
+    return "invalid"
+
+
+def _without_proxy_auth(lines: List[str]) -> List[str]:
+    """응답 머리 줄(빈 끝 줄 포함)에서 프록시 인증 계열 머리를 뺀다 — 나머지는 원문 그대로.
+
+    obs-fold 이어짐 줄(공백·탭 시작)은 앞 머리를 따라 함께 빠지거나 남는다.
+    """
+    out: List[str] = []
+    dropping = False
+    for line in lines:
+        if line[:1] in (" ", "\t") and line.strip():
+            if not dropping:
+                out.append(line)
+            continue
+        dropping = line.split(":", 1)[0].strip().lower() in _UPSTREAM_DROP_HEADERS if line else False
+        if not dropping:
+            out.append(line)
+    return out
 
 
 def _parse_head(head: bytes) -> Tuple[str, List[Tuple[str, str]]]:
