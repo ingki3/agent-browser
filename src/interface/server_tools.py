@@ -117,7 +117,13 @@ class ToolsMixin:
         if self._recipes is None:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": "레시피가 꺼져 있습니다(serve --no-recipes)."}
-        payload = await self._recipes.tool(args)
+        saved = getattr(self, "_saved_pages", None)
+        from recipes.saved_pages import OPS as SAVED_PAGE_OPS
+
+        if saved is not None and str(args.get("op") or "") in SAVED_PAGE_OPS:
+            payload = saved.tool(args)  # WS-61 도착 페이지 기억
+        else:
+            payload = await self._recipes.tool(args)
         data = payload.get("data")
         if isinstance(data, dict) and "injection_suspected" not in data:
             from security.injection_signal import injection_signal
@@ -236,6 +242,12 @@ class ToolsMixin:
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
             # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
             from security.injection_signal import attach_injection_signal
+
+            if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
+                from recipes.saved_pages import fit_saved_pages
+
+                # WS-61: 기억한 페이지 후보가 크기 상한에서 페이지 요소를 밀어내지 않게 — 넘으면 후보를 뺀다.
+                fit_saved_pages(result, self.max_result_chars)
 
             # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
             # 부분은 늘 검사 범위 안이다.
@@ -467,6 +479,13 @@ class ToolsMixin:
                 self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
             if action is ActionType.OBSERVE_PAGE:
                 await self._recipes.observe(result)
+        saved = getattr(self, "_saved_pages", None)
+        if saved is not None and not retry_boundary:
+            # WS-61: uses(navigate 1회당 첫 observe 에서 최대 +1)·관찰 후보 data.saved_pages. 재시도는 바깥 최종 결과 기준.
+            if action is ActionType.NAVIGATE:
+                saved.note_navigate(params, result)
+            elif action is ActionType.OBSERVE_PAGE:
+                saved.observe(result)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 

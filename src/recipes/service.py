@@ -315,7 +315,7 @@ class RecipeService:
                 return await self._run(args)
         except RecipeError as exc:
             return self._error(str(exc))
-        return self._error("op 는 save|run|list|delete 중 하나입니다.")
+        return self._error("op 는 save|run|list|delete|remember_page|pages|forget_page 중 하나입니다.")
 
     def _save(self, args: Dict[str, Any]) -> Dict[str, Any]:
         try:

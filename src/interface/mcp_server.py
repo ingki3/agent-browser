@@ -226,10 +226,14 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         #: recipes.json(0600), 없으면 메모리만.
         self.recipes_enabled = bool(recipes)
         self._recipes: Any = None
+        #: WS-61 도착 페이지 기억(browser_recipe remember_page·pages·forget_page, 관찰 data.saved_pages) — 레시피와 함께 켜고 끈다.
+        self._saved_pages: Any = None
         if self.recipes_enabled:
+            from recipes.saved_pages import SavedPagesService
             from recipes.service import RecipeService
 
             self._recipes = RecipeService(self)
+            self._saved_pages = SavedPagesService(self)
         self._init_window_fields(browser_mode)
         self._init_handoff_fields(browser_mode, profile, handoff_root, approval_ttl_s)
         #: Egress 대역 옵션 (WS-29b). 기본: 루프백 허용, 사설·링크로컬·CGNAT·ULA 차단.
