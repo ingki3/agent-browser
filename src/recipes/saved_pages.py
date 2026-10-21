@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import secrets as _secrets
@@ -29,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from recipes import keys
-from recipes.store import _has_url_token, _pii, _token_in_text, clean_text
+from recipes.store import _decoded_forms, _has_url_token, _pii, _text_secret, _token_in_text, clean_text
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,9 @@ NAME_LIMIT = 80
 MAX_CANDIDATES = 8
 CANDIDATE_URL_LIMIT = 300
 BLOCK_LIMIT = 2500
+#: 로드 때 숫자 범위(NB): uses 상한, 시각(유닉스 초) 상한 — 서기 5000년 무렵.
+MAX_USES = 10 ** 9
+MAX_TIME = 1e11
 #: 파일 상한(바이트) — 200개 × (2KB 주소 + 이름) 보다 넉넉하게.
 MAX_FILE_BYTES = 1_000_000
 #: 관찰 data.saved_pages 의 안내 한 줄(고정).
@@ -110,9 +114,13 @@ def check_url(url: Any) -> str:
         raise SavedPageError(E_USERINFO)
     if has_redaction_mark(url) or _public_form(url) != url:
         raise SavedPageError(E_SECRET)
+    # R1: 구조별(경로 퍼센트, 쿼리·해시 form `+`→공백) 디코드를 최대 3회 반복한 형태 전부로 개인정보·토큰을 본다.
+    forms = _decoded_forms(url)
+    if any(has_redaction_mark(form) for form in forms[1:]):
+        raise SavedPageError(E_SECRET)
     if _pii(url):
         raise SavedPageError(E_PII)
-    if _has_url_token({"url": url}):
+    if any(_has_url_token({"url": form}) for form in forms):
         raise SavedPageError(E_TOKEN)
     return url
 
@@ -124,9 +132,19 @@ def check_name(name: Any) -> str:
         raise SavedPageError(E_NAME)
     if _pii(cleaned):
         raise SavedPageError(E_PII)
-    if _token_in_text(cleaned):
+    # R2: 이름 속 URL 구간의 쿼리·해시·경로 비밀 값(응답 가림이 일어나는 값)·토큰도 저장 전에 거부.
+    if _token_in_text(cleaned) or _text_secret(cleaned):
         raise SavedPageError(E_NAME_TOKEN)
     return cleaned
+
+
+def _finite_time(value: Any) -> bool:
+    """유한하고 범위 안(0 ≤ v ≤ MAX_TIME)인 시각 숫자인가(bool 제외). 큰 정수는 float() 전에 범위로 거른다."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= MAX_TIME
+    return math.isfinite(value) and 0.0 <= value <= MAX_TIME
 
 
 def normalize(url: str) -> str:
@@ -242,9 +260,9 @@ class SavedPageStore:
         if name != raw.get("name"):
             return None
         uses, saved_at, last = raw.get("uses"), raw.get("saved_at"), raw.get("last_used_at")
-        if (not isinstance(uses, int) or isinstance(uses, bool) or uses < 0
-                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (saved_at, last))):
-            return None
+        if (not isinstance(uses, int) or isinstance(uses, bool) or not 0 <= uses <= MAX_USES
+                or not all(_finite_time(v) for v in (saved_at, last))):
+            return None  # NB: NaN·Infinity·초대형 숫자(손으로 고친 파일)는 정렬·int() 에서 터지므로 항목째 버린다
         return {"id": raw["id"], "workspace": workspace, "origin": keys.origin_of(url), "url": url, "name": name,
                 "uses": uses, "saved_at": float(saved_at), "last_used_at": float(last)}
 
@@ -367,14 +385,25 @@ class SavedPageStore:
 # ---------------------------------------------------------------------------
 
 
-def _navigation_failed(result: Any) -> bool:
-    """이동이 실패·차단·challenge·오류 페이지로 끝났는가(uses 0)."""
+def _navigation_failed(result: Any, *, navigate: bool = False) -> bool:
+    """이동이 실패·차단·challenge·오류 페이지로 끝났는가(uses 0).
+
+    navigate 결과는 더 엄격하다(R5): 헤드리스 재시도 실패(identity.retry_failed), 최종 3xx(Location 없는 302 등 —
+    304 재검증 응답은 성공), 상태 누락·정수 아님도 실패다.
+    """
     data = getattr(result, "data", None) or {}
     if not getattr(result, "success", False) or data.get("challenge") is not None or data.get("egress"):
         return True
     if any(str(k).startswith("upstream") for k in data):
         return True
+    identity = data.get("identity")
+    if isinstance(identity, dict) and identity.get("retry_failed"):
+        return True
     status = data.get("last_http_status")
+    if navigate:
+        if not isinstance(status, int) or isinstance(status, bool):
+            return True
+        return status >= 400 or status < 200 or (300 <= status < 400 and status != 304)
     return isinstance(status, int) and status >= 400
 
 
@@ -471,7 +500,7 @@ class SavedPagesService:
         """navigate 1회 → 그 주소가 기억한 페이지면 다음 observe 한 번에서 +1 후보(리다이렉트·실패·재생은 없음)."""
         ws = self._workspace()
         self._pending.pop(ws, None)
-        if self._replaying() or _navigation_failed(result):
+        if self._replaying() or _navigation_failed(result, navigate=True):
             return
         requested = normalize(str(params.get("url") or ""))
         if not requested or len(self.store) == 0:
@@ -541,12 +570,20 @@ def _egress_allows(guard: Any, url: str) -> bool:
         return False
 
 
-def fit_saved_pages(result: Any, max_chars: int) -> None:
-    """응답이 크기 상한을 넘으면 saved_pages 를 통째로 뺀다 — 후보가 페이지 요소를 밀어내지 않게(목록은 pages op)."""
+def fit_saved_pages(result: Any, max_chars: int, finalize: Optional[Callable[[Any], Any]] = None) -> None:
+    """응답이 크기 상한을 넘으면 saved_pages 를 통째로 뺀다 — 후보가 페이지 요소를 밀어내지 않게(목록은 pages op).
+
+    R3: 크기는 **최종** 모양으로 잰다 — finalize(주입 신호 등 자르기 전에 붙는 부가 신호)를 사본에 붙여 본다.
+    후보를 뺀 뒤의 신호는 호출자가 원본에 다시 계산해 붙인다(뺀 후보 이름을 가리키는 신호가 남지 않게).
+    """
     data = getattr(result, "data", None)
     if not isinstance(data, dict) or "saved_pages" not in data:
         return
     from interface.server_envelope import envelope_json
 
-    if len(envelope_json(result)) > max_chars:
+    trial = result
+    if finalize is not None:
+        trial = result.model_copy(deep=True)
+        finalize(trial)
+    if len(envelope_json(trial)) > max_chars:
         del data["saved_pages"]

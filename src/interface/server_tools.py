@@ -208,12 +208,15 @@ class ToolsMixin:
 
         capture: Dict[str, Any] = {}
         if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
-            return self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
-                                     ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
+            early = self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                       ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
+            self._note_saved_pages(action_from_tool(name), arguments, early)
+            return early
         if self._window is not None:
             # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
             blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
             if blocked is not None:
+                self._note_saved_pages(action_from_tool(name), arguments, blocked)
                 return blocked
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
@@ -227,6 +230,8 @@ class ToolsMixin:
             if capture and capture["gen"] != self._pixel_gen:
                 return self._pixels_refused(ActionType.TAKE_SCREENSHOT)
             action = action_from_tool(name)
+            # WS-61 R4: 조작권·HITL·검증 거부 같은 조기 반환을 포함한 모든 결과 경로에서 pending 초기화·소비.
+            self._note_saved_pages(action, arguments, result)
             if action is ActionType.TAB_CONTROL and result.success and "tabs" in result.data:
                 self._note_other_workspaces(result)  # WS-57: 다른 작업 공간 탭은 개수만
             if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
@@ -243,15 +248,18 @@ class ToolsMixin:
             # 덮으려고 여기서 한 번 한다. 자르기 전에 붙여 신호까지 크기 상한 안에 들게 한다.
             from security.injection_signal import attach_injection_signal
 
+            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
+            # 부분은 늘 검사 범위 안이다.
+            scan_chars = 10 * self.max_result_chars
             if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
                 from recipes.saved_pages import fit_saved_pages
 
                 # WS-61: 기억한 페이지 후보가 크기 상한에서 페이지 요소를 밀어내지 않게 — 넘으면 후보를 뺀다.
-                fit_saved_pages(result, self.max_result_chars)
+                # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
+                fit_saved_pages(result, self.max_result_chars,
+                                finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
 
-            # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
-            # 부분은 늘 검사 범위 안이다.
-            attach_injection_signal(result, max_scan_chars=10 * self.max_result_chars)
+            attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
             cap_result_size(result, self.max_result_chars)
             if self._window is not None and (self._window_unreported or self._recovered_notice):
@@ -431,6 +439,20 @@ class ToolsMixin:
 
         return normalize_action_params(action, params)
 
+    def _note_saved_pages(self, action: Optional[ActionType], arguments: Dict[str, Any], result: ActionResult) -> None:
+        """WS-61: 외부 navigate/observe 결과마다(성공·거부 무관) uses pending 초기화·소비 + 관찰 후보 부착.
+
+        uses 는 navigate 1회당 첫 observe 에서 최대 +1. 헤드리스 재시도의 내부 호출(_retry_recipe_boundary)은 건너뛴다
+        — 바깥 navigate 의 최종 결과(재시도 결과 포함)로 한 번만 판정한다.
+        """
+        saved = getattr(self, "_saved_pages", None)
+        if saved is None or self._retry_recipe_boundary.get():
+            return
+        if action is ActionType.NAVIGATE:
+            saved.note_navigate(dict(arguments or {}), result)
+        elif action is ActionType.OBSERVE_PAGE:
+            saved.observe(result)
+
     async def _run_gated_action(self, name: str, arguments: Dict[str, Any], action: ActionType,
                                 params: Dict[str, Any]) -> ActionResult:
         """게이트를 통과한 액션 실행 → 신호 부착 → 헤드리스 재시도 → 레시피 기록."""
@@ -479,13 +501,7 @@ class ToolsMixin:
                 self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
             if action is ActionType.OBSERVE_PAGE:
                 await self._recipes.observe(result)
-        saved = getattr(self, "_saved_pages", None)
-        if saved is not None and not retry_boundary:
-            # WS-61: uses(navigate 1회당 첫 observe 에서 최대 +1)·관찰 후보 data.saved_pages. 재시도는 바깥 최종 결과 기준.
-            if action is ActionType.NAVIGATE:
-                saved.note_navigate(params, result)
-            elif action is ActionType.OBSERVE_PAGE:
-                saved.observe(result)
+        # (WS-61 uses·관찰 후보는 _route_tool_call 의 _note_saved_pages — 조기 반환 경로까지 덮는다.)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
 

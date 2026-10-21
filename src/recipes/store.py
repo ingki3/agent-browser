@@ -310,10 +310,59 @@ def _check_paths(rec: Dict[str, Any]) -> None:
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
+#: 반복 디코딩 상한(WS-61 R1) — 이중·삼중 인코딩까지 풀고 그보다 깊게 감싼 값은 더 풀지 않는다(비용 상한).
+MAX_DECODE_ROUNDS = 3
+
+
+def _structural_decode(text: str) -> Optional[str]:
+    """URL 구조별 한 겹 디코드(WS-61 R1): `?`·`#` 앞(스킴·호스트·경로)은 퍼센트만, 뒤(쿼리·해시)는 form 규칙
+    (`+`→공백)까지. 경로의 `+` 는 글자 그대로다. UTF-8 이 아니거나 제어·서식 문자가 나오면 None."""
+    cut = min((i for i in (text.find("?"), text.find("#")) if i >= 0), default=len(text))
+    try:
+        out = (unquote(text[:cut], encoding="utf-8", errors="strict")
+               + unquote_plus(text[cut:], encoding="utf-8", errors="strict"))
+    except UnicodeDecodeError:
+        return None
+    if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in out):
+        return None
+    return out
+
+
+def _decoded_forms(text: str) -> List[str]:
+    """원문 + 구조별 디코드를 바뀌지 않을 때까지 최대 MAX_DECODE_ROUNDS 회 반복한 형태들(원문 먼저)."""
+    forms = [text]
+    for _ in range(MAX_DECODE_ROUNDS):
+        nxt = _structural_decode(forms[-1])
+        if nxt is None or nxt == forms[-1]:
+            break
+        forms.append(nxt)
+    return forms
+
+
 def _pii(text: str) -> bool:
-    dec = _decode_segment(text)
-    norm = unicodedata.normalize("NFKC", dec if dec is not None else text)
-    return bool(_EMAIL.search(norm) or _PHONE.search(norm))
+    """이메일·전화번호(R1 NB-1). 원문과 구조별·반복 디코드 형태 전부, 자유 문자열 속 URL 구간도 따로 본다."""
+    pieces = [text] + [m.group() for m in _TEXT_URL.finditer(text) if m.group() != text]
+    for piece in pieces:
+        for form in _decoded_forms(piece):
+            norm = unicodedata.normalize("NFKC", form)
+            if _EMAIL.search(norm) or _PHONE.search(norm):
+                return True
+    return False
+
+
+def _text_secret(text: str) -> bool:
+    """자유 문자열(이름) 안 URL 구간의 쿼리·해시·경로에 응답 가림(public_text: 비밀 키 값·JWT·레지스트리 값)이
+    일어나거나 토큰 조각이 있으면 True(WS-61 R2). 원문·구조별 반복 디코드 형태 전부를 본다."""
+    from security.public_url import has_redaction_mark, public_text
+
+    for form in _decoded_forms(text):
+        if has_redaction_mark(form) or public_text(form) != form:
+            return True
+        for match in _TEXT_URL.finditer(form):
+            url = match.group()
+            if _token_in_path(url, is_url="://" in url):
+                return True
+    return False
 
 
 def _has_pii(obj: Any, key: str = "") -> bool:
@@ -362,6 +411,10 @@ def compile_recipe(
     clean_name = clean_text(name)
     if not clean_name:
         raise RecipeError("레시피 이름이 비었습니다.")
+    if _text_secret(clean_name):
+        # WS-61 R2: 이름 속 URL 의 비밀 값(응답에서는 가려지지만 파일에는 원문으로 남는다) — 저장 전 거부.
+        raise RecipeError("레시피 이름의 주소 조각에 비밀 값(토큰·세션·인증 코드 등)으로 보이는 글자가 있어 저장하지 "
+                          "않습니다.")
     if not entries:
         raise RecipeError("저장할 단계가 없습니다(성공하고 사후 확인을 통과한 최근 동작이 없음).")
     if len(entries) > MAX_STEPS:

@@ -268,6 +268,7 @@ def _navigate(srv: FakeServer, svc: SavedPagesService, requested: str, landed: s
     landed = landed or requested
     srv.page.url = landed
     success = kw.pop("success", True)
+    kw.setdefault("last_http_status", 200)  # R5: 상태 누락 navigate 는 실패(uses 0)
     svc.note_navigate({"url": requested}, _result(ActionType.NAVIGATE, landed, success=success, **kw))
 
 
