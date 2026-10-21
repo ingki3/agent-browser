@@ -35,7 +35,7 @@ import stat
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 
 from recipes import keys
@@ -314,13 +314,14 @@ def _check_paths(rec: Dict[str, Any]) -> None:
 MAX_DECODE_ROUNDS = 3
 
 
-def _structural_decode(text: str) -> Optional[str]:
-    """URL 구조별 한 겹 디코드(WS-61 R1): `?`·`#` 앞(스킴·호스트·경로)은 퍼센트만, 뒤(쿼리·해시)는 form 규칙
-    (`+`→공백)까지. 경로의 `+` 는 글자 그대로다. UTF-8 이 아니거나 제어·서식 문자가 나오면 None."""
-    cut = min((i for i in (text.find("?"), text.find("#")) if i >= 0), default=len(text))
+#: 구성요소 경계(WS-61 R2) — 경로 `/`, 쿼리·해시 `?` `&` `=` `#` `;`, 자유 문자열의 공백. 경계 글자는 디코드하지 않는다.
+_COMPONENT_SPLIT = re.compile(r"([/?&=#;\s])")
+
+
+def _decode_component(comp: str, form: bool) -> Optional[str]:
+    """구성요소 하나를 한 겹 디코드. UTF-8 이 아니거나 제어·서식 문자가 나오면 None(그 구성요소만 디코딩 불능)."""
     try:
-        out = (unquote(text[:cut], encoding="utf-8", errors="strict")
-               + unquote_plus(text[cut:], encoding="utf-8", errors="strict"))
+        out = (unquote_plus if form else unquote)(comp, encoding="utf-8", errors="strict")
     except UnicodeDecodeError:
         return None
     if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in out):
@@ -328,15 +329,49 @@ def _structural_decode(text: str) -> Optional[str]:
     return out
 
 
-def _decoded_forms(text: str) -> List[str]:
-    """원문 + 구조별 디코드를 바뀌지 않을 때까지 최대 MAX_DECODE_ROUNDS 회 반복한 형태들(원문 먼저)."""
+def _structural_decode_parts(text: str) -> Tuple[str, bool]:
+    """URL 구조별·**구성요소별** 한 겹 디코드(WS-61 R1·R2): `?`·`#` 앞(스킴·호스트·경로)은 퍼센트만, 뒤(쿼리·해시)는
+    form 규칙(`+`→공백)까지. 디코딩 불능 구성요소는 원문 그대로 두고(다른 구성요소 디코드·검사를 취소하지 않음)
+    두 번째 값으로 알린다."""
+    cut = min((i for i in (text.find("?"), text.find("#")) if i >= 0), default=len(text))
+    out: List[str] = []
+    bad = False
+    for region, form in ((text[:cut], False), (text[cut:], True)):
+        for piece in _COMPONENT_SPLIT.split(region):
+            if not piece or _COMPONENT_SPLIT.fullmatch(piece):
+                out.append(piece)
+                continue
+            dec = _decode_component(piece, form)
+            if dec is None:
+                bad = True
+                out.append(piece)
+            else:
+                out.append(dec)
+    return "".join(out), bad
+
+
+def _decode_rounds(text: str) -> Tuple[List[str], bool]:
+    """원문 + 구성요소별 디코드를 바뀌지 않을 때까지 최대 MAX_DECODE_ROUNDS 회 반복한 형태들과 디코딩 불능 여부."""
     forms = [text]
+    bad = False
     for _ in range(MAX_DECODE_ROUNDS):
-        nxt = _structural_decode(forms[-1])
-        if nxt is None or nxt == forms[-1]:
+        nxt, round_bad = _structural_decode_parts(forms[-1])
+        bad = bad or round_bad
+        if nxt == forms[-1]:
             break
         forms.append(nxt)
-    return forms
+    return forms, bad
+
+
+def _decoded_forms(text: str) -> List[str]:
+    """원문 + 구성요소별 디코드를 최대 MAX_DECODE_ROUNDS 회 반복한 형태들(원문 먼저). 디코딩 불능 구성요소는
+    원문 그대로 남아 같은 형태에서 검사되고, 나머지 구성요소는 계속 풀린다(R2)."""
+    return _decode_rounds(text)[0]
+
+
+def _undecodable(text: str) -> bool:
+    """어느 반복에서든 구성요소 하나라도 UTF-8 디코딩 불능이거나 제어·서식 문자로 풀리면 True(R2 fail-closed)."""
+    return _decode_rounds(text)[1]
 
 
 def _pii(text: str) -> bool:
@@ -373,7 +408,9 @@ def _has_pii(obj: Any, key: str = "") -> bool:
     if isinstance(obj, list):
         return any(_has_pii(v, key) for v in obj)
     if isinstance(obj, str):
-        return _pii(_PLACEHOLDER.sub("", obj))
+        text = _PLACEHOLDER.sub("", obj)
+        # R2: 디코딩 불능·제어/서식 문자 구성요소는 그 안에 무엇이 있는지 확인할 수 없다 — 저장 거부(fail-closed).
+        return _pii(text) or _undecodable(text)
     return False
 
 

@@ -30,7 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from recipes import keys
-from recipes.store import _decoded_forms, _has_url_token, _pii, _text_secret, _token_in_text, clean_text
+from recipes.store import (_decoded_forms, _has_url_token, _pii, _text_secret, _token_in_text, _undecodable,
+                           clean_text)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ E_SECRET = ("주소에 비밀 값(토큰·세션·인증 코드 등)으로 보�
             "(가린 주소로는 이동할 수 없음).")
 E_TOKEN = "주소의 경로·호스트·쿼리 키에 토큰으로 보이는 조각이 있어 기억하지 않습니다(인증·재설정 링크 등)."
 E_PII = "주소 또는 이름에 이메일·전화번호로 보이는 글자가 있어 기억하지 않습니다."
+E_DECODE = ("주소의 경로·쿼리·해시 값에 풀 수 없는 인코딩(UTF-8 아님)이나 제어·서식 문자가 있어 기억하지 않습니다"
+            "(내용을 확인할 수 없는 값은 저장하지 않음).")
 E_NAME_TOKEN = "이름에 토큰으로 보이는 조각이 있어 기억하지 않습니다."
 E_FRAME = "프레임 안에서는 기억하지 않습니다(최상위 문서 주소만) — switch_frame {to_main: true} 뒤 다시 하세요."
 E_NO_PAGE = "열린 페이지가 없습니다 — 먼저 navigate 하세요."
@@ -120,6 +123,9 @@ def check_url(url: Any) -> str:
         raise SavedPageError(E_SECRET)
     if _pii(url):
         raise SavedPageError(E_PII)
+    # R2: 구성요소별 디코딩 불능·제어/서식 문자 — 그 값은 원문 그대로도 검사했지만(위 _pii) 저장은 거부(fail-closed).
+    if _undecodable(url):
+        raise SavedPageError(E_DECODE)
     if any(_has_url_token({"url": form}) for form in forms):
         raise SavedPageError(E_TOKEN)
     return url

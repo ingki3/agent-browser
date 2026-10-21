@@ -251,25 +251,21 @@ class ToolsMixin:
             # 검사 입력 상한 = 결과 크기 상한의 10배(WS-36 R1 NB2) — 자르기가 앞쪽을 남기므로 돌려주는
             # 부분은 늘 검사 범위 안이다.
             scan_chars = 10 * self.max_result_chars
+            # WS-61 R2: 창/복구 보고는 자르기 뒤에 붙는다 — 그 크기를 먼저 빼 둔 상한으로 후보 제거·자르기를 판단해
+            # 보고까지 붙인 최종 직렬화 크기가 상한을 넘지 않게 한다(보고가 없으면 0 — 기존과 같은 바이트).
+            max_chars = self.max_result_chars - self._window_notice_chars(result)
             if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
                 from recipes.saved_pages import fit_saved_pages
 
                 # WS-61: 기억한 페이지 후보가 크기 상한에서 페이지 요소를 밀어내지 않게 — 넘으면 후보를 뺀다.
                 # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
-                fit_saved_pages(result, self.max_result_chars,
+                fit_saved_pages(result, max_chars,
                                 finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
 
             attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-            cap_result_size(result, self.max_result_chars)
-            if self._window is not None and (self._window_unreported or self._recovered_notice):
-                # WS-50: 꺼진 브라우저 복구는 '창 전환 실패 뒤 복구' 와 다른 알림(browser_recovered)으로 싣는다.
-                browser_recovered = self._recovered_notice == self._BROWSER_RECOVERED
-                if browser_recovered:
-                    self._recovered_notice = False
-                self._attach_window_report(result)
-                if browser_recovered:
-                    self._mark_browser_recovered(result)
+            cap_result_size(result, max_chars)
+            self._attach_window_notices(result)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result
@@ -282,6 +278,32 @@ class ToolsMixin:
                 self._inflight -= 1
                 if capture:
                     self._captures_inflight -= 1
+
+    def _attach_window_notices(self, result: ActionResult) -> None:
+        """아직 알리지 않은 창 전환·복구 보고를 결과에 싣는다(1회 소비)."""
+        if self._window is not None and (self._window_unreported or self._recovered_notice):
+            # WS-50: 꺼진 브라우저 복구는 '창 전환 실패 뒤 복구' 와 다른 알림(browser_recovered)으로 싣는다.
+            browser_recovered = self._recovered_notice == self._BROWSER_RECOVERED
+            if browser_recovered:
+                self._recovered_notice = False
+            self._attach_window_report(result)
+            if browser_recovered:
+                self._mark_browser_recovered(result)
+
+    def _window_notice_chars(self, result: ActionResult) -> int:
+        """_attach_window_notices 가 늘릴 봉투 글자 수(WS-61 R2) — 사본에 붙여 재고, 보고 상태는 소비하지 않는다."""
+        if self._window is None or not (self._window_unreported or self._recovered_notice):
+            return 0
+        from interface.server_envelope import envelope_json
+
+        trial = result.model_copy(deep=True)
+        before = len(envelope_json(trial))
+        state = (self._window_unreported, self._recovered_notice)
+        try:
+            self._attach_window_notices(trial)
+        finally:
+            self._window_unreported, self._recovered_notice = state
+        return max(0, len(envelope_json(trial)) - before)
 
     async def _call_wait_tool(self, name: str, arguments: Dict[str, Any],
                               capture: Dict[str, Any]) -> ActionResult:
