@@ -35,7 +35,7 @@ import stat
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 
 from recipes import keys
@@ -310,10 +310,94 @@ def _check_paths(rec: Dict[str, Any]) -> None:
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
+#: 반복 디코딩 상한(WS-61 R1) — 이중·삼중 인코딩까지 풀고 그보다 깊게 감싼 값은 더 풀지 않는다(비용 상한).
+MAX_DECODE_ROUNDS = 3
+
+
+#: 구성요소 경계(WS-61 R2) — 경로 `/`, 쿼리·해시 `?` `&` `=` `#` `;`, 자유 문자열의 공백. 경계 글자는 디코드하지 않는다.
+_COMPONENT_SPLIT = re.compile(r"([/?&=#;\s])")
+
+
+def _decode_component(comp: str, form: bool) -> Optional[str]:
+    """구성요소 하나를 한 겹 디코드. UTF-8 이 아니거나 제어·서식 문자가 나오면 None(그 구성요소만 디코딩 불능)."""
+    try:
+        out = (unquote_plus if form else unquote)(comp, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in out):
+        return None
+    return out
+
+
+def _structural_decode_parts(text: str) -> Tuple[str, bool]:
+    """URL 구조별·**구성요소별** 한 겹 디코드(WS-61 R1·R2): `?`·`#` 앞(스킴·호스트·경로)은 퍼센트만, 뒤(쿼리·해시)는
+    form 규칙(`+`→공백)까지. 디코딩 불능 구성요소는 원문 그대로 두고(다른 구성요소 디코드·검사를 취소하지 않음)
+    두 번째 값으로 알린다."""
+    cut = min((i for i in (text.find("?"), text.find("#")) if i >= 0), default=len(text))
+    out: List[str] = []
+    bad = False
+    for region, form in ((text[:cut], False), (text[cut:], True)):
+        for piece in _COMPONENT_SPLIT.split(region):
+            if not piece or _COMPONENT_SPLIT.fullmatch(piece):
+                out.append(piece)
+                continue
+            dec = _decode_component(piece, form)
+            if dec is None:
+                bad = True
+                out.append(piece)
+            else:
+                out.append(dec)
+    return "".join(out), bad
+
+
+def _decode_rounds(text: str) -> Tuple[List[str], bool]:
+    """원문 + 구성요소별 디코드를 바뀌지 않을 때까지 최대 MAX_DECODE_ROUNDS 회 반복한 형태들과 디코딩 불능 여부."""
+    forms = [text]
+    bad = False
+    for _ in range(MAX_DECODE_ROUNDS):
+        nxt, round_bad = _structural_decode_parts(forms[-1])
+        bad = bad or round_bad
+        if nxt == forms[-1]:
+            break
+        forms.append(nxt)
+    return forms, bad
+
+
+def _decoded_forms(text: str) -> List[str]:
+    """원문 + 구성요소별 디코드를 최대 MAX_DECODE_ROUNDS 회 반복한 형태들(원문 먼저). 디코딩 불능 구성요소는
+    원문 그대로 남아 같은 형태에서 검사되고, 나머지 구성요소는 계속 풀린다(R2)."""
+    return _decode_rounds(text)[0]
+
+
+def _undecodable(text: str) -> bool:
+    """어느 반복에서든 구성요소 하나라도 UTF-8 디코딩 불능이거나 제어·서식 문자로 풀리면 True(R2 fail-closed)."""
+    return _decode_rounds(text)[1]
+
+
 def _pii(text: str) -> bool:
-    dec = _decode_segment(text)
-    norm = unicodedata.normalize("NFKC", dec if dec is not None else text)
-    return bool(_EMAIL.search(norm) or _PHONE.search(norm))
+    """이메일·전화번호(R1 NB-1). 원문과 구조별·반복 디코드 형태 전부, 자유 문자열 속 URL 구간도 따로 본다."""
+    pieces = [text] + [m.group() for m in _TEXT_URL.finditer(text) if m.group() != text]
+    for piece in pieces:
+        for form in _decoded_forms(piece):
+            norm = unicodedata.normalize("NFKC", form)
+            if _EMAIL.search(norm) or _PHONE.search(norm):
+                return True
+    return False
+
+
+def _text_secret(text: str) -> bool:
+    """자유 문자열(이름) 안 URL 구간의 쿼리·해시·경로에 응답 가림(public_text: 비밀 키 값·JWT·레지스트리 값)이
+    일어나거나 토큰 조각이 있으면 True(WS-61 R2). 원문·구조별 반복 디코드 형태 전부를 본다."""
+    from security.public_url import has_redaction_mark, public_text
+
+    for form in _decoded_forms(text):
+        if has_redaction_mark(form) or public_text(form) != form:
+            return True
+        for match in _TEXT_URL.finditer(form):
+            url = match.group()
+            if _token_in_path(url, is_url="://" in url):
+                return True
+    return False
 
 
 def _has_pii(obj: Any, key: str = "") -> bool:
@@ -324,7 +408,9 @@ def _has_pii(obj: Any, key: str = "") -> bool:
     if isinstance(obj, list):
         return any(_has_pii(v, key) for v in obj)
     if isinstance(obj, str):
-        return _pii(_PLACEHOLDER.sub("", obj))
+        text = _PLACEHOLDER.sub("", obj)
+        # R2: 디코딩 불능·제어/서식 문자 구성요소는 그 안에 무엇이 있는지 확인할 수 없다 — 저장 거부(fail-closed).
+        return _pii(text) or _undecodable(text)
     return False
 
 
@@ -362,6 +448,10 @@ def compile_recipe(
     clean_name = clean_text(name)
     if not clean_name:
         raise RecipeError("레시피 이름이 비었습니다.")
+    if _text_secret(clean_name):
+        # WS-61 R2: 이름 속 URL 의 비밀 값(응답에서는 가려지지만 파일에는 원문으로 남는다) — 저장 전 거부.
+        raise RecipeError("레시피 이름의 주소 조각에 비밀 값(토큰·세션·인증 코드 등)으로 보이는 글자가 있어 저장하지 "
+                          "않습니다.")
     if not entries:
         raise RecipeError("저장할 단계가 없습니다(성공하고 사후 확인을 통과한 최근 동작이 없음).")
     if len(entries) > MAX_STEPS:

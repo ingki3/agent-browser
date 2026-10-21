@@ -21,6 +21,7 @@
 - **헤드리스 이름 재시도** — 헤드리스 이름만 막는 사이트에서 이름·Client Hints 만 바꿔 한 번 다시 열고, 그 사실을 `data.identity` 로 공개합니다. → [헤드리스 이름 재시도](docs/headless-retry.md)
 - **사람 인계·로그인 유지** — 조작권(`control take/release`)·승인 코드, 필요할 때만 창(`--browser on-demand`), 영속 프로필(`--profile`), 미리 로그인(`agent-browser login`). → [사람 인계와 로그인](docs/human-handoff.md)
 - **동작 캐시(레시피)** — 통과한 흐름을 자동 저장해 도구 호출 한 번으로 재생하고, 화면이 어긋나면 누르지 않고 멈춥니다. → [기능](docs/features.md#동작-캐시--레시피-browser_recipe)
+- **도착 페이지 기억** — 사용자가 "이 페이지 기억해"라고 한 주소를 저장해 같은 출처를 관찰할 때 후보(`data.saved_pages`)로 붙입니다(자동 저장 없음). → [기능](docs/features.md#도착-페이지-기억-browser_recipe-remember_pagepagesforget_page-ws-61)
 - **PDF 읽기·YouTube 영상 검색** — PDF 본문을 `data.document` 로, YouTube 검색을 공식 Data API v3 로. → [기능](docs/features.md)
 - **Egress 가드·출력 비밀 가림** — 검증 프록시로 사설망·메타데이터를 막고, 응답 주소·문장 속 비밀 값을 `[REDACTED]` 로 가립니다. → [보안](docs/security.md)
 - **우회하지 않습니다** — 캡차 자동 풀이·확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다. 막히면 사람에게 넘깁니다.
@@ -96,7 +97,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-6642개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+6819개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](docs/llm-agent.md)를 보십시오.
 
@@ -143,7 +144,7 @@ LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](do
 | [docs/mcp-integration.md](docs/mcp-integration.md) | MCP 연동 상세 — `serve --browser`·`--nav-settle`·`--pre-approve`/`--mode`, 관찰 → 액션 흐름, 응답 형식 |
 | [docs/signals.md](docs/signals.md) | 차단·캡차, 프롬프트 주입, robots.txt 신호 |
 | [docs/headless-retry.md](docs/headless-retry.md) | 헤드리스 이름 재시도, `data.identity`·`retry_skipped`·`cookie_change`, 쿠키 장부(WS-47·WS-52) |
-| [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피) |
+| [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피), 도착 페이지 기억 |
 | [docs/human-handoff.md](docs/human-handoff.md) | 미리 로그인, 사람 인계(조작권·승인), 로그인 유지(`--profile`), 필요할 때만 창(`on-demand`) |
 | [docs/llm-agent.md](docs/llm-agent.md) | 내장 LLM 에이전트(`run`)·실환경 태스크 실행 |
 | [docs/security.md](docs/security.md) | 안전장치(예산·Egress·주입·출력 비밀 가림·세션 암호화), 로그인 세션과 자격증명 |
