@@ -47,6 +47,7 @@ from actions.healing import (
 )
 from actions.verification import (
     PostConditionResult,
+    StalenessReason,
     capture_state,
     safe_page_text,
     verify_post_condition,
@@ -1314,7 +1315,10 @@ class ActionDispatcher:
             st = await verify_staleness(self.ctx.page, handle, self.ctx.engine.epoch)
         except Exception as exc:  # noqa: BLE001
             return {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
-        return {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
+        out = {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
+        if st.reason is StalenessReason.GROUP_CHANGED:
+            out["group_changed"] = True  # WS-62 NB1: 승인 경로도 재관찰 요구(reobserve_required)
+        return out
 
     # -- WS-56 R1 B1: 승인 대상 노드 결속 ---------------------------------------
 
@@ -1994,6 +1998,24 @@ class ActionDispatcher:
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
+        if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
+            # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
+            # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
+            from perception.repeated import pin_display
+
+            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
+            after = (safe_page_text(pin_display(staleness.observed_group))
+                     if staleness.observed_group is not None else None)
+            hint = "관찰 뒤 묶음(달·행)이 바뀌어 누르지 않았습니다 — 다시 관찰해 data.repeated 에서 고르세요"
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=ErrorCode.TOCTOU_MISMATCH,
+                error_message=f"Staleness 검증 실패({staleness.detail}) — 치유하지 않음: {hint}",
+                reobserve_required=True,
+                data={"group_changed": {"before": before, "after": after}, "hint": hint},
+            )
         if not staleness.fresh and identity_change_refused(staleness.reason, action):
             # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
             # 바뀌었다(제자리 교체). 치유 사다리의 어느 단계로 골라도(testid 유지·비슷한
@@ -2051,6 +2073,10 @@ class ActionDispatcher:
                     error_message="치유된 요소의 핸들을 찾을 수 없습니다.",
                     reobserve_required=True,
                 )
+            if getattr(handle, "group_path", None):
+                # WS-62 R1 R2: 채택한 핸들은 원래 선택 근거(구분 조상·지문)를 잇는다 — 치유 후보 거르기가 이 근거로
+                # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다.
+                new_handle.group_path, new_handle.group_heading = handle.group_path, handle.group_heading
             handle = new_handle
             healed_flag = True
         return handle, healed_flag
@@ -2570,9 +2596,17 @@ class ActionDispatcher:
         """
         self._healing_attempts += 1
 
-        result = await self.ctx.engine.observe_page(
+        engine = self.ctx.engine
+        before = getattr(engine, "handles", None)
+        old_pins = {
+            eid: (h.group_path, h.group_heading)
+            for eid, h in (dict(before).items() if isinstance(before, dict) else [])
+            if getattr(h, "group_path", None)
+        }
+        result = await engine.observe_page(
             page=self.ctx.page, cdp=self.ctx.cdp
         )
+        await self._repin_after_reobserve(result.elements, old_pins)
         candidates: List[HealingCandidate] = []
         for observed in result.elements:
             h = self.ctx.engine.get_handle(observed.element_id)
@@ -2587,11 +2621,53 @@ class ActionDispatcher:
                 )
             )
 
-        healing = heal(handle, candidates, action=action)
+        healing = heal(handle, await self._same_group_candidates(handle, candidates), action=action)
         if healing.healed:
             self._healing_successes += 1
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)
         return healing
+
+    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[str, Any]]) -> None:
+        """WS-62 R1 R2: 치유의 재관찰이 핸들을 새로 만들어도 묶음 고정이 사라지지 않게 한다.
+
+        1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
+        고정돼 있었다면 그 선택 근거(구분 조상·지문)를 같은 id 의 새 핸들에 이어 준다 — id 는 이전 관찰을 보고 고른
+        것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다.
+        """
+        from perception.repeated import annotate_repeated
+
+        engine = self.ctx.engine
+        try:
+            await annotate_repeated(self.ctx.page, engine, elements)
+        except Exception as exc:  # noqa: BLE001 — 주석 실패는 아래 승계로만 고정한다
+            logger.debug("치유 재관찰 묶음 주석 실패: %s", type(exc).__name__)
+        for eid, (path, pin) in old_pins.items():
+            h = engine.get_handle(eid)
+            if h is not None:
+                h.group_path, h.group_heading = path, pin
+
+    async def _same_group_candidates(
+        self, handle: ElementHandle, candidates: List[HealingCandidate]
+    ) -> List[HealingCandidate]:
+        """WS-62 B5: 쌍둥이 묶음에 든 대상이면 같은 구분 조상 안·같은 표제인 후보만 치유에 쓴다.
+
+        role+이름만 보면 다른 달의 '19' 가 정상 치유로 채택된다. 확인을 못 하면 후보 없음(fail-closed).
+        """
+        if not getattr(handle, "group_path", None) or not candidates:
+            return candidates
+        from perception.repeated import GROUP_FILTER_JS
+
+        try:
+            keep = await self.ctx.page.evaluate(GROUP_FILTER_JS, {
+                "paths": [c.css_path for c in candidates],
+                "groupPath": handle.group_path,
+                "groupHeading": handle.group_heading,
+            })
+        except Exception:  # noqa: BLE001 — 묶음 확인 불가면 치유하지 않는다
+            return []
+        if not isinstance(keep, list) or len(keep) != len(candidates):
+            return []
+        return [c for c, ok in zip(candidates, keep) if ok is True]
 
     # -- 실행 ---------------------------------------------------------------
 
@@ -2810,11 +2886,18 @@ class ActionDispatcher:
             page=page,
             cdp=self.ctx.cdp,
         )
+        data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
+        # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
+        from perception.repeated import annotate_repeated
+
+        repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
+        if repeated is not None:
+            data["repeated"] = repeated
         return self._result(
             success=True,
             action=action,
             retry_safe=True,
-            data={"observation": observed.model_dump(mode="json")},
+            data=data,
         )
 
     async def _elementless_navigate(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:

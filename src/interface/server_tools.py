@@ -261,6 +261,13 @@ class ToolsMixin:
                 # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
                 fit_saved_pages(result, max_chars,
                                 finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+            if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
+                from perception.repeated import fit_repeated
+
+                # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
+                # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
+                fit_repeated(result, max_chars,
+                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
 
             attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.

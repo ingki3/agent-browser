@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode
 from perception.engine import ElementHandle
+from perception.repeated import GROUP_CHECK_JS, pin_display
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).
@@ -95,17 +96,23 @@ STALENESS_CHECK_SCRIPT = """
   __ACCESSIBLE_NAME__
   const name = String(accessibleName(el) || '');
 
-  return {
+  const out = {
     connected: true,
     role: String(role).toLowerCase(),
     name: name,
     checked: el.checked !== undefined ? !!el.checked : null,
     value: el.value !== undefined ? String(el.value) : null,
   };
+  // WS-62: 관찰 때 쌍둥이 묶음(data.repeated)에 든 대상 — 아직 그 구분 조상 안이고 표제가 같은가(같은 평가에서).
+  if (args.groupPath) {
+    __GROUP_CHECK__
+    out.group = groupCheck(el, args.groupPath, args.groupHeading === undefined ? null : args.groupHeading);
+  }
+  return out;
 }
 """.replace("__DEEP_QUERY__", DEEP_QUERY_JS).replace(
     "__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip()
-)
+).replace("__GROUP_CHECK__", GROUP_CHECK_JS)
 
 
 #: 페이지 유래 이름·role 을 오류 문구(detail·hint·element_changed)에 실을 때의 길이 상한(글자).
@@ -133,6 +140,8 @@ class StalenessReason(str, Enum):
     NODE_DETACHED = "node_detached"
     ROLE_CHANGED = "role_changed"
     NAME_CHANGED = "name_changed"
+    #: WS-62: 관찰 때의 쌍둥이 묶음(구분 조상·표제)과 다르다 — 달 넘김 후 같은 노드 재사용 등.
+    GROUP_CHANGED = "group_changed"
 
 
 @dataclass
@@ -144,6 +153,8 @@ class StalenessResult:
     detail: str = ""
     observed_role: Optional[str] = None
     observed_name: Optional[str] = None
+    #: WS-62: GROUP_CHANGED 일 때 지금 묶음 표제(구분 조상이 사라졌거나 밖이면 None).
+    observed_group: Optional[str] = None
 
     @property
     def error_code(self) -> Optional[ErrorCode]:
@@ -186,7 +197,12 @@ async def verify_staleness(
             detail="css_path가 비어 있어 재조회 불가",
         )
 
-    probe = await page.evaluate(STALENESS_CHECK_SCRIPT, {"cssPath": handle.css_path})
+    args: Dict[str, Any] = {"cssPath": handle.css_path}
+    group_path = getattr(handle, "group_path", None)
+    if group_path:
+        args["groupPath"] = group_path
+        args["groupHeading"] = getattr(handle, "group_heading", None)
+    probe = await page.evaluate(STALENESS_CHECK_SCRIPT, args)
 
     # 2) 백킹 노드 연결 확인
     if not probe.get("connected"):
@@ -219,6 +235,26 @@ async def verify_staleness(
             observed_role=got_role,
             observed_name=got_name,
         )
+
+    # 5) WS-62: 묶음 고정 — 알고리즘을 다시 돌리지 않고 "그 조상 안 + 표제 같음" 만 본다(epoch 무관).
+    if group_path:
+        group = probe.get("group") if isinstance(probe.get("group"), dict) else {}
+        if not group.get("ok"):
+            now = group.get("now")
+            before = getattr(handle, "group_heading", None)
+            why = str(group.get("why") or "확인 실패")
+            if before is not None and now is not None:
+                detail = f"묶음 '{safe_page_text(pin_display(before))}' -> '{safe_page_text(pin_display(now))}'"
+            else:
+                detail = f"묶음 확인 실패({safe_page_text(why)})"
+            return StalenessResult(
+                fresh=False,
+                reason=StalenessReason.GROUP_CHANGED,
+                detail=detail,
+                observed_role=got_role,
+                observed_name=got_name,
+                observed_group=now if isinstance(now, str) else None,
+            )
 
     return StalenessResult(
         fresh=True,
