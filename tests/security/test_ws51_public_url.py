@@ -157,7 +157,8 @@ def test_public_payload_skips_content_keys_and_does_not_mutate():
     assert out["data"]["observation"]["axtree_summary"] == src["data"]["observation"]["axtree_summary"]
     assert out["data"]["items"] == src["data"]["items"]
     assert out["data"]["n"] == 3 and out["data"]["ok"] is True and out["data"]["none"] is None
-    assert CONTENT_KEYS == frozenset({"elements", "axtree_summary", "items"})
+    # WS-62: 관찰 data.repeated(반복 묶음 대상 이름·표제)도 페이지 내용 경로 — elements[].name 과 같은 원문.
+    assert CONTENT_KEYS == frozenset({"elements", "axtree_summary", "items", "repeated"})
 
 
 @pytest.mark.parametrize("url,marked", [

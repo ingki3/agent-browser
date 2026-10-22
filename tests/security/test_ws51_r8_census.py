@@ -74,6 +74,7 @@ ATTRS = {
     ("tab_id", "active_tab_id"): (ID, "tab-N"),
     ("approval_id", "approval_id"): (ID, "ap_…"),
     ("element_id", "element_id"): (ID, "@eN·@sN"),
+    ("id", "element_id"): (ID, "perception/repeated.py data.repeated.groups[].members[].id — @eN(WS-62)"),
     ("server_id", "server_id"): (ID, "{pid}-{hex6}"),
     ("tag", "tag"): (ID, "actions/dispatcher.py data.som_tags[].tag — vision.candidates.make_tag 두 글자(A1…)"),
     # --- URL
@@ -137,6 +138,9 @@ ATTRS = {
     ("identifier", "script"): (NOT_OUT, "browser/headless_retry.py WS-52 R3 CDP removeScriptToEvaluateOnNewDocument 인자"),
     ("name", "binding"): (NOT_OUT, "browser/headless_retry.py WS-52 R3 CDP addBinding·removeBinding 인자"),
     ("cssPath", "css_path"): (NOT_OUT, "actions/verification.py page.evaluate 인자"),
+    ("groupPath", "group_path"): (NOT_OUT, "actions/verification.py page.evaluate 인자(WS-62 묶음 고정)"),
+    ("groupHeading", "group_heading"): (NOT_OUT, "actions/verification.py page.evaluate 인자(WS-62 묶음 고정)"),
+    ("css", "css_path"): (NOT_OUT, "perception/repeated.py page.evaluate 인자(WS-62 반복 묶음 계산)"),
     ("profile", "profile"): (NOT_OUT, "interface/mcp_server.py 생성자 인자"),
     ("proxy", "playwright_proxy()"): (NOT_OUT, "security/egress_runtime.py 브라우저 실행 인자"),
     ("text", "value"): (NOT_OUT, "actions/dispatcher.py 자격증명 치환 params(Playwright 입력 — 응답에 싣지 않음)"),

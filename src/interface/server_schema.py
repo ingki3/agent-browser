@@ -204,7 +204,9 @@ WORKSPACE_INSTRUCTIONS = (
 
 
 OBSERVE_INSTRUCTIONS = (
-    "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다"
+    "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다\n"
+    "같은 이름 대상(두 달 달력의 날짜·상품 행의 '담기')은 data.repeated 의 group(페이지 글자, null 이면 x·y)으로 "
+    "고르고, 누른 뒤 입력칸 값으로 확인하세요(최근 관찰의 id 만)"
 )
 
 

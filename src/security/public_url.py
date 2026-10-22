@@ -62,7 +62,7 @@
 일반 면제는 없다, 자유 문장 칸은 정제).
 
 **경계**: 페이지 *내용* 으로서의 주소는 가리지 않는다 — 에이전트가 링크를 따라가려면 원문이 필요하다
-(`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`. **경로**로
+(`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`, `data.repeated`(WS-62). **경로**로
 정한다 — 다른 자리의 같은 이름 키는 가린다, R1 NB-1). 서버 내부(탭 복원·창 전환·레시피·robots·쿠키
 장부)는 원문을 계속 쓴다 — 가린 주소로 복원하면 토큰이 필요한 페이지가 깨진다.
 
@@ -170,6 +170,8 @@ CONTENT_PATHS: FrozenSet[Tuple[str, ...]] = frozenset({
     ("data", "items"),
     ("data", "observation", "elements"),
     ("data", "observation", "axtree_summary"),
+    # WS-62: 반복 묶음(대상 이름·묶음 표제) — 같은 대상의 elements[].name 과 같은 원문이어야 에이전트가 맞춰 본다.
+    ("data", "repeated"),
 })
 #: (호환) 위 경로의 마지막 키 이름. 판정은 CONTENT_PATHS(경로)로 한다.
 CONTENT_KEYS: FrozenSet[str] = frozenset(p[-1] for p in CONTENT_PATHS)
@@ -649,6 +651,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "capture_busy", "target_changed",  # server_display·server_hitl
         "not_in_allowlist", "private_network", "unsupported_scheme", "malformed_url",  # security.egress.BlockReason
         "fresh", "epoch_mismatch", "node_detached", "role_changed", "name_changed",  # actions.verification.StalenessReason
+        "group_changed",  # WS-62 StalenessReason.GROUP_CHANGED
         "sabotage",  # harness.tier2_som(사보타주 표지)
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",

@@ -22,6 +22,7 @@
 - **사람 인계·로그인 유지** — 조작권(`control take/release`)·승인 코드, 필요할 때만 창(`--browser on-demand`), 영속 프로필(`--profile`), 미리 로그인(`agent-browser login`). → [사람 인계와 로그인](docs/human-handoff.md)
 - **동작 캐시(레시피)** — 통과한 흐름을 자동 저장해 도구 호출 한 번으로 재생하고, 화면이 어긋나면 누르지 않고 멈춥니다. → [기능](docs/features.md#동작-캐시--레시피-browser_recipe)
 - **도착 페이지 기억** — 사용자가 "이 페이지 기억해"라고 한 주소를 저장해 같은 출처를 관찰할 때 후보(`data.saved_pages`)로 붙입니다(자동 저장 없음). → [기능](docs/features.md#도착-페이지-기억-browser_recipe-remember_pagepagesforget_page-ws-61)
+- **반복 묶음 대상 구분** — 두 달 달력의 같은 날짜·상품 행의 같은 '담기'처럼 같은 틀이 반복되면 관찰에 묶음 표제·위치(`data.repeated`)를 붙이고, 관찰 뒤 묶음(달)이 바뀐 대상은 누르지 않습니다. → [기능](docs/features.md#반복-묶음-대상-구분-datarepeated-ws-62)
 - **PDF 읽기·YouTube 영상 검색** — PDF 본문을 `data.document` 로, YouTube 검색을 공식 Data API v3 로. → [기능](docs/features.md)
 - **Egress 가드·출력 비밀 가림** — 검증 프록시로 사설망·메타데이터를 막고, 응답 주소·문장 속 비밀 값을 `[REDACTED]` 로 가립니다. → [보안](docs/security.md)
 - **우회하지 않습니다** — 캡차 자동 풀이·확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다. 막히면 사람에게 넘깁니다.
