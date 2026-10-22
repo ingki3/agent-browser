@@ -20,15 +20,17 @@
   ARIA 없는 위젯(하나투어)은 상태가 비고, 반영은 누른 뒤 입력칸 값으로 확인한다.
 * **크기**: 블록(groups 직렬화) 3,000자. 넘으면 대상이 많은 쌍둥이 묶음부터 담고 못 담은 묶음은 통째로 빼
   `omitted` 에 개수. 응답 크기 상한 맞춤은 서버(`fit_repeated`, saved_pages 를 먼저 뺀다).
-* **고정(B4)**: 낸(또는 상한으로 뺀) 묶음의 대상 핸들에 구분 조상 css 경로·내부 지문(`rpFingerprint` — ARIA 이름 +
-  대화형·숨김을 뺀 정적 글자 전체, 순서 보존, `PIN_LIMIT`)을 저장한다. 공개 표시(group null·복제 접기)와 무관하게
+* **고정(B4)**: 낸(또는 상한으로 뺀) 묶음의 대상 핸들에 구분 조상 css 경로·내부 지문(`rpFingerprint` — 묶음 신원:
+  ARIA 이름 + 반복 항목 바깥 정적 글자 + 항목 순서열(대상 이름 첫 낱말·빈칸) + 대상 항목 순번, `PIN_LIMIT`)을 저장한다.
+  항목 안 형제 글자(가격·호버 툴팁·선택 표시)는 비교하지 않는다(R2 — 같은 달 가격 갱신만으로 거부하던 과잉 거부). 공개 표시(group null·복제 접기)와 무관하게
   **원래 핸들마다** 실제 지문으로 고정한다(R1 R1). 패널 쌍둥이는 반복 목록 항목 안 대상만 — 이전/다음달 링크는 달이
   바뀌어도 같은 뜻이라 고정하지 않는다. 실행 직전 staleness 검증(`actions.verification`)이 "아직 그 조상 안 + 지문
   같음" 만 확인한다(알고리즘을 다시 돌리지 않는다). epoch 에 기대지 않는다(달 넘김에도 epoch 는 그대로다). 자가
   치유도 같은 묶음 후보만 쓰고, 치유 재관찰도 주석을 달며 채택 핸들은 원래 근거를 잇는다(B5, R1 R2).
 
 한계: 첫 낱말이 서로 다른 반복 대상은 잡지 않는다. 같은 문서 범위만(open/closed shadow 안 대상 제외, 프레임은 전환한
-그 문서 기준). 정적 글자 없는 묶음의 노드 재사용(가상 목록)은 조상 비교만 한다. 지문 상한 뒤 변화는 못 잡는다. 좌표·selector 클릭은 고정 밖.
+그 문서 기준). 바깥 정적 글자가 없고 항목 순서열도 같은 두 묶음(같은 시작 요일·같은 날 수의 두 달)은 구분하지
+못한다. 지문 상한 뒤 변화는 못 잡는다. 좌표·selector 클릭은 고정 밖.
 """
 
 from __future__ import annotations
@@ -175,29 +177,92 @@ COMMON_JS = r"""
     if (c.length > 1) return __AMBIG_RET__;
     return null;
   }
-  // 내부 고정 지문: 묶음의 ARIA 이름 + 정적 글자 전체(대화형·숨김 제외, 문서 순서, 상한).
-  // 표시용 표제(headingOf)와 무관하게 핸들마다 저장·비교한다 — 어느 한 글자라도 바뀌면 다른 묶음이다.
-  // 반복 목록 항목 안 글자도 넣는다: 같은 틀 형제 ≥3 이면 항목으로 보므로, 그것을 빼면 span 셋(배지·달·특가)이
-  // 나란한 패널은 지문이 비어 달 변경을 놓친다(요일 머리글처럼 달마다 같은 글자는 넣어도 해가 없다).
-  function rpFingerprint(g) {
+  function rpTok(s) {
+    const n = String(s || '').normalize('NFKC').trim();
+    return n ? n.split(/\s+/)[0].toLowerCase() : '';
+  }
+  // 묶음 안 반복 항목 단위(R2): 같은 틀 형제 ≥3 인 요소 중 대화형 안·숨김·script 밑이 아니고, 그 아래에 그런 항목이
+  // 더 없는 가장 안쪽 항목(달력 칸 li·td, span 셋의 span, 요일 머리글 li). 문서 순서.
+  function rpUnits(g) {
+    const doc = g.ownerDocument || document;
+    const counts = new Map(), dead = new Map(), items = [];
+    function isItem(e) {
+      const p = e.parentElement;
+      if (!p) return false;
+      let c = counts.get(p);
+      if (!c) {
+        c = new Map();
+        for (const k of p.children) { if (!RP_SKIP[k.tagName]) { const s = rpSig(k); c.set(s, (c.get(s) || 0) + 1); } }
+        counts.set(p, c);
+      }
+      return (c.get(rpSig(e)) || 0) >= RP_MIN;
+    }
+    function blocked(e) {  // e 자신 제외, e 의 조상(g 바로 아래까지)이 대화형·숨김·script 인가(캐시)
+      const p = e.parentElement;
+      if (!p || p === g) return false;
+      if (dead.has(p)) return dead.get(p);
+      const v = RP_SKIP[p.tagName] || rpInteractive(p) || rpHidden(p) || blocked(p);
+      dead.set(p, !!v);
+      return !!v;
+    }
+    const w = doc.createTreeWalker(g, NodeFilter.SHOW_ELEMENT);
+    let e;
+    while ((e = w.nextNode())) {
+      if (RP_SKIP[e.tagName] || !isItem(e) || rpHidden(e) || blocked(e)) continue;
+      items.push(e);
+    }
+    const inner = new Set();
+    for (const it of items) { for (let a = it.parentElement; a && a !== g; a = a.parentElement) inner.add(a); }
+    return items.filter(function (it) { return !inner.has(it); });
+  }
+  // 항목 하나의 신원 낱말: 대상(대화형 — 자신 또는 첫 대화형 자손)이 있으면 그 이름 첫 낱말(형제 글자 아님 — 가격·
+  // 호버 글자·선택 표시는 비교하지 않는다), 대상이 없으면 null(호출자가 빈칸 또는 항목 글자로 정한다).
+  function rpUnitKey(u) {
+    let t = rpInteractive(u) ? u : null;
+    if (!t) {
+      const doc = u.ownerDocument || document;
+      const w = doc.createTreeWalker(u, NodeFilter.SHOW_ELEMENT);
+      let e;
+      while ((e = w.nextNode())) { if (rpInteractive(e)) { t = e; break; } }
+    }
+    return t ? 'i:' + rpTok(t.getAttribute('aria-label') || t.textContent || t.getAttribute('placeholder')) : null;
+  }
+  // 순서열: 대상이 있는 항목은 대상 이름 첫 낱말. 대상 없는 항목은 같은 목록에 대상 항목이 있으면 빈칸('_' — 달력 앞
+  // 빈칸, 그 안에 붙는 글자는 보지 않는다), 목록 전체에 대상이 없으면 항목 글자(span 셋의 달·요일 머리글 — 정적 글자).
+  function rpSequence(units) {
+    const keys = units.map(rpUnitKey), live = new Set();
+    units.forEach(function (u, i) { if (keys[i] !== null) live.add(u.parentElement); });
+    return units.map(function (u, i) {
+      if (keys[i] !== null) return keys[i];
+      return live.has(u.parentElement) ? '_' : 't:' + rpClean(u.textContent);
+    }).join('\u0001');
+  }
+  // 내부 고정 지문 = 묶음 신원(R2). 표시용 표제(headingOf)와 무관하게 핸들마다 저장·비교한다.
+  //  (a) ARIA 이름 + 반복 항목 **바깥**의 정적 글자(대화형·숨김 제외, 문서 순서 — 월 표제 등)
+  //  (b) 반복 항목들의 신원 낱말 순서열(빈칸·1·2·…·31) — span 셋처럼 (a) 가 비는 패널의 달 변경을 메운다
+  //  (c) el 이 주어지면 그 대상이 든 항목의 순번(끝에 두되 상한에 잘리지 않게)
+  // 항목 안 형제 글자(가격·툴팁·선택 표시)는 넣지 않는다 — 같은 달인데 가격 갱신·호버만으로 거부하던 과잉 거부(R5).
+  function rpIdentity(g) {
     const parts = [];
     const lt = rpLabelled(g);
     if (lt) parts.push('L:' + lt);
     const al = rpNorm(g.getAttribute('aria-label'));
     if (al) parts.push('A:' + al);
-    const doc = g.ownerDocument || document;
-    const w = doc.createTreeWalker(g, NodeFilter.SHOW_TEXT);
-    let t;
-    while ((t = w.nextNode())) {
-      if (!t.nodeValue || !t.nodeValue.trim()) continue;
-      let e = t.parentElement, bad = false;
-      for (; e && e !== g; e = e.parentElement) {
-        if (RP_SKIP[e.tagName] || rpInteractive(e) || rpHidden(e)) { bad = true; break; }
-      }
-      if (!bad && e === g) parts.push(rpNorm(t.nodeValue));
-    }
-    return parts.join('\n').slice(0, RP_FP_LIMIT);
+    for (const c of rpCandidates(g)) parts.push(c);
+    const units = rpUnits(g);
+    parts.push('S:' + rpSequence(units));
+    const idx = new Map();
+    units.forEach(function (u, i) { idx.set(u, i); });
+    return {idx: idx, g: g, body: parts.join('\n')};
   }
+  // id = rpIdentity(g) (묶음마다 한 번 계산해 대상마다 재사용 — 대상 수 × 묶음 크기 비용을 피한다).
+  function rpPinOf(id, el) {
+    let k = -1;
+    for (let e = el; e && e !== id.g && k < 0; e = e.parentElement) { if (id.idx.has(e)) k = id.idx.get(e); }
+    const tail = el ? '\n#' + k : '';  // 순번은 끝에 — 본문을 상한에서 먼저 잘라 순번이 잘리지 않게
+    return id.body.slice(0, RP_FP_LIMIT - tail.length) + tail;
+  }
+  function rpFingerprint(g, el) { return rpPinOf(rpIdentity(g), el); }
 """.replace("__LIMIT__", str(NAME_LIMIT)).replace("__MIN__", str(LIST_MIN_ITEMS)).replace(
     "__FP_LIMIT__", str(PIN_LIMIT)).replace("__AMBIG_RET__", _AMBIG_RET).replace("__AMBIG__", _AMBIG_NOTE)
 
@@ -292,7 +357,8 @@ REPEATED_JS = r"""
     for (const gr of groups) {
       gr.members.sort(function (a, b) { return a.el === b.el ? 0 : (a.el.compareDocumentPosition(b.el) & 4 ? -1 : 1); });
       gr.h = headingOf(gr.g);
-      gr.fp = rpFingerprint(gr.g);
+      gr.id = rpIdentity(gr.g);
+      gr.fp = gr.id.body;
       const key = gr.fp + '\u0003' + gr.members.map(function (t) { return t.rn; }).join('\u0002');
       const prev = byKey.get(key);
       if (prev) { prev.copies++; prev.folded.push(gr); continue; }
@@ -314,18 +380,18 @@ REPEATED_JS = r"""
       const r = gr.g.getBoundingClientRect();
       const h = gr.h;
       out.push({path: path, x: Math.round(r.x), y: Math.round(r.y), heading: h ? h.text : null,
-                source: h ? h.source : null, copies: gr.copies, fp: gr.fp,
+                source: h ? h.source : null, copies: gr.copies,
                 // 고정(pin): 항목 쌍둥이는 전부, 패널 쌍둥이는 반복 목록 항목 안 대상만(날짜) — 패널의 이전/다음달
                 // 링크는 달이 바뀌어도 뜻이 같아 같은 id 로 다시 누를 수 있다.
                 members: gr.members.map(function (t) {
-                  return {i: t.i, states: states(t.el),
+                  return {i: t.i, states: states(t.el), fp: rpPinOf(gr.id, t.el),
                           pin: kind === 'item' || t.lv.some(function (lv) { return gr.g.contains(lv.list) && gr.g !== lv.item; })};
                 }),
                 folded: [].concat.apply([], gr.folded.map(function (f) {
                   // 접힌 복제본도 자기 묶음의 경로·지문으로 고정한다(표시는 접어도 고정은 핸들마다, R1 R1).
                   const fpath = absPath(f.g);
                   return f.members.map(function (t) {
-                    return {i: t.i, path: fpath, fp: f.fp,
+                    return {i: t.i, path: fpath, fp: rpPinOf(f.id, t.el),
                             pin: kind === 'item' || t.lv.some(function (lv) { return f.g.contains(lv.list) && f.g !== lv.item; })};
                   });
                 }))});
@@ -381,7 +447,7 @@ GROUP_CHECK_JS = r"""
     if (!g) return {ok: false, now: null, why: 'group_gone'};
     if (!el || !g.contains(el)) return {ok: false, now: null, why: 'outside_group'};
     if (groupPin === null || groupPin === undefined) return {ok: true, now: null, why: ''};
-    const now = rpFingerprint(g);
+    const now = rpFingerprint(g, el);
     return {ok: now === groupPin, now: now, why: now === groupPin ? '' : 'heading_changed'};
   }
 """.replace("__COMMON__", COMMON_JS)
@@ -418,7 +484,7 @@ def _pin_text(value: Any) -> str:
 
 def pin_display(pin: Any) -> str:
     """내부 고정 지문을 오류 문구용 한 줄로(조각 사이 ' | '). 비교에는 쓰지 않는다."""
-    return " | ".join(str(pin or "").split("\n"))
+    return " | ".join(str(pin or "").replace("\x01", " ").split("\n"))
 
 
 def _block_chars(groups: Sequence[Dict[str, Any]]) -> int:
@@ -487,7 +553,7 @@ def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]
                 members.append(member)
                 if m.get("pin", True) is not False:
                     # 고정은 표시(group null·복제 접기)와 무관하게 핸들마다 실제 묶음 지문으로(R1 R1).
-                    pins.append((h, g["path"], _pin_text(g.get("fp"))))
+                    pins.append((h, g["path"], _pin_text(m.get("fp"))))
                 ranks.append(idx)
             for f in g.get("folded") or []:
                 idx = f.get("i") if isinstance(f, dict) else None
