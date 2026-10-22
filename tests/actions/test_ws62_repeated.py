@@ -85,7 +85,7 @@ async def test_hana_two_month_panels_are_told_apart():
     assert not names & set("일월화수목금토")
     assert "" not in names
     assert not any("특가" in n or n in ("회사소개", "이용약관") for n in names)
-    assert len(groups) == 2
+    assert len(groups) == 2 and "omitted" not in rep  # 다른 쌍둥이 묶음(본문 직속 영역·푸터·캐러셀)도 없다
     # ARIA 없는 위젯 — 상태는 class 추측하지 않는다(states 없음).
     assert not any("states" in m for g in groups for m in g["members"])
     # 블록 상한·id 는 관찰 id

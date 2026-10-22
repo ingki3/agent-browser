@@ -271,15 +271,18 @@ REPEATED_JS = r"""
   for (const t of ts) {
     if (t.done) continue;
     for (const lv of t.lv) {
-      // 항목이 대상 자신(버튼 목록)이면 묶음이 대상과 같아 구분 정보가 없다
-      if (lv.item !== t.el && lists.indexOf(lv.list) < 0) lists.push(lv.list);
+      // 항목이 대상 자신(버튼 목록)이면 묶음이 대상과 같아 구분 정보가 없다. body 바로 아래는 목록으로 보지 않는다.
+      if (lv.item === t.el || lv.list === document.body) continue;
+      const key = rpSig(lv.item);
+      const k2 = lists.findIndex(function (x) { return x.list === lv.list && x.sig === key; });
+      if (k2 < 0) lists.push({list: lv.list, sig: key});
     }
   }
   function depth(e) { let d = 0; while (e) { d++; e = e.parentElement; } return d; }
-  lists.sort(function (a, b) { return depth(b) - depth(a); });  // 안쪽(깊은) 목록 먼저
+  lists.sort(function (a, b) { return depth(b.list) - depth(a.list); });  // 안쪽(깊은) 목록 먼저
   for (const L of lists) {
     const items = [];
-    for (const c of L.children) { if (!RP_SKIP[c.tagName]) items.push(c); }
+    for (const c of L.list.children) { if (!RP_SKIP[c.tagName] && rpSig(c) === L.sig) items.push(c); }
     const s = finish('item', items, ts);
     if (s) sets.push(s);
   }
