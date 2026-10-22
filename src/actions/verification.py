@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode
 from perception.engine import ElementHandle
-from perception.repeated import GROUP_CHECK_JS
+from perception.repeated import GROUP_CHECK_JS, pin_display
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).
@@ -244,7 +244,7 @@ async def verify_staleness(
             before = getattr(handle, "group_heading", None)
             why = str(group.get("why") or "확인 실패")
             if before is not None and now is not None:
-                detail = f"묶음 '{safe_page_text(before)}' -> '{safe_page_text(now)}'"
+                detail = f"묶음 '{safe_page_text(pin_display(before))}' -> '{safe_page_text(pin_display(now))}'"
             else:
                 detail = f"묶음 확인 실패({safe_page_text(why)})"
             return StalenessResult(

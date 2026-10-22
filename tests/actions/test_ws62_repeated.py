@@ -114,10 +114,12 @@ async def test_aria_grid_heading_and_states():
 
 @requires_chromium
 async def test_product_rows_same_button_name():
-    """같은 이름 '담기' 버튼이 든 상품 행 → 행마다 묶음, 표제는 행의 첫 비대화형 글자(상품명)."""
+    """같은 이름 '담기' 버튼이 든 상품 행 → 행마다 묶음. 정적 후보가 둘(상품명·가격)이라 하나를 고르지 않고 순서대로
+    이은 글자를 표제로 싣는다(R1 R3, 결정 A)."""
     r = await _observe_html(PRODUCTS_HTML)
     groups = _groups(r)
-    assert [g["group"] for g in groups] == ["상품 A", "상품 B", "상품 C", "상품 D"]
+    assert [g["group"] for g in groups] == ["상품 A 12,000원", "상품 B 15,000원", "상품 C 9,900원", "상품 D 30,000원"]
+    assert {g["group_source"] for g in groups} == {"text"}
     assert all([m["name"] for m in g["members"]] == ["담기"] for g in groups)
     assert len({g["members"][0]["id"] for g in groups}) == 4
 
@@ -255,7 +257,8 @@ async def test_month_moved_same_node_reused_is_refused():
     assert res.reobserve_required is True
     assert "healing_attempts" not in res.data  # 치유로 다른 대상을 찾지 않는다
     changed = res.data.get("group_changed")
-    assert changed == {"before": "2026년 12월", "after": "2027년 1월"}, res.data
+    # 내부 지문(묶음 정적 글자 전체, R1 R3)을 한 줄로 — 달 이름이 앞에 온다.
+    assert changed["before"].startswith("2026년 12월") and changed["after"].startswith("2027년 1월"), res.data
 
 
 @requires_chromium

@@ -57,8 +57,9 @@ class ElementHandle:
     #: /newcomments(사이트 전체), 하나는 item?id=(개별 기사)였다.
     #: 이름만으로는 구분이 불가능해 LLM이 오답을 골랐다.
     href: Optional[str] = None
-    #: WS-62: 관찰 때 이 대상이 든 쌍둥이 묶음(data.repeated)의 구분 조상 css 경로와 표제 글자(싣지 않았으면 None).
-    #: 실행 직전 staleness 검증이 "아직 그 조상 안 + 표제 같음" 을 확인한다(달 넘김 후 같은 노드 재사용 거부).
+    #: WS-62: 관찰 때 이 대상이 든 쌍둥이 묶음(data.repeated)의 구분 조상 css 경로와 내부 고정 지문(묶음의 ARIA 이름 +
+    #: 정적 글자 전체, 고정 안 했으면 None). 공개 표시(group null·복제 접기)와 무관하게 핸들마다 저장한다(R1).
+    #: 실행 직전 staleness 검증이 "아직 그 조상 안 + 지문 같음" 을 확인한다(달 넘김 후 같은 노드 재사용 거부).
     group_path: Optional[str] = None
     group_heading: Optional[str] = None
 
