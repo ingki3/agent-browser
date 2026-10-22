@@ -67,6 +67,8 @@ TABLES = {
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
     ("interface/handoff.py", "_KEY_LABEL"): (FREE, "승인 불일치 사유 문장에 쓰는 사람용 이름"),
+    ("interface/server_elicit.py", "_STATUS"): (FREE, "WS-56 data.elicitation.answer 낱말(declined·cancelled·timeout·"
+                                                  "error) — 어휘 밖(등록 값이면 가림)"),
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
     ("security/hitl.py", "ICON_CLASS_RISK"): (NOT_OUT, "아이콘 class → 위험 키워드 조회표(판정 입력)"),
     ("security/robots_signal.py", "_SCOPE_NOTES"): (FREE, "data.robots.note 고정 문장(키는 scope 어휘)"),
@@ -116,6 +118,7 @@ KEYS = {
     "next": (FREE, "다음 할 일 문장"),
     "note": (FREE, "주의 문장"),
     "unresolved": (FREE, "좌표 판정 불가 사유 문장"),
+    "via": (FREE, "WS-56 interface/server_elicit.py data.approval.via(elicitation·policy) — 어휘 밖(등록 값이면 가림)"),
     # --- NOT_OUT
     "Accept": (NOT_OUT, "HTTP 요청 머리"),
     "Accept-Encoding": (NOT_OUT, "HTTP 요청 머리"),

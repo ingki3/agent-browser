@@ -1515,7 +1515,7 @@
  "retry_disabled_recipe": {
   "recipe_bad_op": {
    "error_code": "E_FEATURE_NOT_IMPLEMENTED",
-   "error_message": "op 는 save|run|list|delete 중 하나입니다.",
+   "error_message": "op 는 save|run|list|delete|remember_page|pages|forget_page 중 하나입니다.",
    "success": false
   },
   "recipe_list": {
@@ -2623,11 +2623,15 @@
     "name": "browser_approval_wait"
    },
    {
-    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete",
+    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete. remember_page·pages·forget_page",
     "inputSchema": {
      "properties": {
+      "all": {
+       "description": "forget_page: 현재 사이트 전부",
+       "type": "boolean"
+      },
       "id": {
-       "description": "run·delete 대상 레시피 id",
+       "description": "run·delete·forget_page 대상 id",
        "type": "string"
       },
       "last_n": {
@@ -2637,7 +2641,7 @@
        "type": "integer"
       },
       "name": {
-       "description": "save 할 이름",
+       "description": "save 이름 · remember_page: 현재 페이지를 이 이름으로 기억(사용자가 시킬 때만)",
        "type": "string"
       },
       "op": {
@@ -2645,7 +2649,10 @@
         "save",
         "run",
         "list",
-        "delete"
+        "delete",
+        "remember_page",
+        "pages",
+        "forget_page"
        ]
       },
       "params": {
@@ -2764,11 +2771,15 @@
     "name": "browser_approval_wait"
    },
    {
-    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete",
+    "description": "통과한 흐름은 자동 저장. run: 관찰 data.recipes 후보 일괄 실행, 멈추면 reason 보고 직접 이어감. save: 이름·params 바꿀 때만(last_n). list·delete. remember_page·pages·forget_page",
     "inputSchema": {
      "properties": {
+      "all": {
+       "description": "forget_page: 현재 사이트 전부",
+       "type": "boolean"
+      },
       "id": {
-       "description": "run·delete 대상 레시피 id",
+       "description": "run·delete·forget_page 대상 id",
        "type": "string"
       },
       "last_n": {
@@ -2778,7 +2789,7 @@
        "type": "integer"
       },
       "name": {
-       "description": "save 할 이름",
+       "description": "save 이름 · remember_page: 현재 페이지를 이 이름으로 기억(사용자가 시킬 때만)",
        "type": "string"
       },
       "op": {
@@ -2786,7 +2797,10 @@
         "save",
         "run",
         "list",
-        "delete"
+        "delete",
+        "remember_page",
+        "pages",
+        "forget_page"
        ]
       },
       "params": {

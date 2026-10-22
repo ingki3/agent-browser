@@ -71,6 +71,8 @@ CANDIDATES = {
     ("browser/serve_profile.py", "f'{EPHEMERAL_PREFIX}{server_id}'"): (NOT_OUT + " (디스크 임시 프로필 디렉터리 이름)",
                                                                        None, None),
     ("browser/login_watch.py", "'abw' + secrets.token_hex(8)"): (NOT_OUT + " (WS-58 조작권 감시 CDP 바인딩 이름)", None, None),
+    ("recipes/saved_pages.py", "'p_' + _secrets.token_hex(4)"): ("WS-61 기억한 페이지 id — 면제하지 않음(public_text 를 지나며 "
+                                                               "모양이 바뀌지 않음, 등록 대상 아님)", None, None),
     ("interface/profile_cli.py", "f'{n}B'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.0f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
     ("interface/profile_cli.py", "f'{size:.1f}{unit}'"): (NOT_OUT + " (CLI 크기 표기)", None, None),
@@ -89,6 +91,8 @@ CANDIDATES = {
     ("browser/chrome_cookies.py", "'Cookies' + suffix"): ("WS-59 Chrome 쿠키 DB 곁 파일(-journal·-wal) 사본 이름(경로 "
                                                            "조립) — 값 생산 아님", None, None),
     ("security/hitl.py", "key + '-'"): ("아이콘 클래스 접두 비교용 조각 — 값 생산 아님", None, None),
+    ("security/approve_policy.py", "key + '-'"): ("WS-56 아이콘 클래스 접두 비교용 조각(정책 최고위험 판정) — 값 생산 아님",
+                                                   None, None),
     ("security/public_url.py", "'#' + _public_fragment(fragment, depth, sink)"): ("주소 fragment 조립(이미 가린 값) — "
                                                                                   "식별자 아님", None, None),
 }

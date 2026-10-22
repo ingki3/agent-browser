@@ -37,7 +37,8 @@ WORKSPACE_SERVER_TOOLS = frozenset({"browser_recipe"})
 #: 호출(요청 태스크)별 임시 상태 묶음 — call_tool 입구에서 새 dict 를 단다. 그 호출 안에서 만든 하위
 #: 태스크(asyncio.wait_for 등)도 같은 dict 를 물려받아 쓰기가 보이고, 다른 호출과는 섞이지 않는다.
 _CALL_STATE: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_call_state", default=None)
-_PER_CALL = ("_pending_gate_basis", "_used_approval")
+#: WS-56 R4: 승인 경로의 호출별 상태(_approval_via·_oob_note·_approval_pin)도 같은 묶음 하나(예전 ContextVar 5개를 합침).
+_PER_CALL = ("_pending_gate_basis", "_used_approval", "_approval_via", "_oob_note", "_approval_pin")
 
 
 @dataclass
@@ -219,6 +220,12 @@ class WorkspaceMixin:
         같은 호출 흐름 안의 중첩 호출(헤드리스 재시도·레시피 재생 단계)은 이미 쥔 락을 다시 잡지 않는다."""
         return _WorkspaceSerial(self, current_workspace())
 
+    def _serial_pause(self) -> "_SerialPause":
+        """사람 응답 대기(elicitation) 동안 이 호출 흐름이 쥔 작업 공간 직렬화 구간을 잠시 놓는다(async with, WS-56 R4).
+        나오면 다시 잡는다 — 그사이 같은 작업 공간의 다른 호출이 돌았을 수 있으니 부른 쪽이 대상·조작권을 다시 본다.
+        구간을 쥐지 않은 흐름(단위 테스트의 직접 호출)에서는 아무것도 하지 않는다."""
+        return _SerialPause()
+
     def _dispatch_lock(self, name: str) -> Any:
         import asyncio
 
@@ -335,6 +342,8 @@ class _CallScope:
 
 #: 이 호출 흐름(태스크와 그 하위 태스크)이 이미 쥔 작업 공간 직렬화 락 이름들 — 중첩 호출의 자기 교착 방지.
 _SERIAL_HELD: ContextVar[frozenset] = ContextVar("agent_browser_serial_held", default=frozenset())
+#: 이 호출 흐름이 실제로 잡은 직렬화 구간들(바깥→안) — 사람 응답 대기 동안 잠시 놓기(_SerialPause)에 쓴다(WS-56 R4).
+_SERIAL_STACK: ContextVar[tuple] = ContextVar("agent_browser_serial_stack", default=())
 
 
 class _WorkspaceSerial:
@@ -357,16 +366,57 @@ class _WorkspaceSerial:
         self.waited = lock.locked()
         await lock.acquire()
         self._lock = lock
-        self._token = _SERIAL_HELD.set(held | {self.name})
+        self._token = (_SERIAL_HELD.set(held | {self.name}), _SERIAL_STACK.set(_SERIAL_STACK.get() + (self,)))
 
     async def __aexit__(self, *exc: Any) -> None:
         lock, self._lock = self._lock, None
-        if lock is None:
+        if self._token is None:
+            return
+        held_token, stack_token = self._token
+        self._token = None
+        try:
+            _SERIAL_STACK.reset(stack_token)
+            _SERIAL_HELD.reset(held_token)
+        finally:
+            if lock is not None:  # 잠시 놓은 뒤 다시 잡다 취소됐으면(_SerialPause) 쥔 것이 없다
+                lock.release()
+
+
+class _SerialPause:
+    """_serial_pause 의 async 컨텍스트 관리자(WS-56 R4). 들어가며 이 흐름이 쥔 구간을 모두 놓고(안→바깥), 나오며
+    같은 순서(바깥→안)로 다시 잡는다. 다시 잡기를 기다리다 취소되면 못 잡은 구간은 쥔 것이 없는 상태로 남아
+    바깥 __aexit__ 가 놓지 않는다(남의 락을 풀지 않음)."""
+
+    def __init__(self) -> None:
+        self._paused: tuple = ()
+        self._token: Any = None
+        #: 실제로 놓았다가 다시 잡았는가(놓지 않았으면 False).
+        self.paused = False
+
+    async def __aenter__(self) -> "_SerialPause":
+        paused = tuple(s for s in _SERIAL_STACK.get() if s._lock is not None)
+        if not paused:
+            return self
+        self._token = _SERIAL_HELD.set(_SERIAL_HELD.get() - {s.name for s in paused})
+        for serial in reversed(paused):
+            lock, serial._lock = serial._lock, None
+            lock.release()
+        self._paused = paused
+        self.paused = True
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        paused, self._paused = self._paused, ()
+        if not paused:
             return
         try:
-            _SERIAL_HELD.reset(self._token)
+            for serial in paused:
+                lock = serial.owner._dispatch_lock(serial.name)
+                await lock.acquire()
+                serial._lock = lock
+                serial.waited = True
         finally:
-            lock.release()
+            _SERIAL_HELD.reset(self._token)
 
 
 def _closed(page: Any) -> bool:

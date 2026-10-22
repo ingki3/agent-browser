@@ -12,6 +12,7 @@
     agent-browser control take|release|status [--server ID]   # 사람: serve 의 조작권 (WS-29)
     agent-browser approve <approval_id> [--server ID] [--code N|--deny]  # 사람: 고위험 행동 승인(창의 확인 코드)
     agent-browser profile list|remove NAME [--yes]     # serve --profile 영속 프로필 관리 (WS-32)
+    agent-browser approve-policy add|list|remove --profile NAME ...  # 사람: 사이트별 상시 허용 (WS-56)
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -200,6 +201,10 @@ def _build_parser() -> argparse.ArgumentParser:
     from interface import profile_cli
 
     profile_cli.add_parser(sub)
+    # --- approve-policy (WS-56: 사람 전용 사이트별 상시 허용) ---
+    from interface import approve_policy_cli
+
+    approve_policy_cli.add_parser(sub)
     from interface import login_cli
 
     login_cli.add_parser(sub)
@@ -499,6 +504,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from interface import profile_cli
 
         return profile_cli.run(args)
+    if args.command == "approve-policy":
+        from interface import approve_policy_cli
+
+        return approve_policy_cli.run(args)
     if args.command == "login":
         from interface import login_cli
 

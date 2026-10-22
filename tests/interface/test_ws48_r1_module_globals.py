@@ -61,6 +61,8 @@ PRESERVED = (
     "workspace_scope",
     # WS-57 R2 작업 공간 직렬화
     "_SERIAL_HELD", "_WorkspaceSerial",
+    # WS-56 R4 사람 응답 대기 동안 직렬화 구간 잠시 놓기
+    "_SERIAL_STACK", "_SerialPause",
 )
 
 

@@ -279,16 +279,132 @@ def match_signal(source: str, text: str, path_only: bool = False) -> Optional[st
     """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None.
 
     `path_only`: 폼 목적지(form_action·formaction)의 쿼리를 보지 않는다(GET 제출).
+    WS-56 R3 B4: 키워드가 없어도 계정 '자체' 종료(Close account·계정 비활성화 …)면 고위험(`ACCOUNT_TERMINATION_KEYWORD`).
     """
     if not text or source in META_SOURCES:
         return None
     if source == "href":
-        return _match_href(text)
+        hit = _match_href(text)
+    elif source in PATH_SOURCES:
+        hit = _match_path(text, path_only=path_only)
+    elif source in TOKEN_SOURCES:
+        hit = _match_markup(source, text)
+    else:
+        hit = _match_text(text)
+    if hit is None and account_termination(source, text):
+        return ACCOUNT_TERMINATION_KEYWORD
+    return hit
+
+
+# ---------------------------------------------------------------------------
+# WS-56 R3 B4·B8: 계정 '자체' 종료 판정 — 게이트(위험 HIGH)와 정책 금지 범주(approve_policy)가 공유한다.
+# ---------------------------------------------------------------------------
+#
+# 계정 명사와 종료 동사가 **붙어서**(사이에 소유격·관사만) 나올 때만 계정 자체 종료다:
+#   'Close account' · 'Delete my account' · 'Account deletion' · '계정 비활성화' · '계정을 영구 삭제'.
+# 명사 뒤에 다른 대상이 오거나(목적어가 계정 안 항목) 동사와 명사 사이에 다른 목적어가 끼면 일반 동작이다:
+#   'Delete email from my account' · '계정에서 메일 삭제' · 'Remove profile photo' · 'Delete account email'.
+# 정규화: NFKC(전각) · 보이지 않는 문자 제거 · camelCase/kebab/snake 분해 · 한 글자씩 띄운 영문('d e l e t e')은 이어 붙임.
+# 한글은 공백·구두점을 지운 정규형에서 '명사(+정보)(+을/를)(+영구/완전)+동사' 연속만 본다.
+
+#: 게이트가 근거로 보고하는 키워드(matched_keyword).
+ACCOUNT_TERMINATION_KEYWORD = "account termination"
+_ACCT_NOUNS = frozenset({"account", "accounts", "profile", "membership"})
+#: 닫기·취소 동사가 붙어도 종료인 명사(프로필 '닫기'는 창 닫기라 뺀다).
+_ACCT_HARD_NOUNS = frozenset({"account", "accounts", "membership"})
+_ACCT_VERBS = frozenset({"delete", "remove", "close", "erase", "deactivate", "disable", "terminate", "cancel",
+                         "destroy", "wipe"})
+#: 닫기·취소 계열(동사·동사형 명사의 앞머리).
+_ACCT_SOFT_PREFIXES = ("clos", "canc")
+#: 명사 뒤에 오는 동사(형 명사) ('Account deletion' · 'account-close').
+_ACCT_VERB_NOUNS = frozenset({"deletion", "delete", "removal", "remove", "closure", "close", "erasure", "erase",
+                              "deactivation", "deactivate", "termination", "terminate", "cancellation", "cancel",
+                              "disable"})
+#: 동사와 명사 사이에 와도 되는 말(소유격·관사·강조).
+_ACCT_FILLERS = frozenset({"my", "your", "the", "this", "our", "a", "an", "entire", "whole", "user"})
+#: 종료 구 뒤에 와도 계정 자체 종료로 보는 말(버튼·링크 꾸밈, 부사). 그 밖의 말이 이어지면 계정 안 항목('… photo').
+_ACCT_TRAILERS = frozenset({"btn", "button", "link", "cta", "now", "permanently", "forever", "confirm",
+                            "confirmation", "request", "page", "form", "modal", "dialog", "action", "submit",
+                            "here", "and"})
+_ACCT_COMPOUND_RE = re.compile(
+    r"^(?:(?P<v>delete|remove|close|erase|deactivate|disable|terminate|cancel)(?:my|your|the|this)?"
+    r"(?P<n>account|profile|membership)s?"
+    r"|(?P<n2>account|profile|membership)(?P<vn>deletion|delete|removal|remove|closure|close|erasure|erase"
+    r"|deactivation|deactivate|termination|terminate|cancellation|cancel))$"
+)
+_ACCT_KO_RE = re.compile(r"(?:계정|회원|프로필|멤버십)(?:정보)?(?:을|를|은|는)?(?:영구|완전)?"
+                         r"(?:삭제|비활성|해지|폐쇄|탈퇴|종료|제거)")
+
+
+def _acct_tokens(text: str) -> List[str]:
+    """식별자 토큰(class_tokens) — 한 글자씩 띄운 영문 연속(2개 이상)은 한 토큰으로 잇는다."""
+    out: List[str] = []
+    run: List[str] = []
+    for tok in class_tokens(text):
+        if len(tok) == 1 and tok.isalpha():
+            run.append(tok)
+            continue
+        if run:
+            out.extend(["".join(run)] if len(run) > 1 else run)
+            run = []
+        out.append(tok)
+    if run:
+        out.extend(["".join(run)] if len(run) > 1 else run)
+    return out
+
+
+def _acct_end_ok(tokens: List[str], idx: int) -> bool:
+    """idx(종료 구 다음 자리)가 끝이거나 꾸밈말인가."""
+    return idx >= len(tokens) or tokens[idx] in _ACCT_TRAILERS
+
+
+def _acct_pair(verb: str, noun: str) -> bool:
+    """닫기·취소(close/cancel)는 account·membership 에만 — 'Close profile'(프로필 창 닫기)은 종료가 아니다."""
+    return noun in _ACCT_NOUNS and (not verb.startswith(_ACCT_SOFT_PREFIXES) or noun in _ACCT_HARD_NOUNS)
+
+
+def _account_termination_tokens(tokens: List[str]) -> bool:
+    for i, tok in enumerate(tokens):
+        if _acct_end_ok(tokens, i + 1):
+            m = _ACCT_COMPOUND_RE.match(tok)
+            if m and _acct_pair(m.group("v") or m.group("vn") or "", m.group("n") or m.group("n2") or ""):
+                return True
+        if tok in _ACCT_VERBS:
+            j = i + 1
+            while j < len(tokens) and tokens[j] in _ACCT_FILLERS:
+                j += 1
+            if j < len(tokens) and _acct_pair(tok, tokens[j]) and _acct_end_ok(tokens, j + 1):
+                return True
+        if tok in _ACCT_NOUNS and i + 1 < len(tokens) and tokens[i + 1] in _ACCT_VERB_NOUNS \
+                and _acct_pair(tokens[i + 1], tok) and _acct_end_ok(tokens, i + 2):
+            return True
+    return False
+
+
+def account_termination(source: str, text: str) -> bool:
+    """이 원천의 문자열이 계정 '자체' 종료(삭제·탈퇴·비활성화·닫기)를 말하는가 (계정 안 항목 삭제는 아님)."""
+    if not text or source in META_SOURCES:
+        return False
+    raw = str(text)
     if source in PATH_SOURCES:
-        return _match_path(text, path_only=path_only)
-    if source in TOKEN_SOURCES:
-        return _match_markup(source, text)
-    return _match_text(text)
+        # 목적지는 경로만(쿼리 값·호스트는 다른 말이 이어져 판정을 흐린다) — 퍼센트 디코딩 후.
+        try:
+            raw = unquote_plus(urlsplit(raw).path)
+        except Exception:  # noqa: BLE001 - 해석 실패 = 원문
+            pass
+    if source == "class":
+        tokens: List[str] = []
+        for cls in raw.split():
+            if not _BOOTSTRAP_ORDER_RE.match(cls.lower()):
+                tokens.extend(_acct_tokens(cls))
+            if _account_termination_tokens(tokens):
+                return True
+            tokens = []
+        return False
+    if _account_termination_tokens(_acct_tokens(raw)):
+        return True
+    compact = "".join(ch for ch in normalize_gate_text(raw) if ch.isalnum())
+    return bool(_ACCT_KO_RE.search(compact))
 
 
 @dataclass

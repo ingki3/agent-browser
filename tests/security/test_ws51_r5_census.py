@@ -108,7 +108,8 @@ REVIEWED = {
     ("outcome", "interface/handoff.py", "outcome"): "succeeded·failed·outcome_unknown",
     ("outcome", "interface/server_hitl.py", "outcome"): "succeeded·failed·outcome_unknown",
     ("op", "interface/handoff.py", "op"): "handoff._OPS · status",
-    ("op", "interface/server_schema.py", "{'enum': ['save', 'run', 'list', 'delete']}"): "도구 스키마(값 아님)",
+    ("op", "interface/server_schema.py",
+     "{'enum': ['save', 'run', 'list', 'delete', 'remember_page', 'pages', 'forget_page']}"): "도구 스키마(값 아님, WS-61 op 추가)",
     ("risk", "interface/server_hitl.py", "decision.risk.value"): "RiskLevel",
     ("risk", "security/hitl.py", "risk"): "RiskLevel",
     ("sticky_reason", "interface/on_demand.py",
@@ -243,11 +244,20 @@ ID_PRODUCERS = {
     ("browser/session_store.py", "secrets.token_bytes(SALT_BYTES)"): ("암호화 salt(바이트) — 출구 아님", None, None),
     ("browser/session_store.py", "secrets.token_bytes(NONCE_BYTES)"): ("암호화 nonce(바이트) — 출구 아님", None, None),
     ("recipes/store.py", "_secrets.token_hex(3)"): ("임시 파일 이름 — 출구 아님", None, None),
+    # WS-56
+    ("interface/server_elicit.py", "secrets.token_hex(3)"): ("elicitation 문구 꼬리표(클라이언트 사람 확인 문구) — "
+                                                            "도구 응답 출구 아님", None, None),
+    ("security/approve_policy.py", "secrets.token_hex(6)"): ("정책 임시 파일 이름(.tmp-policy-) — 출구 아님", None, None),
+    # WS-56 R2 B1
+    ("security/approve_policy.py", "secrets.token_hex(_KEY_BYTES)"): ("정책 서명 HMAC 키(서버 상태 폴더 0600 파일) — 출구 아님",
+                                                                      None, None),
     # WS-57: 붙은 연결의 기본 작업 공간 이름(악수 IPC). 응답에는 window.tabs[].workspace 로만(FREE — 면제 없음).
     ("interface/attach.py", "f'attach-{self._seq}'"): ("WS-57 작업 공간 이름 — 면제하지 않음(FREE 칸)", None, None),
     ("browser/login_ledger.py", "secrets.token_hex(6)"): ("WS-59 로그인 기록 임시 파일 이름 — 출구 아님", None, None),
     ("browser/login_watch.py", "secrets.token_hex(6)"): ("WS-58 조작권 감시 격리 world 이름(CDP 내부) — 출구 아님", None, None),
     ("browser/login_watch.py", "secrets.token_hex(8)"): ("WS-58 조작권 감시 바인딩 이름(CDP 내부) — 출구 아님", None, None),
+    ("recipes/saved_pages.py", "_secrets.token_hex(4)"): ("WS-61 기억한 페이지 id(p_+hex8 — 제어 키 면제·등록 제외 없이 "
+                                                         "public_text 를 지나며 모양이 바뀌지 않음)·임시 파일 이름", None, None),
     ("interface/profile_cli.py", "secrets.token_hex(4)"): ("WS-59 import-cookies 프로필 잠금 server_id(잠금 파일·사람 CLI "
                                                           "stderr) — 출구 아님", None, None),
 }
