@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
@@ -305,13 +306,18 @@ async def test_labelledby_repeated_item_reference_is_not_heading():
 
 
 @requires_chromium
-async def test_three_sibling_spans_panel_month_change_is_refused():
+@pytest.mark.parametrize("prefix", ["", "예약 가능한 출발일의 항공권 가격 및 특별 혜택을 아래에서 확인하세요 - "])
+async def test_three_sibling_spans_panel_month_change_is_refused(prefix):
     """security_probe triple_spans: 배지·달·특가 span 셋(같은 틀 형제 ≥3 → 반복 목록처럼 보임) — 표시는 null 이어도
-    지문에는 들어가 달을 넘기면 거부한다."""
+    지문에는 들어가 달을 넘기면 거부한다. R6: 월 글자가 40자(표시 절단) 뒤에 있어도 신원에 남아야 한다."""
     html = HANA_MINI_HTML.replace(
         "+ '<span class=\"month\"></span>'",
         "+ '<span class=badge>추천</span><span class=\"month\"></span><span>특가</span>'",
     )
+    if prefix:
+        old = ".textContent = y + '년 ' + (m + 1) + '월';"
+        assert old in html
+        html = html.replace(old, ".textContent = " + json.dumps(prefix, ensure_ascii=False) + " + y + '년 ' + (m + 1) + '월';")
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:

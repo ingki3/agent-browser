@@ -234,7 +234,8 @@ COMMON_JS = r"""
     units.forEach(function (u, i) { if (keys[i] !== null) live.add(u.parentElement); });
     return units.map(function (u, i) {
       if (keys[i] !== null) return keys[i];
-      return live.has(u.parentElement) ? '_' : 't:' + rpClean(u.textContent);
+      // 신원은 표시용 40자 절단(rpClean)과 분리 — 긴 공통 접두어 뒤의 월 글자를 잃지 않게(R6). 항목당 200자로 묶어 둔다.
+      return live.has(u.parentElement) ? '_' : 't:' + rpNorm(u.textContent).slice(0, 200);
     }).join('\u0001');
   }
   // 내부 고정 지문 = 묶음 신원(R2). 표시용 표제(headingOf)와 무관하게 핸들마다 저장·비교한다.
