@@ -19,7 +19,8 @@
   ARIA 없는 위젯(하나투어)은 상태가 비고, 반영은 누른 뒤 입력칸 값으로 확인한다.
 * **크기**: 블록(groups 직렬화) 3,000자. 넘으면 대상이 많은 쌍둥이 묶음부터 담고 못 담은 묶음은 통째로 빼
   `omitted` 에 개수. 응답 크기 상한 맞춤은 서버(`fit_repeated`, saved_pages 를 먼저 뺀다).
-* **고정(B4)**: 낸(또는 상한으로 뺀) 묶음의 대상 핸들에 구분 조상 css 경로·표제 글자를 저장한다. 실행 직전 staleness
+* **고정(B4)**: 낸(또는 상한으로 뺀) 묶음의 대상 핸들에 구분 조상 css 경로·표제 글자를 저장한다(패널 쌍둥이는 반복
+  목록 항목 안 대상만 — 이전/다음달 링크는 달이 바뀌어도 같은 뜻이라 고정하지 않는다). 실행 직전 staleness
   검증(`actions.verification`)이 "아직 그 조상 안 + 표제 같음" 만 확인한다(알고리즘을 다시 돌리지 않는다). epoch 에
   기대지 않는다(달 넘김에도 epoch 는 그대로다). 자가 치유도 같은 묶음 후보만 쓴다(B5).
 
@@ -245,7 +246,12 @@ REPEATED_JS = r"""
       const h = gr.h;
       out.push({path: path, x: Math.round(r.x), y: Math.round(r.y), heading: h ? h.text : null,
                 source: h ? h.source : null, copies: gr.copies,
-                members: gr.members.map(function (t) { return {i: t.i, states: states(t.el)}; }),
+                // 고정(pin): 항목 쌍둥이는 전부, 패널 쌍둥이는 반복 목록 항목 안 대상만(날짜) — 패널의 이전/다음달
+                // 링크는 달이 바뀌어도 뜻이 같아 같은 id 로 다시 누를 수 있다.
+                members: gr.members.map(function (t) {
+                  return {i: t.i, states: states(t.el),
+                          pin: kind === 'item' || t.lv.some(function (lv) { return gr.g.contains(lv.list) && gr.g !== lv.item; })};
+                }),
                 folded: [].concat.apply([], gr.folded.map(function (f) {
                   return f.members.map(function (t) { return {i: t.i, path: absPath(f.g)}; });
                 }))});
@@ -394,7 +400,8 @@ def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]
                 if states:
                     member["states"] = states
                 members.append(member)
-                pins.append((h, g["path"], head if shown else None))
+                if m.get("pin", True) is not False:
+                    pins.append((h, g["path"], head if shown else None))
                 ranks.append(idx)
             for f in g.get("folded") or []:
                 idx = f.get("i") if isinstance(f, dict) else None

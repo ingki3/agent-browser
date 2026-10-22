@@ -156,7 +156,10 @@ async def test_only_link_text_candidate_gives_null():
     twin_panels("회사", "고객", names_a=("회사소개", "채용", "제휴"), names_b=("공지사항", "자주묻는질문", "문의")),
     # 메가메뉴 열: 같은 틀의 열, 이름 첫 낱말이 다 다름
     twin_panels("여행", "호텔", names_a=("해외여행", "국내여행", "크루즈"), names_b=("국내호텔", "해외호텔", "리조트")),
-], ids=["footer-cols", "mega-menu-cols"])
+    # 쌍둥이 밖에 첫 낱말이 겹치는 대상이 있어(사전 거르기 통과) 페이지 계산까지 가는 푸터 열
+    twin_panels("회사", "고객", names_a=("회사소개", "채용", "제휴"), names_b=("공지사항", "자주묻는질문", "문의")).replace(
+        "<body>", "<body><button>검색</button><button>검색 옵션</button>"),
+], ids=["footer-cols", "mega-menu-cols", "footer-cols-prefilter-passed"])
 async def test_twins_without_shared_first_word_do_not_fire(html):
     """사용자 결정 A: 묶음 사이에 이름 첫 낱말이 겹치지 않으면 내지 않는다(응답 키 자체가 없다)."""
     r = await _observe_html(html)
@@ -280,3 +283,27 @@ async def test_rerender_same_month_heal_still_works():
     res, dep, _ = await _hana_flow("rerender(0)", ("2026년 12월", "19"), html=HANA_MINI_HTML)
     assert res.success and res.healed, (res.error_code, res.error_message, res.data)
     assert dep == "2026.12.19"
+
+
+@requires_chromium
+async def test_next_month_link_can_be_pressed_twice_with_same_id():
+    """패널의 다음달 링크(반복 목록 밖)는 고정하지 않는다 — 같은 id 로 두 번 넘길 수 있다(날짜는 여전히 고정)."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser, page, engine, d = await _open(pw, HANA_HTML)
+        try:
+            groups = _groups(await _observe(d))
+            nxt = _member(groups, "2027년 1월", "다음달")["id"]
+            day = _member(groups, "2026년 12월", "19")["id"]
+            first = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
+            second = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
+            heading = await page.text_content("#cal .inr.right .month")
+            stale_day = await d.dispatch(ActionType.CLICK, {"element_id": day})
+            dep = await page.input_value("#dep")
+        finally:
+            await browser.close()
+    assert first.success and second.success, (second.error_code, second.error_message)
+    assert heading == "2027년 3월"
+    assert stale_day.error_code is ErrorCode.TOCTOU_MISMATCH and dep == ""
+
