@@ -198,34 +198,72 @@ async def test_lone_last_week_day_is_pinned_and_refused_after_move():
     assert dep == "" and res.error_code is ErrorCode.TOCTOU_MISMATCH, (dep, res.error_code, res.error_message)
 
 
-# ------------------------------------------------------------------ N2: 행 틀 거르기 뒤 빈 쌍둥이가 생기면 세트를 버린다
+# ------------------------------------------------------------------ N2(R5 의미 변경): 행 틀 거르기 뒤 빈 쌍둥이는 빼고 남은 쌍둥이를 낸다
 
 
-@requires_chromium
-async def test_twin_left_empty_by_row_filter_drops_set():
-    """셋 중 하나가 행(ul>li) 밖 단추만 가진 패널 — 거르기 뒤 멤버 0 → 그 패널 세트는 버린다(N2, WS-62 이전 동작).
-    버린 세트의 대상은 배정되지 않은 채 남아 항목 쌍둥이(세 패널 = 같은 틀 형제 3)가 받는다 — 날짜 '1' 은 계속 고정.
-    (빈 묶음이 든 세트를 그대로 내면 서버 블록이 세트를 통째로 버려 날짜 고정까지 사라진다.)"""
-    from playwright.async_api import async_playwright
-
+def _n2_html(empties: int) -> str:
     def panel(head: str, body: str) -> str:
         return f"<div class=p><span>{head}</span>{body}</div>"
 
     days = "<ul>" + "".join(f"<li><a href='#'>{n}</a></li>" for n in (1, 2, 3)) + "</ul>"
-    only_buttons = ("<ul><li>가</li><li>나</li><li>다</li></ul><div class=b>"
-                    + "".join(f"<button>{n}번</button>" for n in "xyz") + "</div>")
-    html = ("<!doctype html><html><body><div style='display:flex'>" + panel("1월", days) + panel("2월", days)
-            + panel("안내", only_buttons) + "</div></body></html>")
+
+    def only_buttons(names: str) -> str:   # 패널마다 다른 이름 — 단추끼리 항목 쌍둥이 충돌을 만들지 않게
+        return ("<ul><li>가</li><li>나</li><li>다</li></ul><div class=b>"
+                + "".join(f"<button>{n}번</button>" for n in names) + "</div>")
+
+    extra = "".join(panel(head, only_buttons(names)) for head, names in (("안내", "xyz"), ("공지", "uvw"))[:empties])
+    return ("<!doctype html><html><body><div style='display:flex'>" + panel("1월", days) + panel("2월", days)
+            + extra + "</div></body></html>")
+
+
+@requires_chromium
+@pytest.mark.parametrize("empties", [1, 2], ids=["one_empty", "two_empty"])
+async def test_twin_left_empty_by_row_filter_is_dropped_rest_shown(empties):
+    """셋(넷) 중 하나(둘)가 행(ul>li) 밖 단추만 가진 패널 — 거르기 뒤 멤버 0 인 쌍둥이만 빼고, 남은 두 달 패널은 여전히
+    충돌하므로 묶음을 낸다(표시 [1월, 2월] + 고정, 패널마다 다른 path).
+
+    의미 변경(R5, 조정자 결정 B): R4 까지는 빈 쌍둥이가 생기면 세트를 통째로 버리고 세 패널 항목 쌍둥이가 날짜를 받았다
+    ([1월, 2월, 안내]). 항목 쌍둥이는 이제 대상의 가장 안쪽 반복 행이 그 항목일 때만 받으므로(R2 — 날짜의 행은 li)
+    버리면 달 정보가 사라진다. 충돌 대상은 늘 행 대상이라 충돌한 쌍둥이는 비지 않는다 — 남은 쌍둥이가 2 미만이 되는
+    경우는 구조상 생기지 않고, 생기면 표시 없이 고정만 한다(아래 단위 시험)."""
+    from playwright.async_api import async_playwright
+
     async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, html)
+        browser, page, engine, d = await _open(pw, _n2_html(empties))
         try:
             r = await _observe(d, {"prune_top_n": 300})
             ones = [await _by_selector(engine, page, f".p:nth-child({k}) li:first-child a") for k in (1, 2)]
             pins = [engine.get_handle(e).group_path for e in ones]
+            btn_pin = engine.get_handle(_named(r, "x번")).group_path
         finally:
             await browser.close()
-    assert [g["group"] for g in r.data["repeated"]["groups"]] == ["1월", "2월", "안내"]
+    assert [g["group"] for g in r.data["repeated"]["groups"]] == ["1월", "2월"]
     assert all(pins) and pins[0] != pins[1], pins
+    assert btn_pin is None
+
+
+async def test_display_less_pins_are_applied_without_sets():
+    """페이지 계산이 표시 세트 없이 고정만(pins — R5 R1 fail-closed) 돌려줘도 핸들에 고정이 붙는다(블록은 None)."""
+    from types import SimpleNamespace
+
+    from perception import repeated as rp
+
+    handles = {f"@e{i}": SimpleNamespace(element_id=f"@e{i}", role="link", name=n, css_path=f"#a{i}", is_shadow=False,
+                                         group_path=None, group_heading=None) for i, n in enumerate(("1", "1", "2"))}
+
+    class Engine:
+        def get_handle(self, eid):
+            return handles.get(eid)
+
+    class Page:
+        async def evaluate(self, script, arg=None):
+            return {"sets": [], "pins": [{"i": 0, "path": "#p1", "fp": "2026년 10월\n#0"}, {"i": 9, "path": "#x", "fp": ""},
+                                         {"i": 1, "path": None, "fp": "x"}]}
+
+    elements = [SimpleNamespace(element_id=k) for k in handles]
+    assert await rp.annotate_repeated(Page(), Engine(), elements) is None
+    assert (handles["@e0"].group_path, handles["@e0"].group_heading) == ("#p1", "2026년 10월\n#0")
+    assert handles["@e1"].group_path is None and handles["@e2"].group_path is None
 
 
 # ------------------------------------------------------------------ 크기(R1-4): 예산 초과 시 먼저 압축 → 그래도 넘는 세트만 빼기

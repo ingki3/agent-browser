@@ -10,8 +10,9 @@
   같은 묶음(캐러셀 복제)은 하나로 접고(`copies`), 접은 뒤 묶음이 2개 미만이거나 첫 낱말이 더 겹치지 않으면 내지
   않는다(정적 글자가 없고 이름 열까지 같은 두 묶음은 복제와 구분하지 못해 접힌다 — 한계).
 * **국소성(R4)**: 묶음은 대상 가까이에서만 대상을 받는다 — 패널 쌍둥이는 그 대상의 가장 안쪽 반복 행 목록에서 위로
-  `GROUP_CLIMB`(6) 단계 이내, 항목 쌍둥이는 그 대상 자신의 반복 항목이고 6단계 이내. 패널 쌍둥이는 깊은(작은) 것부터
-  배정한다. 실사례(2026-10-23): 바깥 레이아웃 쌍둥이(#wrap/#footer)가 날짜·다음달·검색 단추를 먼저 흡수했다.
+  `GROUP_CLIMB`(6) 단계 이내, 항목 쌍둥이는 그 대상의 가장 안쪽 반복 행(대상 자신 제외)이 그 항목이고 6단계 이내(R5).
+  패널 쌍둥이는 깊은(작은) 것부터 배정한다. 국소성은 형성(먼저 차지)에만 쓰고, 형성된 패널은 그 행 틀 대상을 깊이와
+  무관하게 받는다(R5 — 신원 고정과 분리). 실사례(2026-10-23): 바깥 레이아웃 쌍둥이(#wrap/#footer)가 날짜·다음달·검색 단추를 먼저 흡수했다.
 * **모양**: `{how, groups:[{group, group_source, x, y, role?, members:[{id, role?, name, states?}], copies?}], compact?, omitted?}` —
   페이지 문자열은 모두 값(이름을 키로 쓰지 않는다 — 주입 신호·가림 규칙이 키를 보지 않는다, 리뷰 B1).
 * **표제(group)**: 묶음의 aria-labelledby/aria-label → caption → legend → heading(h1~h6·role=heading) → 묶음 안
@@ -29,8 +30,8 @@
   항목 안 형제 글자(가격·호버 툴팁·선택 표시)는 비교하지 않는다(R2 — 같은 달 가격 갱신만으로 거부하던 과잉 거부). 공개 표시(group null·복제 접기)와 무관하게
   **원래 핸들마다** 실제 지문으로 고정한다(R1 R1). 패널 쌍둥이는 묶음 사이 첫 낱말 충돌을 만든 행 틀(목록>항목, 예
   `UL>LI`)의 대상 전부(주마다 다른 ul.day·단독 '31' 포함, 자기 낱말 충돌 무관) — 행 밖 대상(이전/다음달·표제·탭)은
-  묶음 대상도 고정도 아니다(달이 바뀌어도 같은 뜻, 같은 id 로 다시 누른다). 거르기 뒤 빈 쌍둥이가 생기면 그 패널 세트는
-  버린다(대상은 항목 쌍둥이가 받을 수 있다). 실행 직전 staleness 검증(`actions.verification`)이 "아직 그 조상 안 + 지문
+  묶음 대상도 고정도 아니다(달이 바뀌어도 같은 뜻, 같은 id 로 다시 누른다). 거르기 뒤 빈 쌍둥이는 빼고 남은 쌍둥이가
+  2개 이상이며 여전히 충돌하면 낸다(R5) — 아니면 표시 없이 고정만(`pins`, fail-closed). 실행 직전 staleness 검증(`actions.verification`)이 "아직 그 조상 안 + 지문
   같음" 만 확인한다(알고리즘을 다시 돌리지 않는다). epoch 에 기대지 않는다(달 넘김에도 epoch 는 그대로다). 자가
   치유도 같은 묶음 후보만 쓰고, 치유 재관찰도 주석을 달며 같은 id·같은 노드(css 경로)인 핸들만 원래 근거를 잇는다
   (B5, R1 R2, R4 R1-6).
@@ -38,8 +39,8 @@
 한계: 첫 낱말이 서로 다른 반복 대상은 잡지 않는다. 같은 문서 범위만(open/closed shadow 안 대상 제외, 프레임은 전환한
 그 문서 기준). 바깥 정적 글자가 없고 항목 순서열도 같은 두 묶음(같은 시작 요일·같은 날 수의 두 달)은 구분하지
 못한다. 지문 상한 뒤 변화는 못 잡는다. 좌표·selector 클릭은 고정 밖. 대상이 더 많은 다른 세트(무 CSS 의 전체 메뉴)가
-예산을 먼저 쓰면 달력 세트가 omitted 될 수 있다(고정은 유지). 항목 쌍둥이(팝업 래퍼 형제 등)에서 첫 낱말이 우연히
-겹치면 그 안 이전/다음 단추도 항목 단위로 고정된다.
+예산을 먼저 쓰면 달력 세트가 omitted 될 수 있다(고정은 유지). 항목 쌍둥이(팝업 래퍼 형제 등)에서 충돌하는 바깥 대상이
+래퍼 항목 바로 아래(사이 반복 행 없음)에 있으면 그 안 이전/다음 단추도 항목 단위로 고정된다.
 """
 
 from __future__ import annotations
@@ -374,9 +375,15 @@ REPEATED_JS = r"""
   // 대상별 국소성(R4 R2 — sbp GROUP_CLIMB=6): 바깥 레이아웃 쌍둥이(#wrap/#footer 등)가 멀리 있는 대상(날짜·다음달·
   // 항공권 검색)을 흡수하지 않게, 묶음은 그 대상 가까이(위로 RP_CLIMB 단계 이내)에서만 대상을 받는다.
   //  패널: 그 대상의 가장 안쪽 반복 행 목록에서 위로 RP_CLIMB 이내. 항목: 그 대상 자신의 반복 항목(levels)이고 RP_CLIMB 이내.
+  //  항목(R5 R2 — sbp rowElement): 대상의 **가장 안쪽** 반복 행(대상 자신 제외)이 그 항목일 때만 — 팝업 래퍼 형제(div.row ↔
+  //  달력 팝업) 안의 바깥 날짜 표시(가장 안쪽 행 = div.bowl)·날짜(li)는 래퍼 항목 쌍둥이의 대상이 아니다.
+  function innerRow(t) {
+    for (const lv of t.lv) { if (lv.item !== t.el) return lv.item; }
+    return null;
+  }
   function local(kind, t, g) {
     if (kind === 'panel') { const r = rowOf(t, g); return !!r && r.dist <= RP_CLIMB; }
-    return t.lv.some(function (lv) { return lv.item === g; }) && rpDist(t.el, g) <= RP_CLIMB;
+    return innerRow(t) === g && rpDist(t.el, g) <= RP_CLIMB;
   }
   // 대상이 g 안에서 keys 의 행 틀(목록 틀>항목 틀) 안에 있는가 — 항목이 하나뿐인 주(마지막 주 '31')도 같은 틀이면 행이다.
   function inRow(t, g, keys) {
@@ -393,7 +400,8 @@ REPEATED_JS = r"""
     }
     if (groups.length < 2 || !collide(groups)) return null;
     // 캐러셀 복제: 표제와 (role, name) 열이 모두 같은 묶음 → 하나로 접는다(표제가 다르면 두 달 달력처럼 다른 묶음)
-    const kept = [], byKey = new Map();
+    let kept = [];
+    const byKey = new Map();
     for (const gr of groups) {
       gr.members.sort(function (a, b) { return a.el === b.el ? 0 : (a.el.compareDocumentPosition(b.el) & 4 ? -1 : 1); });
       gr.h = headingOf(gr.g);
@@ -422,12 +430,30 @@ REPEATED_JS = r"""
       kept.forEach(function (gr) {
         for (const t of gr.members) { if (where.get(t.tok).size > 1) { const r = rowOf(t, gr.g); if (r) keys.add(r.key); } }
       });
+      // 신원 고정은 국소성과 분리(R5 R1): 국소성은 어떤 묶음이 형성되는지(먼저 차지)에만 쓰고, 형성된 패널이 담은 그 행
+      // 틀의 대상은 깊이와 무관하게 전부 받는다 — 같은 달 안 일부 날짜 목록만 깊이 묻혀(section 7개 아래) 고정 없이 남으면
+      // 표제가 바뀐 달의 옛 날짜가 다른 달에서 눌린다.
+      const rowMembers = function (g) {
+        return pool.filter(function (t) { return !t.done && g.contains(t.el) && inRow(t, g, keys); }).sort(function (a, b) {
+          return a.el === b.el ? 0 : (a.el.compareDocumentPosition(b.el) & 4 ? -1 : 1);
+        });
+      };
       for (const gr of kept) {
-        gr.members = gr.members.filter(function (t) { return inRow(t, gr.g, keys); });
-        for (const f of gr.folded) f.members = f.members.filter(function (t) { return inRow(t, f.g, keys); });
+        gr.members = rowMembers(gr.g);
+        for (const f of gr.folded) f.members = rowMembers(f.g);
       }
-      // 거르기 뒤 빈 쌍둥이가 생기면 세트를 버린다(N2 — WS-62 이전 동작).
-      if (kept.some(function (gr) { return !gr.members.length || gr.folded.some(function (f) { return !f.members.length; }); })) return null;
+      // 거르기 뒤 빈 쌍둥이(충돌 행이 없는 패널)는 빼고, 남은 쌍둥이가 2개 이상이고 여전히 충돌하면 그 세트를 낸다(R5 — N2
+      // 의미 변경: 예전엔 세트를 통째로 버렸고 패널 항목 쌍둥이가 받았으나, 항목 쌍둥이는 이제 가장 안쪽 행이 그 항목인 대상만
+      // 받으므로 버리면 달 정보가 사라진다). 아니면 표시 없이 고정만(R5 R1 fail-closed — orphans → pins).
+      for (const gr of kept) gr.folded = gr.folded.filter(function (f) { return f.members.length > 0; });
+      const live = kept.filter(function (gr) { return gr.members.length > 0; });
+      if (live.length < kept.length) {
+        if (live.length < 2 || !collide(live)) {
+          orphans.push(live);
+          return null;
+        }
+        kept = live;
+      }
     }
     const out = [];
     for (const gr of kept) {
@@ -455,7 +481,7 @@ REPEATED_JS = r"""
     for (const gr of kept) { for (const t of gr.members) t.done = true; for (const f of gr.folded) for (const t of f.members) t.done = true; }
     return {kind: kind, groups: out};
   }
-  const sets = [];
+  const sets = [], orphans = [];
   // (a) 패널 쌍둥이 — 각 대상의 가장 안쪽 반복 목록보다 위에서 같은 틀의 형제 묶음(같은 틀 목록을 담은)
   const panels = new Map();
   for (const t of ts) {
@@ -490,7 +516,22 @@ REPEATED_JS = r"""
     const s = finish('item', items, ts);
     if (s) sets.push(s);
   }
-  return {sets: sets};
+  // (c) 표시 없이 고정만(R5 R1 fail-closed): N2 로 버린 패널 세트의 행 대상 중 다른 묶음도 받지 않은 것.
+  const pins = [];
+  for (const kept of orphans) {
+    for (const gr of kept) {
+      for (const one of [gr].concat(gr.folded)) {
+        const path = absPath(one.g);
+        if (!path) continue;
+        for (const t of one.members) {
+          if (t.done) continue;
+          pins.push({i: t.i, path: path, fp: rpPinOf(one.id, t.el)});
+          t.done = true;
+        }
+      }
+    }
+  }
+  return {sets: sets, pins: pins};
 }
 """.replace("__COMMON__", COMMON_JS)
 
@@ -576,6 +617,13 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
         logger.debug("반복 묶음 계산 실패: %s", type(exc).__name__)
         return None
     sets = raw.get("sets") if isinstance(raw, dict) else None
+    # 표시 없는 고정(R5 R1 fail-closed — 버린 패널 세트의 행 대상). 세트가 없어도 적용한다.
+    raw_pins = raw.get("pins") if isinstance(raw, dict) else None
+    for p in (raw_pins if isinstance(raw_pins, list) else []):
+        idx = p.get("i") if isinstance(p, dict) else None
+        if isinstance(idx, int) and 0 <= idx < len(handles) and isinstance(p.get("path"), str):
+            handles[idx].group_path = p["path"]
+            handles[idx].group_heading = _pin_text(p.get("fp"))
     if not isinstance(sets, list) or not sets:
         return None
     return _build_block(sets, handles)

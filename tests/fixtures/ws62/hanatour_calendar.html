@@ -10,7 +10,8 @@ WS-62 R4 시험 자료 — 실제 여행 예약 페이지(2026-10-23 캡처)의 
   * 슬라이드는 role=group·이동 단추는 role=button(슬라이더 접근성 속성 — 같은 틀 판정에 role 이 들어간다).
   * 빈 칸 링크(월 앞 공백 — 이름 없는 a). 이전/다음 달 이동은 노드를 재사용해 표제·날짜 글자만 바꾼다.
 변형: <style id="hide"> 를 빼면 무 CSS(닫힌 층이 모두 보여 묶음 지문 앞부분이 메뉴 글자로 찬다). longnote() = 각 달 패널에
-1000자+ 안내문. 날짜를 누르면 #dep → #ret 순서로 'YYYY.MM.DD' 를 넣는다.
+1000자+ 안내문. 날짜를 누르면 #dep → #ret 순서로 'YYYY.MM.DD' 를 넣는다(가는 날을 고르면 오는 날 표시는 '오는 날' 로
+돌아간다 — 입력칸 이름과 같은 첫 낱말). pendingReturn() = 가는 날만 고른 상태(R5).
 -->
 <html lang="ko"><head><meta charset="utf-8"><title>여행 예약 시험 페이지</title>
 <style>
@@ -227,9 +228,18 @@ function say(what) { window.clicks.push(what); document.getElementById('out').te
     const key = window.picks.length ? 'ret' : 'dep';
     document.getElementById(key).value = a.dataset.date;
     document.getElementById(key + 'set').textContent = a.dataset.date.slice(5);
+    // 가는 날을 고르면 오는 날은 미선택으로 돌아간다(바깥 표시 = 입력칸 이름 '오는 날', WS-62 R5 R2)
+    if (key === 'dep') { document.getElementById('ret').value = ''; document.getElementById('retset').textContent = '오는 날'; }
     window.picks.push(a.dataset.date);
     a.parentNode.className = 'select';
   }
+  // 시험 변형(R5 R2): 가는 날 10.24 만 고른 상태 — 오는 날 미선택(노드·계층은 그대로, 글자·값만 바꾼다).
+  window.pendingReturn = function () {
+    document.getElementById('dep').value = '2026.10.24';
+    document.getElementById('ret').value = '';
+    document.getElementById('retset').textContent = '오는 날';
+    window.picks = ['2026.10.24'];
+  };
   function render() {
     panels.forEach(function (inr, k) {
       const mm = base + k, y = Math.floor(mm / 12), m = mm % 12 + 1;
