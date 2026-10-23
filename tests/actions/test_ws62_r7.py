@@ -262,31 +262,7 @@ def live_panels_html(kind: str) -> str:
             " + '/' + this.textContent; return false; }; });</script></body></html>")
 
 
-@requires_chromium
-@pytest.mark.parametrize("kind", ["live", "timer", "status", "marquee"])
-async def test_live_region_text_excluded_from_identity(kind):
-    """양쪽 패널 모두(대칭)에 있는 aria-live·role=timer/status/marquee 글자는 구조 표지로 뺀다 — 갱신만으로 거부하지 않고,
-    월 표제가 바뀌면 여전히 거부."""
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, live_panels_html(kind))
-        try:
-            await _observe(d, {"prune_top_n": 300})
-            one = await _by_selector(engine, page, "#cal > .inr:nth-of-type(1) li:nth-child(3) a")
-            two = await _by_selector(engine, page, "#cal > .inr:nth-of-type(1) li:nth-child(4) a")
-            pinned = bool(engine.get_handle(one).group_path)
-            await page.evaluate("document.querySelectorAll('.ticker').forEach((e, k) => e.textContent = '소식 ' + (k + 7))")
-            ok = await d.dispatch(ActionType.CLICK, {"element_id": one})
-            out = await page.text_content("#out")
-            await page.evaluate("document.querySelector('#cal .inr span').textContent = '2027년 3월'")
-            bad = await d.dispatch(ActionType.CLICK, {"element_id": two})
-            out2 = await page.text_content("#out")
-        finally:
-            await browser.close()
-    assert pinned
-    assert ok.success and out == "2026년 12월/3", (ok.error_code, ok.error_message, out)
-    assert bad.error_code is ErrorCode.TOCTOU_MISMATCH and out2 == out, (bad.error_code, out2)
+# test_live_region_text_excluded_from_identity → test_ws62_r10.py(R10: 같은 경로 기준 고정은 live 영역도 비교 — 거부 ≤ 기준).
 
 
 @requires_chromium

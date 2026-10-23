@@ -26,6 +26,13 @@
   실제로 비교하는 글자만 가린다(가림마다 안쪽 대칭 자리 `mask_slots` 저장, null 이면 안쪽이 전체 비교). 안쪽이 비교하지 않는 글자는
   태그·역할과 무관하게 바깥 지문에 남긴다 — 구조로는 롤링 공지와 비제목 상품명(strong·span·dd·안쪽 루트 aria-labelledby)을 구별할 수
   없다. 실측: 첫 옵션 section 에만 있는 상품명을 양쪽 규칙이 함께 빼 상품 Z 를 눌렀다(R8 의 제목 태그 목록 예외는 이 규칙에 포함).
+* **진짜 합집합(R10 — 사용자 결정 A)**: 기준 고정은 같은 (대상, 경로)가 위 고정에 이미 있어도 **건너뛰지 않는다** — 안쪽 고정은 대칭
+  자리만 비교해 첫 section 에만 있는 상품명을 뺄 수 있다(안쪽 쌍둥이 셋 이상이면 바깥 지문도 반복 항목 제외로 못 본다 — 실측 4변형·
+  21대상 오클릭). 경로가 같아도 지문이 다르면 둘 다 보관·비교(지문까지 같으면 add_pin 이 하나로). 기준 고정 지문은 기준처럼 동적
+  글자 제외(live 영역·텍스트 노드 경계)를 쓰지 않는다(`raw` — 배정·복제 접기도 같게; 구조로는 live 영역 안 상품명·'여행 상품 <b>A</b>'
+  를 롤링·가격과 구별할 수 없다). 기준 고정에 남은 변경은 내비게이션 예외와 바깥 가림뿐. 한계: 가린 안쪽 쌍둥이의 항목 낱말은 안쪽
+  고정(첫 텍스트 노드)에 맡긴다 — 상품 신원이 버튼 안 조각 글자('담기<span>A</span>')에만 있으면 바깥 대상이 기준 대비 오클릭(하나투어
+  달력 링크 '4<p>101만</p>' 가격과 구조가 같아 비교하면 하나투어 흐름이 거부된다 — 조정자 결정, #156).
 * **모양**: `{how, groups:[{group, group_source, x, y, role?, members:[{id, role?, name, states?}], copies?}], compact?, omitted?}` —
   페이지 문자열은 모두 값(이름을 키로 쓰지 않는다 — 주입 신호·가림 규칙이 키를 보지 않는다, 리뷰 B1).
 * **표제(group)**: 묶음의 aria-labelledby/aria-label → caption → legend → heading(h1~h6·role=heading) → 묶음 안
@@ -119,7 +126,11 @@ COMMON_JS = r"""
   }
   // R7(R6-R3): 동적 글자 영역(구조 표지만 — 문구 사전 없음). aria-live(off 제외)·role=marquee/timer/status.
   const RP_LIVE_ROLES = {marquee: 1, timer: 1, status: 1};
+  // R10: 기준 고정 지문 계산 동안만 켠다(rpIdentity 의 opt.raw) — 기준(v1.16.0)처럼 동적 글자 제외 둘(live 영역·텍스트 노드
+  // 경계)을 쓰지 않는다. 구조로는 live 영역 안 상품명·'담기<span>A</span>' 를 롤링·가격과 구별할 수 없다(실측 기준 대비 오클릭).
+  let rpRaw = false;
   function rpLive(el) {
+    if (rpRaw) return false;
     const lv = (el.getAttribute('aria-live') || '').toLowerCase().trim();
     if (lv && lv !== 'off') return true;
     return !!RP_LIVE_ROLES[(el.getAttribute('role') || '').toLowerCase().trim()];
@@ -303,7 +314,7 @@ COMMON_JS = r"""
       let e;
       while ((e = w.nextNode())) { if (rpInteractive(e)) { t = e; break; } }
     }
-    return t ? 'i:' + rpTok(t.getAttribute('aria-label') || rpFirstText(t) || t.getAttribute('placeholder')) : null;
+    return t ? 'i:' + rpTok(t.getAttribute('aria-label') || (rpRaw ? t.textContent : rpFirstText(t)) || t.getAttribute('placeholder')) : null;
   }
   // 첫 텍스트 노드(R7 R6-R3): 낱말은 텍스트 노드 경계로 — <span>1</span><p>138만</p> 를 '1138만' 으로 합치지 않는다.
   function rpFirstText(t) {
@@ -331,10 +342,12 @@ COMMON_JS = r"""
   // 항목 안 형제 글자(가격·툴팁·선택 표시)는 넣지 않는다 — 같은 달인데 가격 갱신·호버만으로 거부하던 과잉 거부(R5).
   //  opt(R7): {masks: [요소] — 가릴 안쪽 형성 쌍둥이, slots: Set|null — 대칭 자리}. 없으면 전체(기존과 같다).
   //  opt.maskSlots(R8·R9): Map(가림 요소 → 그 안쪽 고정의 대칭 자리 Set|null) — 대칭 자리 글자만 가린다.
+  //  opt.raw(R10): 기준 고정 — 동적 글자 제외 둘을 끈다(rpRaw).
   function rpIdentity(g, opt) {
-    const prev = rpMasks, prevSlots = rpMaskSlots;
+    const prev = rpMasks, prevSlots = rpMaskSlots, prevRaw = rpRaw;
     rpMasks = (opt && opt.masks) || [];
     rpMaskSlots = (opt && opt.maskSlots) || null;
+    rpRaw = !!(opt && opt.raw);
     try {
       const parts = [];
       const lt = rpLabelled(g);
@@ -348,7 +361,7 @@ COMMON_JS = r"""
       units.forEach(function (u, i) { idx.set(u, i); });
       return {idx: idx, g: g, body: parts.join('\n')};
     } finally {
-      rpMasks = prev; rpMaskSlots = prevSlots;
+      rpMasks = prev; rpMaskSlots = prevSlots; rpRaw = prevRaw;
     }
   }
   // id = rpIdentity(g) (묶음마다 한 번 계산해 대상마다 재사용 — 대상 수 × 묶음 크기 비용을 피한다).
@@ -712,7 +725,14 @@ REPEATED_JS = r"""
   const pathCache = new Map();
   function pathOf(e) { if (!pathCache.has(e)) pathCache.set(e, absPath(e)); return pathCache.get(e); }
   function docOrder(a, b) { return a.el === b.el ? 0 : (a.el.compareDocumentPosition(b.el) & 4 ? -1 : 1); }
+  // R10: 기준 배정 전체(복제 접기 열쇠·표제)를 기준처럼 동적 글자 제외 없이(rpRaw) — live 영역 상품명만 다른 상품 카드를
+  // 복제로 접어 기준 고정을 통째로 잃지 않게(실측).
   function basePins() {
+    const prevRaw = rpRaw;
+    rpRaw = true;
+    try { return basePinsRaw(); } finally { rpRaw = prevRaw; }
+  }
+  function basePinsRaw() {
     const out = [];
     function bfinish(kind, conts) {
       const groups = [];
@@ -724,7 +744,7 @@ REPEATED_JS = r"""
       const kept = [], byKey = new Map();
       for (const gr of groups) {
         gr.members.sort(docOrder);
-        const key = rpIdentity(gr.g).body + '\u0003' + gr.members.map(function (t) { return t.rn; }).join('\u0002');
+        const key = rpIdentity(gr.g, {raw: true}).body + '\u0003' + gr.members.map(function (t) { return t.rn; }).join('\u0002');
         const prev = byKey.get(key);
         if (prev) { prev.folded.push(gr); continue; }
         gr.folded = []; byKey.set(key, gr); kept.push(gr);
@@ -765,26 +785,20 @@ REPEATED_JS = r"""
     }
     return out;
   }
-  const have = new Map();
-  function mark(i, path) { const s = have.get(i) || new Set(); s.add(path); have.set(i, s); }
-  for (const st of sets) {
-    for (const g of st.groups) { for (const m of g.members) mark(m.i, g.path); for (const f of g.folded) mark(f.i, f.path); }
-  }
-  for (const p of pins) mark(p.i, p.path);
+  // R10(진짜 합집합): 같은 (대상, 경로)가 위 고정에 이미 있어도 건너뛰지 않는다 — 위 고정은 대칭 자리만 비교할 수 있어(안쪽
+  // 쌍둥이 셋 이상이면 첫 section 에만 있는 상품명을 뺀다) 기준 전체 지문과 다르다. 지문까지 같은 고정은 add_pin 이 하나로 둔다.
   const extra = [], masked = new Map();
   for (const hit of basePins()) {
     const t = hit.t, g = hit.g, path = pathOf(g);
     if (!rowBetween(t, g)) continue;  // 내비게이션 예외(사이 반복 행 없음)
-    if (have.has(t.i) && have.get(t.i).has(path)) continue;
     let m = masked.get(g);
     if (!m) {
       const els = formedEls.filter(function (e, k) { return e !== g && g.contains(e) && formedEls.indexOf(e) === k && pathOf(e); });
-      m = {id: rpIdentity(g, {masks: els, maskSlots: formedSlots}), mask: els.map(pathOf),
+      m = {id: rpIdentity(g, {masks: els, maskSlots: formedSlots, raw: true}), mask: els.map(pathOf),
            mslots: els.map(function (e) { const x = formedSlots.get(e); return x ? Array.from(x).sort() : null; })};
       masked.set(g, m);
     }
-    extra.push({i: t.i, path: path, fp: rpPinOf(m.id, t.el), mask: m.mask, mask_slots: m.mslots});
-    mark(t.i, path);
+    extra.push({i: t.i, path: path, fp: rpPinOf(m.id, t.el), mask: m.mask, mask_slots: m.mslots, raw: true});
   }
   return {sets: sets, pins: pins, extra: extra};
 }
@@ -796,7 +810,8 @@ GROUP_CHECK_JS = r"""
   // groupPin: 관찰 때 그 핸들의 묶음 지문(rpFingerprint). null 이면 구분 조상 포함만 본다.
   // masks(R7): 가릴 안쪽 형성 쌍둥이 css 경로(지금 g 안에 있는 것만 — 없어졌으면 가리지 않아 지문이 달라진다, fail-closed).
   // slots(R7): 대칭 자리 목록(null 이면 전체 정적 글자). maskSlots(R8): masks 와 같은 순서의 안쪽 대칭 자리(목록|null).
-  function groupCheck(el, groupPath, groupPin, masks, slots, maskSlots) {
+  // raw(R10): 기준 고정 — 동적 글자 제외 없이 계산(관찰 때와 같게).
+  function groupCheck(el, groupPath, groupPin, masks, slots, maskSlots, raw) {
     let g = null;
     try { g = document.querySelector(groupPath); } catch (x) { g = null; }
     if (!g) return {ok: false, now: null, why: 'group_gone'};
@@ -811,14 +826,14 @@ GROUP_CHECK_JS = r"""
       const sl = Array.isArray(maskSlots) ? maskSlots[k] : null;
       if (Array.isArray(sl)) msl.set(m, new Set(sl));
     });
-    const now = rpFingerprint(g, el, {masks: ms, slots: Array.isArray(slots) ? new Set(slots) : null, maskSlots: msl});
+    const now = rpFingerprint(g, el, {masks: ms, slots: Array.isArray(slots) ? new Set(slots) : null, maskSlots: msl, raw: raw === true});
     return {ok: now === groupPin, now: now, why: now === groupPin ? '' : 'heading_changed'};
   }
-  // 다중 고정(R7 — 기준 ∪ R6): pins = [[path, pin, masks, slots, maskSlots], ...] 전부 같아야 ok. 처음 다른 고정의 결과(k = 순번).
+  // 다중 고정(R7 — 기준 ∪ R6): pins = [[path, pin, masks, slots, maskSlots, raw], ...] 전부 같아야 ok. 처음 다른 고정의 결과(k = 순번).
   function groupCheckAll(el, pins) {
     for (let k = 0; k < pins.length; k++) {
       const p = pins[k] || [];
-      const r = groupCheck(el, p[0], p[1], p[2], p[3], p[4]);
+      const r = groupCheck(el, p[0], p[1], p[2], p[3], p[4], p[5]);
       if (!r.ok) { r.k = k; return r; }
     }
     return {ok: true, now: null, why: ''};
@@ -880,6 +895,8 @@ class GroupPin(NamedTuple):
     slots: Optional[Tuple[str, ...]] = None
     #: R8·R9: mask 와 같은 순서의 안쪽 고정 대칭 자리(None = 안쪽이 전체 비교) — 그 자리 글자만 가린다(나머지는 바깥이 비교).
     mask_slots: Tuple[Optional[Tuple[str, ...]], ...] = ()
+    #: R10: 기준 고정 — 동적 글자 제외(live 영역·텍스트 노드 경계) 없이 계산한 지문(실행 직전에도 같게 계산).
+    raw: bool = False
 
 
 def handle_pins(handle: Any) -> List[GroupPin]:
@@ -922,7 +939,7 @@ def _mask_slots(mask: Tuple[str, ...], value: Any) -> Optional[Tuple[Optional[Tu
 
 
 def add_pin(handle: Any, path: str, pin: Optional[str], mask: Any = None, slots: Any = None,
-            mask_slots: Any = None) -> None:
+            mask_slots: Any = None, raw: bool = False) -> None:
     """고정 하나를 더한다(빼지 않는다 — R7 원칙 1). 같은 고정이 이미 있으면 그대로.
 
     R8: 가림 경로가 있는데 안쪽 대칭 자리(mask_slots)가 어긋나면 가림을 버린다 — 관찰 지문(가림)과 달라져 거부(fail-closed).
@@ -931,16 +948,16 @@ def add_pin(handle: Any, path: str, pin: Optional[str], mask: Any = None, slots:
     ms = _mask_slots(masks, mask_slots)
     if ms is None:
         masks, ms = (), ()
-    entry = GroupPin(path, pin, masks, _str_tuple(slots), ms)
+    entry = GroupPin(path, pin, masks, _str_tuple(slots), ms, raw)
     pins = handle_pins(handle)
     if entry not in pins:
         set_pins(handle, pins + [entry])
 
 
 def pin_args(handle: Any) -> List[List[Any]]:
-    """실행 직전 확인(groupCheckAll)에 넘길 [[path, pin, masks, slots, mask_slots], ...]."""
+    """실행 직전 확인(groupCheckAll)에 넘길 [[path, pin, masks, slots, mask_slots, raw], ...]."""
     return [[p.path, p.pin, list(p.mask), list(p.slots) if p.slots is not None else None,
-             [list(x) if x is not None else None for x in p.mask_slots]] for p in handle_pins(handle)]
+             [list(x) if x is not None else None for x in p.mask_slots], p.raw] for p in handle_pins(handle)]
 
 
 def _block_chars(groups: Sequence[Dict[str, Any]]) -> int:
@@ -987,7 +1004,8 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
     for p in (extra if isinstance(extra, list) else []):
         idx = p.get("i") if isinstance(p, dict) else None
         if isinstance(idx, int) and 0 <= idx < len(handles) and isinstance(p.get("path"), str):
-            add_pin(handles[idx], p["path"], _pin_text(p.get("fp")), mask=p.get("mask"), mask_slots=p.get("mask_slots"))
+            add_pin(handles[idx], p["path"], _pin_text(p.get("fp")), mask=p.get("mask"), mask_slots=p.get("mask_slots"),
+                    raw=p.get("raw") is True)
     return block
 
 
