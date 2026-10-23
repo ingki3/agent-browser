@@ -22,6 +22,9 @@
 * **동적 글자 제외(R7)**: 항목 첫 낱말은 텍스트 노드 경계(span+p 결합 금지), aria-live·role=marquee/timer/status 영역 제외, R6
   새 고정 지문은 형성된 쌍둥이 전부에 같은 틀 사슬로 있는 자리(대칭 자리)의 정적 글자만(한쪽에만 붙은 롤링 공지 제외 — 쌍둥이
   하나뿐·공통 자리 없음이면 전체, fail-closed). 기준 고정 비교에는 대칭 자리를 쓰지 않는다.
+* **가림 예외(R8 — 가린 신원 근거는 어딘가에서 비교된다)**: 바깥 기준 고정의 가림은 그 안쪽 고정이 대칭 자리 규칙으로 비교하지
+  않는 '신원 성격' 글자(h1~h6·role=heading·caption·legend·th·바깥 루트 aria-labelledby 대상 — 구조로만)를 가리지 않는다
+  (가림마다 안쪽 대칭 자리 `mask_slots` 저장). 실측: 첫 옵션 section 에만 있는 상품명 H2 를 양쪽 규칙이 함께 빼 상품 Z 를 눌렀다.
 * **모양**: `{how, groups:[{group, group_source, x, y, role?, members:[{id, role?, name, states?}], copies?}], compact?, omitted?}` —
   페이지 문자열은 모두 값(이름을 키로 쓰지 않는다 — 주입 신호·가림 규칙이 키를 보지 않는다, 리뷰 B1).
 * **표제(group)**: 묶음의 aria-labelledby/aria-label → caption → legend → heading(h1~h6·role=heading) → 묶음 안
@@ -103,6 +106,25 @@ COMMON_JS = r"""
   function rpSig(el) { const r = el.getAttribute('role'); return el.tagName + (r ? '[' + r.toLowerCase() + ']' : ''); }
   // R7: 신원 지문 계산 동안만 켜는 가림(rpIdentity 의 opt.masks) — 바깥 쌍둥이 지문에서 그 안에 형성된 안쪽 쌍둥이 subtree.
   let rpMasks = [];
+  // R8: 가림 예외 — 가린 안쪽 쌍둥이(요소 → 그 안쪽 고정의 대칭 자리 Set|null). 안쪽 고정이 비교하지 않는(비대칭 자리)
+  // '신원 성격' 글자는 바깥 지문에서 가리지 않는다(가린 신원 근거는 어딘가에서 반드시 비교된다). rpLabelIds: 바깥 쌍둥이
+  // 루트의 aria-labelledby 대상 id.
+  let rpMaskSlots = null, rpLabelIds = null;
+  const RP_HEAD_TAGS = {H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1, CAPTION: 1, LEGEND: 1, TH: 1};
+  // 신원 성격(구조로만 — 문구 사전 없음): 제목 h1~h6·role=heading·caption·legend·th(행 머리)·루트 aria-labelledby 대상.
+  function rpHeadEl(e) {
+    if (RP_HEAD_TAGS[e.tagName]) return true;
+    if ((e.getAttribute('role') || '').toLowerCase().trim() === 'heading') return true;
+    return !!(rpLabelIds && e.id && rpLabelIds.has(e.id));
+  }
+  // node(글자 부모)가 가림 m 안에서 신원 성격이고 m 의 안쪽 고정이 그 자리를 비교하지 않으면 가리지 않는다.
+  function rpMaskKeep(node, m) {
+    const s = rpMaskSlots ? rpMaskSlots.get(m) : null;
+    if (!s) return false;  // 안쪽 고정이 전체 정적 글자를 비교(null) — 가려도 어딘가에서 비교된다
+    let head = false;
+    for (let e = node; e; e = e.parentElement) { if (rpHeadEl(e)) { head = true; break; } if (e === m) break; }
+    return head && !s.has(rpSlot(node, m));
+  }
   // R7(R6-R3): 동적 글자 영역(구조 표지만 — 문구 사전 없음). aria-live(off 제외)·role=marquee/timer/status.
   const RP_LIVE_ROLES = {marquee: 1, timer: 1, status: 1};
   function rpLive(el) {
@@ -140,7 +162,7 @@ COMMON_JS = r"""
     let e = node;
     while (e && e !== stop) {
       if (RP_SKIP[e.tagName] || rpInteractive(e) || rpIsItem(e) || (!allowHidden && rpHidden(e)) || rpLive(e)) return true;
-      if (rpMasks.length && rpMasks.indexOf(e) >= 0) return true;
+      if (rpMasks.length && rpMasks.indexOf(e) >= 0 && !rpMaskKeep(node, e)) return true;
       e = e.parentElement;
     }
     return false;
@@ -316,9 +338,12 @@ COMMON_JS = r"""
   //  (c) el 이 주어지면 그 대상이 든 항목의 순번(끝에 두되 상한에 잘리지 않게)
   // 항목 안 형제 글자(가격·툴팁·선택 표시)는 넣지 않는다 — 같은 달인데 가격 갱신·호버만으로 거부하던 과잉 거부(R5).
   //  opt(R7): {masks: [요소] — 가릴 안쪽 형성 쌍둥이, slots: Set|null — 대칭 자리}. 없으면 전체(기존과 같다).
+  //  opt.maskSlots(R8): Map(가림 요소 → 그 안쪽 고정의 대칭 자리 Set|null) — 비대칭 자리 신원 성격 글자는 가리지 않는다.
   function rpIdentity(g, opt) {
-    const prev = rpMasks;
+    const prev = rpMasks, prevSlots = rpMaskSlots, prevIds = rpLabelIds;
     rpMasks = (opt && opt.masks) || [];
+    rpMaskSlots = (opt && opt.maskSlots) || null;
+    rpLabelIds = new Set((g.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean));
     try {
       const parts = [];
       const lt = rpLabelled(g);
@@ -332,7 +357,7 @@ COMMON_JS = r"""
       units.forEach(function (u, i) { idx.set(u, i); });
       return {idx: idx, g: g, body: parts.join('\n')};
     } finally {
-      rpMasks = prev;
+      rpMasks = prev; rpMaskSlots = prevSlots; rpLabelIds = prevIds;
     }
   }
   // id = rpIdentity(g) (묶음마다 한 번 계산해 대상마다 재사용 — 대상 수 × 묶음 크기 비용을 피한다).
@@ -496,7 +521,7 @@ REPEATED_JS = r"""
       if (!ts.length) return;
       const path = absPath(one.g);
       if (!path) return;
-      formedEls.push(one.g);
+      formedAdd(one.g, one.slots);
       for (const t of ts) { pins.push({i: t.i, path: path, fp: rpPinOf(one.sid || one.id, t.el), slots: one.slots || null}); t.done = true; }
     });
   }
@@ -607,9 +632,9 @@ REPEATED_JS = r"""
     // 배정 끝: 낸 대상, 그리고 형성된 쌍둥이 안 반복 행 대상 전부(표시 없이 고정 — R6). 행 밖 대상(이전/다음달·표제·
     // 탭)은 다른 묶음이 받을 수 있게 남긴다.
     for (const gr of kept) {
-      formedEls.push(gr.g);
+      formedAdd(gr.g, gr.slots);
       for (const t of gr.members) t.done = true;
-      for (const f of gr.folded) { formedEls.push(f.g); for (const t of f.members) t.done = true; }
+      for (const f of gr.folded) { formedAdd(f.g, f.slots); for (const t of f.members) t.done = true; }
     }
     hidePins(kind, formed, pool);
     return {kind: kind, groups: out};
@@ -617,6 +642,17 @@ REPEATED_JS = r"""
   const sets = [], pins = [], unformed = [];
   // 형성된 쌍둥이 요소(R7 — 바깥 기준 고정 지문에서 가린다): 낸 묶음·접힌 복제본·표시 없는 고정의 쌍둥이.
   const formedEls = [];
+  // R8: 형성된 쌍둥이마다 그 안쪽 고정의 대칭 자리(null = 전체 비교). 둘 이상 등록되면 교집합(비교 자리가 적은 쪽 —
+  // 바깥 가림 예외가 넓어지는 fail-closed 방향).
+  const formedSlots = new Map();
+  function formedAdd(e, slots) {
+    formedEls.push(e);
+    const s = slots ? new Set(slots) : null;
+    if (!formedSlots.has(e)) { formedSlots.set(e, s); return; }
+    const old = formedSlots.get(e);
+    if (!old) formedSlots.set(e, s);
+    else if (s) formedSlots.set(e, new Set(Array.from(old).filter(function (k) { return s.has(k); })));
+  }
   // (a) 패널 쌍둥이 — 각 대상의 가장 안쪽 반복 목록보다 위에서 같은 틀의 형제 묶음(같은 틀 목록을 담은)
   const panels = new Map();
   for (const t of ts) {
@@ -673,7 +709,7 @@ REPEATED_JS = r"""
       if (!hit.length) continue;
       const path = absPath(gr.g);
       if (!path) continue;
-      formedEls.push(gr.g);
+      formedAdd(gr.g, slots);
       const id = rpIdentity(gr.g, slots ? {slots: new Set(slots)} : null);
       for (const t of hit) { pins.push({i: t.i, path: path, fp: rpPinOf(id, t.el), slots: slots}); t.done = true; }
     }
@@ -752,10 +788,11 @@ REPEATED_JS = r"""
     let m = masked.get(g);
     if (!m) {
       const els = formedEls.filter(function (e, k) { return e !== g && g.contains(e) && formedEls.indexOf(e) === k && pathOf(e); });
-      m = {id: rpIdentity(g, {masks: els}), mask: els.map(pathOf)};
+      m = {id: rpIdentity(g, {masks: els, maskSlots: formedSlots}), mask: els.map(pathOf),
+           mslots: els.map(function (e) { const x = formedSlots.get(e); return x ? Array.from(x).sort() : null; })};
       masked.set(g, m);
     }
-    extra.push({i: t.i, path: path, fp: rpPinOf(m.id, t.el), mask: m.mask});
+    extra.push({i: t.i, path: path, fp: rpPinOf(m.id, t.el), mask: m.mask, mask_slots: m.mslots});
     mark(t.i, path);
   }
   return {sets: sets, pins: pins, extra: extra};
@@ -767,27 +804,30 @@ GROUP_CHECK_JS = r"""
   __COMMON__
   // groupPin: 관찰 때 그 핸들의 묶음 지문(rpFingerprint). null 이면 구분 조상 포함만 본다.
   // masks(R7): 가릴 안쪽 형성 쌍둥이 css 경로(지금 g 안에 있는 것만 — 없어졌으면 가리지 않아 지문이 달라진다, fail-closed).
-  // slots(R7): 대칭 자리 목록(null 이면 전체 정적 글자).
-  function groupCheck(el, groupPath, groupPin, masks, slots) {
+  // slots(R7): 대칭 자리 목록(null 이면 전체 정적 글자). maskSlots(R8): masks 와 같은 순서의 안쪽 대칭 자리(목록|null).
+  function groupCheck(el, groupPath, groupPin, masks, slots, maskSlots) {
     let g = null;
     try { g = document.querySelector(groupPath); } catch (x) { g = null; }
     if (!g) return {ok: false, now: null, why: 'group_gone'};
     if (!el || !g.contains(el)) return {ok: false, now: null, why: 'outside_group'};
     if (groupPin === null || groupPin === undefined) return {ok: true, now: null, why: ''};
-    const ms = [];
-    for (const p of (masks || [])) {
+    const ms = [], msl = new Map();
+    (masks || []).forEach(function (p, k) {
       let m = null;
       try { m = document.querySelector(p); } catch (x) { m = null; }
-      if (m && m !== g && g.contains(m)) ms.push(m);
-    }
-    const now = rpFingerprint(g, el, {masks: ms, slots: Array.isArray(slots) ? new Set(slots) : null});
+      if (!m || m === g || !g.contains(m)) return;
+      ms.push(m);
+      const sl = Array.isArray(maskSlots) ? maskSlots[k] : null;
+      if (Array.isArray(sl)) msl.set(m, new Set(sl));
+    });
+    const now = rpFingerprint(g, el, {masks: ms, slots: Array.isArray(slots) ? new Set(slots) : null, maskSlots: msl});
     return {ok: now === groupPin, now: now, why: now === groupPin ? '' : 'heading_changed'};
   }
-  // 다중 고정(R7 — 기준 ∪ R6): pins = [[path, pin, masks, slots], ...] 전부 같아야 ok. 처음 다른 고정의 결과(k = 순번).
+  // 다중 고정(R7 — 기준 ∪ R6): pins = [[path, pin, masks, slots, maskSlots], ...] 전부 같아야 ok. 처음 다른 고정의 결과(k = 순번).
   function groupCheckAll(el, pins) {
     for (let k = 0; k < pins.length; k++) {
       const p = pins[k] || [];
-      const r = groupCheck(el, p[0], p[1], p[2], p[3]);
+      const r = groupCheck(el, p[0], p[1], p[2], p[3], p[4]);
       if (!r.ok) { r.k = k; return r; }
     }
     return {ok: true, now: null, why: ''};
@@ -847,6 +887,8 @@ class GroupPin(NamedTuple):
     mask: Tuple[str, ...] = ()
     #: 대칭 자리(None 이면 전체 정적 글자).
     slots: Optional[Tuple[str, ...]] = None
+    #: R8: mask 와 같은 순서의 안쪽 고정 대칭 자리(None = 안쪽이 전체 비교) — 비대칭 자리 신원 성격 글자는 가리지 않는다.
+    mask_slots: Tuple[Optional[Tuple[str, ...]], ...] = ()
 
 
 def handle_pins(handle: Any) -> List[GroupPin]:
@@ -870,17 +912,44 @@ def set_pins(handle: Any, pins: Sequence[GroupPin]) -> None:
     handle.group_heading = items[0].pin if items else None
 
 
-def add_pin(handle: Any, path: str, pin: Optional[str], mask: Any = None, slots: Any = None) -> None:
-    """고정 하나를 더한다(빼지 않는다 — R7 원칙 1). 같은 고정이 이미 있으면 그대로."""
-    entry = GroupPin(path, pin, _str_tuple(mask) or (), _str_tuple(slots))
+def _mask_slots(mask: Tuple[str, ...], value: Any) -> Optional[Tuple[Optional[Tuple[str, ...]], ...]]:
+    """가림 경로와 같은 길이의 (대칭 자리 목록|None) — 어긋나면 None(호출자가 가림을 버린다, fail-closed)."""
+    if not mask:
+        return ()
+    if not isinstance(value, (list, tuple)) or len(value) != len(mask):
+        return None
+    out: List[Optional[Tuple[str, ...]]] = []
+    for v in value:
+        if v is None:
+            out.append(None)
+            continue
+        t = _str_tuple(v)
+        if t is None:
+            return None
+        out.append(t)
+    return tuple(out)
+
+
+def add_pin(handle: Any, path: str, pin: Optional[str], mask: Any = None, slots: Any = None,
+            mask_slots: Any = None) -> None:
+    """고정 하나를 더한다(빼지 않는다 — R7 원칙 1). 같은 고정이 이미 있으면 그대로.
+
+    R8: 가림 경로가 있는데 안쪽 대칭 자리(mask_slots)가 어긋나면 가림을 버린다 — 관찰 지문(가림)과 달라져 거부(fail-closed).
+    """
+    masks = _str_tuple(mask) or ()
+    ms = _mask_slots(masks, mask_slots)
+    if ms is None:
+        masks, ms = (), ()
+    entry = GroupPin(path, pin, masks, _str_tuple(slots), ms)
     pins = handle_pins(handle)
     if entry not in pins:
         set_pins(handle, pins + [entry])
 
 
 def pin_args(handle: Any) -> List[List[Any]]:
-    """실행 직전 확인(groupCheckAll)에 넘길 [[path, pin, masks, slots], ...]."""
-    return [[p.path, p.pin, list(p.mask), list(p.slots) if p.slots is not None else None] for p in handle_pins(handle)]
+    """실행 직전 확인(groupCheckAll)에 넘길 [[path, pin, masks, slots, mask_slots], ...]."""
+    return [[p.path, p.pin, list(p.mask), list(p.slots) if p.slots is not None else None,
+             [list(x) if x is not None else None for x in p.mask_slots]] for p in handle_pins(handle)]
 
 
 def _block_chars(groups: Sequence[Dict[str, Any]]) -> int:
@@ -927,7 +996,7 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
     for p in (extra if isinstance(extra, list) else []):
         idx = p.get("i") if isinstance(p, dict) else None
         if isinstance(idx, int) and 0 <= idx < len(handles) and isinstance(p.get("path"), str):
-            add_pin(handles[idx], p["path"], _pin_text(p.get("fp")), mask=p.get("mask"))
+            add_pin(handles[idx], p["path"], _pin_text(p.get("fp")), mask=p.get("mask"), mask_slots=p.get("mask_slots"))
     return block
 
 
