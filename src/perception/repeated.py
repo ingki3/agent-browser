@@ -13,6 +13,9 @@
   `GROUP_CLIMB`(6) 단계 이내, 항목 쌍둥이는 그 대상의 가장 안쪽 반복 행(대상 자신 제외)이 그 항목이고 6단계 이내(R5).
   패널 쌍둥이는 깊은(작은) 것부터 배정한다. 국소성은 형성(먼저 차지)에만 쓰고, 형성된 패널은 그 행 틀 대상을 깊이와
   무관하게 받는다(R5 — 신원 고정과 분리). 실사례(2026-10-23): 바깥 레이아웃 쌍둥이(#wrap/#footer)가 날짜·다음달·검색 단추를 먼저 흡수했다.
+* **형성/고정 분리(R6)**: 형성된 쌍둥이가 담은 대상 중 패널은 그 안 어떤 반복 행(틀 무관) 안 대상 전부(깊이 무관), 항목은 6단계
+  이내 전부 + 더 깊어도 다른 항목에 같은 첫 낱말이 있는 대상을 표시 없이 고정(`pins`). 셀 대상(가장 안쪽 행이 항목 안 셀)은 같은
+  틀 경로끼리 충돌로 형성에 참여(상품 카드·표 행). 형성 안 된 패널 쌍둥이도 쌍둥이 사이 같은 첫 낱말 대상은 고정(fail-closed).
 * **모양**: `{how, groups:[{group, group_source, x, y, role?, members:[{id, role?, name, states?}], copies?}], compact?, omitted?}` —
   페이지 문자열은 모두 값(이름을 키로 쓰지 않는다 — 주입 신호·가림 규칙이 키를 보지 않는다, 리뷰 B1).
 * **표제(group)**: 묶음의 aria-labelledby/aria-label → caption → legend → heading(h1~h6·role=heading) → 묶음 안
@@ -36,7 +39,7 @@
   치유도 같은 묶음 후보만 쓰고, 치유 재관찰도 주석을 달며 같은 id·같은 노드(css 경로)인 핸들만 원래 근거를 잇는다
   (B5, R1 R2, R4 R1-6).
 
-한계: 첫 낱말이 서로 다른 반복 대상은 잡지 않는다. 같은 문서 범위만(open/closed shadow 안 대상 제외, 프레임은 전환한
+한계: 첫 낱말이 서로 다른 반복 대상은 잡지 않는다. 패널 안 반복 행 대상(안내 링크 줄 등)은 달이 바뀌면 거부(재관찰, R6). 같은 문서 범위만(open/closed shadow 안 대상 제외, 프레임은 전환한
 그 문서 기준). 바깥 정적 글자가 없고 항목 순서열도 같은 두 묶음(같은 시작 요일·같은 날 수의 두 달)은 구분하지
 못한다. 지문 상한 뒤 변화는 못 잡는다. 좌표·selector 클릭은 고정 밖. 대상이 더 많은 다른 세트(무 CSS 의 전체 메뉴)가
 예산을 먼저 쓰면 달력 세트가 omitted 될 수 있다(고정은 유지). 항목 쌍둥이(팝업 래퍼 형제 등)에서 충돌하는 바깥 대상이
@@ -355,12 +358,13 @@ REPEATED_JS = r"""
     if (!k) continue;
     ts.push({i: t.i, el: el, tok: k, rn: String(t.role) + '\u0001' + String(t.name), lv: levels(el)});
   }
-  function collide(groups) {  // groups: [{members:[t]}] — 첫 낱말이 둘 이상의 묶음에 걸치나
+  function collide(groups, keyOf) {  // groups: [{members:[t]}] — 첫 낱말(keyOf)이 둘 이상의 묶음에 걸치나
     const seen = new Map();
     for (let gi = 0; gi < groups.length; gi++) {
       for (const t of groups[gi].members) {
-        const s = seen.get(t.tok);
-        if (s === undefined) seen.set(t.tok, gi); else if (s !== gi) return true;
+        const k = keyOf ? keyOf(t) : t.tok;
+        const s = seen.get(k);
+        if (s === undefined) seen.set(k, gi); else if (s !== gi) return true;
       }
     }
     return false;
@@ -377,13 +381,24 @@ REPEATED_JS = r"""
   //  패널: 그 대상의 가장 안쪽 반복 행 목록에서 위로 RP_CLIMB 이내. 항목: 그 대상 자신의 반복 항목(levels)이고 RP_CLIMB 이내.
   //  항목(R5 R2 — sbp rowElement): 대상의 **가장 안쪽** 반복 행(대상 자신 제외)이 그 항목일 때만 — 팝업 래퍼 형제(div.row ↔
   //  달력 팝업) 안의 바깥 날짜 표시(가장 안쪽 행 = div.bowl)·날짜(li)는 래퍼 항목 쌍둥이의 대상이 아니다.
-  function innerRow(t) {
-    for (const lv of t.lv) { if (lv.item !== t.el) return lv.item; }
-    return null;
+  function innerRow(t) {  // 깊이 제한 없음(R6 — 8단계 아래 셀 대상도 셀 행을 찾는다), 대상마다 한 번
+    if (t.ir === undefined) {
+      t.ir = null;
+      for (let e = t.el.parentElement; e && e !== document.body; e = e.parentElement) { if (rpIsItem(e)) { t.ir = e; break; } }
+    }
+    return t.ir;
   }
   function local(kind, t, g) {
     if (kind === 'panel') { const r = rowOf(t, g); return !!r && r.dist <= RP_CLIMB; }
-    return innerRow(t) === g && rpDist(t.el, g) <= RP_CLIMB;
+    return (innerRow(t) === g && rpDist(t.el, g) <= RP_CLIMB) || cellOf(t, g);
+  }
+  // 항목 쌍둥이의 셀 대상(R6 R2): 가장 안쪽 반복 행이 항목 안의 셀(article>div×3·tr>td×3)인 대상(깊이 무관 — 같은 틀
+  // 경로가 다른 항목에도 있어야 하므로 구조 쌍둥이 신호다). 충돌은 항목에서 대상까지의 틀 경로가 같은 셀 대상끼리만 본다(itemKey) — 상품 카드마다 같은 자리의 '담기'(DIV>BUTTON) 는 충돌, 팝업 래퍼 항목
+  // (div.row) 의 바깥 '오는 날'(DIV>A) 은 팝업의 입력칸 '오는 날'(래퍼 항목 바로 아래 대상) 과 충돌하지 않는다(R5 R2 유지).
+  function cellOf(t, g) { const r = innerRow(t); return !!r && r !== g && g.contains(r); }
+  function relPath(el, g) { const out = []; for (let e = el; e && e !== g; e = e.parentElement) out.push(rpSig(e)); return out.join('<'); }
+  function itemKey(g) {
+    return function (t) { return innerRow(t) === g ? t.tok : t.tok + '\u0004' + relPath(t.el, g); };
   }
   // 대상이 g 안에서 keys 의 행 틀(목록 틀>항목 틀) 안에 있는가 — 항목이 하나뿐인 주(마지막 주 '31')도 같은 틀이면 행이다.
   function inRow(t, g, keys) {
@@ -392,13 +407,61 @@ REPEATED_JS = r"""
     }
     return false;
   }
+  // 고정(R6 — 형성과 분리): 형성된 쌍둥이 g 가 담은 대상 중 g 안의 어떤 반복 행(sig 무관 — 셀 목록·대상 자신이 반복
+  // 항목인 경우 포함) 안에 있는 대상. 항목 쌍둥이는 항목 자체가 행이라 안의 대상 전부. 행이 하나도 없는 대상(패널의
+  // 이전/다음·표제·탭)만 고정 없음. 깊이 제한 없이 g 까지 올라간다(혼합 깊이 이종 행 — R5 R1).
+  function rowBetween(t, g) {
+    for (let e = t.el; e && e !== g; e = e.parentElement) { if (rpIsItem(e)) return true; }
+    return false;
+  }
+  // 항목 쌍둥이는 항목 자체가 행: 항목에서 RP_CLIMB 이내 대상 전부. 그보다 깊은 대상은 다른 항목(형성된 쌍둥이)에 같은 첫
+  // 낱말 대상이 있을 때만(fail-closed — 항목 사이 혼동) — 페이지 섹션 항목(div.submain) 깊숙한 달력 이전/다음·탭·입력칸이
+  // 섹션 지문으로 고정되는 과잉 거부를 막는다. 더 안쪽 쌍둥이가 먼저 잡은 대상(done)은 건드리지 않는다.
+  function pinTargets(kind, g, pool, others) {
+    return pool.filter(function (t) {
+      if (t.done || !g.contains(t.el)) return false;
+      if (kind !== 'item') return rowBetween(t, g);
+      return rpDist(t.el, g) <= RP_CLIMB || others.has(t.tok);
+    });
+  }
+  // 표시 없는 고정(R6): 형성된 쌍둥이마다 아직 배정되지 않은 고정 대상을 그 쌍둥이 경로·지문으로 pins 에 싣는다.
+  // elements 로 눌러도 표시된 대상과 같은 확인을 받는다. 경로를 못 만드는 쌍둥이는 건너뛴다(다른 묶음이 받을 수 있게).
+  function hidePins(kind, formed, pool) {
+    const toks = formed.map(function (one) {
+      const s = new Set();
+      if (kind === 'item') { for (const t of pool) { if (one.g.contains(t.el)) s.add(t.tok); } }
+      return s;
+    });
+    formed.forEach(function (one, k) {
+      const others = new Set();
+      toks.forEach(function (s, j) { if (j !== k) s.forEach(function (x) { others.add(x); }); });
+      const ts = pinTargets(kind, one.g, pool, others);
+      if (!ts.length) return;
+      const path = absPath(one.g);
+      if (!path) return;
+      for (const t of ts) { pins.push({i: t.i, path: path, fp: rpPinOf(one.id, t.el)}); t.done = true; }
+    });
+  }
   function finish(kind, conts, pool) {  // conts: 묶음 요소들, pool: 배정 가능한 대상
-    const groups = [];
+    const groups = [], keys0 = new Map();
     for (const g of conts) {
       const members = pool.filter(function (t) { return !t.done && g.contains(t.el) && local(kind, t, g); });
+      if (kind === 'item') { const kf = itemKey(g); for (const t of members) keys0.set(t, kf(t)); }
       if (members.length) groups.push({g: g, members: members});
     }
-    if (groups.length < 2 || !collide(groups)) return null;
+    if (kind === 'item') {
+      // 셀 대상은 같은 키가 다른 항목에도 있을 때만 묶음 대상(표시 변화 최소 — 충돌하지 않는 셀 대상은 고정만, hidePins).
+      const cnt = new Map();
+      groups.forEach(function (gr, gi) {
+        for (const t of gr.members) { const k = keys0.get(t); const s = cnt.get(k) || new Set(); s.add(gi); cnt.set(k, s); }
+      });
+      for (const gr of groups) {
+        gr.members = gr.members.filter(function (t) { return innerRow(t) === gr.g || cnt.get(keys0.get(t)).size > 1; });
+      }
+      for (let i = groups.length - 1; i >= 0; i--) { if (!groups[i].members.length) groups.splice(i, 1); }
+    }
+    const keyOf = kind === 'item' ? function (t) { return keys0.get(t); } : null;
+    if (groups.length < 2 || !collide(groups, keyOf)) return null;
     // 캐러셀 복제: 표제와 (role, name) 열이 모두 같은 묶음 → 하나로 접는다(표제가 다르면 두 달 달력처럼 다른 묶음)
     let kept = [];
     const byKey = new Map();
@@ -412,7 +475,10 @@ REPEATED_JS = r"""
       if (prev) { prev.copies++; prev.folded.push(gr); continue; }
       gr.copies = 0; gr.folded = []; byKey.set(key, gr); kept.push(gr);
     }
-    if (kept.length < 2 || !collide(kept)) return null;
+    if (kept.length < 2 || !collide(kept, keyOf)) return null;
+    // 형성된 쌍둥이 전부(접힌 복제본 포함) — 아래 표시 거르기와 무관하게 고정 대상(R6).
+    const formed = [];
+    for (const gr of kept) { formed.push(gr); for (const f of gr.folded) formed.push(f); }
     if (kind === 'item') {
       // 항목 쌍둥이는 묶음이 정보를 줄 때만 — 대상 둘 이상을 묶거나 서로 다른 표제(상품명)가 있을 때.
       const heads = kept.map(function (gr) { return gr.h ? gr.h.text : ''; });
@@ -444,12 +510,12 @@ REPEATED_JS = r"""
       }
       // 거르기 뒤 빈 쌍둥이(충돌 행이 없는 패널)는 빼고, 남은 쌍둥이가 2개 이상이고 여전히 충돌하면 그 세트를 낸다(R5 — N2
       // 의미 변경: 예전엔 세트를 통째로 버렸고 패널 항목 쌍둥이가 받았으나, 항목 쌍둥이는 이제 가장 안쪽 행이 그 항목인 대상만
-      // 받으므로 버리면 달 정보가 사라진다). 아니면 표시 없이 고정만(R5 R1 fail-closed — orphans → pins).
+      // 받으므로 버리면 달 정보가 사라진다). 아니면 표시 없이 고정만(R5 R1 fail-closed — hidePins).
       for (const gr of kept) gr.folded = gr.folded.filter(function (f) { return f.members.length > 0; });
       const live = kept.filter(function (gr) { return gr.members.length > 0; });
       if (live.length < kept.length) {
         if (live.length < 2 || !collide(live)) {
-          orphans.push(live);
+          hidePins(kind, formed, pool);
           return null;
         }
         kept = live;
@@ -477,11 +543,13 @@ REPEATED_JS = r"""
                 }))});
       if (out[out.length - 1].folded.some(function (f) { return !f.path; })) return null;  // 고정 못 할 복제본
     }
-    // 배정 끝: 낸 대상만(행 밖으로 뺀 대상은 다른 묶음이 받을 수 있게 남긴다).
+    // 배정 끝: 낸 대상, 그리고 형성된 쌍둥이 안 반복 행 대상 전부(표시 없이 고정 — R6). 행 밖 대상(이전/다음달·표제·
+    // 탭)은 다른 묶음이 받을 수 있게 남긴다.
     for (const gr of kept) { for (const t of gr.members) t.done = true; for (const f of gr.folded) for (const t of f.members) t.done = true; }
+    hidePins(kind, formed, pool);
     return {kind: kind, groups: out};
   }
-  const sets = [], orphans = [];
+  const sets = [], pins = [], unformed = [];
   // (a) 패널 쌍둥이 — 각 대상의 가장 안쪽 반복 목록보다 위에서 같은 틀의 형제 묶음(같은 틀 목록을 담은)
   const panels = new Map();
   for (const t of ts) {
@@ -495,18 +563,26 @@ REPEATED_JS = r"""
   const panelSets = Array.from(panels.values()).sort(function (a, b) { return depth(b[0]) - depth(a[0]); });
   for (const twins of panelSets) {
     const s = finish('panel', twins, ts);
-    if (s) sets.push(s);
+    if (s) sets.push(s); else unformed.push(twins);
   }
   // (b) 항목 쌍둥이 — 남은 대상의 반복 목록 중 첫 낱말이 항목 사이에 겹치는 가장 안쪽 목록의 항목들
   const lists = [];
+  function addList(item) {
+    const key = rpSig(item);
+    const k2 = lists.findIndex(function (x) { return x.list === item.parentElement && x.sig === key; });
+    if (k2 < 0) lists.push({list: item.parentElement, sig: key});
+  }
   for (const t of ts) {
     if (t.done) continue;
     for (const lv of t.lv) {
       // 항목이 대상 자신(버튼 목록)이면 묶음이 대상과 같아 구분 정보가 없다. body 바로 아래는 목록으로 보지 않는다.
       if (lv.item === t.el || lv.list === document.body) continue;
-      const key = rpSig(lv.item);
-      const k2 = lists.findIndex(function (x) { return x.list === lv.list && x.sig === key; });
-      if (k2 < 0) lists.push({list: lv.list, sig: key});
+      addList(lv.item);
+    }
+    // 셀 대상(R6 R2): 가장 안쪽 행(셀)과 그 위 행(상품 항목)은 깊이 제한(levels 8) 밖이어도 후보 — 8단계 아래 '담기'.
+    let n = 0;
+    for (let e = innerRow(t); e && e.parentElement && e.parentElement !== document.body && n < 2; e = e.parentElement) {
+      if (rpIsItem(e)) { addList(e); n++; }
     }
   }
   lists.sort(function (a, b) { return depth(b.list) - depth(a.list); });  // 안쪽(깊은) 목록 먼저
@@ -516,19 +592,21 @@ REPEATED_JS = r"""
     const s = finish('item', items, ts);
     if (s) sets.push(s);
   }
-  // (c) 표시 없이 고정만(R5 R1 fail-closed): N2 로 버린 패널 세트의 행 대상 중 다른 묶음도 받지 않은 것.
-  const pins = [];
-  for (const kept of orphans) {
-    for (const gr of kept) {
-      for (const one of [gr].concat(gr.folded)) {
-        const path = absPath(one.g);
-        if (!path) continue;
-        for (const t of one.members) {
-          if (t.done) continue;
-          pins.push({i: t.i, path: path, fp: rpPinOf(one.id, t.el)});
-          t.done = true;
-        }
-      }
+  // (c) 남은 쌍둥이 간 혼동(R6 — 조정자 결정 A'): 국소성 때문에 형성되지 않은 패널 쌍둥이(바깥 레이아웃 등)라도, 아직 아무
+  // 묶음에도 들지 않은 대상 중 첫 낱말이 그 쌍둥이 사이에 걸치는 대상은 그 쌍둥이로 고정한다(표시 없음). 레이아웃 흡수(이전/
+  // 다음·검색·탭 — 짝 없는 대상)는 되살리지 않고, 다른 쌍둥이에 같은 이름이 있는 대상만 fail-closed.
+  for (const twins of unformed) {
+    // 걸침은 쌍둥이 안 대상 전부(이미 더 안쪽 묶음이 고정한 짝 포함)로 보고, 고정은 아직 아무 묶음에도 들지 않은 대상만.
+    const grs = twins.map(function (g) { return {g: g, members: ts.filter(function (t) { return g.contains(t.el); })}; });
+    const where = new Map();
+    grs.forEach(function (gr, gi) { for (const t of gr.members) { const s = where.get(t.tok) || new Set(); s.add(gi); where.set(t.tok, s); } });
+    for (const gr of grs) {
+      const hit = gr.members.filter(function (t) { return !t.done && where.get(t.tok).size > 1; });
+      if (!hit.length) continue;
+      const path = absPath(gr.g);
+      if (!path) continue;
+      const id = rpIdentity(gr.g);
+      for (const t of hit) { pins.push({i: t.i, path: path, fp: rpPinOf(id, t.el)}); t.done = true; }
     }
   }
   return {sets: sets, pins: pins};

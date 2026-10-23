@@ -239,7 +239,9 @@ async def test_twin_left_empty_by_row_filter_is_dropped_rest_shown(empties):
             await browser.close()
     assert [g["group"] for g in r.data["repeated"]["groups"]] == ["1월", "2월"]
     assert all(pins) and pins[0] != pins[1], pins
-    assert btn_pin is None
+    # R6(형성/고정 분리): 단추 셋(button×3 — 반복 행)은 형성된 패널 쌍둥이 안 반복 행 대상이라 표시 없이 그 패널로 고정
+    # (v1.16.0 과 같음 — R4·R5 는 충돌 행 틀 밖이라 고정을 뺐다).
+    assert btn_pin, btn_pin
 
 
 async def test_display_less_pins_are_applied_without_sets():
@@ -386,13 +388,16 @@ async def test_heal_repin_inherits_only_when_same_node(monkeypatch):
     assert engine.get_handle("@e2").group_path is None and engine.get_handle("@e2").group_heading is None
 
 
-# ------------------------------------------------------------------ R1-3: 충돌을 만든 행 틀 밖 대상은 묶음 대상·고정이 아니다
+# ------------------------------------------------------------------ R1-3: 충돌을 만든 행 틀 밖 대상은 묶음 대상(표시)이 아니다(R6: 반복 행 안이면 고정)
 
 
 @requires_chromium
 async def test_panel_targets_outside_colliding_row_kind_are_not_pinned():
     """달 패널 안이지만 날짜 행(ul>li) 이 아닌 다른 행 틀(div>span)의 안내 링크 — 이름이 패널마다 달라 충돌을 만들지
-    않았으므로 묶음 대상도 고정도 아니다(달이 바뀌어도 누를 수 있다). 날짜는 그대로 고정."""
+    않았으므로 묶음 대상(표시)은 아니다. 날짜는 그대로 고정.
+
+    R6 의미 변경(형성/고정 분리): 안내 링크도 형성된 달 패널 안 반복 행(span×3) 대상이라 표시 없이 그 패널로 고정한다
+    (v1.16.0 과 같은 fail-closed — 표제가 바뀐 달의 안내 링크는 거부, 재관찰 뒤 누른다). 행 밖 대상(이전/다음달)만 고정 없음."""
     from playwright.async_api import async_playwright
 
     def panel(month: str, notes) -> str:
@@ -418,7 +423,7 @@ async def test_panel_targets_outside_colliding_row_kind_are_not_pinned():
             await browser.close()
     names = {m["name"] for g in r.data["repeated"]["groups"] for m in g["members"]}
     assert "2" in names and not any("안내" in n for n in names), names
-    assert res.success and out == "휴무", (res.error_code, res.error_message)
+    assert res.error_code is ErrorCode.TOCTOU_MISMATCH and out == "대기", (res.error_code, res.error_message, out)
     assert day_res.error_code is ErrorCode.TOCTOU_MISMATCH
 
 
