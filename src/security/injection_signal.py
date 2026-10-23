@@ -145,13 +145,53 @@ def scan_texts(texts: List[Tuple[str, str]],
     return signal
 
 
+#: 관찰 결과의 서버 부가 블록(WS-62 반복 묶음·WS-61 기억한 페이지) — 응답 크기 맞춤이 요소보다 먼저 남기므로
+#: 앞쪽 요소가 검사 예산을 다 써도 따로(자기 예산으로) 검사한다(WS-62 R1 R4). 블록 자체에 상한이 있다.
+SIDE_BLOCK_KEYS = ("repeated", "saved_pages")
+
+
 def injection_signal(data: Any, error_message: Optional[str] = None,
                      max_scan_chars: int = DEFAULT_MAX_SCAN_CHARS) -> Optional[Dict[str, Any]]:
     """결과 data(+오류 문구)의 웹 유래 텍스트에서 IPI 신호를 만든다. 의심 없으면 None."""
-    texts = iter_web_texts(data)
+    side = [k for k in SIDE_BLOCK_KEYS if isinstance(data, dict) and isinstance(data.get(k), dict)]
+    if not side:
+        texts = iter_web_texts(data)
+        if error_message:
+            texts.append(("error_message", error_message))
+        return scan_texts(texts, max_scan_chars)
+    main_data = {k: v for k, v in data.items() if k not in side}
+    texts = iter_web_texts(main_data)
     if error_message:
         texts.append(("error_message", error_message))
-    return scan_texts(texts, max_scan_chars)
+    signal = scan_texts(texts, max_scan_chars)
+    for key in side:
+        extra = scan_texts(iter_web_texts({key: data[key]}), max_scan_chars)
+        if extra is not None:
+            if signal is None:
+                # 본문에서 신호가 없었어도 본문 검사가 끊겼으면 그 사실을 함께 알린다.
+                _, scanned, cut = _limit(texts, max_scan_chars)
+                signal = {k: v for k, v in extra.items() if k not in ("scanned_chars", "truncated_scan")}
+                if cut:
+                    signal["scanned_chars"] = scanned
+                    signal["truncated_scan"] = True
+                continue
+            signal = _merge_signals(signal, extra)
+    return signal
+
+
+def _merge_signals(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """두 신호를 합친다(패턴·where 순서 유지, where 상한). 검사 끊김 표시는 앞(본문) 신호의 것을 둔다."""
+    patterns = list(base["patterns"]) + [p for p in extra["patterns"] if p not in base["patterns"]]
+    where_all = int(base.get("where_total") or len(base["where"]))
+    total = where_all + int(extra.get("where_total") or len(extra["where"]))
+    where = (list(base["where"]) + list(extra["where"]))[:MAX_WHERE]
+    out: Dict[str, Any] = {"patterns": patterns, "where": where, "hint": INJECTION_HINT}
+    if total > MAX_WHERE:
+        out["where_total"] = total
+    for k in ("scanned_chars", "truncated_scan"):
+        if k in base:
+            out[k] = base[k]
+    return out
 
 
 def attach_injection_signal(result: Any, max_scan_chars: int = DEFAULT_MAX_SCAN_CHARS) -> bool:

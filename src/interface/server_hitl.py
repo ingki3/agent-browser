@@ -136,7 +136,7 @@ class HitlMixin:
             # WS-56 R1 B1: 이름·role·css 가 같아도 증표 발급(승인 요청) 때 잡은 그 노드여야 한다.
             target = await self._pinned_check(self._approval_pins().get(approval_id), params)
         if not target.get("fresh"):
-            return self._error_result(
+            refused = self._error_result(
                 action,
                 ErrorCode.TOCTOU_MISMATCH,
                 "승인한 대상이 바뀌어 실행하지 않았습니다(" + str(target.get("detail") or "") + "). "
@@ -145,6 +145,9 @@ class HitlMixin:
                                    "reason": "target_changed",
                                    "detail": str(target.get("detail") or "")}},
             )
+            if target.get("group_changed") is True:
+                refused.reobserve_required = True  # WS-62 NB1: 묶음(달·행)이 바뀌었다 — 재관찰해야 고를 수 있다
+            return refused
         ok, why = self.hub.consume_approval(approval_id, components)
         if not ok:  # 그사이 다른 호출이 썼다
             return {"approval_id": approval_id, "reason": why, "reason_code": "used"}

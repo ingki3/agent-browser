@@ -325,7 +325,10 @@ class ElicitMixin:
             except Exception as exc:  # noqa: BLE001
                 fresh = {"fresh": False, "detail": f"대상 확인 실패: {type(exc).__name__}"}
         if not fresh.get("fresh"):
-            return self._oob_toctou(action, str(fresh.get("detail") or ""), via=via), None
+            refused = self._oob_toctou(action, str(fresh.get("detail") or ""), via=via)
+            if fresh.get("group_changed") is True:
+                refused.reobserve_required = True  # WS-62 NB1: 묶음(달·행)이 바뀌었다
+            return refused, None
         # B1: 이름·role·css 가 같아도 승인 요청 때 그 노드가 아니면(새 노드로 교체) 실행하지 않는다.
         same = await self._pinned_check(self._approval_pin, params)
         if not same.get("fresh"):
