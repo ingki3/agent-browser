@@ -22,9 +22,10 @@
 * **동적 글자 제외(R7)**: 항목 첫 낱말은 텍스트 노드 경계(span+p 결합 금지), aria-live·role=marquee/timer/status 영역 제외, R6
   새 고정 지문은 형성된 쌍둥이 전부에 같은 틀 사슬로 있는 자리(대칭 자리)의 정적 글자만(한쪽에만 붙은 롤링 공지 제외 — 쌍둥이
   하나뿐·공통 자리 없음이면 전체, fail-closed). 기준 고정 비교에는 대칭 자리를 쓰지 않는다.
-* **가림 예외(R8 — 가린 신원 근거는 어딘가에서 비교된다)**: 바깥 기준 고정의 가림은 그 안쪽 고정이 대칭 자리 규칙으로 비교하지
-  않는 '신원 성격' 글자(h1~h6·role=heading·caption·legend·th·바깥 루트 aria-labelledby 대상 — 구조로만)를 가리지 않는다
-  (가림마다 안쪽 대칭 자리 `mask_slots` 저장). 실측: 첫 옵션 section 에만 있는 상품명 H2 를 양쪽 규칙이 함께 빼 상품 Z 를 눌렀다.
+* **가림은 안쪽이 비교하는 글자만(R9 — 안전 우선, 사용자 결정 A)**: 바깥 기준 고정의 가림은 그 안쪽 고정이 대칭 자리로 남겨
+  실제로 비교하는 글자만 가린다(가림마다 안쪽 대칭 자리 `mask_slots` 저장, null 이면 안쪽이 전체 비교). 안쪽이 비교하지 않는 글자는
+  태그·역할과 무관하게 바깥 지문에 남긴다 — 구조로는 롤링 공지와 비제목 상품명(strong·span·dd·안쪽 루트 aria-labelledby)을 구별할 수
+  없다. 실측: 첫 옵션 section 에만 있는 상품명을 양쪽 규칙이 함께 빼 상품 Z 를 눌렀다(R8 의 제목 태그 목록 예외는 이 규칙에 포함).
 * **모양**: `{how, groups:[{group, group_source, x, y, role?, members:[{id, role?, name, states?}], copies?}], compact?, omitted?}` —
   페이지 문자열은 모두 값(이름을 키로 쓰지 않는다 — 주입 신호·가림 규칙이 키를 보지 않는다, 리뷰 B1).
 * **표제(group)**: 묶음의 aria-labelledby/aria-label → caption → legend → heading(h1~h6·role=heading) → 묶음 안
@@ -53,7 +54,8 @@
 못한다. 지문 상한 뒤 변화는 못 잡는다. 좌표·selector 클릭은 고정 밖. 대상이 더 많은 다른 세트(무 CSS 의 전체 메뉴)가
 예산을 먼저 쓰면 달력 세트가 omitted 될 수 있다(고정은 유지). 항목 쌍둥이(팝업 래퍼 형제 등)에서 충돌하는 바깥 대상이
 래퍼 항목 바로 아래(사이 반복 행 없음)에 있으면 그 안 이전/다음 단추도 항목 단위로 고정된다. 양쪽 쌍둥이에 같은 구조로 있는
-표지 없는 롤링 글자는 대칭 자리라 거부한다(#154). 바깥 상품 쌍둥이가 기준·R6 어디서도 형성되지 않는 중첩은 기준과 같은 결함(#153).
+표지 없는 롤링 글자는 대칭 자리라 거부한다(#154). 안쪽 쌍둥이 한쪽에만 있는 표지 없는 롤링 글자도 바깥 기준 고정이 비교하므로
+재관찰을 요구한다(R9 안전 우선 — 기준 수준, #154). 바깥 상품 쌍둥이가 기준·R6 어디서도 형성되지 않는 중첩은 기준과 같은 결함(#153).
 """
 
 from __future__ import annotations
@@ -106,24 +108,14 @@ COMMON_JS = r"""
   function rpSig(el) { const r = el.getAttribute('role'); return el.tagName + (r ? '[' + r.toLowerCase() + ']' : ''); }
   // R7: 신원 지문 계산 동안만 켜는 가림(rpIdentity 의 opt.masks) — 바깥 쌍둥이 지문에서 그 안에 형성된 안쪽 쌍둥이 subtree.
   let rpMasks = [];
-  // R8: 가림 예외 — 가린 안쪽 쌍둥이(요소 → 그 안쪽 고정의 대칭 자리 Set|null). 안쪽 고정이 비교하지 않는(비대칭 자리)
-  // '신원 성격' 글자는 바깥 지문에서 가리지 않는다(가린 신원 근거는 어딘가에서 반드시 비교된다). rpLabelIds: 바깥 쌍둥이
-  // 루트의 aria-labelledby 대상 id.
-  let rpMaskSlots = null, rpLabelIds = null;
-  const RP_HEAD_TAGS = {H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1, CAPTION: 1, LEGEND: 1, TH: 1};
-  // 신원 성격(구조로만 — 문구 사전 없음): 제목 h1~h6·role=heading·caption·legend·th(행 머리)·루트 aria-labelledby 대상.
-  function rpHeadEl(e) {
-    if (RP_HEAD_TAGS[e.tagName]) return true;
-    if ((e.getAttribute('role') || '').toLowerCase().trim() === 'heading') return true;
-    return !!(rpLabelIds && e.id && rpLabelIds.has(e.id));
-  }
-  // node(글자 부모)가 가림 m 안에서 신원 성격이고 m 의 안쪽 고정이 그 자리를 비교하지 않으면 가리지 않는다.
+  // R9(안전 우선 — 사용자 결정 A): 가림은 안쪽 고정 지문이 실제로 비교하는 글자만 — 가린 안쪽 쌍둥이(요소 → 그 안쪽 고정의
+  // 대칭 자리 Set|null). 안쪽이 대칭 자리로 남긴 글자만 가리고, 비교하지 않는(비대칭 자리) 글자는 태그·역할과 무관하게 바깥
+  // 지문에 남긴다(R8 의 '신원 성격' 태그 목록 예외를 일반화 — 구조로는 롤링 공지와 비제목 상품명을 구별할 수 없다).
+  let rpMaskSlots = null;
+  // node(글자 부모)의 가림 m 안 자리를 m 의 안쪽 고정이 비교하지 않으면 가리지 않는다(null = 안쪽이 전체 비교 — 가린다).
   function rpMaskKeep(node, m) {
     const s = rpMaskSlots ? rpMaskSlots.get(m) : null;
-    if (!s) return false;  // 안쪽 고정이 전체 정적 글자를 비교(null) — 가려도 어딘가에서 비교된다
-    let head = false;
-    for (let e = node; e; e = e.parentElement) { if (rpHeadEl(e)) { head = true; break; } if (e === m) break; }
-    return head && !s.has(rpSlot(node, m));
+    return !!s && !s.has(rpSlot(node, m));
   }
   // R7(R6-R3): 동적 글자 영역(구조 표지만 — 문구 사전 없음). aria-live(off 제외)·role=marquee/timer/status.
   const RP_LIVE_ROLES = {marquee: 1, timer: 1, status: 1};
@@ -338,12 +330,11 @@ COMMON_JS = r"""
   //  (c) el 이 주어지면 그 대상이 든 항목의 순번(끝에 두되 상한에 잘리지 않게)
   // 항목 안 형제 글자(가격·툴팁·선택 표시)는 넣지 않는다 — 같은 달인데 가격 갱신·호버만으로 거부하던 과잉 거부(R5).
   //  opt(R7): {masks: [요소] — 가릴 안쪽 형성 쌍둥이, slots: Set|null — 대칭 자리}. 없으면 전체(기존과 같다).
-  //  opt.maskSlots(R8): Map(가림 요소 → 그 안쪽 고정의 대칭 자리 Set|null) — 비대칭 자리 신원 성격 글자는 가리지 않는다.
+  //  opt.maskSlots(R8·R9): Map(가림 요소 → 그 안쪽 고정의 대칭 자리 Set|null) — 대칭 자리 글자만 가린다.
   function rpIdentity(g, opt) {
-    const prev = rpMasks, prevSlots = rpMaskSlots, prevIds = rpLabelIds;
+    const prev = rpMasks, prevSlots = rpMaskSlots;
     rpMasks = (opt && opt.masks) || [];
     rpMaskSlots = (opt && opt.maskSlots) || null;
-    rpLabelIds = new Set((g.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean));
     try {
       const parts = [];
       const lt = rpLabelled(g);
@@ -357,7 +348,7 @@ COMMON_JS = r"""
       units.forEach(function (u, i) { idx.set(u, i); });
       return {idx: idx, g: g, body: parts.join('\n')};
     } finally {
-      rpMasks = prev; rpMaskSlots = prevSlots; rpLabelIds = prevIds;
+      rpMasks = prev; rpMaskSlots = prevSlots;
     }
   }
   // id = rpIdentity(g) (묶음마다 한 번 계산해 대상마다 재사용 — 대상 수 × 묶음 크기 비용을 피한다).
@@ -887,7 +878,7 @@ class GroupPin(NamedTuple):
     mask: Tuple[str, ...] = ()
     #: 대칭 자리(None 이면 전체 정적 글자).
     slots: Optional[Tuple[str, ...]] = None
-    #: R8: mask 와 같은 순서의 안쪽 고정 대칭 자리(None = 안쪽이 전체 비교) — 비대칭 자리 신원 성격 글자는 가리지 않는다.
+    #: R8·R9: mask 와 같은 순서의 안쪽 고정 대칭 자리(None = 안쪽이 전체 비교) — 그 자리 글자만 가린다(나머지는 바깥이 비교).
     mask_slots: Tuple[Optional[Tuple[str, ...]], ...] = ()
 
 

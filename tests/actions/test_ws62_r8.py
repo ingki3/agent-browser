@@ -126,35 +126,8 @@ async def test_adversarial_old_target_refused_after_product_change(case):
     assert good.success and ctrl == ["B"], (good.error_code, good.error_message, ctrl)
 
 
-@requires_chromium
-@pytest.mark.parametrize("case", BURIED)
-async def test_buried_name_with_rolling_small(case):
-    """결합 회귀: 첫 옵션 section 에 표지 없는 롤링 <small>(비제목 비대칭 글자)이 함께 있을 때 — 롤링만 바뀌면 거부 0
-    (5회 갱신 뒤 같은 id 로 상품 A 정상 클릭), 상품 A→Z 면 옛 id 거부·sink 없음."""
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, adversarial_html(case, rolling=True))
-        try:
-            await _abort_all(page)
-            await page.evaluate(SINK)
-            await _observe(d, {"force_full_tree": True, "prune_top_n": 1000})
-            a_all = await _targets_by_sku(engine, page, "A")
-            rolled = []
-            for n in range(1, 6):
-                await page.evaluate(ROLL, n)
-                rolled.append(await d.dispatch(ActionType.CLICK, {"element_id": a_all[n % len(a_all)].element_id}))
-            ok_sink = await page.evaluate("window.sink")
-            await page.evaluate(TO_Z)
-            await page.evaluate(ROLL, 9)
-            bad = [await d.dispatch(ActionType.CLICK, {"element_id": h.element_id}) for h in a_all]
-            sink = await page.evaluate("window.sink")
-        finally:
-            await browser.close()
-    assert [r.error_code for r in rolled] == [None] * 5 and ok_sink == ["A"] * 5, \
-        ([(r.error_code, r.error_message) for r in rolled], ok_sink)
-    assert sink == ok_sink, f"다른 상품을 눌렀다: {sink}"
-    assert all(r.error_code is ErrorCode.TOCTOU_MISMATCH for r in bad), [(r.error_code, r.error_message) for r in bad]
+# 결합 회귀(buried × 표지 없는 롤링 <small>)는 R9 에서 기대값이 '롤링만 바뀌면 거부 0' → '거부 수 ≤ 기준' 으로 바뀌어
+# tests/actions/test_ws62_r9.py::test_buried_rolling_small_refusals_at_most_baseline 로 옮겼다(안전 우선 — #154).
 
 
 # ------------------------------------------------------------------ census 보강: 신원 보존 단정
