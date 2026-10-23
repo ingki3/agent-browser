@@ -10,18 +10,16 @@ R2 상품 카드(article>div×3)·표 행(tr>td×3) — R5 의 가장 안쪽 행
 (항목 쌍둥이는 항목 자체가 행 — 항목 안 대상 전부). 고정 없음은 쌍둥이와 대상 사이에 반복 행이 없는 대상(이전/다음·
 표제·탭)뿐.
 
-census: 시험 자료·WS-62 시험 페이지에서 v1.16.0(6e449e2) 의 REPEATED_JS 원문(tests/fixtures/ws62/repeated_v1160.js)이
-고정하던 대상이 지금 고정 없음이면 실패(조정자 결정 A'). 같은 기준 세트의 다른 쌍둥이에 같은 첫 낱말이 있는 대상(쌍둥이 간
-혼동)은 반드시 고정, 같은 쌍둥이 안 중복만 있는 대상은 기준 쌍둥이가 레이아웃(R4 가 없앤 흡수)일 때만 상실 허용
-(classify_lost). 이름 목록(HANATOUR_NAV)은 보조.
+census: R6 의 A' 예외 census(classify_lost·HANATOUR_NAV)는 R7 에서 없앴다 — A' 가 실제 오클릭을 허용했다(R6 재검증 R2).
+기준 대비 census 는 tests/actions/test_ws62_r7.py(기준 고정 ⊆ 다중 고정, 예외는 사이 반복 행 없는 내비게이션만)가 이 파일의
+페이지(CENSUS_PAGES)·도우미(_base_js·_targets·_hanatour_states)로 잰다.
 모든 시험은 로컬 Chromium set_content(공개 사이트 접속 없음).
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -187,77 +185,6 @@ def _targets(engine: Any, elements: Any) -> Tuple[List[Dict[str, Any]], List[Any
     return targets, handles
 
 
-def _base_pinned(raw: Any) -> Set[int]:
-    out: Set[int] = set()
-    for st in (raw or {}).get("sets") or []:
-        for g in st.get("groups") or []:
-            for m in list(g.get("members") or []) + list(g.get("folded") or []):
-                if m.get("pin", True) is not False:
-                    out.add(int(m["i"]))
-    return out
-
-
-#: 기준 쌍둥이가 바깥 레이아웃(R4 가 없앤 흡수)일 때만 '같은 쌍둥이 안 중복만 있는 대상' 의 고정 상실을 허용. 시험 자료가
-#: 밝힌 레이아웃 쌍둥이 두 층: #screenArea > [#wrap, #footer], #wrap > [머리 div, #container] (무 CSS 에서 둘째 층이 나온다).
-LAYOUT_JS = ("(p) => { const e = document.querySelector(p); if (!e) return null;"
-             " const lay = e.id === 'wrap' || e.id === 'footer' || (e.parentElement && e.parentElement.id === 'wrap');"
-             " return lay ? 'layout:' + (e.id || 'wrap>div') : (e.id || e.tagName.toLowerCase()); }")
-
-
-def classify_lost(raw: Any, handles: List[Any], twin_ids: List[List[str]]) -> List[Dict[str, Any]]:
-    """기준이 고정했고 지금 고정 없는 대상마다 판정(조정자 결정 A').
-
-    * cross: 같은 기준 세트의 **다른 쌍둥이** 안에 같은 첫 낱말 대상이 있다(쌍둥이 간 혼동 = 신원 위험) → 허용 안 함.
-    * 그 밖(같은 쌍둥이 안 중복만·짝 없음)은 기준 쌍둥이가 레이아웃(LAYOUT_IDS)일 때만 허용.
-    twin_ids[s][g] = 기준 세트 s 의 쌍둥이 g 요소 id.
-    """
-    from perception.repeated import first_token
-
-    out = []
-    for si, st in enumerate((raw or {}).get("sets") or []):
-        groups = st.get("groups") or []
-        toks = [{first_token(handles[int(m["i"])].name) for m in list(g.get("members") or []) + list(g.get("folded") or [])}
-                for g in groups]
-        for gi, g in enumerate(groups):
-            for m in list(g.get("members") or []) + list(g.get("folded") or []):
-                h = handles[int(m["i"])]
-                if m.get("pin", True) is False or h.group_path:
-                    continue
-                tok = first_token(h.name)
-                cross = any(tok in t for j, t in enumerate(toks) if j != gi)
-                layout = str(twin_ids[si][gi] or "").startswith("layout:")
-                out.append({"name": h.name, "twin": twin_ids[si][gi], "cross": cross, "ok": (not cross) and layout})
-    return out
-
-
-def install_census(monkeypatch) -> List[Dict[str, Any]]:
-    """관찰마다(annotate_repeated 호출마다) 기준 고정 대상 중 지금 고정 없는 대상을 판정해 기록한다."""
-    import perception.repeated as rp
-
-    original = rp.annotate_repeated
-    log: List[Dict[str, Any]] = []
-    base_js = _base_js()
-
-    async def census(page, engine, elements):
-        block = await original(page, engine, elements)
-        targets, handles = _targets(engine, elements)
-        raw = await page.evaluate(base_js, {"targets": targets}) if targets else {"sets": []}
-        twin_ids = [[await page.evaluate(LAYOUT_JS, g["path"])
-                     for g in st.get("groups") or []] for st in raw.get("sets") or []]
-        lost = classify_lost(raw, handles, twin_ids)
-        log.append({"base": len(_base_pinned(raw)), "now": sum(1 for h in handles if h.group_path),
-                    "bad": [x for x in lost if not x["ok"]], "allowed": sorted({x["name"] for x in lost if x["ok"]})})
-        return block
-
-    monkeypatch.setattr(rp, "annotate_repeated", census)
-    return log
-
-
-#: 보조(이름 목록): 시험 자료에서 레이아웃 흡수 제거로 고정이 없어져야 하는(R4 과잉 거부 수정) 내비게이션 — census 가 실제로
-#: 레이아웃 경우를 재고 있는지(규칙 4) 확인용. 판정은 위 일반 규칙(classify_lost)이 한다.
-HANATOUR_NAV = {"이전달", "다음달", "항공권 검색", "TOP"}
-
-
 async def _hanatour_states(d, page, css: bool):
     """시험 자료 6상태: 처음·오는 날 미선택·다음달·가는 날 선택·LONGNOTE·다음달 12회(6주 달)."""
     from test_ws62_r4_hanatour import _cal_groups, _day
@@ -320,47 +247,3 @@ def _census_html(name: str) -> str:
     if name.startswith("n2_"):
         return _n2_html(1 if name == "n2_one" else 2)
     return _legend_html() if name == "legend" else _widgets_html()
-
-
-@requires_chromium
-@pytest.mark.parametrize("name", CENSUS_PAGES)
-async def test_identity_census_against_v1160(name, monkeypatch):
-    """기준(v1.16.0) 이 고정하던 대상이 지금 고정 없음이면 실패 — 허용 목록(사이 반복 행 없는 내비게이션)만 예외."""
-    from playwright.async_api import async_playwright
-
-    log = install_census(monkeypatch)
-    async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, _census_html(name))
-        try:
-            if name.startswith("hanatour"):
-                await _hanatour_states(d, page, name.endswith("_css"))
-            else:
-                await _observe(d, {"prune_top_n": 300})
-        finally:
-            await browser.close()
-    assert log and all(e["base"] > 0 for e in log), log  # 측정 조건(규칙 4): 기준이 실제로 고정한 대상이 있다
-    bad = [x for e in log for x in e["bad"]]
-    assert not bad, json.dumps(bad, ensure_ascii=False)[:1500]
-    if name.startswith("hanatour"):
-        assert HANATOUR_NAV <= set(log[0]["allowed"]), log[0]["allowed"]
-    else:
-        assert not any(e["allowed"] for e in log), log  # 레이아웃 쌍둥이가 없는 페이지는 상실 0
-
-
-def test_census_classifies_lost_pins():
-    """census 판정 단위 시험: 다른 쌍둥이에 같은 첫 낱말이 있으면(cross) 레이아웃이어도 실패, 같은 쌍둥이 안 중복만이면
-    레이아웃일 때만 허용, 레이아웃 아닌 쌍둥이의 상실은 실패, pin=False·지금 고정된 대상은 상실 아님."""
-    from types import SimpleNamespace
-
-    def h(name, pinned=False):
-        return SimpleNamespace(name=name, group_path="#p" if pinned else None)
-
-    handles = [h("19"), h("19"), h("이전달"), h("오는 날"), h("오는 날"), h("20", True), h("다음달")]
-    raw = {"sets": [{"groups": [{"members": [{"i": 0}, {"i": 2, "pin": False}, {"i": 3}, {"i": 4}], "folded": []},
-                                {"members": [{"i": 1}, {"i": 5}], "folded": [{"i": 6}]}]}]}
-    assert _base_pinned(raw) == {0, 1, 3, 4, 5, 6}
-    got = {(x["name"], x["twin"]): x["ok"] for x in classify_lost(raw, handles, [["layout:wrap", "layout:footer"]])}
-    assert got == {("19", "layout:wrap"): False, ("19", "layout:footer"): False, ("오는 날", "layout:wrap"): True,
-                   ("다음달", "layout:footer"): True}
-    got2 = {x["name"]: x["ok"] for x in classify_lost(raw, handles, [["cal1", "cal2"]])}
-    assert got2 == {"19": False, "오는 날": False, "다음달": False}

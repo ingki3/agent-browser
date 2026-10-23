@@ -21,7 +21,7 @@ from contracts import ActionType, ErrorCode
 
 from test_scroll_navigation import requires_chromium  # noqa: F401
 from test_ws62_r1 import _by_selector
-from test_ws62_r4_hanatour import FULL, _cal_groups, _day, _months, _named, _observe, _open, page_html
+from test_ws62_r4_hanatour import FULL, _cal_groups, _day, _months, _named, _observe, _open, nav_pins_ok, page_html
 
 
 # ------------------------------------------------------------------ R1: 혼합 깊이(얕은 1~18일 + section 7개 아래 19~31일)
@@ -106,7 +106,9 @@ async def test_pending_return_month_nav_not_refused_then_pick_jan6(css):
             await page.evaluate("pendingReturn()")
             r = await _observe(d)
             nxt, prv = _named(r, "다음달"), _named(r, "이전달")
-            pins = {n: engine.get_handle(e).group_path for n, e in (("다음달", nxt), ("이전달", prv))}
+            # 팝업 래퍼 항목 쌍둥이(#tabCon01 > div 의 div.row ↔ 달력 팝업)에 고정되지 않는다(R5 R2). 기준 바깥 레이아웃
+            # 고정(R7 합집합)은 달 패널을 가린 지문이라 달 이동에 흔들리지 않는다.
+            pins = {n: await nav_pins_ok(page, engine.get_handle(e), "#tabCon01 > div") for n, e in (("다음달", nxt), ("이전달", prv))}
             moves = [await d.dispatch(ActionType.CLICK, {"element_id": nxt}) for _ in range(3)]
             back = await d.dispatch(ActionType.CLICK, {"element_id": prv})
             months = await _months(page)
@@ -116,7 +118,7 @@ async def test_pending_return_month_nav_not_refused_then_pick_jan6(css):
             values = [await page.input_value("#dep"), await page.input_value("#ret")]
         finally:
             await browser.close()
-    assert pins == {"다음달": None, "이전달": None}, pins
+    assert pins == {"다음달": True, "이전달": True}, pins
     outcomes: List = [(m.success, m.error_code) for m in moves + [back]]
     assert outcomes == [(True, None)] * 4, [(m.error_code, m.error_message) for m in moves + [back]]
     assert months == ["2026년 12월", "2027년 1월"]
@@ -139,14 +141,14 @@ async def test_pending_return_tabs_and_inputs_not_pinned_to_popup_wrapper():
             sels = ["#cal > a.next", "#cal > a.prev", "#dep", "#ret", "#retset", ".tabs li:nth-child(1) a",
                     ".tabs li:nth-child(2) a"]
             ids = [await _by_selector(engine, page, s) for s in sels]
-            pins = {s: engine.get_handle(e).group_path for s, e in zip(sels, ids)}
+            pins = {s: await nav_pins_ok(page, engine.get_handle(e), "#tabCon01 > div") for s, e in zip(sels, ids)}
             nxt = ids[0]
             first = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
             again = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
             back = await d.dispatch(ActionType.CLICK, {"element_id": ids[1]})
         finally:
             await browser.close()
-    assert all(p is None for p in pins.values()), pins
+    assert all(pins.values()), pins
     assert [r.success for r in (first, again, back)] == [True] * 3, [(r.error_code, r.error_message) for r in (first, again, back)]
 
 

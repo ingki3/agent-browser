@@ -69,6 +69,27 @@ def _day(groups, month: str, day: str) -> str:
     raise AssertionError(f"{month}/{day} 없음: {json.dumps(groups, ensure_ascii=False)[:600]}")
 
 
+#: R7(합집합): 행 밖 대상(이전/다음달·검색·TOP·입력칸)은 달 패널에 고정되지 않는다. 기준(v1.16.0)이 바깥 레이아웃 쌍둥이로
+#: 고정하던 것은 그대로 고정하되(사이에 반복 행이 있으면 — 구조 판정) 그 지문은 안쪽 형성 쌍둥이(두 달 패널)를 가린다 —
+#: 달이 바뀌어도 흔들리지 않는다. forbid: 그 안에 고정되면 안 되는 범위(팝업 래퍼 항목 쌍둥이 등).
+NAV_PIN_JS = ("([path, masks, forbid]) => { const g = document.querySelector(path), cal = document.getElementById('cal');"
+              " if (!g || cal.contains(g)) return false;"
+              " if (forbid && [...document.querySelectorAll(forbid)].some(f => f.contains(g))) return false;"
+              " if (!g.contains(cal)) return true;"
+              " const ms = masks.map(m => document.querySelector(m));"
+              " return [...cal.querySelectorAll(':scope > .inr')].every(p => ms.some(m => m && m.contains(p))); }")
+
+
+async def nav_pins_ok(page, handle, forbid: Optional[str] = None) -> bool:
+    """행 밖 대상의 고정이 모두 '달 패널 밖 + 달 패널을 가린 바깥 고정' 인가(고정 없음도 참)."""
+    from perception.repeated import handle_pins
+
+    for p in handle_pins(handle):
+        if not await page.evaluate(NAV_PIN_JS, [p.path, list(p.mask), forbid]):
+            return False
+    return True
+
+
 async def _months(page) -> List[str]:
     return await page.evaluate("() => [...document.querySelectorAll('#cal > .inr .header span')].map(s => s.textContent)")
 
@@ -85,6 +106,9 @@ async def test_full_observe_has_two_month_groups():
         browser, page, engine, d = await _open(pw, page_html())
         try:
             r = await _observe(d)
+            # 날짜는 각 달 패널에. 다음달·검색·TOP 은 달 패널에 고정되지 않는다 — 기준 고정(바깥 레이아웃)은 달 패널을 가린 지문(R7)
+            navs = {name: await nav_pins_ok(page, engine.get_handle(_named(r, name)))
+                    for name in ("다음달", "이전달", "항공권 검색", "TOP")}
         finally:
             await browser.close()
     groups = _cal_groups(r)
@@ -96,9 +120,7 @@ async def test_full_observe_has_two_month_groups():
     assert not names & {"이전달", "다음달", "항공권", "TOP"}
     _day(groups, "2026년 10월", "19")
     _day(groups, "2026년 11월", "19")
-    # 바깥 레이아웃 묶음(#wrap 등)에 고정되지 않았다 — 날짜는 각 달 패널에, 다음달·검색·TOP 은 고정 없음
-    for name in ("다음달", "이전달", "항공권 검색", "TOP"):
-        assert engine.get_handle(_named(r, name)).group_path is None, name
+    assert all(navs.values()), navs
 
 
 # ------------------------------------------------------------------ F2: 같은 다음달 id 연속·달 이동 뒤 검색·TOP

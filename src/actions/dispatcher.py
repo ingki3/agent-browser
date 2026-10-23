@@ -2003,7 +2003,8 @@ class ActionDispatcher:
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
             from perception.repeated import pin_display
 
-            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
+            expected = staleness.expected_group if staleness.expected_group is not None else handle.group_heading
+            before = safe_page_text(pin_display(expected)) if expected is not None else None
             after = (safe_page_text(pin_display(staleness.observed_group))
                      if staleness.observed_group is not None else None)
             hint = "관찰 뒤 묶음(달·행)이 바뀌어 누르지 않았습니다 — 다시 관찰해 data.repeated 에서 고르세요"
@@ -2073,10 +2074,13 @@ class ActionDispatcher:
                     error_message="치유된 요소의 핸들을 찾을 수 없습니다.",
                     reobserve_required=True,
                 )
-            if getattr(handle, "group_path", None):
+            from perception.repeated import handle_pins, set_pins
+
+            old = handle_pins(handle)
+            if old:
                 # WS-62 R1 R2: 채택한 핸들은 원래 선택 근거(구분 조상·지문)를 잇는다 — 치유 후보 거르기가 이 근거로
-                # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다.
-                new_handle.group_path, new_handle.group_heading = handle.group_path, handle.group_heading
+                # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다. R7: 다중 고정 전부.
+                set_pins(new_handle, old)
             handle = new_handle
             healed_flag = True
         return handle, healed_flag
@@ -2598,10 +2602,12 @@ class ActionDispatcher:
 
         engine = self.ctx.engine
         before = getattr(engine, "handles", None)
+        from perception.repeated import handle_pins
+
         old_pins = {
-            eid: (h.group_path, h.group_heading, h.css_path)
+            eid: (handle_pins(h), h.css_path)
             for eid, h in (dict(before).items() if isinstance(before, dict) else [])
-            if getattr(h, "group_path", None)
+            if handle_pins(h)
         }
         result = await engine.observe_page(
             page=self.ctx.page, cdp=self.ctx.cdp
@@ -2627,7 +2633,7 @@ class ActionDispatcher:
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)
         return healing
 
-    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[str, Any, str]]) -> None:
+    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[List[Any], str]]) -> None:
         """WS-62 R1 R2: 치유의 재관찰이 핸들을 새로 만들어도 묶음 고정이 사라지지 않게 한다.
 
         1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
@@ -2635,17 +2641,17 @@ class ActionDispatcher:
         것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다. 단 같은 노드(css_path 같음)일 때만
         잇는다(WS-62 R4 R1-6) — id 가 다른 노드(다음달 링크 등)로 옮겨 가면 옛 날짜 고정을 물려받아 과잉 거부한다.
         """
-        from perception.repeated import annotate_repeated
+        from perception.repeated import annotate_repeated, set_pins
 
         engine = self.ctx.engine
         try:
             await annotate_repeated(self.ctx.page, engine, elements)
         except Exception as exc:  # noqa: BLE001 — 주석 실패는 아래 승계로만 고정한다
             logger.debug("치유 재관찰 묶음 주석 실패: %s", type(exc).__name__)
-        for eid, (path, pin, css) in old_pins.items():
+        for eid, (pins, css) in old_pins.items():
             h = engine.get_handle(eid)
             if h is not None and h.css_path == css:
-                h.group_path, h.group_heading = path, pin
+                set_pins(h, pins)  # R7: 다중 고정 전부
 
     async def _same_group_candidates(
         self, handle: ElementHandle, candidates: List[HealingCandidate]
@@ -2654,15 +2660,15 @@ class ActionDispatcher:
 
         role+이름만 보면 다른 달의 '19' 가 정상 치유로 채택된다. 확인을 못 하면 후보 없음(fail-closed).
         """
-        if not getattr(handle, "group_path", None) or not candidates:
-            return candidates
-        from perception.repeated import GROUP_FILTER_JS
+        from perception.repeated import GROUP_FILTER_JS, pin_args
 
+        pins = pin_args(handle)
+        if not pins or not candidates:
+            return candidates
         try:
             keep = await self.ctx.page.evaluate(GROUP_FILTER_JS, {
                 "paths": [c.css_path for c in candidates],
-                "groupPath": handle.group_path,
-                "groupHeading": handle.group_heading,
+                "pins": pins,  # R7 다중 고정 — 전부 같아야 같은 묶음
             })
         except Exception:  # noqa: BLE001 — 묶음 확인 불가면 치유하지 않는다
             return []
