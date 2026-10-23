@@ -1,0 +1,261 @@
+<!doctype html>
+<!--
+WS-62 R4 시험 자료 — 실제 여행 예약 페이지(2026-10-23 캡처)의 **구조만** 합성했다. 문구·상호·공지는 모두 지어낸 것이고
+스크립트는 이 시험을 위해 새로 썼다(원본 코드·문구 없음). 보존한 구조(리뷰 B3·R2):
+  * 바깥 레이아웃 쌍둥이: #screenArea > [div#wrap, div#footer], #wrap > [머리 div, div#container] — 각자 ul>li·div 목록을 담는다.
+  * 달력 앞 머리(로그인 줄·검색 상자·인기 검색어 롤링·전체 메뉴·오른쪽 고정 단추)와 검색 탭.
+  * 달력 팝업을 감싸는 같은 틀 형제 층: 팝업 래퍼 4(div.row ×3 + 달력 팝업), 탭 패널 3(div.panel), 페이지 섹션 7(div.submain).
+  * .calendar_wrap > a.prev · a.next · div.inr ×2, .inr > div.header > span("YYYY년 M월") + div.week > p×7
+    + div.calendar > 주별 ul.day > li > a > span(날짜) [+ p.price "127만"] [+ p.badge "최저가"] [+ p "TODAY"].
+  * 슬라이드는 role=group·이동 단추는 role=button(슬라이더 접근성 속성 — 같은 틀 판정에 role 이 들어간다).
+  * 빈 칸 링크(월 앞 공백 — 이름 없는 a). 이전/다음 달 이동은 노드를 재사용해 표제·날짜 글자만 바꾼다.
+변형: <style id="hide"> 를 빼면 무 CSS(닫힌 층이 모두 보여 묶음 지문 앞부분이 메뉴 글자로 찬다). longnote() = 각 달 패널에
+1000자+ 안내문. 날짜를 누르면 #dep → #ret 순서로 'YYYY.MM.DD' 를 넣는다.
+-->
+<html lang="ko"><head><meta charset="utf-8"><title>여행 예약 시험 페이지</title>
+<style>
+body{margin:0;font:13px sans-serif;width:1280px}
+ul{list-style:none;margin:0;padding:0}
+a,button{display:inline-block;min-width:16px;min-height:16px}
+.gnb_wrap .inr,.right_fixed{margin:2px 0}
+.global_menu_wrap li,.private_menu li,.gnb_menu>li,.tabs li,.sns_list li,.company_provision li,.travel_mark li{display:inline-block;margin-right:6px}
+.rolling_wrap .swiper-wrapper,.rolling_wrap_all{display:flex;gap:6px}
+.visual_wrap{position:relative}
+.calendar_wrap{display:flex;gap:16px;align-items:flex-start}
+.calendar_wrap .inr{width:330px}
+.week{display:flex}.week p{width:46px;margin:0}
+ul.day{display:flex}ul.day li{width:46px;height:52px}
+ul.day a{min-width:30px;min-height:30px}
+ul.day p{margin:0;font-size:10px}
+.row{display:flex;gap:8px;margin:4px 0}
+.submain{min-height:20px}
+.notice_list .swiper-wrapper{display:flex;flex-direction:column}
+</style>
+<style id="hide">
+/* 실제 CSS 가 닫아 두는 층(키워드 모음·전체 메뉴·2단 메뉴·닫힌 팝업·선택 안 된 탭) */
+.keyword_collection,.list_total_menu,.list_depth2_wrap,.js_show_wrap:not(.on):not(.quicksearch),.panels>.panel:not(.selected){display:none}
+</style>
+</head><body>
+<div id="app"><div id="layout"><div id="wrapper"><div id="screenArea">
+<div id="wrap">
+ <div>
+  <div></div>
+  <div class="gnb_wrap">
+   <div class="inr"><div class="global_menu_wrap"><div class="fl"></div><div class="fr"><ul>
+    <li><a href="#">로그인</a></li><li><a href="#">회원가입</a></li><li><a href="#">고객센터</a></li></ul></div></div></div>
+   <div class="inr"><div class="local_menu_wrap">
+    <div class="fl">
+     <h1 class="logo"><a href="#">여행사</a></h1>
+     <div class="searchform_com">
+      <form onsubmit="return false"><fieldset><legend>통합 검색어 입력폼</legend><div class="box_search">
+       <input type="text" placeholder="#해시태그 검색"><span></span><button type="button">검색</button></div></fieldset></form>
+      <div class="keyword_collection"><div class="panels" id="kwpanels"></div>
+       <div class="option_wrap"><span class="right_cont"><a href="#" class="txt">닫기</a></span></div></div>
+      <div class="list_srchword_wrap"></div>
+     </div>
+     <div class="rolling_wrap"><div class="swiper-wrapper" id="rolling"></div><span></span></div>
+     <div class="rolling_wrap_all" id="rollall"><p class="tit">인기검색어</p></div>
+    </div>
+    <div class="fr"><div class="private_menu"><ul>
+     <li><a href="#">마이메뉴</a><div class="my_menu_wrap"><div class="inr"><p>로그인하고 더 많은 혜택을 받으세요</p>
+      <a href="#">로그인</a><a href="#">회원가입</a></div></div></li>
+     <li><a href="#">예약내역</a></li><li><a href="#">장바구니</a></li></ul></div></div>
+   </div></div>
+   <div class="inr"><div class="menu_wrap"><a href="#" class="btn_all">전체메뉴</a><ul class="gnb_menu" id="gnb"></ul>
+    <div class="list_total_menu" id="totalmenu"></div></div></div>
+   <div class="right_fixed">
+    <div class="chatting"><div class="chatting_button_wrap"><div class="tip"></div><div class="tip"></div><div class="motion"></div>
+     <button type="button" class="btn_chatting">여행 도우미</button></div></div>
+    <div class="app_coupon_pack"><a href="#">앱 설치 쿠폰</a></div>
+    <a href="#" class="btn_recent_items">최근 본 상품(0)</a>
+    <div class="list_wrap"><p></p></div>
+    <a href="#" class="btn_go_top" onclick="say('top');return false">TOP</a>
+   </div>
+  </div>
+ </div>
+ <div id="container"><div class="inr"><div><div class="root-container"><div class="container">
+  <div class="submain air"><div class="visual_wrap">
+   <div class="swiper-container prevNext"><div class="swiper-wrapper" id="movies"></div>
+    <div class="control"><a href="#" class="prev" role="button">이전</a><a href="#" class="next" role="button">다음</a><a href="#" class="btn_cntrl" role="button">재생</a><span>1 / 6</span></div><span></span></div>
+   <div id="flight_change" class="js_show_wrap flight_change quicksearch"><div class="search_field"><div class="js_tabs">
+    <ul class="tabs"><li class="selected"><a href="#">왕복</a></li><li><a href="#">편도</a></li><li><a href="#">다구간</a></li></ul>
+    <div class="sale_airtieket"><a href="#">할인 항공권보기</a></div>
+    <div class="panels">
+     <div id="tabCon01" class="panel selected"><div>
+      <div class="row"><div class="bowl"><a href="#" class="set">출발 인천</a></div><div class="js_show_wrap select_area"><input type="text" placeholder="출발지"></div>
+       <div class="mid_cell"><a href="#"></a></div><div class="bowl"><a href="#" class="set">도착지</a></div><div class="js_show_wrap select_area"><input type="text" placeholder="도착지"></div></div>
+      <div class="row"><div class="bowl"><a href="#" class="set ok" id="depset">10.24(토)</a></div><div class="bowl"><a href="#" class="set ok" id="retset">10.28(수)</a></div>
+       <div class="mid_cell"></div><div class="bowl"><a href="#" class="set">성인 1명</a></div></div>
+      <div class="row right"><a href="#" class="btn big em" onclick="say('search');return false">항공권 검색</a>
+       <span class="btn_together"><a href="#" class="btn big em">항공+호텔<br>검색</a><span class="btn_tag">함께 사면 할인</span></span></div>
+      <div id="select_tripstartdate" class="js_show_wrap lypop_calendar on">
+       <div class="ly_wrap"><div class="calendar_wrap" id="cal">
+        <a href="#" class="prev off"><span class="blind">이전달</span></a>
+        <a href="#" class="next"><span class="blind">다음달</span></a>
+       </div></div>
+       <div class="option_wrap"><input type="text" id="dep" readonly placeholder="가는 날" aria-label="가는 날"><span class="move_arrow"></span>
+        <input type="text" id="ret" readonly placeholder="오는 날" aria-label="오는 날"><button type="button" class="btn pink">선택완료</button></div>
+      </div>
+     </div></div>
+     <div id="tabCon02" class="panel"></div>
+     <div id="tabCon03" class="panel"></div>
+    </div>
+   </div></div></div>
+  </div></div>
+  <div class="submain"></div>
+  <div class="submain"><div class="inr banner_col3"><div class="swiper-container page"><div class="swiper-wrapper" id="banners"></div></div></div></div>
+  <div class="submain"><div class="item"><div class="fl"><div class="text_wrap big"></div><div class="photo_tab">
+   <span class="form_holder"><input type="radio" id="pt1" name="pt"><label for="pt1">단독 특가</label></span>
+   <span class="form_holder"><input type="radio" id="pt2" name="pt"><label for="pt2">일본 특가</label></span>
+   <span class="form_holder"><input type="radio" id="pt3" name="pt"><label for="pt3">동남아 특가</label></span></div></div><div class="fr"></div></div></div>
+  <div class="submain air"><div class="ticket_zone"><div class="inr"><div>
+   <div class="text_wrap big"><p class="stit">이번 주 특가</p><strong class="tit">땡처리 항공권</strong><div class="right_cont"><a href="#" class="txt">더보기</a></div></div>
+   <div class="f_layout"><div class="swiper-container col4"><div class="swiper-wrapper" id="tickets"></div>
+    <div class="swiper-pagination"></div><a href="#" class="prev" role="button">이전</a><a href="#" class="next" role="button">다음</a></div></div>
+  </div></div></div></div>
+  <div class="submain"></div>
+  <div class="submain"></div>
+ </div></div></div></div></div>
+</div>
+<div id="footer">
+ <div class="inr">
+  <div class="service_info_wrap">
+   <div class="fl"><dl class="type"><dt>공지</dt><dd><div class="notice_list"><div class="swiper-wrapper" id="notices"></div></div>
+    <a href="#" class="btn_more">더보기</a></dd></dl></div>
+   <div class="fr"><ul class="sns_list"><li><a href="#">블로그</a></li><li><a href="#">사진 채널</a></li><li><a href="#">영상 채널</a></li><li><a href="#">소식 채널</a></li></ul></div>
+  </div>
+  <div class="company_info_wrap">
+   <div class="fl"><ul class="company_provision"><li><a href="#">회사소개</a></li><li><a href="#">이용약관</a></li><li><a href="#">개인정보처리방침</a></li>
+    <li><a href="#">여행약관</a></li><li><a href="#">고객센터</a></li></ul><div><div><p>※ 이 페이지는 시험용이며 실제 상품이 아닙니다.</p></div></div></div>
+   <div class="fr"><div class="safe_service"><dl><dt>안전 서비스</dt><dd>가입 확인</dd><dd><a href="#">서비스 가입사실 확인</a></dd></dl></div></div>
+  </div>
+ </div>
+ <div class="certification_mark"><div class="list_merit">
+  <div class="award_list_wrap"><div class="award_list"></div><a href="#" class="btn_prev">이전보기</a><a href="#" class="btn_next">다음보기</a></div>
+  <ul class="travel_mark"><li><a href="#">브랜드 인증</a></li><li><a href="#">정보제공 표준 참여</a></li><li><a href="#">고객만족 인증</a></li></ul>
+ </div></div>
+</div>
+</div></div></div></div>
+<p id="out">대기</p>
+<script>
+// 누른 결과를 화면 글자로 남긴다(사후조건이 효과를 보게)
+window.clicks = [];
+function say(what) { window.clicks.push(what); document.getElementById('out').textContent = what + ' ' + window.clicks.length; }
+(function () {
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; }
+  function link(text, cls) { const a = el('a', cls, text); a.href = '#'; return a; }
+  const cities = ['도쿄', '오사카', '후쿠오카', '삿포로', '타이베이', '다낭', '방콕', '세부', '괌', '상하이'];
+  // 인기 검색어: 롤링(앞뒤 복제 슬라이드) + 전체 목록 + 닫힌 키워드 모음(탭 패널 3)
+  const roll = document.getElementById('rolling');
+  [cities[9]].concat(cities, [cities[0]]).forEach(function (c) { const a = link(c, 'swiper-slide'); a.setAttribute('role', 'group'); roll.appendChild(a); });
+  const all = document.getElementById('rollall');
+  cities.forEach(function (c) { all.appendChild(link(c)); });
+  const kw = document.getElementById('kwpanels');
+  ['최근 검색어', '추천 검색어', '해시태그'].forEach(function (t, k) {
+    const p = el('div', 'panel'); p.appendChild(el('p', 'tit', t));
+    const ul = el('ul'); cities.slice(k, k + 6).forEach(function (c) { const li = el('li'); li.appendChild(link('#' + c + ' 여행')); ul.appendChild(li); });
+    p.appendChild(ul); kw.appendChild(p);
+  });
+  // 전체 메뉴: 보이는 1단(12) + 닫힌 2단 목록 + 닫힌 전체 메뉴(무 CSS 에서 지문 앞부분을 채운다)
+  const cats = ['베스트', '해외여행', '항공', '호텔', '항공+호텔', '투어/입장권', '국내여행', '테마여행', '골프', '맞춤여행', '라이브', '이벤트'];
+  const subs = ['패키지', '자유여행', '허니문', '골프여행', '크루즈', '가족여행', '단체여행', '기획전', '특가모음', '지역별 상품'];
+  const gnb = document.getElementById('gnb');
+  cats.forEach(function (c, k) {
+    const li = el('li'); li.appendChild(link(c));
+    const d2 = el('div', 'list_depth2_wrap'); const ul = el('ul');
+    subs.forEach(function (s) { const l2 = el('li'); l2.appendChild(link(c + ' ' + s)); ul.appendChild(l2); });
+    d2.appendChild(ul); li.appendChild(d2); gnb.appendChild(li);
+  });
+  const tm = document.getElementById('totalmenu');
+  cats.forEach(function (c) {
+    const box = el('div', 'menu_box'); box.appendChild(el('strong', 'tit', c + ' 전체 보기 안내'));
+    const ul = el('ul');
+    subs.forEach(function (s) { const li = el('li'); li.appendChild(link(s)); ul.appendChild(li); });
+    box.appendChild(ul); tm.appendChild(box);
+  });
+  // 본문 슬라이드(이름 없는 동영상 카드)·배너·특가 항공권·공지
+  const mv = document.getElementById('movies');
+  for (let i = 0; i < 6; i++) { const a = link('', 'swiper-slide movie_box'); a.setAttribute('role', 'group'); mv.appendChild(a); }
+  const bn = document.getElementById('banners');
+  for (let i = 0; i < 6; i++) { const s = el('div', 'swiper-slide'); s.setAttribute('role', 'group'); s.appendChild(link('', 'banner')); bn.appendChild(s); }
+  const tk = document.getElementById('tickets');
+  ['가람항공 서울 출발 다낭 219,000원', '누리항공 부산 출발 후쿠오카 223,600원', '다온항공 청주 출발 오사카 209,000원',
+   '가람항공 서울 출발 세부 245,000원', '누리항공 서울 출발 괌 312,000원', '다온항공 대구 출발 타이베이 198,000원']
+    .forEach(function (t) { const s = el('div', 'swiper-slide'); s.setAttribute('role', 'group'); s.appendChild(link(t, 'ticket')); tk.appendChild(s); });
+  const nt = document.getElementById('notices');
+  ['[항공] 보조배터리 기내 반입 안내', '[항공] 운항 시간 변경 안내', '[해외항공] 유류할증료 변경 안내', '[국내항공] 결항 시 환불 안내',
+   '[해외항공] 발권 후 취소 규정 안내', '[항공] 시스템 점검 안내'].forEach(function (t) { nt.appendChild(link(t, 'swiper-slide')); });
+
+  // ---- 달력: 두 달 패널, 이전/다음 달은 노드를 재사용해 글자만 바꾼다(실측) ----
+  const cal = document.getElementById('cal');
+  const START = 2026 * 12 + 9;     // 2026년 10월(0-based 달)
+  const TODAY = [2026, 10, 23];
+  let base = START;
+  window.picks = [];
+  const panels = [];
+  for (let k = 0; k < 2; k++) {
+    const inr = el('div', k ? 'inr right' : 'inr');
+    const head = el('div', 'header'); head.appendChild(el('span'));
+    const area = el('div', 'calendar_area');
+    const week = el('div', 'week');
+    '일월화수목금토'.split('').forEach(function (d) { week.appendChild(el('p', '', d)); });
+    area.appendChild(week); area.appendChild(el('div', 'calendar'));
+    inr.appendChild(head); inr.appendChild(area); cal.appendChild(inr); panels.push(inr);
+  }
+  function price(y, m, d) { const v = (d * 37 + m * 11 + y) % 9; return v < 6 ? (100 + (d * 13 + m * 7) % 45) + '만' : ''; }
+  function cell(li, y, m, d) {
+    // 노드(li·a)는 그대로 두고 내용만 바꾼다
+    let a = li.firstChild;
+    if (!a) { a = link(''); li.appendChild(a); a.onclick = function () { pick(a); return false; }; }
+    a.textContent = '';
+    a.dataset.date = d ? y + '.' + String(m).padStart(2, '0') + '.' + String(d).padStart(2, '0') : '';
+    a.appendChild(el('span', '', d ? String(d) : ''));
+    li.className = '';
+    if (!d) return;
+    if (y === TODAY[0] && m === TODAY[1] && d === TODAY[2]) { a.appendChild(el('p', '', 'TODAY')); li.className = 'today'; return; }
+    const p = price(y, m, d);
+    if (p) a.appendChild(el('p', 'price', p));
+    if (p && d === lowest(y, m)) a.appendChild(el('p', 'badge', '최저가'));
+  }
+  function lowest(y, m) {
+    let best = 0, bv = 1e9;
+    for (let d = 1; d <= 31; d++) { const p = price(y, m, d); if (p && parseInt(p, 10) < bv) { bv = parseInt(p, 10); best = d; } }
+    return best;
+  }
+  function pick(a) {
+    if (!a.dataset.date) return;
+    const key = window.picks.length ? 'ret' : 'dep';
+    document.getElementById(key).value = a.dataset.date;
+    document.getElementById(key + 'set').textContent = a.dataset.date.slice(5);
+    window.picks.push(a.dataset.date);
+    a.parentNode.className = 'select';
+  }
+  function render() {
+    panels.forEach(function (inr, k) {
+      const mm = base + k, y = Math.floor(mm / 12), m = mm % 12 + 1;
+      inr.querySelector('.header span').textContent = y + '년 ' + m + '월';
+      const first = new Date(y, m - 1, 1).getDay(), n = new Date(y, m, 0).getDate();
+      const weeks = Math.ceil((first + n) / 7);
+      const box = inr.querySelector('.calendar');
+      while (box.children.length < weeks) box.appendChild(el('ul', 'day'));
+      while (box.children.length > weeks) box.removeChild(box.lastChild);
+      for (let w = 0; w < weeks; w++) {
+        const ul = box.children[w];
+        const cnt = w === weeks - 1 ? (first + n) - 7 * w : 7;   // 마지막 주는 남은 날만
+        while (ul.children.length < cnt) ul.appendChild(el('li'));
+        while (ul.children.length > cnt) ul.removeChild(ul.lastChild);
+        for (let i = 0; i < cnt; i++) { const d = 7 * w + i - first + 1; cell(ul.children[i], y, m, d >= 1 ? d : 0); }
+      }
+    });
+    cal.querySelector('a.prev').className = base > START ? 'prev' : 'prev off';
+  }
+  cal.querySelector('a.next').onclick = function () { base += 1; render(); return false; };
+  cal.querySelector('a.prev').onclick = function () { if (base > START) { base -= 1; render(); } return false; };
+  // 시험 변형: 각 달 패널에 1000자가 넘는 안내문(표제 뒤) — 지문 상한을 넘겨도 표제가 앞에 있어야 한다.
+  window.longnote = function () {
+    panels.forEach(function (inr, k) { inr.appendChild(el('p', 'note', ('출발 안내와 공휴일 운항 일정 참고 문구 ' + k + ' ').repeat(50))); });
+  };
+  render();
+})();
+</script>
+</body></html>

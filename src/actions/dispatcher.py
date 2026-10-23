@@ -2599,7 +2599,7 @@ class ActionDispatcher:
         engine = self.ctx.engine
         before = getattr(engine, "handles", None)
         old_pins = {
-            eid: (h.group_path, h.group_heading)
+            eid: (h.group_path, h.group_heading, h.css_path)
             for eid, h in (dict(before).items() if isinstance(before, dict) else [])
             if getattr(h, "group_path", None)
         }
@@ -2627,12 +2627,13 @@ class ActionDispatcher:
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)
         return healing
 
-    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[str, Any]]) -> None:
+    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[str, Any, str]]) -> None:
         """WS-62 R1 R2: 치유의 재관찰이 핸들을 새로 만들어도 묶음 고정이 사라지지 않게 한다.
 
         1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
         고정돼 있었다면 그 선택 근거(구분 조상·지문)를 같은 id 의 새 핸들에 이어 준다 — id 는 이전 관찰을 보고 고른
-        것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다.
+        것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다. 단 같은 노드(css_path 같음)일 때만
+        잇는다(WS-62 R4 R1-6) — id 가 다른 노드(다음달 링크 등)로 옮겨 가면 옛 날짜 고정을 물려받아 과잉 거부한다.
         """
         from perception.repeated import annotate_repeated
 
@@ -2641,9 +2642,9 @@ class ActionDispatcher:
             await annotate_repeated(self.ctx.page, engine, elements)
         except Exception as exc:  # noqa: BLE001 — 주석 실패는 아래 승계로만 고정한다
             logger.debug("치유 재관찰 묶음 주석 실패: %s", type(exc).__name__)
-        for eid, (path, pin) in old_pins.items():
+        for eid, (path, pin, css) in old_pins.items():
             h = engine.get_handle(eid)
-            if h is not None:
+            if h is not None and h.css_path == css:
                 h.group_path, h.group_heading = path, pin
 
     async def _same_group_candidates(
