@@ -75,6 +75,10 @@ def settle_handoff(data: Dict[str, Any]) -> None:
     """
     if not robots_disallowed(data) or "handoff" not in data:
         return
+    from security.manual_sites import is_manual_handoff
+
+    if is_manual_handoff(data):
+        return  # WS-64: 직접 조작할 사이트 인계는 robots 와 무관하다(사람이 하는 단계) — 지우지 않는다
     data.pop("handoff", None)
     hint = str(data.get("hint") or "")
     if HANDOFF_HINT in hint:

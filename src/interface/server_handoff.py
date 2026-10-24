@@ -82,6 +82,8 @@ class HandoffMixin:
                         _write_private(self.hub.dir / f"ack-{nonce}.json", {"ok": False})
             if event == "login":
                 self._spawn_login()
+            if event == "handoff_done":
+                self._manual_note_done()  # WS-64: 사람이 직접 조작을 마침(조작권·창·비밀 입력 보호 불변)
             if event == "released":
                 self._release_unreported = True
                 # 사람이 화면을 바꿨을 수 있다 — 기존 element_id 를 모두 무효로. WS-57 R1(R3): 모든 작업 공간 —
@@ -412,6 +414,12 @@ class HandoffMixin:
 
     async def _control_wait(self, timeout: float) -> Dict[str, Any]:
         st = self._control_view()
+        if st["holder"] == "agent" and not st["requested"] and not (self._window is not None
+                                                                    and self._release_unreported):
+            # WS-64: 직접 조작할 사이트 인계 대기(clicked|page_changed|done|expired) — 조작권 인계가 없을 때.
+            manual = await self._manual_wait(timeout)
+            if manual is not None:
+                return manual
         # WS-34: on-demand 에서는 감시 태스크가 반납을 먼저 처리하고 창 전환을 시작했을 수 있다 —
         # 에이전트가 아직 듣지 못한 반납이면 그 반납(과 전환 결과)을 알린다.
         pre_released = self._window is not None and self._release_unreported

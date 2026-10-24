@@ -34,6 +34,9 @@ NOT_OUT = "MCP 응답 출구 아님(에이전트 루프·LLM·하네스 내부·
 
 #: (키, 파일, 식) → 분류. 어휘 출처면 그 집합이 CONTROL_VOCABULARY[키] 에 든다(아래 enum 테스트).
 REVIEWED = {
+    # WS-64 직접 조작할 사이트
+    ("changed", "interface/server_manual.py", "h.ended"): "security.manual_sites OUTCOMES(clicked·page_changed·done·expired)",
+    ("sticky_reason", "interface/server_manual.py", "f'직접 조작할 사이트 {hit}'"): FREE + " (on-demand 미리 창 sticky 사유 — 늘 정제)",
     ("status", "interface/handoff.py", "ap.status"): "handoff Approval.status — _APPROVAL_STATUS",
     ("status", "interface/handoff.py", "self.login.status"): "LoginJob.status — opening·ready",
     ("status", "interface/handoff.py", "status"): "handoff._set_status 인자 — _APPROVAL_STATUS",
@@ -216,6 +219,12 @@ def test_vocabulary_is_closed_words_only():
 EXEMPT = "등록 제외 + 제어 키 면제"
 #: (파일, 식) → (분류, TOOL_ID_FORMATS 이름 또는 None, 표본 생성기).
 ID_PRODUCERS = {
+    # WS-64: 감지 바인딩·격리 world 이름(CDP 내부), 인계 id(mh-hex8 — 모양이 바뀌지 않음, 면제하지 않음), 목록 임시 파일 이름
+    ("browser/manual_watch.py", "secrets.token_hex(6)"): ("WS-64 직접 조작 감지 바인딩·격리 world 이름(CDP 내부) — 출구 아님",
+                                                         None, None),
+    ("interface/server_manual.py", "secrets.token_hex(4)"): ("WS-64 인계 handoff_id(mh-+hex8) — 면제하지 않음(public_text 를 "
+                                                            "지나며 모양이 바뀌지 않음)", None, None),
+    ("security/manual_sites.py", "_secrets.token_hex(6)"): ("WS-64 목록 임시 파일 이름(.tmp-manual-) — 출구 아님", None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{secrets.randbelow(9999)}"),

@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
@@ -795,6 +795,19 @@ class DispatchContext:
     #: click/press_key 가 감지 창(NAV_DETECT_MS)만큼 빨라지는 대신, 이동 뒤 새 문서를
     #: 확인할 책임(wait_for/observe)이 호출자에게 있다. `serve --nav-settle off`.
     nav_settle: bool = True
+    #: WS-64 직접 조작할 사이트(security.manual_sites 의 ManualSites·ManualSiteStore). 목록 사이트의 부작용 액션은
+    #: dispatch 입구에서 거부만 한다(서버 관문과 같은 판정·같은 오류 모양). 기본 None = 빈 목록 — harness·시험은
+    #: 홈 파일을 읽지 않는다. `agent-browser run` 은 cli.main 이 넣는 프로세스 기본값(process_default)을 쓴다.
+    manual_sites: Any = field(default_factory=lambda: _manual_process_default())
+    #: WS-64 R2-3: 이 페이지의 네이티브 대화상자를 자동으로 닫지 않고 사람에게 둘지(서버가 headed + 목록 출처 탭에서만
+    #: True). None 이면 지금처럼 처리(handle_dialog 예약 또는 거절).
+    dialog_hold: Any = None
+
+
+def _manual_process_default() -> Any:
+    from security.manual_sites import process_default
+
+    return process_default()
 
 
 #: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
@@ -1180,6 +1193,15 @@ class ActionDispatcher:
         self._dialog_pages.append(page)
 
     def _on_dialog(self, dialog: Any) -> None:
+        hold = getattr(self.ctx, "dialog_hold", None)
+        if callable(hold):
+            try:
+                held = bool(hold(getattr(dialog, "page", None)))
+            except Exception:  # noqa: BLE001 — 판정 실패: 지금처럼 처리
+                held = False
+            if held:
+                # WS-64 R2-3: 사람이 보는 창의 목록 사이트 탭 — 닫지 않고 사람에게 둔다(예약도 쓰지 않는다).
+                return
         arm, self._dialog_arm = self._dialog_arm, None
         try:
             kind = str(dialog.type)
@@ -1724,6 +1746,9 @@ class ActionDispatcher:
         started = time.perf_counter()
         # WS-30: 계약 키(trigger_element_id 등)를 디스패처 키로 맞춘다.
         params = normalize_action_params(action, params)
+        refused = await self._manual_site_refusal(action, params)
+        if refused is not None:
+            return refused
         params, secret_resolved = self._resolve_secret(action, params)
         if action is ActionType.TYPE_TEXT and secret_resolved is not True:
             # WS-55 R2: 입력 중 민감 판정 표시(_CONCEAL_KEY)를 사본에만 붙인다 — 호출자 params(트레이스)엔 남기지 않는다.
@@ -1787,6 +1812,33 @@ class ActionDispatcher:
             # 사용자는 키 이름이 그대로 입력된 것을 눈치채지 못한다.
             result.data["secret_resolved"] = secret_resolved
         return result
+
+    async def _manual_site_refusal(self, action: ActionType, params: Dict[str, Any]) -> Optional[ActionResult]:
+        """WS-64 백스톱: 목록 사이트의 부작용 액션은 실행하지 않는다(서버 관문과 같은 판정·같은 오류 모양).
+
+        서버(MCP)는 _call_tool 관문이 먼저 막고 표시·인계를 한다 — 여기는 `agent-browser run` 처럼 디스패처를 직접
+        부르는 경로의 거부 전용(창·인계 없음 → available=false).
+        """
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return None
+        from security.manual_sites import MANUAL_SITE_MESSAGE, handoff_data, manual_site_hit
+
+        if await manual_site_hit(self.ctx, action, params, store) is None:
+            return None
+        return self._result(success=False, action=action, retry_safe=False,
+                            error_code=ErrorCode.HITL_UNATTENDED_BLOCKED, error_message=MANUAL_SITE_MESSAGE,
+                            data=handoff_data(action, available=False, target=self.manual_target(params)))
+
+    def manual_target(self, params: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """인계 대상의 role·이름(관찰 핸들 — element_id 대상만). 없으면 None."""
+        element_id = params.get("element_id")
+        engine = getattr(self.ctx, "engine", None)
+        getter = getattr(engine, "get_handle", None)
+        handle = getter(element_id) if element_id and callable(getter) else None
+        if handle is None:
+            return None
+        return {"role": str(handle.role or ""), "name": str(handle.name or "")}
 
     def _secret_allowed_here(self) -> bool:
         """현재 페이지에서 치환된 값을 입력해도 되는가.

@@ -102,6 +102,13 @@ class ToolsMixin:
                 data["window"] = self._window.info()
             if self._tab_notice is not None:
                 data["tab_closed_by_human"] = self._tab_notice
+            sites = self._manual_list()
+            if not sites.empty:
+                # WS-64: 목록은 읽기만(사람이 CLI 로 바꾼다) — 대기 중인 사람 인계도 함께.
+                data["manual_sites"] = sites.texts()
+            pending = self._manual_pending_view()
+            if pending is not None:
+                data["manual_handoff"] = pending
             return {"success": True, "data": data}
         if short == "control_request":
             result = await self._control_request(args)
@@ -218,6 +225,9 @@ class ToolsMixin:
             if blocked is not None:
                 self._note_saved_pages(action_from_tool(name), arguments, blocked)
                 return blocked
+            # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
+            # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
+            await self._manual_pre_switch(action_from_tool(name), arguments)
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
         navigation_scope = AsyncExitStack()
@@ -234,7 +244,10 @@ class ToolsMixin:
             self._note_saved_pages(action, arguments, result)
             if action is ActionType.TAB_CONTROL and result.success and "tabs" in result.data:
                 self._note_other_workspaces(result)  # WS-57: 다른 작업 공간 탭은 개수만
-            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+            from security.manual_sites import is_manual_handoff
+
+            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED and not is_manual_handoff(result.data):
+                # WS-64: 직접 조작할 사이트 인계에는 로그인 안내를 붙이지 않는다(로그인 문제가 아니다).
                 result.data["login_hint"] = self._login_hint()
             if action is not None:
                 await self._attach_observation_guidance(action, arguments or {}, result)
@@ -387,6 +400,11 @@ class ToolsMixin:
                 if refused is not None:
                     return refused
             self._observation_state()
+            # WS-64: 직접 조작할 사이트 — 사람 조작 거부·입력 검증 뒤, HITL 앞(승인 증표를 소비하지 않고 elicitation 을
+            # 띄우지 않는다). 레시피 재생·작업 공간·attach 도 모두 이 경로를 지난다.
+            manual = await self._manual_site_gate(action, params)
+            if manual is not None:
+                return manual
 
             # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
             self._pending_gate_basis = None

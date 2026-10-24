@@ -290,6 +290,8 @@ class LifecycleMixin:
                 secrets=self.secrets,  # 자격증명 플레이스홀더 해석 (PRD 5.3)
                 som_enabled=self.som_enabled,  # Tier-2 SoM 게이트 (PRD §8-2)
                 nav_settle=self.nav_settle,  # 이동 대기 스위치 (WS-28)
+                manual_sites=getattr(self, "_manual_store", None),  # WS-64 거부 백스톱(같은 판정)
+                dialog_hold=getattr(self, "_manual_dialog_hold", None),  # WS-64 R2-3 대화상자 보류
             )
         )
         # WS-29b: 루프백만 기본 허용(이전 allow_loopback=True 는 사설 대역 전체를 열었다).

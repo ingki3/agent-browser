@@ -108,6 +108,31 @@ agent-browser approve ap_XXXX --code 123456
 
 **사이트별 상시 허용 (`agent-browser approve-policy`, 사람 전용).** `agent-browser approve-policy add --profile NAME --origin https://… --action click [--target-name 이름]` 은 그 영속 프로필(`serve --profile NAME`)에서 (origin, 액션, [대상 이름]) 이 맞는 고위험 동작을 묻지 않고 실행하게 합니다(`data.approval.via="policy"`). 터미널에서 origin 을 다시 입력해야 추가되고(편의 장치 — 보안 경계 아님), `list`·`remove` 로 관리합니다. 정책은 프로필 폴더 안 `approve_policy.json`(0600)이고 실행 중인 서버는 판정 때마다 바뀌었는지 보고 다시 읽습니다 — 파일 손상·권한·링크 이상이면 정책 없음(fail-closed). 사람 CLI 가 쓸 때 서버 상태 폴더(`~/.agent-browser/servers`, 프로필 밖)의 0600 키로 만든 서명(HMAC — 정책 내용·프로필 폴더에 결속)을 함께 남기고, 서버는 서명이 맞지 않거나 형식이 깨졌으면(직접 고친 파일·다른 프로필에서 복사·키 없음·서명 손상) 이전에 읽어 둔 정책까지 버리고 정책을 쓰지 않습니다. 정책 판정은 작업 공간 실행 순서 안에서 하고(판정과 실행 사이에 다른 호출이 끼지 않음), 대상 노드를 잡은 뒤 대상·목적지·정책·금지 범주를 한 번 더 판정합니다(WS-56 R3·R4). `download_file` 은 최종 저장 경로(symlink 해석 후)가 agent-browser 프로필·상태 폴더(`~/.agent-browser` 전체, `AGENT_BROWSER_PROFILE_ROOT`·`AGENT_BROWSER_SERVERS_DIR`) 안이면 저장하지 않습니다(`E_DOWNLOAD_FAILED`) — 사이트 파일로 정책·승인 상태를 바꾸는 통로를 막습니다(WS-56 R2). **정책으로 열 수 없는 범주**: 돈 이동(결제·구매·주문·송금·이체·출금·pay·checkout·order·transfer·withdraw·subscribe 등)·계정 해지·삭제(탈퇴·해지·deactivate·cancel account·terminate, 그리고 계정·회원·프로필·account·profile 과 삭제·비활성화·폐쇄·delete·remove·close·disable 이 **붙은 구**('Close account'·'계정 비활성화'·'Account deletion', 띄어쓰기·전각 변형 포함 — 게이트도 이 구를 고위험으로 봄). 계정 **안 항목** 삭제('Delete email from my account'·'계정에서 메일 삭제'·'Remove profile photo')와 '메일 삭제'·'Remove from cart' 같은 일반 삭제는 해당 없음, WS-56 R3)·권한 변경(권한·관리자·permission·admin·grant·revoke)·판정 불가 대상·`upload_file`. 이름뿐 아니라 selector·문맥 신호 전부를 다시 봐서 하나라도 걸리면 `data.approval.policy_refused=<범주>`를 싣고 elicitation·기존 승인으로 넘깁니다. MCP 도구에는 정책을 만드는 수단이 없습니다.
 
+## 직접 조작할 사이트 (`agent-browser manual-sites`, WS-64)
+
+자동 조작을 막는 사이트(예: SRT 예매 — 매크로 방지)는 **사용자가 명시적으로 목록에 넣으면** 에이전트가 그 사이트에서 누르기·입력·고르기·키·대화상자·파일 동작을 하지 않고, 대상을 창에 표시해 **사람이 직접** 하게 합니다. agent-browser 는 매크로 방지·봇 탐지를 우회하지 않습니다 — 목록은 그 사이트의 규칙을 존중하는 장치입니다. 페이지 글자로 사이트를 짐작하지 않습니다(사람이 넣은 것만).
+
+```text
+agent-browser manual-sites add srail.kr          # 비대화형도 됨(막는 방향이라 안전)
+agent-browser manual-sites add '*.srail.kr'      # srail.kr 과 그 하위 전부
+agent-browser manual-sites list
+agent-browser manual-sites remove srail.kr       # 터미널에서 사이트를 한 번 더 입력해야 지워짐
+agent-browser serve --browser on-demand --manual-site srail.kr   # 시작 플래그(반복 가능, 파일과 합침)
+agent-browser handoff done                       # 사람: 표시된 단계를 마쳤다고 알림
+```
+
+- **목록**: `~/.agent-browser/manual_sites.json`(0600, 이 사용자의 모든 serve — 위치는 환경변수 `AGENT_BROWSER_MANUAL_SITES_FILE` 로 바꿀 수 있음). 실행 중인 serve 는 판정 때마다 바뀌었는지 보고 다시 읽습니다(재시작 불필요). 파일이 손상·권한 이상이면 마지막으로 읽은 목록을 유지합니다(막는 방향 — fail-closed). **MCP 도구로는 바꿀 수 없습니다** — `browser_control_status` 의 `data.manual_sites` 로 읽기만. `remove` 는 TTY 에서 재입력 확인이 있어 셸 도구로 그냥 지울 수 없습니다(보안 경계는 아님 — 같은 OS 사용자 한계). `--attach` 로 붙는 serve 의 `--manual-site` 는 무시됩니다(먼저 뜬 serve 의 목록 — 파일에 넣으십시오).
+- **사이트 비교**: 스킴 무시(http·https 같음), 호스트 소문자·끝 점 제거·국제화 도메인 punycode·IP 정규화. 포트 없는 항목은 모든 포트, 80·443 은 '포트 없음'. `srail.kr` 은 그 호스트만, `*.srail.kr` 은 srail.kr 과 하위 전부 — `srail.kr.evil.test`·`xsrail.kr` 은 맞지 않습니다. `*`·`*.kr`·`co.kr` 처럼 공개 접미사 전체는 거부합니다.
+- **막는 동작 9종**: click·type_text·select_option·check_box·hover(실제 포인터 입력)·press_key·handle_dialog·upload_file·download_file. **허용 10종**: observe_page·take_screenshot·navigate·go_back·reload·scroll(JS 스크롤 — 입력 이벤트 없음)·wait_for·extract·switch_frame·tab_control. 허용 목록에 없는 새 동작은 기본으로 막습니다. 판정 출처는 대상 프레임 ∪ 최상위 문서 ∪ 그 탭을 연 opener 탭이고, 좌표 클릭·press_key·handle_dialog 는 그 탭의 모든 프레임입니다(목록 사이트 안 결제 iframe·목록 사이트가 연 달력 팝업도 막힘). 주소를 읽지 못하면 막습니다.
+- **응답**: `success=false`, `E_HITL_UNATTENDED_BLOCKED`, `retry_safe=false`, `data.handoff={suggested, reason:"manual_site", tool:"browser_control_wait", available, steps, action, handoff_id}`(고정 문장만), 대상 role·이름은 주입 검사를 받는 `data.handoff_target`. 로그인 안내는 붙지 않고, 레시피 궤적은 끊깁니다(재생은 그 단계에서 `manual_site` 로 멈추고 실패로 세지 않음). 사람 조작권 거부·입력 검증 뒤, 승인(HITL) 판정 **앞**에서 막으므로 승인 증표는 소비되지 않고 버튼 승인(elicitation)도 뜨지 않습니다. `agent-browser run`(디스패처 직접 호출) 경로도 같은 판정으로 거부만 합니다(창·인계 없음, `available=false`).
+- **사람이 볼 창이 있을 때**(`--browser human`·`user-chrome`, `on-demand` 의 창 상태): 대상에 DevTools 오버레이 테두리(`Overlay.highlightNode`)와 안내 띠 "직접 해 주세요: <동작> <대상 이름> [값]" 을 띄웁니다 — 페이지 DOM 은 바꾸지 않습니다. 값은 사람 창의 띠에만(응답·로그에는 없음), 비밀번호·카드·인증번호 같은 민감 칸과 저장된 자격증명 키(`저장된 자격증명 <키>`)는 가립니다. 같은 호출을 반복하면 같은 `handoff_id`(다시 표시하지 않음), 다른 대상이면 기존 인계를 대체합니다(대기 인계는 1개).
+- **끝 판정**: 에이전트는 `browser_control_wait` 로 기다리고 `data.changed` 가 `clicked`(사람이 표시 대상을 실제로 누르거나 값을 바꿈 — 격리 world 의 수동 리스너, 페이지 스크립트가 볼 수 없고 이벤트를 막거나 바꾸지 않음, 스크립트가 만든 가짜 클릭은 세지 않음)·`page_changed`(최상위나 대상 프레임 문서가 바뀜)·`done`(사람이 `agent-browser handoff done`)·`expired`(15분)로 돌아옵니다. 그 뒤 `snapshot_epoch` 이 올라가므로 다시 관찰하십시오. `done` 은 조작권·창·비밀 입력 보호를 바꾸지 않는 '다시 관찰' 신호일 뿐이라, 셸을 가진 에이전트가 스스로 보내도 다음 동작은 여전히 막힙니다. 사용자가 그만두면 `done`(또는 15분 뒤 `expired`)으로 끝납니다(`cancelled` 는 쓰지 않음). 페이지가 리스너보다 먼저 이벤트 전파를 끊거나 닫힌 shadow 안 대상이면 `clicked` 를 놓칠 수 있어 `page_changed`·`done` 이 대신합니다.
+- **창이 없을 때**(고정 headless, on-demand 가 headless 인 채 리다이렉트·클릭으로 목록 사이트에 도착, 디스플레이 없음): 실행하지 않고 `available=false` + "사용자에게 직접 하도록 안내하거나 `browser_control_request` 로 창을 연 뒤 다시 관찰(현재 페이지 상태는 재시작으로 사라짐)" 안내만 줍니다.
+- **on-demand 미리 창**: 목록 사이트로 가는 `navigate`·`tab_control create` 를 **실행하기 전에** 창을 열고 서버 수명 동안 유지합니다(sticky, `data.window.notice.reason="manual_site"` — 브라우저를 다시 열어 이전 페이지 상태가 사라졌음을 함께 알림). 목록이 비면 창을 열지 않습니다.
+- **대화상자**: 사람이 볼 창이 있고 목록 사이트 프레임을 가진 탭의 alert·confirm 은 자동으로 닫지 않고 사람에게 둡니다(SRT '예매하시겠습니까?'). 그동안 그 탭의 허용 동작은 멈추지 않고 짧은 시간 안에 `E_TIMEOUT` + `data.dialog_open=true` 로 돌아옵니다 — 사람이 닫은 뒤 다시 하십시오. 창이 없거나 목록 밖 사이트는 지금처럼 자동 거절(`data.dialogs[].handled="dismissed"`)입니다.
+- **봇(텔레그램 등)에서 쓰기**: 사용자가 맥 터미널에서 `agent-browser manual-sites add <사이트>` 를 실행하면 실행 중인 serve 도 다음 동작부터 따릅니다(`--manual-site` 플래그로 넣었다면 serve 재시작). 에이전트는 막힌 응답의 `data.handoff.steps` 대로 "창에 표시한 대상을 직접 눌러 주세요"를 사용자에게 전하고 `browser_control_wait` 로 기다립니다.
+- **한계**: 허용된 `reload` 는 POST 결과 문서를 다시 보낼 수 있고, `navigate` 는 동작을 하는 GET 주소를 열 수 있습니다(읽기 보조로 허용). 팝업 자동 따라가기·opener 복귀·이름 있는 창 재사용은 WS-65 범위입니다(목록 사이트가 연 팝업은 사람이 직접 다룸 — `tab_control list`·`switch` 로 관찰은 가능).
+
 ## 로그인 유지 (`serve --profile NAME`)
 
 `serve`는 기본으로 매번 빈 브라우저로 시작합니다 — 서버를 다시 켜면 로그인이 사라집니다. `--profile NAME`을 주면 **이름 붙인 영속 프로필 폴더**로 시작해 쿠키·로컬 저장소·IndexedDB 가 다음 실행에도 남습니다(쿠키만 옮겨 담는 방식은 네이버가 다음 실행에서 거부한 실측이 있어 폴더를 통째로 씁니다). `--profile`이 없으면 동작은 예전과 같습니다.
