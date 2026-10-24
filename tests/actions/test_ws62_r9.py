@@ -99,15 +99,14 @@ def baseline_runtime():
         mp.undo()
 
 
-#: R8 가림 규칙(제목 성격 태그만 예외) — 주입(사보타주)용. R9 의 한 줄 규칙을 이것으로 되돌린다.
-R9_RULE = "    return !!s && !s.has(rpSlot(node, m));"
-R8_RULE = """    if (!s) return false;
-    let head = false;
-    for (let e = node; e; e = e.parentElement) {
-      if (/^(H[1-6]|CAPTION|LEGEND|TH)$/.test(e.tagName) || (e.getAttribute('role') || '').toLowerCase().trim() === 'heading') { head = true; break; }
-      if (e === m) break;
-    }
-    return head && !s.has(rpSlot(node, m));"""
+#: R8 가림 규칙(제목 성격 태그만 예외) — 주입(사보타주)용. 가림 판정 한 줄(R11 rpMaskedText — 안쪽이 실제 비교하는 글자만)을
+#: R8 방식(대칭 자리 null 이면 통째로, 아니면 제목 성격 태그 밖 글자는 전부 가림)으로 되돌린다.
+R9_RULE = "      if (c && c.text.has(t)) return true;"
+R8_RULE = """      let head = false;
+      for (let e = t.parentElement; e && e !== m; e = e.parentElement) {
+        if (/^(H[1-6]|CAPTION|LEGEND|TH)$/.test(e.tagName) || (e.getAttribute('role') || '').toLowerCase().trim() === 'heading') { head = true; break; }
+      }
+      if (c && (c.slots === null || !head || c.text.has(t))) return true;"""
 
 
 @contextlib.contextmanager
