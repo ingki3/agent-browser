@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as _dt
 import ipaddress
 import json
@@ -22,7 +24,7 @@ import secrets as _secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from contracts import ActionType
@@ -59,6 +61,9 @@ OUTCOMES = (OUTCOME_CLICKED, OUTCOME_PAGE_CHANGED, OUTCOME_DONE, OUTCOME_EXPIRED
 #: 사람 인계 대기 만료(초) — 넘으면 expired(실패).
 HANDOFF_TTL_S = 15 * 60
 
+MANUAL_SITE_BROKEN_MESSAGE = ("직접 조작할 사이트 목록 파일을 읽지 못해(손상·권한) 이 동작을 실행하지 않았습니다 — 판정할 수 "
+                              "없어 모든 사이트에서 누르기·입력 등을 막고 있습니다. 사용자에게 목록 파일을 고쳐 달라고 "
+                              "하세요(`agent-browser manual-sites list` 로 확인). data.handoff 를 따르세요.")
 MANUAL_SITE_MESSAGE = ("이 사이트는 사용자가 '직접 조작할 사이트'로 정해 두어 이 동작을 자동으로 실행하지 않았습니다 "
                        "(매크로 방지를 우회하지 않음). data.handoff 를 따르세요.")
 STEPS_AVAILABLE = (
@@ -87,24 +92,100 @@ def _public_suffixes() -> frozenset:
     return PUBLIC_SUFFIXES
 
 
+#: R1 B5: IDNA2003(표준 라이브러리 idna 코덱)와 Chromium(UTS46 비전이 처리)이 다르게 바꾸는 글자 — 이 글자가 든
+#: 항목은 받지 않는다(저장한 호스트와 브라우저 주소의 호스트가 달라져 보호가 빠진다: faß.de → fass.de ≠ xn--fa-hia.de).
+_IDNA_DEVIATIONS = frozenset({"\u00df", "\u03c2", "\u200c", "\u200d"})  # ß · ς · ZWNJ · ZWJ
+
+
+def _idn_to_ascii(host: str) -> str:
+    """국제화 호스트 → punycode. Chromium 과 같은 결과를 보장할 수 없으면 ManualSiteError(받지 않음)."""
+    import unicodedata
+
+    if any(ch in _IDNA_DEVIATIONS for ch in host):
+        raise ManualSiteError("이 국제화 도메인은 브라우저와 같은 이름으로 바꿀 수 없어 받지 않습니다(ß·ς·보이지 않는 연결 "
+                              "문자) — 브라우저 주소창의 xn-- 형태로 넣으세요")
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower()
+        back = ascii_host.encode("ascii").decode("idna")
+    except UnicodeError as exc:
+        raise ManualSiteError("국제화 도메인을 변환할 수 없습니다") from exc
+    # 되돌린 이름이 입력의 NFKC·소문자형과 다르면 IDNA2003 이 글자를 지우거나 바꾼 것이다(UTS46 과 어긋날 수 있음).
+    if back != unicodedata.normalize("NFKC", host).lower():
+        raise ManualSiteError("이 국제화 도메인은 브라우저와 같은 이름으로 바꿀 수 없어 받지 않습니다 — 브라우저 주소창의 "
+                              "xn-- 형태로 넣으세요")
+    return ascii_host
+
+
+def _ipv4_number(part: str) -> Optional[int]:
+    """WHATWG IPv4 number parser(0x 16진·0 8진·10진). 숫자가 아니면 None."""
+    radix = 10
+    if part[:2] in ("0x", "0X"):
+        part, radix = part[2:], 16
+    elif len(part) > 1 and part[0] == "0":
+        part, radix = part[1:], 8
+    if part == "":
+        return 0
+    digits = {10: "0123456789", 8: "01234567", 16: "0123456789abcdefABCDEF"}[radix]
+    if not all(c in digits for c in part):
+        return None
+    return int(part, radix)
+
+
+def _whatwg_ipv4(host: str) -> Optional[str]:
+    """R1 B6: WHATWG URL 의 IPv4 판정(브라우저와 같은 규칙). 숫자로 끝나는 호스트면 정규 점 4개 형태, 아니면 None.
+
+    숫자로 끝나는데 IPv4 로 읽을 수 없으면(브라우저가 주소를 거부) ManualSiteError. 127.1·2130706433·0x7f000001·
+    0177.0.0.1 은 모두 127.0.0.1 이다.
+    """
+    parts = host.split(".")
+    if parts[-1] == "" and len(parts) > 1:
+        parts = parts[:-1]
+    last = parts[-1]
+    if not last or not (all(c in "0123456789" for c in last) or _ipv4_number(last) is not None):
+        return None  # 숫자로 끝나지 않음 — 도메인
+    if len(parts) > 4:
+        raise ManualSiteError(f"IPv4 주소 형식이 아닙니다: {host!r}")
+    numbers = []
+    for part in parts:
+        n = _ipv4_number(part) if part else None
+        if n is None:
+            raise ManualSiteError(f"IPv4 주소 형식이 아닙니다: {host!r}")
+        numbers.append(n)
+    if any(n > 255 for n in numbers[:-1]) or numbers[-1] >= 256 ** (5 - len(numbers)):
+        raise ManualSiteError(f"IPv4 주소 범위 밖입니다: {host!r}")
+    value = numbers[-1]
+    for i, n in enumerate(numbers[:-1]):
+        value += n * 256 ** (3 - i)
+    return str(ipaddress.IPv4Address(value))
+
+
 def _norm_host(raw: str) -> str:
-    """호스트 → 비교용 정규형(소문자·끝 점 제거·IDN punycode·IP 정규화). 받을 수 없으면 ManualSiteError."""
+    """호스트 → 비교용 정규형(소문자·끝 점 제거·IDN punycode·IP 정규화). 받을 수 없으면 ManualSiteError.
+
+    R1: 브라우저(Chromium·WHATWG URL)가 만드는 호스트와 같은 표현이어야 한다 — 국제화 이름은 Chromium 과 결과가 같을 때만
+    받고(B5), 숫자로 끝나는 호스트는 WHATWG IPv4 규칙으로 정규화한다(B6). 페이지 주소의 호스트도 같은 함수를 지난다.
+    """
     host = str(raw or "").strip().lower()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
+        try:
+            return ipaddress.IPv6Address(host).compressed
+        except ValueError as exc:
+            raise ManualSiteError(f"IPv6 주소 형식이 아닙니다: {host!r}") from exc
     if host.endswith(".") and not host.endswith(".."):
         host = host[:-1]
     if not host:
         raise ManualSiteError("호스트가 비어 있습니다")
-    try:
-        return ipaddress.ip_address(host).compressed
-    except ValueError:
-        pass
-    if any(ord(ch) > 127 for ch in host):
+    if ":" in host:
         try:
-            host = host.encode("idna").decode("ascii").lower()
-        except UnicodeError as exc:
-            raise ManualSiteError("국제화 도메인을 변환할 수 없습니다") from exc
+            return ipaddress.IPv6Address(host).compressed
+        except ValueError as exc:
+            raise ManualSiteError(f"호스트 형식이 아닙니다: {host!r}") from exc
+    if any(ord(ch) > 127 for ch in host):
+        host = _idn_to_ascii(host)
+    ipv4 = _whatwg_ipv4(host)
+    if ipv4 is not None:
+        return ipv4
     labels = host.split(".")
     for label in labels:
         if not label or len(label) > 63 or not all(c.isalnum() or c == "-" for c in label) \
@@ -198,9 +279,12 @@ def parse_entry(raw: Any) -> SiteEntry:
 def url_host_port(url: Any) -> Optional[Tuple[str, Optional[int]]]:
     """페이지 주소 → (정규 호스트, 정규 포트). http(s) 가 아니면(about:blank·data: 등) None.
 
+    R1 B2: `blob:https://site/uuid` 는 만든 문서의 출처를 주소에 담는다 — 그 안쪽 주소로 판정한다.
     형식이 깨진 http(s) 주소는 ManualSiteError(호출자가 fail-closed 로 다룬다).
     """
     text = str(url or "")
+    if text[:5].lower() == "blob:":
+        text = text[5:]
     try:
         parts = urlsplit(text)
     except ValueError as exc:
@@ -215,13 +299,17 @@ def url_host_port(url: Any) -> Optional[Tuple[str, Optional[int]]]:
 
 
 class ManualSites:
-    """판정용 목록(불변). `current()` 는 자기 자신 — 저장소(ManualSiteStore)와 같은 꼴로 쓴다."""
+    """판정용 목록(불변). `current()` 는 자기 자신 — 저장소(ManualSiteStore)와 같은 꼴로 쓴다.
 
-    def __init__(self, entries: Iterable[SiteEntry] = ()) -> None:
+    R1 B3: `broken` 이 있으면(목록 파일을 처음부터 읽지 못함) 판정 불가 — 모든 부작용 액션을 막는다(manual_site_hit).
+    """
+
+    def __init__(self, entries: Iterable[SiteEntry] = (), broken: str = "") -> None:
         seen: Dict[str, SiteEntry] = {}
         for e in entries:
             seen.setdefault(e.text, e)
         self.entries: Tuple[SiteEntry, ...] = tuple(seen.values())
+        self.broken = str(broken or "")
 
     @classmethod
     def of(cls, raws: Iterable[Any]) -> "ManualSites":
@@ -229,7 +317,7 @@ class ManualSites:
 
     @property
     def empty(self) -> bool:
-        return not self.entries
+        return not self.entries and not self.broken
 
     def current(self) -> "ManualSites":
         return self
@@ -239,7 +327,7 @@ class ManualSites:
 
     def match(self, url: Any) -> Optional[str]:
         """주소가 목록 사이트면 그 항목 문자열, 아니면 None. 주소를 읽지 못하면 ManualSiteError."""
-        if self.empty:
+        if not self.entries:
             return None
         hp = url_host_port(url)
         if hp is None:
@@ -271,6 +359,15 @@ def _check_file(path: Path) -> None:
 
 def read_entries(path: Path = MANUAL_SITES_FILE) -> List[Dict[str, Any]]:
     """파일의 항목 [{site, added_at}]. 파일이 없으면 []. 손상·권한 문제는 ManualSiteError."""
+    return _load(Path(path))
+
+
+#: 파일을 고치라는 안내(손상·권한 오류에 덧붙인다 — CLI·serve 경고·거부 응답).
+FIX_HINT = ("목록 파일을 고치세요: `agent-browser manual-sites list` 로 확인하고, 손상됐으면 지우고 다시 add, 권한이면 "
+            "`chmod 600` (그 전까지 판정할 수 없어 모든 사이트에서 누르기·입력 등을 실행하지 않습니다)")
+
+
+def _load(path: Path) -> List[Dict[str, Any]]:
     path = Path(path)
     try:
         _check_file(path)
@@ -319,27 +416,57 @@ def _write(path: Path, rows: List[Dict[str, Any]]) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """R1 B4: 목록 편집(read-modify-write) 전체를 프로세스 간 배타 잠금(fcntl.flock) 안에서 한다.
+
+    잠금 파일은 목록 옆 `<이름>.lock`(0600, 심볼릭 링크 거부). 원자적 교체(os.replace)는 찢어진 읽기만 막고 동시 add 의
+    잃어버린 갱신은 막지 못한다(검증 B4).
+    """
+    import fcntl
+
+    path = Path(path)
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = parent / (path.name + ".lock")
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise ManualSiteError(f"목록 잠금 파일을 열 수 없습니다({type(exc).__name__})") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def add_site(raw: Any, path: Path = MANUAL_SITES_FILE) -> Tuple[str, bool]:
-    """항목 추가. 반환: (정규형, 새로 넣었는가)."""
+    """항목 추가. 반환: (정규형, 새로 넣었는가). 읽기·추가·쓰기는 한 잠금 안의 트랜잭션(R1 B4)."""
     entry = parse_entry(raw)
-    rows = read_entries(path)
-    if any(r["site"] == entry.text for r in rows):
-        return entry.text, False
-    if len(rows) >= MAX_ENTRIES:
-        raise ManualSiteError(f"항목이 {MAX_ENTRIES}개를 넘을 수 없습니다")
-    rows.append({"site": entry.text,
-                 "added_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")})
-    _write(path, rows)
+    with _locked(path):
+        rows = _load(path)
+        if any(r["site"] == entry.text for r in rows):
+            return entry.text, False
+        if len(rows) >= MAX_ENTRIES:
+            raise ManualSiteError(f"항목이 {MAX_ENTRIES}개를 넘을 수 없습니다")
+        rows.append({"site": entry.text,
+                     "added_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")})
+        _write(path, rows)
     return entry.text, True
 
 
 def remove_site(raw: Any, path: Path = MANUAL_SITES_FILE) -> bool:
     entry = parse_entry(raw)
-    rows = read_entries(path)
-    kept = [r for r in rows if r["site"] != entry.text]
-    if len(kept) == len(rows):
-        return False
-    _write(path, kept)
+    with _locked(path):
+        rows = _load(path)
+        kept = [r for r in rows if r["site"] != entry.text]
+        if len(kept) == len(rows):
+            return False
+        _write(path, kept)
     return True
 
 
@@ -347,7 +474,8 @@ class ManualSiteStore:
     """serve 가 쓰는 목록: 파일(판정마다 상태를 보고 바뀌었으면 다시 읽음) + 시작 플래그(`--manual-site`).
 
     파일을 읽지 못하면(손상·권한) 마지막으로 읽은 목록을 유지하고 error 에 사유를 둔다 — 목록은 막는 방향이라
-    이전 값을 버리지 않는다(fail-closed).
+    이전 값을 버리지 않는다(fail-closed). R1 B3: 한 번도 읽지 못했으면(cold start) 마지막 목록이 없다 — 빈 목록이 아니라
+    판정 불가(broken)로 두어 모든 부작용 액션을 막는다. 파일을 고치면 다음 판정에서 풀린다.
     """
 
     def __init__(self, path: Optional[Path] = MANUAL_SITES_FILE, extra: Iterable[Any] = ()) -> None:
@@ -356,6 +484,7 @@ class ManualSiteStore:
         self._file: Tuple[SiteEntry, ...] = ()
         self._sig: Any = object()
         self.error = ""
+        self._loaded = False
         self._cached = ManualSites(self._extra)
 
     def _signature(self) -> Any:
@@ -377,9 +506,11 @@ class ManualSiteStore:
                 try:
                     self._file = tuple(parse_entry(r["site"]) for r in read_entries(self.path))
                     self.error = ""
+                    self._loaded = True
                 except ManualSiteError as exc:
                     self.error = str(exc)
-            self._cached = ManualSites(self._extra + self._file)
+            broken = self.error if (self.error and not self._loaded) else ""
+            self._cached = ManualSites(self._extra + self._file, broken=broken)
         return self._cached
 
     @property
@@ -420,20 +551,89 @@ def wide_target(action: ActionType, params: Dict[str, Any]) -> bool:
     return action is ActionType.CLICK and not params.get("element_id") and not params.get("selector")
 
 
+#: R1 B2: 주소로 출처를 알 수 없는 문서(about:blank·about:srcdoc)의 실효 출처를 읽는 상한(초) — 대화상자가 열린 탭 등에서
+#: 멈추지 않게. 넘거나 실패하면 판정 불가(그 문서의 프레임 사슬·최상위·opener 로만 판정).
+EFFECTIVE_ORIGIN_TIMEOUT_S = 1.0
+
+
+def refusal_message(sites: Any) -> str:
+    """거부 응답 문구 — 목록 파일을 읽지 못해 막았으면(R1 B3) 파일을 고치라는 안내."""
+    return MANUAL_SITE_BROKEN_MESSAGE if getattr(sites, "broken", "") else MANUAL_SITE_MESSAGE
+
+
+def _ancestors(src: Any) -> List[Any]:
+    """프레임의 부모 프레임 사슬(가까운 것부터). Page·가짜 객체는 []."""
+    out: List[Any] = []
+    cur = getattr(src, "parent_frame", None)
+    while cur is not None and len(out) < 32:
+        out.append(cur)
+        cur = getattr(cur, "parent_frame", None)
+    return out
+
+
+async def _effective_origin(src: Any) -> Optional[str]:
+    """주소에 출처가 없는 문서의 실효 출처(location.origin — Chromium 의 securityOrigin). 불투명('null')·실패면 None."""
+    evaluate = getattr(src, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        origin = await asyncio.wait_for(evaluate("location.origin"), EFFECTIVE_ORIGIN_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — 시간 초과·떨어진 프레임: 판정 불가
+        return None
+    origin = str(origin or "")
+    return origin if origin.lower().startswith(("http://", "https://")) else None
+
+
+async def _source_hit(sites: "ManualSites", src: Any) -> Optional[str]:
+    """한 문서(Page·Frame)의 실효 출처가 목록이면 그 항목. 주소를 읽지 못하면 '?'.
+
+    http(s)·blob: 은 주소(blob 은 안쪽 출처)로, about:blank·about:srcdoc 은 실효 출처(location.origin)로 판정한다.
+    data: 등 불투명 출처·판정 실패는 None — 호출자가 같은 사슬(부모 프레임·최상위·opener)을 함께 보므로 사슬에 목록
+    출처가 있으면 막힌다.
+    """
+    try:
+        url = _url_of(src)
+        hp = url_host_port(url)
+        if hp is not None:
+            for e in sites.entries:
+                if e.matches(*hp):
+                    return e.text
+            return None
+    except Exception:  # noqa: BLE001 — 주소를 읽지 못함: fail-closed
+        return "?"
+    if not url.lower().startswith("about:"):
+        return None
+    origin = await _effective_origin(src)
+    if origin is None:
+        return None
+    try:
+        return sites.match(origin)
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
 async def manual_site_hit(ctx: Any, action: ActionType, params: Dict[str, Any], store: Any) -> Optional[str]:
     """이 호출을 목록 사이트 때문에 막는가 — 막으면 맞은 항목 문자열(주소를 못 읽었으면 '?'), 아니면 None.
 
-    판정 출처: 대상 프레임(ctx.page — switch_frame 뒤면 Frame) ∪ 최상위(ctx.root_page) ∪ 그 탭을 연 opener 탭,
-    좌표 클릭·press_key·handle_dialog 는 그 탭의 모든 프레임도.
+    판정 출처: 대상 프레임(ctx.page — switch_frame 뒤면 Frame)과 그 부모 프레임 사슬 ∪ 최상위(ctx.root_page) ∪ 그 탭을
+    연 opener 탭, 좌표 클릭·press_key·handle_dialog 는 그 탭의 모든 프레임도. 각 문서는 주소가 아니라 실효 출처로
+    본다(R1 B2 — blob·about:blank·about:srcdoc 상속). 목록 파일을 처음부터 읽지 못했으면(R1 B3) 판정 불가 — '?'.
     """
     if store is None or not is_gated(action):
         return None
     sites = store.current()
     if sites.empty:
         return None
+    if getattr(sites, "broken", ""):
+        return "?"
     page = getattr(ctx, "page", None)
     top = getattr(ctx, "root_page", None) or page
-    sources: List[Any] = [page, top]
+    sources: List[Any] = [page]
+    try:
+        sources.extend(_ancestors(page))
+    except Exception:  # noqa: BLE001 — 부모 프레임을 못 읽음: fail-closed
+        return "?"
+    sources.append(top)
     if wide_target(action, params or {}):
         try:
             sources.extend(list(getattr(top, "frames", []) or []))
@@ -446,15 +646,37 @@ async def manual_site_hit(ctx: Any, action: ActionType, params: Dict[str, Any], 
         opener = None
     if opener is not None:
         sources.append(opener)
+    seen: List[int] = []
     for src in sources:
-        if src is None:
+        if src is None or id(src) in seen:
             continue
-        try:
-            hit = sites.match(_url_of(src))
-        except Exception:  # noqa: BLE001 — 주소를 읽지 못함: fail-closed
-            return "?"
+        seen.append(id(src))
+        hit = await _source_hit(sites, src)
         if hit is not None:
             return hit
+    return None
+
+
+def manual_hit_sync(sites: Any, page: Any) -> Optional[str]:
+    """동기 판정(대화상자 처리기처럼 await 할 수 없는 곳): 그 탭과 모든 프레임의 주소(blob 안쪽 출처 포함).
+
+    목록 파일을 읽지 못했으면 '?', 주소를 읽지 못하면 '?'. 주소에 출처가 없는 문서는 같은 탭의 다른 프레임(부모)으로 본다.
+    """
+    if sites is None or page is None:
+        return None
+    sites = sites.current()
+    if sites.empty:
+        return None
+    if getattr(sites, "broken", ""):
+        return "?"
+    try:
+        docs = [page] + list(getattr(page, "frames", []) or [])
+        for doc in docs:
+            hit = sites.match(_url_of(doc))
+            if hit is not None:
+                return hit
+    except Exception:  # noqa: BLE001 — fail-closed
+        return "?"
     return None
 
 

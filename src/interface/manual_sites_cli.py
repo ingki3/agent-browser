@@ -88,6 +88,9 @@ def run(args: argparse.Namespace) -> int:
         print("목록에 없는 사이트입니다(`agent-browser manual-sites list`).")
         return 1
     except ms.ManualSiteError as exc:
+        if args.manual_action == "list":
+            # WS-64 R1 B3: 목록을 읽지 못하면 오류 종료 + 고치는 방법(serve 는 그동안 모든 부작용 액션을 막는다).
+            return _err(f"{exc} — {ms.FIX_HINT}")
         return _err(str(exc))
 
 

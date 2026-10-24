@@ -85,7 +85,7 @@ class ManualSiteMixin:
 
     async def _manual_site_gate(self, action: ActionType, params: Dict[str, Any]) -> Optional[ActionResult]:
         """_call_tool 직렬 구간의 관문(입력 검증 뒤·HITL 앞). 막으면 거부 결과, 아니면 None."""
-        from security.manual_sites import MANUAL_ALLOWED, MANUAL_SITE_MESSAGE, handoff_data, manual_site_hit
+        from security.manual_sites import MANUAL_ALLOWED, handoff_data, manual_site_hit, refusal_message
 
         sites = self._manual_list()
         if sites.empty:
@@ -105,7 +105,7 @@ class ManualSiteMixin:
             target = manual_target(params)
         available = self._manual_available()
         handoff_id = await self._manual_begin(action, params, target, ctx) if available else None
-        result = self._error_result(action, ErrorCode.HITL_UNATTENDED_BLOCKED, MANUAL_SITE_MESSAGE,
+        result = self._error_result(action, ErrorCode.HITL_UNATTENDED_BLOCKED, refusal_message(sites),
                                     data=handoff_data(action, available=available, handoff_id=handoff_id,
                                                       target=target))
         result.retry_safe = False
@@ -207,8 +207,9 @@ class ManualSiteMixin:
         if action is ActionType.TYPE_TEXT:
             value = await self._manual_value_label(str(params.get("text") or ""), name, handle)
         elif action is ActionType.SELECT_OPTION:
+            # WS-64 R1 B7: 고를 값도 type_text 와 같은 민감 판정(자리표시자·민감 이름·민감 칸) — 민감이면 가린다.
             raw = params.get("value") if params.get("value") is not None else params.get("index")
-            value = display_safe(str(raw if raw is not None else ""), 40)
+            value = await self._manual_value_label(str(raw if raw is not None else ""), name, handle)
         elif action is ActionType.CHECK_BOX:
             value = "체크" if params.get("checked", True) else "체크 해제"
         elif action is ActionType.PRESS_KEY:
@@ -331,13 +332,13 @@ class ManualSiteMixin:
 
     def _manual_dialog_hold(self, page: Any) -> bool:
         """이 탭의 대화상자를 사람에게 둘까 — 사람이 볼 창 + 목록 출처 프레임을 가진 탭에서만."""
+        from security.manual_sites import manual_hit_sync
+
         sites = self._manual_list()
         if sites.empty or page is None or not self._manual_available():
             return False
         try:
-            frames = list(getattr(page, "frames", []) or [])
-            urls = [str(getattr(page, "url", "") or "")] + [str(getattr(f, "url", "") or "") for f in frames]
-            hit = any(sites.match(u) for u in urls)
+            hit = manual_hit_sync(sites, page) is not None  # blob 안쪽 출처·목록 파일 판정 불가(R1) 포함
         except Exception:  # noqa: BLE001 - 판정 불가: 지금처럼 처리
             return False
         if hit:
@@ -429,8 +430,8 @@ class ManualSiteMixin:
             return
         url = args.get("url")
         sites = self._manual_list()
-        if not url or sites.empty or w.state != "headless":
-            return
+        if not url or sites.empty or getattr(sites, "broken", "") or w.state != "headless":
+            return  # 목록 파일을 읽지 못함(R1 B3): 모든 이동에 창을 열지 않는다(부작용 액션은 관문이 막는다)
         try:
             hit = sites.match(str(url))
         except Exception:  # noqa: BLE001 - 깨진 주소: 이동이 실패할 것 — 창을 열지 않는다

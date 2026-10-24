@@ -1026,6 +1026,14 @@ _PROTECTED_SAVE_MESSAGE = (
 class _ProtectedSaveRefused(Exception):
     """다운로드 최종 경로가 보호 폴더 안이라 저장을 거부함(WS-56 R2 B1)."""
 
+
+class _ManualSiteRefused(Exception):
+    """WS-64 R1 B1: 실제 입력 직전 재판정에서 목록 사이트 — 입력을 보내지 않음(result 는 거부 응답)."""
+
+    def __init__(self, result: ActionResult) -> None:
+        super().__init__("manual_site")
+        self.result = result
+
 #: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
 _POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
 _POINT_SAME_JS = ("([x, y, pinned]) => { const el = (" + _POINT_TARGET_JS.strip()
@@ -1192,6 +1200,17 @@ class ActionDispatcher:
             return
         self._dialog_pages.append(page)
 
+    def _manual_dialog_listed(self, page: Any) -> bool:
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return False
+        from security.manual_sites import manual_hit_sync
+
+        try:
+            return manual_hit_sync(store, page) is not None
+        except Exception:  # noqa: BLE001 — 판정 불가: 예약을 쓰지 않는다
+            return True
+
     def _on_dialog(self, dialog: Any) -> None:
         hold = getattr(self.ctx, "dialog_hold", None)
         if callable(hold):
@@ -1203,6 +1222,9 @@ class ActionDispatcher:
                 # WS-64 R2-3: 사람이 보는 창의 목록 사이트 탭 — 닫지 않고 사람에게 둔다(예약도 쓰지 않는다).
                 return
         arm, self._dialog_arm = self._dialog_arm, None
+        if arm is not None and self._manual_dialog_listed(getattr(dialog, "page", None)):
+            # WS-64 R1 B1: 예약은 목록 밖에서 했지만 대화상자는 목록 사이트 탭에서 떴다 — 예약을 쓰지 않는다(기본 처리).
+            arm = None
         try:
             kind = str(dialog.type)
             message = str(dialog.message)[:300]
@@ -1822,13 +1844,24 @@ class ActionDispatcher:
         store = getattr(self.ctx, "manual_sites", None)
         if store is None:
             return None
-        from security.manual_sites import MANUAL_SITE_MESSAGE, handoff_data, manual_site_hit
+        from security.manual_sites import handoff_data, manual_site_hit, refusal_message
 
         if await manual_site_hit(self.ctx, action, params, store) is None:
             return None
         return self._result(success=False, action=action, retry_safe=False,
-                            error_code=ErrorCode.HITL_UNATTENDED_BLOCKED, error_message=MANUAL_SITE_MESSAGE,
+                            error_code=ErrorCode.HITL_UNATTENDED_BLOCKED,
+                            error_message=refusal_message(store.current()),
                             data=handoff_data(action, available=False, target=self.manual_target(params)))
+
+    async def _manual_guard(self, action: ActionType, params: Dict[str, Any]) -> None:
+        """WS-64 R1 B1: 실제 입력(포인터·키·값·파일·대화상자) **직전** 공통 관문 — dispatch 입구와 같은 판정 함수.
+
+        입구 판정 뒤의 치유(재관찰·새 핸들 채택)·대기·이동 감지 사이에 페이지가 목록 사이트로 바뀌었을 수 있다. 목록이면
+        _ManualSiteRefused(입력을 보내지 않음). 빈 목록이면 비용 없음.
+        """
+        refused = await self._manual_site_refusal(action, params)
+        if refused is not None:
+            raise _ManualSiteRefused(refused)
 
     def manual_target(self, params: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """인계 대상의 role·이름(관찰 핸들 — element_id 대상만). 없으면 None."""
@@ -2404,6 +2437,12 @@ class ActionDispatcher:
         )
         try:
             await self._execute_element_action(action, handle, params)
+        except _ManualSiteRefused as exc:
+            # WS-64 R1 B1: 입력 직전 재판정에서 목록 사이트 — 아무 입력도 보내지 않았다.
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return exc.result
         except _ProtectedSaveRefused as exc:
             # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
             self._off_popup(_on_popup)
@@ -2566,6 +2605,8 @@ class ActionDispatcher:
         # 멱등 액션만 1회 재시도
         try:
             await self._execute_element_action(action, handle, params)
+        except _ManualSiteRefused as exc:
+            return exc.result
         except Exception as exc:  # noqa: BLE001
             return self._result(
                 success=False,
@@ -2805,6 +2846,7 @@ class ActionDispatcher:
         # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
         # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
         target = pin.node if pin is not None else self._locator_for(handle)
+        await self._manual_guard(action, params)  # WS-64 R1 B1: 치유·대기 뒤 실제 입력 직전 재판정
 
         if action is ActionType.CLICK:
             await target.click(button=params.get("button", "left"), timeout=5000)
@@ -2822,9 +2864,11 @@ class ActionDispatcher:
             if params.get("clear_before", True):
                 await target.fill("", timeout=5000)
                 await self._mark_sensitive_input(handle, params, text)
+            await self._manual_guard(action, params)
             await target.type(text, timeout=5000)
             await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
+                await self._manual_guard(action, params)
                 await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
@@ -2918,6 +2962,9 @@ class ActionDispatcher:
             return await self._switch_frame(params)
 
         if action is ActionType.HANDLE_DIALOG:
+            refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 예약 직전 재판정
+            if refused is not None:
+                return refused
             accept = params.get("accept", True)
             # WS-30: 다음 다이얼로그 처리를 예약한다. 실제 처리는 탭에 단 리스너
             # (_on_dialog)가 한다 — 같은 리스너가 다이얼로그 발생을 효과 신호로 기록한다.
@@ -3073,6 +3120,11 @@ class ActionDispatcher:
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
             watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
+        refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 키 입력 직전 재판정
+        if refused is not None:
+            if watch is not None:
+                watch.close()
+            return refused
         try:
             await top.keyboard.press(key)
         except Exception as exc:  # noqa: BLE001
@@ -3198,9 +3250,16 @@ class ActionDispatcher:
 
         before = await self._capture_state(page)
         button = params.get("button", "left")
+        refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 포인터 입력 직전 재판정
+        if refused is not None:
+            return refused
         if pin is not None:
             # R3 B1: 이동(hover)이 대상을 바꿀 수 있다 — 먼저 옮기고 반영된 뒤 그 지점 노드를 다시 본다(아직 안 누름).
             refused = self._elementless_pin_refusal(action, pin, await self._pin_after_move(page, pin, params))
+            if refused is not None:
+                return refused
+        if pin is not None:
+            refused = await self._manual_site_refusal(action, params)  # 이동(hover) 뒤 누르기 직전 다시
             if refused is not None:
                 return refused
         watch = _NavWatch(page) if self.ctx.nav_settle else None

@@ -434,9 +434,10 @@ def _manual_store(args: argparse.Namespace) -> object:
     store = ms.ManualSiteStore(ms.manual_sites_file(), extra=getattr(args, "manual_site", None) or ())
     sites = store.current()
     if store.error:
-        print(f"agent-browser serve: 경고: 직접 조작할 사이트 목록을 읽지 못했습니다({store.error}) — "
-              "--manual-site 만 씁니다.", file=sys.stderr)
-    if not sites.empty:
+        # WS-64 R1 B3: 처음부터 읽지 못하면 빈 목록이 아니라 판정 불가 — 모든 부작용 액션을 막는다(파일을 고치면 풀림).
+        print(f"agent-browser serve: 경고: 직접 조작할 사이트 목록을 읽지 못했습니다({store.error}) — {ms.FIX_HINT}.",
+              file=sys.stderr)
+    if sites.entries:
         print(f"agent-browser serve: 직접 조작할 사이트 {len(sites.entries)}곳 — 그 사이트에서는 대상만 표시하고 "
               "사람이 직접 조작합니다.", file=sys.stderr)
     return store
