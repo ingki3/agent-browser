@@ -24,6 +24,13 @@ R15(R14 재검증 B1 FAIL — 단위 끼움·숫자 사이 결합문자 우회; 
   전부 '#'. 둘 중 하나라도 숫자면 '#'(NFKC 가 'Ⅻ'→'XII' 처럼 숫자를 글자로 바꾸거나 '㋀'→'1月' 처럼 숫자를 낳아도). '#' 연속은 둔다.
 * 창으로 자른 뒤에도 한 번 더 '#' 처리(살균 표기 등 어느 단계가 숫자를 들여와도). '#' 뒤 앞/뒤가 같으면 그 쌍 생략 — 숫자만
   바뀐 쌍은 보이지 않는다(hint 의 재관찰 안내가 주 경로). R13·R14 의 숫자 사슬 가림·잔여 4자리 생략·단위 예외는 삭제했다.
+
+R16(R15 재검증 B1 — NFKC 전 Nl→'0' 선치환이 'pwⅾ'·'Authorⅰzation' 같은 민감 키를 깨 비밀 값 노출; #158):
+* 순서: 원문 → NFKC + 보이지 않는 글자 제거 + 숫자 뒤 결합문자 제거(**숫자 치환 없이**, `_nfkc`) → 공유 마스킹 → 숫자 성격
+  글자 '#'(NFKC 전 숫자 범주 글자에서 나온 글자 전부 + NFKC 뒤 숫자, `_carry` 가 자리를 옮김) → 잔여 검사 → 창 80자.
+  원문 선마스킹은 없앴다(보이지 않는 글자로 쪼갠 이메일을 부분만 가려 앞부분을 남겼다).
+* 잔여 검사는 '#' 뷰와 함께 공유 마스킹 직후 뷰(숫자는 'x')에서도 — 민감 키 패턴이 남으면 그 쌍(바깥 글자면 changed 전체) 생략.
+* before/after(묶음 표제 pin_display)도 같은 함수(`display_pair`): 값만 가리고 필드는 그대로(같아져도 생략 안 함, 잔여·실패는 가림 표시).
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from __future__ import annotations
 import difflib
 import re
 import unicodedata
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 #: 바깥 글자 앞/뒤 쌍 최대 수·각 글자 상한.
 CHANGED_PAIRS = 3
@@ -100,10 +107,9 @@ def _is_numeric(ch: str) -> bool:
         unicodedata.category(x) in _NUMERIC_CATS for x in unicodedata.normalize("NFKC", ch))
 
 
-def _premap(text: str) -> str:
-    """NFKC 전 판정: 원문의 숫자 성격 글자를 '0' 으로('Ⅻ'→'XII' 처럼 NFKC 가 숫자를 글자로 바꾸기 전에). '0' 이라 뒤의 공유
-    마스킹(숫자 든 전각 이메일 등)이 계속 맞는다 — 마지막에 '#' 가 된다."""
-    return "".join("0" if unicodedata.category(ch) in _NUMERIC_CATS else ch for ch in text)
+def _pre_numeric(ch: str) -> bool:
+    """NFKC 전 판정: 원문 글자 자체가 숫자 범주('Ⅻ'→'XII'·'ⅾ'→'d' 처럼 NFKC 가 글자로 바꿔도 그 결과 전부 '#')."""
+    return unicodedata.category(ch) in _NUMERIC_CATS
 
 
 def _hash(text: str) -> str:
@@ -111,18 +117,66 @@ def _hash(text: str) -> str:
     return "".join("#" if _is_numeric(ch) else ch for ch in text)
 
 
-def _view(masked: str) -> str:
-    """표시 글자: NFKC 전 숫자 판정('0') + NFKC + 보이지 않는 글자 제거(줄바꿈은 둠) + 숫자 바로 뒤 결합문자 제거 + 줄마다 정리 +
-    공유 마스킹 한 번 더(전각 @) + 숫자 성격 글자 전부 '#'."""
-    t = unicodedata.normalize("NFKC", _premap(masked))
-    kept: List[str] = []
-    for ch in t:
+def _nfkc(text: str) -> Tuple[str, List[bool]]:
+    """R16 검사 뷰(숫자 치환 없음): 보이지 않는 글자 제거(줄바꿈은 둠) + 글자 묶음(기본 글자 + 뒤 결합문자)마다 NFKC — 기본 글자가
+    숫자 성격이면 뒤 결합문자(U+0301·U+20E3 등)는 지운다. 돌려주는 표시는 뷰 글자마다 '숫자 성격 원천'(NFKC 전 숫자 범주 글자에서
+    나왔거나 그 자체가 숫자 성격) — 공유 마스킹 뒤 '#' 로 바꿀 자리."""
+    clusters: List[List[str]] = []
+    for ch in text:
         if ch != "\n" and unicodedata.category(ch) in _HIDDEN:
             continue
-        if unicodedata.category(ch)[0] == "M" and kept and _is_numeric(kept[-1]):
-            continue  # 숫자 사이·뒤 결합문자(U+0301·U+20E3 등)는 지운다
-        kept.append(ch)
-    return _hash("\n".join(_mask(_norm(line)) for line in "".join(kept).split("\n")))
+        if unicodedata.category(ch)[0] == "M" and clusters:
+            clusters[-1].append(ch)
+        else:
+            clusters.append([ch])
+    kept: List[str] = []
+    flags: List[bool] = []
+    for cl in clusters:
+        base = cl[0]
+        pre = _pre_numeric(base)
+        if _is_numeric(base):
+            cl = [base]
+        for x in unicodedata.normalize("NFKC", "".join(cl)):
+            if x != "\n" and unicodedata.category(x) in _HIDDEN:
+                continue
+            kept.append(x)
+            flags.append(pre or _is_numeric(x))
+    return "".join(kept), flags
+
+
+def _carry(src: str, flags: List[bool], dst: str) -> str:
+    """공유 마스킹(+줄 정리)을 거친 dst 에 src 의 '숫자 성격 원천' 표시를 옮겨 '#'. 가림 표시([REDACTED])는 그대로.
+    원천 표시 글자가 가림 바깥에서 짝을 잃으면(정리·가림이 예상 밖으로 글자를 바꿈) 예외 — 호출 쪽이 싣지 않는다(fail-closed)."""
+    from security.masking import MASK
+
+    hide = [_is_numeric(c) for c in dst]
+    masked = [False] * len(dst)
+    pos = dst.find(MASK)
+    while pos >= 0:
+        for k in range(pos, pos + len(MASK)):
+            masked[k] = True
+        pos = dst.find(MASK, pos + len(MASK))
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=src, b=dst, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                if flags[i1 + k] and not masked[j1 + k]:
+                    hide[j1 + k] = True
+        elif any(flags[i1:i2]) and any(not masked[j] and not dst[j].isspace() and not hide[j]
+                                       for j in range(j1, j2)):
+            raise ValueError("숫자 원천 글자의 자리를 잃음")
+    return "".join(c if m or not h else "#" for c, h, m in zip(dst, hide, masked))
+
+
+def _view(text: str) -> Tuple[str, str]:
+    """R16 순서: NFKC 검사 뷰(숫자 치환 없음) → 줄마다 정리 + 공유 마스킹 → (마스킹 직후 뷰, 숫자 성격 글자 '#' 표시 뷰)."""
+    v, flags = _nfkc(text)
+    m = "\n".join(_mask(_norm(line)) for line in v.split("\n"))
+    return m, _carry(v, flags, m)
+
+
+def _unsure(m: str, d: str) -> bool:
+    """잔여 검사 — 공유 마스킹 직후 뷰(민감 키·이메일 등이 남았나; 숫자는 'x' 로 보아 숫자 규칙은 걸지 않는다)와 '#' 표시 뷰 둘 다."""
+    return _residual_pii("".join("x" if _is_numeric(c) else c for c in m)) or _residual_pii(d)
 
 
 def _escape(text: str) -> str:
@@ -165,11 +219,11 @@ def _side(pin: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     outer_raw = "\n".join(_norm(line) for line in pin["outer"])
     seq_raw = _norm(" ".join(_token(t) for t in pin["seq"][2:].split("\x01")))
     try:
-        outer, seq = _view(_mask(outer_raw)), _view(_mask(seq_raw))
+        (om, outer), (sm, seq) = _view(outer_raw), _view(seq_raw)  # R16: 원문 선마스킹 없음 — NFKC 뷰에서 한 번
         return {"outer": outer.split("\n") if outer_raw else [], "seq": seq,
-                "outer_unsure": _residual_pii(outer), "seq_unsure": _residual_pii(seq),
+                "outer_unsure": _unsure(om, outer), "seq_unsure": _unsure(sm, seq),
                 # 바깥 마지막 줄과 순서열 첫 항목에 걸친 PII(이메일 등) — 가린 둘을 이어 다시 본다.
-                "joint_unsure": bool(outer_raw) and _residual_pii(outer + " " + seq)}
+                "joint_unsure": bool(outer_raw) and _unsure(om + " " + sm, outer + " " + seq)}
     except Exception:  # noqa: BLE001 — 표시 전용: 마스킹이 실패하면 싣지 않는다(fail-closed)
         return None
 
@@ -214,3 +268,25 @@ def _changed_parts(old_pin: Any, new_pin: Any) -> Optional[Dict[str, Any]]:
     if old["k"] != new["k"]:
         out["position"] = {"before": old["k"], "after": new["k"]}
     return out
+
+
+def display_pair(old_pin: Any, new_pin: Any) -> "Tuple[Optional[str], Optional[str]]":
+    """#158: data.group_changed.before/after(묶음 표제 pin_display) — changed 와 같은 처리(NFKC 검사 뷰 → 공유 마스킹 → 숫자 '#' →
+    잔여 검사 → 80자 창). 필드 계약은 그대로: 없는 쪽은 None, 앞/뒤가 같아져도 생략하지 않는다. 잔여 PII 가 보이거나 처리가
+    실패하면 그 값은 가림 표시 하나(fail-closed)."""
+    from security.masking import MASK
+
+    def one(pin: Any) -> Optional[str]:
+        if pin is None:
+            return None
+        try:
+            from perception.repeated_v1160 import pin_display
+
+            m, d = _view(pin_display(pin))
+            return MASK if _unsure(m, d) else _hash(_escape(d))
+        except Exception:  # noqa: BLE001 — 표시 전용: 실패하면 값을 가린다(fail-closed)
+            return MASK
+
+    before, after = one(old_pin), one(new_pin)
+    start = _start(before, after) if before is not None and after is not None and before != after else 0
+    return (None if before is None else _cut(before, start), None if after is None else _cut(after, start))

@@ -2003,12 +2003,10 @@ class ActionDispatcher:
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
             # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — 무엇이 바뀌었나(changed, data 에만 — 페이지 글자는
             # error_message 에 넣지 않는다)와 '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고 재관찰도 하지 않는다.
-            from actions.group_changed import changed_parts
-            from perception.repeated_v1160 import pin_display
+            from actions.group_changed import changed_parts, display_pair
 
-            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
-            after = (safe_page_text(pin_display(staleness.observed_group))
-                     if staleness.observed_group is not None else None)
+            # WS-62 R16(#158): before/after(묶음 표제)도 changed 와 같은 마스킹·숫자 '#'·80자(값만 가림, 필드 그대로).
+            before, after = display_pair(handle.group_heading, staleness.observed_group)
             group_changed: Dict[str, Any] = {"before": before, "after": after}
             changed = changed_parts(handle.group_heading, staleness.observed_group)
             if changed is not None:

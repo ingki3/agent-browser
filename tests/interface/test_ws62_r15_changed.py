@@ -140,7 +140,8 @@ def test_unit_and_combining_bypass_shows_hashes():
     assert ch["items"]["before"].endswith("전화 ###만####원####명 이전"), ch
     ch = _pair("outer", "\u0301".join(RAW))
     (p,) = ch["text"]
-    assert p["before"].endswith("전화 ########### 이전") and p["after"].endswith("이후"), p
+    # R16: 숫자 뒤 결합문자를 지운 NFKC 뷰에서 공유 마스킹이 전화로 잡는다(숫자 치환 전) — 가림, 숫자 0.
+    assert p["before"].endswith("전화 [REDACTED] 이전") and p["after"].endswith("이후"), p
     assert not any(unicodedata.category(c)[0] == "M" for s in _strings(ch) for c in s), ch
 
 
@@ -254,7 +255,7 @@ def test_injection_without_pre_nfkc_judgment_is_detected(monkeypatch):
     """주입 — NFKC 전 판정 제거: 로마 숫자 Ⅻ 가 NFKC 로 'XII' 가 되어 '#' 이 아니다(고정 표본 단언이 잡는다)."""
     import actions.group_changed as g
 
-    monkeypatch.setattr(g, "_premap", lambda text: text)
+    monkeypatch.setattr(g, "_pre_numeric", lambda ch: False)  # R16: NFKC 전 판정 지점(옛 _premap)
     s = _strings(_pair("seq", "가Ⅻ나"))
     assert "가XII나" in s[0], s
 

@@ -255,7 +255,8 @@ def test_fullwidth_phone_masked_via_nfkc_view():
     """전각 전화 '０１０ ７３９４ ８２６１' — 표시는 정규화 글자 기준이고 숫자는 전부 '#'(R15). 전각 구분자·전각 글자도 정규화."""
     ch = _parts(_pin(["문의 ０１０ ７３９４ ８２６１ 이전"], ["i:1"]), _pin(["문의 ０１０ ７３９４ ８２６１ 이후"], ["i:1"]))
     (p,) = ch["text"]
-    assert p["before"] == "문의 ### #### #### 이전" and p["after"] == "문의 ### #### #### 이후", p
+    # R16: 공유 마스킹이 NFKC 뷰(숫자 치환 전)에서 전화로 잡아 가린다 — 숫자 0 은 그대로.
+    assert p["before"] == "문의 [REDACTED] 이전" and p["after"] == "문의 [REDACTED] 이후", p
     assert not _leak(ch)[0], ch
     for sep in ("／", "．", "－", "："):
         num = sep.join(["０１０", "７３９４", "８２６１"])
