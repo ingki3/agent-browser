@@ -95,6 +95,7 @@ KEYS = {
     "storage": (CONTROL, "recipes/service.py list data.storage"),
     "source": (CONTROL, "interface/youtube_search.py data.youtube.source · security/hitl.py gate_basis.source"),
     "how_to_wait": (CONTROL, "interface/handoff.py 조작권 요청 안내 — 도구 이름"),
+    "tool": (CONTROL, "interface/server_signals.py data.handoff.tool — 인계 도구 이름(WS-63 C)"),
     "changed": (CONTROL, "interface/server_handoff.py control_wait"),
     "holder": (CONTROL, "interface/handoff.py control_status"),
     "outcome": (CONTROL, "interface/server_hitl.py 승인 결과"),
@@ -236,7 +237,7 @@ def public_text_masks(value: str) -> bool:
 
 #: R7 에 새로 넣은 제어 키(어휘 + 불변 테스트 대상).
 R7_KEYS = ("nav_frame", "resolved_from", "captured", "handled", "coordinate_target", "blocked_by", "code",
-           "category", "scope", "storage", "source", "how_to_wait")
+           "category", "scope", "storage", "source", "how_to_wait", "tool")
 
 
 def _r7_pairs():

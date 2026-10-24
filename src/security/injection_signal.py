@@ -37,7 +37,7 @@ MAX_WHERE = 20
 #: 이름과 무관하게 전부 검사한다(`RAW_PAGE_KEYS`).
 #: * hint·how_to_*·next·note·pre_approve_hint: 서버 안내문(pre_approve_hint 의 대상 이름은
 #:   gate_basis.name·error_message 에서 이미 본다)
-#: * window·control·approval·egress·challenge·truncated: 서버 상태·판정 문구
+#: * window·control·approval·egress·challenge·handoff·truncated: 서버 상태·판정 문구(handoff 는 WS-63 C 고정 안내)
 #: * url·*_url·frame_path·selector_path·downloaded_path·signals: 주소·경로·서버 신호 문자열
 #: * image_b64: 스크린샷 바이트
 #: * axtree_summary: 관찰 요소 이름(elements[].name)을 그대로 이은 요약 — 요소 단위로 본다
@@ -46,7 +46,7 @@ SKIP_KEYS = frozenset({
     "element_id", "tab_id", "role",
     SIGNAL_KEY,
     "hint", "how_to_approve", "how_to_respond", "next", "note", "pre_approve_hint",
-    "window", "control", "approval", "egress", "challenge", "truncated",
+    "window", "control", "approval", "egress", "challenge", "handoff", "truncated",
     "url", "frame_url", "current_frame_url", "frame_path", "selector_path", "downloaded_path",
     "signals", "image_b64", "axtree_summary",
 })

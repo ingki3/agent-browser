@@ -653,6 +653,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "fresh", "epoch_mismatch", "node_detached", "role_changed", "name_changed",  # actions.verification.StalenessReason
         "group_changed",  # WS-62 StalenessReason.GROUP_CHANGED
         "sabotage",  # harness.tier2_som(사보타주 표지)
+        "captcha", "blocked",  # WS-63 C data.handoff.reason = browser.challenge.ChallengeKind
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
                               "mismatch"}),  # handoff.check_approval 사유 코드
@@ -697,6 +698,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                          "keyring", "prompt", "ci_env",  # browser.session_store KeyResolution.source(응답 출구 아님)
                          "chrome_import", "login_flow", "human_control"}),  # browser.login_ledger SOURCE_*(WS-59, 기록 파일)
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
+    "tool": frozenset({"browser_control_request"}),  # WS-63 C server_signals data.handoff.tool(도구 이름)
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
     # healing_attempts 는 R9 부터 목록 경로 어휘(CONTROL_LIST_VOCABULARY — 복합 코드는 낱말 모양이 아니다)
