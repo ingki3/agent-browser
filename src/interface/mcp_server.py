@@ -107,6 +107,8 @@ from interface.server_signals import (  # noqa: E402,F401
     _HANDOFF_EXCLUDED_STATUSES,
     _PageObservation,
     challenge_handoff,
+    robots_disallowed,
+    settle_handoff,
 )
 from interface.server_hitl import (  # noqa: E402,F401
     HitlMixin,

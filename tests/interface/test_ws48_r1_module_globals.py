@@ -57,7 +57,7 @@ PRESERVED = (
     "pre_approve_hint", "time", "tool_name", "unicodedata",
     # WS-63 C 사람 인계 안내
     "HANDOFF_HINT", "HANDOFF_STEPS_AVAILABLE", "HANDOFF_STEPS_UNAVAILABLE", "HANDOFF_TOOL", "_HANDOFF_EXCLUDED_STATUSES",
-    "challenge_handoff",
+    "challenge_handoff", "robots_disallowed",  # R1: robots 금지 시 인계 안내 제외
     # WS-57 작업 공간
     "DEFAULT_WORKSPACE", "WORKSPACE_ARG", "WorkspaceNameError", "WorkspaceRuntime", "_CALL_STATE", "_CallScope",
     "_all_tabs", "_closed", "_snapshot_tabs", "current_workspace", "pop_workspace_arg", "validate_workspace",

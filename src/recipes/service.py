@@ -95,6 +95,11 @@ class ServerHost:
         for k in ("injection_suspected", "truncated", "challenge"):
             if data.get(k) is not None:
                 out[k] = data[k]
+        if data.get("handoff") is not None:
+            # WS-63 C R3: 확인 화면 중단 응답에 사람 인계 안내와 그 hint 문장도 보존(관찰 응답 그대로).
+            out["handoff"] = data["handoff"]
+            if data.get("hint"):
+                out["hint"] = data["hint"]
         if not res.success:
             out["observation_error"] = clean_text(res.error_message or "")
         return out

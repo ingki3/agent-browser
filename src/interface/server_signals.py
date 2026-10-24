@@ -61,6 +61,30 @@ def challenge_handoff(challenge: Optional[Dict[str, Any]], last_status: Optional
             "steps": list(steps)}
 
 
+def robots_disallowed(data: Dict[str, Any]) -> bool:
+    """이 응답에 robots.txt 전체 금지(data.robots.disallowed)가 실렸는가."""
+    robots = data.get("robots")
+    return isinstance(robots, dict) and robots.get("disallowed") is True
+
+
+def settle_handoff(data: Dict[str, Any]) -> None:
+    """최종 응답 기준 정리(WS-63 C R1 R2): robots 금지가 실렸으면 인계 안내와 그 hint 문장을 뺀다.
+
+    금지 경로 방문을 사람 인계로 권하지 않는다 — robots 안내가 우선한다. 부착 순서와 무관하게 응답을
+    돌려주기 직전에 한 번 부른다. 기존 hint 문장은 그대로 둔다.
+    """
+    if not robots_disallowed(data) or "handoff" not in data:
+        return
+    data.pop("handoff", None)
+    hint = str(data.get("hint") or "")
+    if HANDOFF_HINT in hint:
+        rest = hint.replace(HANDOFF_HINT, "").strip()
+        if rest:
+            data["hint"] = rest
+        else:
+            data.pop("hint", None)
+
+
 @dataclass
 class _PageObservation:
     context_id: int
@@ -573,8 +597,10 @@ class SignalsMixin:
             if self._window.sticky_pending is not None:
                 result.data.setdefault("window", dict(self._window.info(), hint=STICKY_PENDING_HINT))
         # WS-63 C: 사람 인계 안내만 — 창을 열거나 재시도하지 않는다. 한 응답에 한 번(기존 값 유지).
-        handoff = challenge_handoff(challenge, last_status, available=self._human_can_see())
-        if handoff is not None and "handoff" not in result.data:
+        # R1: 401/429 제외는 판정용 상태로(SPA 로 옮긴 화면에 옛 문서 상태를 쓰지 않는다 — challenge 판정과 같은 값).
+        # R2: robots 금지가 이미 실렸으면 붙이지 않는다(나중에 실리는 경우는 call_tool 의 settle_handoff).
+        handoff = challenge_handoff(challenge, judge_status, available=self._human_can_see())
+        if handoff is not None and "handoff" not in result.data and not robots_disallowed(result.data):
             result.data["handoff"] = handoff
             hint = str(result.data.get("hint") or "")
             if HANDOFF_HINT not in hint:
