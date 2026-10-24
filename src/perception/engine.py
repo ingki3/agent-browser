@@ -62,9 +62,6 @@ class ElementHandle:
     #: 실행 직전 staleness 검증이 "아직 그 조상 안 + 지문 같음" 을 확인한다(달 넘김 후 같은 노드 재사용 거부).
     group_path: Optional[str] = None
     group_heading: Optional[str] = None
-    #: WS-62 R7: 다중 고정(기준 v1.16.0 고정 ∪ R6 고정) — perception.repeated.GroupPin 목록, 첫째 = group_path·group_heading.
-    #: 실행 직전 전부 비교한다(하나라도 바뀌면 거부). perception.repeated.handle_pins·set_pins 로만 읽고 쓴다.
-    group_pins: Optional[List[Any]] = None
 
 
 @dataclass

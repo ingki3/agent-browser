@@ -4,6 +4,8 @@
 (1) 달력 두 묶음이 만들어지지 않고 레이아웃 묶음은 크기 상한으로 통째로 빠져 `groups: [], omitted: 2`,
 (2) 같은 '다음달' id 2회째가 E_TOCTOU_MISMATCH, (3) 달 이동 뒤 '항공권 검색' 도 거부,
 (4) 무 CSS 에선 레이아웃 묶음 지문(1000자)이 메뉴 글자로 차 월 표제가 지문 밖 — 옛 '19' 가 통과.
+R12(사용자 결정 B): 고정·실행 직전 확인은 v1.16.0 원문으로 되돌렸다 — 이 파일은 묶음 표시(data.repeated) 시험과 v1.16.0 한계
+(엄격 xfail)만 남긴다. 같은 다음달 id 연속·치유 승계 css 조건 시험은 지웠다(진행성은 test_ws62_r12 의 '거부 → observe → 새 id').
 모든 시험은 로컬 Chromium set_content(공개 사이트 접속 없음).
 """
 
@@ -69,27 +71,6 @@ def _day(groups, month: str, day: str) -> str:
     raise AssertionError(f"{month}/{day} 없음: {json.dumps(groups, ensure_ascii=False)[:600]}")
 
 
-#: R7(합집합): 행 밖 대상(이전/다음달·검색·TOP·입력칸)은 달 패널에 고정되지 않는다. 기준(v1.16.0)이 바깥 레이아웃 쌍둥이로
-#: 고정하던 것은 그대로 고정하되(사이에 반복 행이 있으면 — 구조 판정) 그 지문은 안쪽 형성 쌍둥이(두 달 패널)를 가린다 —
-#: 달이 바뀌어도 흔들리지 않는다. forbid: 그 안에 고정되면 안 되는 범위(팝업 래퍼 항목 쌍둥이 등).
-NAV_PIN_JS = ("([path, masks, forbid]) => { const g = document.querySelector(path), cal = document.getElementById('cal');"
-              " if (!g || cal.contains(g)) return false;"
-              " if (forbid && [...document.querySelectorAll(forbid)].some(f => f.contains(g))) return false;"
-              " if (!g.contains(cal)) return true;"
-              " const ms = masks.map(m => document.querySelector(m));"
-              " return [...cal.querySelectorAll(':scope > .inr')].every(p => ms.some(m => m && m.contains(p))); }")
-
-
-async def nav_pins_ok(page, handle, forbid: Optional[str] = None) -> bool:
-    """행 밖 대상의 고정이 모두 '달 패널 밖 + 달 패널을 가린 바깥 고정' 인가(고정 없음도 참)."""
-    from perception.repeated import handle_pins
-
-    for p in handle_pins(handle):
-        if not await page.evaluate(NAV_PIN_JS, [p.path, list(p.mask), forbid]):
-            return False
-    return True
-
-
 async def _months(page) -> List[str]:
     return await page.evaluate("() => [...document.querySelectorAll('#cal > .inr .header span')].map(s => s.textContent)")
 
@@ -106,9 +87,6 @@ async def test_full_observe_has_two_month_groups():
         browser, page, engine, d = await _open(pw, page_html())
         try:
             r = await _observe(d)
-            # 날짜는 각 달 패널에. 다음달·검색·TOP 은 달 패널에 고정되지 않는다 — 기준 고정(바깥 레이아웃)은 달 패널을 가린 지문(R7)
-            navs = {name: await nav_pins_ok(page, engine.get_handle(_named(r, name)))
-                    for name in ("다음달", "이전달", "항공권 검색", "TOP")}
         finally:
             await browser.close()
     groups = _cal_groups(r)
@@ -120,46 +98,18 @@ async def test_full_observe_has_two_month_groups():
     assert not names & {"이전달", "다음달", "항공권", "TOP"}
     _day(groups, "2026년 10월", "19")
     _day(groups, "2026년 11월", "19")
-    assert all(navs.values()), navs
-
-
-# ------------------------------------------------------------------ F2: 같은 다음달 id 연속·달 이동 뒤 검색·TOP
-
-
-@requires_chromium
-async def test_next_month_three_times_then_search_top_prev_not_refused():
-    """RED(v1.16.0): 다음달 2회째 E_TOCTOU_MISMATCH, 달 이동 뒤 항공권 검색도 거부.
-
-    (계획 R1-2 처럼 국소성을 묶음 단위로만 걸면 레이아웃 항목 쌍둥이가 다음달을 고정해 2회째가 다시 거부된다 — 회귀 고정.)
-    """
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, page_html())
-        try:
-            r = await _observe(d)
-            nxt = _named(r, "다음달")
-            moves = [await d.dispatch(ActionType.CLICK, {"element_id": nxt}) for _ in range(3)]
-            months = await _months(page)
-            search = await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "항공권 검색")})
-            top = await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "TOP")})
-            prev = await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "이전달")})
-            months_after_prev = await _months(page)
-            clicks = await page.evaluate("window.clicks")
-        finally:
-            await browser.close()
-    assert [(m.success, m.error_code) for m in moves] == [(True, None)] * 3, [(m.error_code, m.error_message) for m in moves]
-    assert months == ["2027년 1월", "2027년 2월"]
-    assert search.success and top.success, (search.error_code, search.error_message, top.error_code, top.error_message)
-    assert clicks == ["search", "top"]
-    assert prev.success, (prev.error_code, prev.error_message)
-    assert months_after_prev == ["2026년 12월", "2027년 1월"]
 
 
 # ------------------------------------------------------------------ 안전: 표제만 바뀐 달의 옛 '19' 는 거부
 
 
+#: R12(사용자 결정 B — 고정은 v1.16.0 원문): 표제만 바뀌고 날짜 배치·바깥 글자가 같은 달은 v1.16.0 이 구분하지 못한다(옛 날짜 id 가
+#: 다른 달을 누름 — v1.16.0 한계 '바깥 정적 글자가 없고 항목 순서열도 같은 두 묶음'). 기준 동일성 불변식이 이 동작을 고정한다.
+V1160_LIMIT = pytest.mark.xfail(strict=True, reason="v1.16.0 동일 한계(R12 결정 B) — 표제만 바뀐 같은 배치의 달")
+
+
 @requires_chromium
+@V1160_LIMIT
 @pytest.mark.parametrize("css,longnote", [(True, False), (False, False), (True, True)], ids=["css", "nocss", "longnote"])
 async def test_heading_only_change_refuses_old_day(css, longnote):
     """무 CSS(RED v1.16.0 — 지문 1000자가 메뉴 글자로 차 옛 '19' 통과)·LONGNOTE(달 패널 1000자+ 안내문)에서도 거부."""
@@ -192,6 +142,7 @@ async def test_heading_only_change_refuses_old_day(css, longnote):
 
 
 @requires_chromium
+@V1160_LIMIT
 async def test_lone_last_week_day_is_pinned_and_refused_after_move():
     """2027년 10월은 6주 — 마지막 주가 '31' 하나뿐(li 하나 = 반복 항목 아님)이고 11월(30일·5주)에는 31 이 없다(자기 낱말
     충돌 없음). 같은 행 틀(ul.day > li)이므로 고정되고, 표제가 바뀌면 옛 id 는 거부된다(B2)."""
@@ -201,9 +152,11 @@ async def test_lone_last_week_day_is_pinned_and_refused_after_move():
         browser, page, engine, d = await _open(pw, page_html())
         try:
             r = await _observe(d)
-            nxt = _named(r, "다음달")
-            for _ in range(12):
-                assert (await d.dispatch(ActionType.CLICK, {"element_id": nxt})).success
+            for _ in range(12):  # R12: 같은 id 2회째는 기준대로 거부 → 다시 관찰해 새 id 로(봇 정책)
+                res = await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "다음달")})
+                if not res.success:
+                    r = await _observe(d)
+                    assert (await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "다음달")})).success
             assert await _months(page) == ["2027년 10월", "2027년 11월"]
             await _observe(d)
             lone = await _by_selector(engine, page, "#cal > .inr:nth-of-type(1) ul.day:nth-child(6) li a")
@@ -264,30 +217,6 @@ async def test_twin_left_empty_by_row_filter_is_dropped_rest_shown(empties):
     # R6(형성/고정 분리): 단추 셋(button×3 — 반복 행)은 형성된 패널 쌍둥이 안 반복 행 대상이라 표시 없이 그 패널로 고정
     # (v1.16.0 과 같음 — R4·R5 는 충돌 행 틀 밖이라 고정을 뺐다).
     assert btn_pin, btn_pin
-
-
-async def test_display_less_pins_are_applied_without_sets():
-    """페이지 계산이 표시 세트 없이 고정만(pins — R5 R1 fail-closed) 돌려줘도 핸들에 고정이 붙는다(블록은 None)."""
-    from types import SimpleNamespace
-
-    from perception import repeated as rp
-
-    handles = {f"@e{i}": SimpleNamespace(element_id=f"@e{i}", role="link", name=n, css_path=f"#a{i}", is_shadow=False,
-                                         group_path=None, group_heading=None) for i, n in enumerate(("1", "1", "2"))}
-
-    class Engine:
-        def get_handle(self, eid):
-            return handles.get(eid)
-
-    class Page:
-        async def evaluate(self, script, arg=None):
-            return {"sets": [], "pins": [{"i": 0, "path": "#p1", "fp": "2026년 10월\n#0"}, {"i": 9, "path": "#x", "fp": ""},
-                                         {"i": 1, "path": None, "fp": "x"}]}
-
-    elements = [SimpleNamespace(element_id=k) for k in handles]
-    assert await rp.annotate_repeated(Page(), Engine(), elements) is None
-    assert (handles["@e0"].group_path, handles["@e0"].group_heading) == ("#p1", "2026년 10월\n#0")
-    assert handles["@e1"].group_path is None and handles["@e2"].group_path is None
 
 
 # ------------------------------------------------------------------ 크기(R1-4): 예산 초과 시 먼저 압축 → 그래도 넘는 세트만 빼기
@@ -359,55 +288,8 @@ def test_build_block_compacts_then_greedy_omits():
     assert all(len(m["name"]) <= rp.COMPACT_WORD for g in block["groups"] for m in g["members"])
     assert rp._block_chars(block["groups"]) <= rp.REPEATED_MAX_CHARS
     assert block.get("omitted", 0) >= 2 and len(block["groups"]) + block["omitted"] == 6
-    # 고정은 뺀 세트까지 핸들마다
-    assert all(h.group_path for h in handles)
-
-
-# ------------------------------------------------------------------ R1-6: 치유 재관찰의 고정 승계는 같은 노드(css_path)일 때만
-
-
-async def test_heal_repin_inherits_only_when_same_node(monkeypatch):
-    """재관찰에서 같은 id 가 다른 노드(다음달)로 옮겨 가면 옛 날짜 고정을 물려받지 않는다(NB3 — 또 다른 과잉 거부 경로).
-    같은 id·같은 css 경로면 원래 선택 근거를 잇는다(R1 R2 유지)."""
-    from types import SimpleNamespace
-
-    import perception.repeated as rp
-    from actions import ActionDispatcher, DispatchContext
-    from perception.engine import ElementHandle
-
-    async def no_annotate(page, engine, elements):
-        return None
-
-    monkeypatch.setattr(rp, "annotate_repeated", no_annotate)
-
-    def h(eid, name, css, path=None, pin=None):
-        return ElementHandle(element_id=eid, epoch=0, role="link", name=name, css_path=css, is_shadow=False,
-                             group_path=path, group_heading=pin)
-
-    class Engine:
-        def __init__(self):
-            self.handles = {"@e1": h("@e1", "19", "#cal li:nth-child(2) a", "#p1", "2026년 10월"),
-                            "@e2": h("@e2", "20", "#cal li:nth-child(3) a", "#p1", "2026년 10월")}
-
-        async def observe_page(self, page=None, cdp=None):
-            # 재관찰: @e1 은 같은 노드, @e2 는 다른 노드(다음달 링크)가 됐다.
-            self.handles = {"@e1": h("@e1", "19", "#cal li:nth-child(2) a"), "@e2": h("@e2", "다음달", "#cal > a.next")}
-            return SimpleNamespace(elements=[SimpleNamespace(element_id=k, role=v.role, name=v.name, is_shadow=False)
-                                             for k, v in self.handles.items()])
-
-        def get_handle(self, eid):
-            return self.handles.get(eid)
-
-    class Page:
-        async def evaluate(self, script, arg=None):
-            return [True] * len((arg or {}).get("paths", []))
-
-    engine = Engine()
-    d = ActionDispatcher(DispatchContext(page=Page(), engine=engine))
-    old = engine.handles["@e1"]
-    await d._attempt_heal(old, ActionType.CLICK)
-    assert (engine.get_handle("@e1").group_path, engine.get_handle("@e1").group_heading) == ("#p1", "2026년 10월")
-    assert engine.get_handle("@e2").group_path is None and engine.get_handle("@e2").group_heading is None
+    # R12: 표시 모듈은 핸들을 고정하지 않는다(고정은 perception.repeated_v1160 원문만)
+    assert not any(h.group_path or h.group_heading for h in handles)
 
 
 # ------------------------------------------------------------------ R1-3: 충돌을 만든 행 틀 밖 대상은 묶음 대상(표시)이 아니다(R6: 반복 행 안이면 고정)

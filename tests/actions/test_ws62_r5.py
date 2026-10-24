@@ -4,6 +4,8 @@ R1 혼합 깊이 — 월 패널 안 날짜 목록 일부(19~31일)가 패널에�
 뺐고 고정까지 사라져, 표제만 바뀐 달의 옛 '19' 가 다른 달(2027년 1월/19)에서 눌렸다. 국소성은 묶음 형성(먼저 차지)
 에만 쓰고, 형성된 패널이 담은 충돌 행과 같은 틀의 행 대상은 깊이와 무관하게 그 패널로 고정한다.
 
+R12(사용자 결정 B): 고정은 v1.16.0 원문 — R2 시험은 '같은 id 거부 0' 대신 봇 정책(거부 → observe → 새 id)의 진행성으로 바꿨다.
+
 R2 오는 날 미선택 — 바깥 오는날 표시 '오는 날' 이 팝업 안 입력칸 이름과 같아 팝업 래퍼 항목 쌍둥이(div.row ↔ 달력
 팝업)가 형성되고 이전/다음달이 항목 단위로 고정돼 2회째 다음달·이전달이 거부됐다. 항목 쌍둥이는 대상의 가장 안쪽 반복
 행이 그 항목 자신일 때만 대상으로 받는다.
@@ -20,8 +22,7 @@ import pytest
 from contracts import ActionType, ErrorCode
 
 from test_scroll_navigation import requires_chromium  # noqa: F401
-from test_ws62_r1 import _by_selector
-from test_ws62_r4_hanatour import FULL, _cal_groups, _day, _months, _named, _observe, _open, nav_pins_ok, page_html
+from test_ws62_r4_hanatour import _cal_groups, _day, _months, _observe, _open, page_html
 
 
 # ------------------------------------------------------------------ R1: 혼합 깊이(얕은 1~18일 + section 7개 아래 19~31일)
@@ -90,85 +91,67 @@ async def test_mixed_depth_dates_pinned_and_old_day_refused(kind):
     assert same.success and out2 == "2026년 11월/19", (same.error_code, same.error_message, out2)
 
 
-# ------------------------------------------------------------------ R2: 오는 날 미선택 상태의 이전/다음달
+# ------------------------------------------------------------------ R2: 오는 날 미선택 상태의 이전/다음달(R12 — 봇 정책으로 진행)
 
 
 @requires_chromium
 @pytest.mark.parametrize("css", [True, False], ids=["css", "nocss"])
-async def test_pending_return_month_nav_not_refused_then_pick_jan6(css):
-    """RED(R4 dfef218): 바깥 '오는 날' ↔ 팝업 입력칸 '오는 날' 충돌로 팝업 래퍼 항목 쌍둥이가 다음달·이전달을 고정 —
-    2회째 다음달·이전달 E_TOCTOU_MISMATCH. 지금은 다음달 연속 3회·이전달 거부 0, 그 뒤 2027년 1월 6일 선택."""
+async def test_pending_return_month_nav_progress_then_pick_jan6(css):
+    """R12(결정 B): 오는 날 미선택 상태에서 다음달×3·이전달 — 같은 id 2회째가 기준대로 거부되면 observe_page 뒤 같은 이름 새 id
+    (클릭당 호출 ≤3, 포기 0), 그 뒤 2027년 1월 6일은 관찰한 data.repeated 에서 고른다."""
     from playwright.async_api import async_playwright
+
+    from test_ws62_r12 import HANA, pick_day, press
 
     async with async_playwright() as pw:
         browser, page, engine, d = await _open(pw, page_html(css))
         try:
             await page.evaluate("pendingReturn()")
-            r = await _observe(d)
-            nxt, prv = _named(r, "다음달"), _named(r, "이전달")
-            # 팝업 래퍼 항목 쌍둥이(#tabCon01 > div 의 div.row ↔ 달력 팝업)에 고정되지 않는다(R5 R2). 기준 바깥 레이아웃
-            # 고정(R7 합집합)은 달 패널을 가린 지문이라 달 이동에 흔들리지 않는다.
-            pins = {n: await nav_pins_ok(page, engine.get_handle(e), "#tabCon01 > div") for n, e in (("다음달", nxt), ("이전달", prv))}
-            moves = [await d.dispatch(ActionType.CLICK, {"element_id": nxt}) for _ in range(3)]
-            back = await d.dispatch(ActionType.CLICK, {"element_id": prv})
+            r = await _observe(d, HANA)
+            per: List[int] = []
+            for name in ("다음달", "다음달", "다음달", "이전달"):
+                calls: List[str] = []
+                r, res = await press(d, r, name, calls)
+                assert res.success, (name, res.error_code, res.error_message)
+                per.append(len(calls))
             months = await _months(page)
-            r2 = await _observe(d)
-            groups = _cal_groups(r2)
-            day_res = await d.dispatch(ActionType.CLICK, {"element_id": _day(groups, "2027년 1월", "6")}) if css else None
+            if css:
+                r = await _observe(d, HANA)
+                r, res = await pick_day(d, r, "2027년 1월", "6", [])
             values = [await page.input_value("#dep"), await page.input_value("#ret")]
         finally:
             await browser.close()
-    assert pins == {"다음달": True, "이전달": True}, pins
-    outcomes: List = [(m.success, m.error_code) for m in moves + [back]]
-    assert outcomes == [(True, None)] * 4, [(m.error_code, m.error_message) for m in moves + [back]]
+    assert all(n <= 3 for n in per), per
     assert months == ["2026년 12월", "2027년 1월"]
     if css:
-        assert day_res.success, (day_res.error_code, day_res.error_message)
         assert values == ["2026.10.24", "2027.01.06"], values
 
 
 @requires_chromium
-async def test_pending_return_tabs_and_inputs_not_pinned_to_popup_wrapper():
-    """팝업 래퍼 항목 쌍둥이(div.row ↔ 달력 팝업)에 입력칸·이전/다음·왕복/편도 탭이 고정되지 않는다 — 가장 안쪽 반복 행이
-    그 래퍼 항목 자신이 아닌 대상(바깥 '오는 날' = div.bowl)이 빠지면 쌍둥이는 형성되지 않는다."""
+async def test_dep_pick_clears_return_then_next_month_progress():
+    """가는 날을 고르면(오는 날 표시가 '오는 날' 로 돌아감) 다음달 두 번 — 거부되면 다시 관찰해 새 id(클릭당 호출 ≤3)."""
     from playwright.async_api import async_playwright
+
+    from test_ws62_r12 import HANA, press
 
     async with async_playwright() as pw:
         browser, page, engine, d = await _open(pw, page_html())
         try:
-            await page.evaluate("pendingReturn()")
-            await _observe(d)
-            sels = ["#cal > a.next", "#cal > a.prev", "#dep", "#ret", "#retset", ".tabs li:nth-child(1) a",
-                    ".tabs li:nth-child(2) a"]
-            ids = [await _by_selector(engine, page, s) for s in sels]
-            pins = {s: await nav_pins_ok(page, engine.get_handle(e), "#tabCon01 > div") for s, e in zip(sels, ids)}
-            nxt = ids[0]
-            first = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
-            again = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
-            back = await d.dispatch(ActionType.CLICK, {"element_id": ids[1]})
-        finally:
-            await browser.close()
-    assert all(pins.values()), pins
-    assert [r.success for r in (first, again, back)] == [True] * 3, [(r.error_code, r.error_message) for r in (first, again, back)]
-
-
-@requires_chromium
-async def test_dep_pick_clears_return_then_next_month_not_refused():
-    """가는 날을 고르면(오는 날 표시가 '오는 날' 로 돌아감) 재관찰 뒤 다음달을 같은 id 로 두 번 눌러도 거부 0."""
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        browser, page, engine, d = await _open(pw, page_html())
-        try:
-            r = await _observe(d)
-            assert (await d.dispatch(ActionType.CLICK, {"element_id": _named(r, "다음달")})).success
-            r = await _observe(d)
+            r = await _observe(d, HANA)
+            r, res = await press(d, r, "다음달")
+            assert res.success
+            r = await _observe(d, HANA)
             assert (await d.dispatch(ActionType.CLICK, {"element_id": _day(_cal_groups(r), "2026년 12월", "19")})).success
             ret_label = await page.text_content("#retset")
-            r = await _observe(d)
-            nxt = _named(r, "다음달")
-            moves = [await d.dispatch(ActionType.CLICK, {"element_id": nxt}) for _ in range(2)]
+            r = await _observe(d, HANA)
+            per = []
+            for _ in range(2):
+                calls: List[str] = []
+                r, res = await press(d, r, "다음달", calls)
+                assert res.success, (res.error_code, res.error_message)
+                per.append(len(calls))
+            months = await _months(page)
         finally:
             await browser.close()
     assert ret_label == "오는 날"
-    assert [(m.success, m.error_code) for m in moves] == [(True, None)] * 2, [(m.error_code, m.error_message) for m in moves]
+    assert all(n <= 3 for n in per) and months == ["2027년 1월", "2027년 2월"], (per, months)

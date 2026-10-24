@@ -2001,21 +2001,28 @@ class ActionDispatcher:
         if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
             # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
-            from perception.repeated import pin_display
+            # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — 무엇이 바뀌었나(changed, data 에만 — 페이지 글자는
+            # error_message 에 넣지 않는다)와 '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고 재관찰도 하지 않는다.
+            from actions.group_changed import changed_parts
+            from perception.repeated_v1160 import pin_display
 
-            expected = staleness.expected_group if staleness.expected_group is not None else handle.group_heading
-            before = safe_page_text(pin_display(expected)) if expected is not None else None
+            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
             after = (safe_page_text(pin_display(staleness.observed_group))
                      if staleness.observed_group is not None else None)
-            hint = "관찰 뒤 묶음(달·행)이 바뀌어 누르지 않았습니다 — 다시 관찰해 data.repeated 에서 고르세요"
+            group_changed: Dict[str, Any] = {"before": before, "after": after}
+            changed = changed_parts(handle.group_heading, staleness.observed_group)
+            if changed is not None:
+                group_changed["changed"] = changed
+            hint = ("관찰 뒤 이 버튼이 속한 화면 부분이 바뀌어(data.group_changed.changed) 누르지 않았습니다 — "
+                    "observe_page 로 다시 관찰한 뒤 같은 버튼을 새 id 로 누르세요.")
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.TOCTOU_MISMATCH,
-                error_message=f"Staleness 검증 실패({staleness.detail}) — 치유하지 않음: {hint}",
+                error_message=f"Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: {hint}",
                 reobserve_required=True,
-                data={"group_changed": {"before": before, "after": after}, "hint": hint},
+                data={"group_changed": group_changed, "hint": hint},
             )
         if not staleness.fresh and identity_change_refused(staleness.reason, action):
             # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
@@ -2074,13 +2081,10 @@ class ActionDispatcher:
                     error_message="치유된 요소의 핸들을 찾을 수 없습니다.",
                     reobserve_required=True,
                 )
-            from perception.repeated import handle_pins, set_pins
-
-            old = handle_pins(handle)
-            if old:
+            if getattr(handle, "group_path", None):
                 # WS-62 R1 R2: 채택한 핸들은 원래 선택 근거(구분 조상·지문)를 잇는다 — 치유 후보 거르기가 이 근거로
-                # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다. R7: 다중 고정 전부.
-                set_pins(new_handle, old)
+                # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다.
+                new_handle.group_path, new_handle.group_heading = handle.group_path, handle.group_heading
             handle = new_handle
             healed_flag = True
         return handle, healed_flag
@@ -2602,12 +2606,10 @@ class ActionDispatcher:
 
         engine = self.ctx.engine
         before = getattr(engine, "handles", None)
-        from perception.repeated import handle_pins
-
         old_pins = {
-            eid: (handle_pins(h), h.css_path)
+            eid: (h.group_path, h.group_heading)
             for eid, h in (dict(before).items() if isinstance(before, dict) else [])
-            if handle_pins(h)
+            if getattr(h, "group_path", None)
         }
         result = await engine.observe_page(
             page=self.ctx.page, cdp=self.ctx.cdp
@@ -2633,25 +2635,25 @@ class ActionDispatcher:
             logger.debug("치유 성공: %s (%s)", healing.strategy, healing.reason)
         return healing
 
-    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[List[Any], str]]) -> None:
+    async def _repin_after_reobserve(self, elements: Sequence[Any], old_pins: Dict[str, Tuple[str, Any]]) -> None:
         """WS-62 R1 R2: 치유의 재관찰이 핸들을 새로 만들어도 묶음 고정이 사라지지 않게 한다.
 
         1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
         고정돼 있었다면 그 선택 근거(구분 조상·지문)를 같은 id 의 새 핸들에 이어 준다 — id 는 이전 관찰을 보고 고른
-        것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다. 단 같은 노드(css_path 같음)일 때만
-        잇는다(WS-62 R4 R1-6) — id 가 다른 노드(다음달 링크 등)로 옮겨 가면 옛 날짜 고정을 물려받아 과잉 거부한다.
+        것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다.
+        WS-62 R12: 고정은 v1.16.0 원문(perception.repeated_v1160)만 — 승계도 v1.16.0 그대로(같은 id 면 css 와 무관).
         """
-        from perception.repeated import annotate_repeated, set_pins
+        from perception.repeated_v1160 import annotate_repeated
 
         engine = self.ctx.engine
         try:
             await annotate_repeated(self.ctx.page, engine, elements)
         except Exception as exc:  # noqa: BLE001 — 주석 실패는 아래 승계로만 고정한다
             logger.debug("치유 재관찰 묶음 주석 실패: %s", type(exc).__name__)
-        for eid, (pins, css) in old_pins.items():
+        for eid, (path, pin) in old_pins.items():
             h = engine.get_handle(eid)
-            if h is not None and h.css_path == css:
-                set_pins(h, pins)  # R7: 다중 고정 전부
+            if h is not None:
+                h.group_path, h.group_heading = path, pin
 
     async def _same_group_candidates(
         self, handle: ElementHandle, candidates: List[HealingCandidate]
@@ -2660,15 +2662,15 @@ class ActionDispatcher:
 
         role+이름만 보면 다른 달의 '19' 가 정상 치유로 채택된다. 확인을 못 하면 후보 없음(fail-closed).
         """
-        from perception.repeated import GROUP_FILTER_JS, pin_args
-
-        pins = pin_args(handle)
-        if not pins or not candidates:
+        if not getattr(handle, "group_path", None) or not candidates:
             return candidates
+        from perception.repeated_v1160 import GROUP_FILTER_JS
+
         try:
             keep = await self.ctx.page.evaluate(GROUP_FILTER_JS, {
                 "paths": [c.css_path for c in candidates],
-                "pins": pins,  # R7 다중 고정 — 전부 같아야 같은 묶음
+                "groupPath": handle.group_path,
+                "groupHeading": handle.group_heading,
             })
         except Exception:  # noqa: BLE001 — 묶음 확인 불가면 치유하지 않는다
             return []
@@ -2895,8 +2897,12 @@ class ActionDispatcher:
         )
         data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
+        # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
+        # 관찰 정보 전용이라 핸들을 건드리지 않는다.
+        from perception import repeated_v1160
         from perception.repeated import annotate_repeated
 
+        await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
         if repeated is not None:
             data["repeated"] = repeated

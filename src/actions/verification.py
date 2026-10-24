@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode
 from perception.engine import ElementHandle
-from perception.repeated import GROUP_CHECK_JS, pin_args, pin_display
+from perception.repeated_v1160 import GROUP_CHECK_JS, pin_display
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).
@@ -104,11 +104,9 @@ STALENESS_CHECK_SCRIPT = """
     value: el.value !== undefined ? String(el.value) : null,
   };
   // WS-62: 관찰 때 쌍둥이 묶음(data.repeated)에 든 대상 — 아직 그 구분 조상 안이고 표제가 같은가(같은 평가에서).
-  if (args.groupPins || args.groupPath) {
+  if (args.groupPath) {
     __GROUP_CHECK__
-    // R7 다중 고정(기준 ∪ R6): 전부 같아야 한다.
-    out.group = args.groupPins ? groupCheckAll(el, args.groupPins)
-      : groupCheck(el, args.groupPath, args.groupHeading === undefined ? null : args.groupHeading);
+    out.group = groupCheck(el, args.groupPath, args.groupHeading === undefined ? null : args.groupHeading);
   }
   return out;
 }
@@ -157,8 +155,6 @@ class StalenessResult:
     observed_name: Optional[str] = None
     #: WS-62: GROUP_CHANGED 일 때 지금 묶음 표제(구분 조상이 사라졌거나 밖이면 None).
     observed_group: Optional[str] = None
-    #: WS-62 R7: GROUP_CHANGED 일 때 어긋난 고정의 관찰 때 지문(다중 고정 중 처음 다른 것).
-    expected_group: Optional[str] = None
 
     @property
     def error_code(self) -> Optional[ErrorCode]:
@@ -203,12 +199,9 @@ async def verify_staleness(
 
     args: Dict[str, Any] = {"cssPath": handle.css_path}
     group_path = getattr(handle, "group_path", None)
-    pins = pin_args(handle)
     if group_path:
         args["groupPath"] = group_path
         args["groupHeading"] = getattr(handle, "group_heading", None)
-    if pins:
-        args["groupPins"] = pins
     probe = await page.evaluate(STALENESS_CHECK_SCRIPT, args)
 
     # 2) 백킹 노드 연결 확인
@@ -244,12 +237,11 @@ async def verify_staleness(
         )
 
     # 5) WS-62: 묶음 고정 — 알고리즘을 다시 돌리지 않고 "그 조상 안 + 표제 같음" 만 본다(epoch 무관).
-    if group_path or pins:
+    if group_path:
         group = probe.get("group") if isinstance(probe.get("group"), dict) else {}
         if not group.get("ok"):
             now = group.get("now")
-            k = group.get("k")
-            before = pins[k][1] if isinstance(k, int) and 0 <= k < len(pins) else getattr(handle, "group_heading", None)
+            before = getattr(handle, "group_heading", None)
             why = str(group.get("why") or "확인 실패")
             if before is not None and now is not None:
                 detail = f"묶음 '{safe_page_text(pin_display(before))}' -> '{safe_page_text(pin_display(now))}'"
@@ -262,7 +254,6 @@ async def verify_staleness(
                 observed_role=got_role,
                 observed_name=got_name,
                 observed_group=now if isinstance(now, str) else None,
-                expected_group=before if isinstance(before, str) else None,
             )
 
     return StalenessResult(
