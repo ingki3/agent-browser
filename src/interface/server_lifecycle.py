@@ -276,6 +276,10 @@ class LifecycleMixin:
         from security.secret_registry import watch_browser_context
 
         watch_browser_context(context)
+        # WS-64 R2 B3: 탭·팝업 생성 이력(불투명 문서 판정)도 첫 탭 전에 — 이 뒤에 생기는 탭은 모두 이력을 안다.
+        from security.manual_origin import watch_lineage
+
+        watch_lineage(context)
         tab = await self._core.new_tab("mcp-session")
         self._page = tab.page
         self._cdp = await self._core.new_cdp_session(tab.tab_id)

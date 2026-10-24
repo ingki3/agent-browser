@@ -83,6 +83,8 @@ TABLES = {
 #: 키 → (분류, 근거). (키, 파일) 은 같은 키의 파일별 예외.
 KEYS = {
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
+    "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
+    "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
     # --- CONTROL: 도구 열거 어휘
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),
     "resolved_from": (CONTROL, "actions/dispatcher.py switch_frame — current_frame|root(server_schema 안내, R6-B1)"),

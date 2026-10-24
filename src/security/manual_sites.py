@@ -551,8 +551,8 @@ def wide_target(action: ActionType, params: Dict[str, Any]) -> bool:
     return action is ActionType.CLICK and not params.get("element_id") and not params.get("selector")
 
 
-#: R1 B2: 주소로 출처를 알 수 없는 문서(about:blank·about:srcdoc)의 실효 출처를 읽는 상한(초) — 대화상자가 열린 탭 등에서
-#: 멈추지 않게. 넘거나 실패하면 판정 불가(그 문서의 프레임 사슬·최상위·opener 로만 판정).
+#: R1 B2·R2: 주소로 출처를 알 수 없는 문서의 실효 출처(CDP·격리 world)를 읽는 상한(초) — **판정 호출 한 번 전체** 기준
+#: (문서 수와 무관, 대화상자가 열린 탭 등에서 멈추지 않게). 넘거나 실패하면 판정 불가 = 차단('?').
 EFFECTIVE_ORIGIN_TIMEOUT_S = 1.0
 
 
@@ -571,25 +571,19 @@ def _ancestors(src: Any) -> List[Any]:
     return out
 
 
-async def _effective_origin(src: Any) -> Optional[str]:
-    """주소에 출처가 없는 문서의 실효 출처(location.origin — Chromium 의 securityOrigin). 불투명('null')·실패면 None."""
-    evaluate = getattr(src, "evaluate", None)
-    if not callable(evaluate):
-        return None
-    try:
-        origin = await asyncio.wait_for(evaluate("location.origin"), EFFECTIVE_ORIGIN_TIMEOUT_S)
-    except Exception:  # noqa: BLE001 — 시간 초과·떨어진 프레임: 판정 불가
-        return None
-    origin = str(origin or "")
-    return origin if origin.lower().startswith(("http://", "https://")) else None
+def _origin_probe(budget_s: float) -> Any:
+    """판정 호출 한 번의 출처 조회기(시험이 가짜로 바꿔 끼운다)."""
+    from security.manual_origin import OriginProbe
+
+    return OriginProbe(budget_s)
 
 
-async def _source_hit(sites: "ManualSites", src: Any) -> Optional[str]:
-    """한 문서(Page·Frame)의 실효 출처가 목록이면 그 항목. 주소를 읽지 못하면 '?'.
+async def _source_hit(sites: "ManualSites", src: Any, probe: Any, top: Any) -> Optional[str]:
+    """한 문서(Page·Frame)의 실효 출처가 목록이면 그 항목, 판정 불가면 '?', 아니면 None.
 
-    http(s)·blob: 은 주소(blob 은 안쪽 출처)로, about:blank·about:srcdoc 은 실효 출처(location.origin)로 판정한다.
-    data: 등 불투명 출처·판정 실패는 None — 호출자가 같은 사슬(부모 프레임·최상위·opener)을 함께 보므로 사슬에 목록
-    출처가 있으면 막힌다.
+    http(s)·blob:(안쪽 출처) 은 주소로. 그 밖(about:blank·about:srcdoc·data:·blob:null·빈 주소 등)은 R2 B2 — 브라우저가 아는
+    값(CDP securityOrigin → 격리 world self.origin), 못 읽으면 '?'. 불투명('null')이면 R2 B3 — 그 문서의 생성 이력(lineage)에
+    목록 출처가 있거나 이력을 모르면 차단. 페이지 world 의 self.origin·location.origin 은 보조(목록이면 차단 근거로만).
     """
     try:
         url = _url_of(src)
@@ -601,33 +595,63 @@ async def _source_hit(sites: "ManualSites", src: Any) -> Optional[str]:
             return None
     except Exception:  # noqa: BLE001 — 주소를 읽지 못함: fail-closed
         return "?"
-    if not url.lower().startswith("about:"):
-        return None
-    origin = await _effective_origin(src)
-    if origin is None:
-        return None
     try:
-        return sites.match(origin)
-    except Exception:  # noqa: BLE001
+        origins = await probe.origins(src)
+        if origins is None:
+            return "?"
+        for origin in origins:
+            if origin == "null":
+                lineage = await probe.lineage(src, top)
+                if lineage is None:
+                    return "?"
+                for o in sorted(lineage):
+                    hit = sites.match(o)
+                    if hit is not None:
+                        return hit
+                continue
+            hit = sites.match(origin)
+            if hit is not None:
+                return hit
+        for aux in await probe.page_world(src):  # 보조: 허용 근거로는 쓰지 않는다
+            try:
+                hit = sites.match(aux)
+            except Exception:  # noqa: BLE001
+                hit = None
+            if hit is not None:
+                return hit
+    except Exception:  # noqa: BLE001 — 판정 불가
         return "?"
+    return None
+
+
+def _watch(top: Any) -> None:
+    """R2 B3: 이 탭 컨텍스트의 탭 생성 이력 기록을 켠다(이미 켜졌으면 아무것도 안 함). 실패는 조용히(이력 모름 = 차단)."""
+    try:
+        from security.manual_origin import watch_lineage
+
+        watch_lineage(getattr(top, "context", None))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def manual_site_hit(ctx: Any, action: ActionType, params: Dict[str, Any], store: Any) -> Optional[str]:
-    """이 호출을 목록 사이트 때문에 막는가 — 막으면 맞은 항목 문자열(주소를 못 읽었으면 '?'), 아니면 None.
+    """이 호출을 목록 사이트 때문에 막는가 — 막으면 맞은 항목 문자열(판정 불가면 '?'), 아니면 None.
 
     판정 출처: 대상 프레임(ctx.page — switch_frame 뒤면 Frame)과 그 부모 프레임 사슬 ∪ 최상위(ctx.root_page) ∪ 그 탭을
     연 opener 탭, 좌표 클릭·press_key·handle_dialog 는 그 탭의 모든 프레임도. 각 문서는 주소가 아니라 실효 출처로
-    본다(R1 B2 — blob·about:blank·about:srcdoc 상속). 목록 파일을 처음부터 읽지 못했으면(R1 B3) 판정 불가 — '?'.
+    본다(R2 B2 브라우저 값 · B3 불투명 문서 lineage). 목록 파일을 처음부터 읽지 못했으면(R1 B3) 판정 불가 — '?'.
+    출처 조회 상한은 이 호출 전체에 EFFECTIVE_ORIGIN_TIMEOUT_S.
     """
     if store is None or not is_gated(action):
         return None
+    page = getattr(ctx, "page", None)
+    top = getattr(ctx, "root_page", None) or page
+    _watch(top)
     sites = store.current()
     if sites.empty:
         return None
     if getattr(sites, "broken", ""):
         return "?"
-    page = getattr(ctx, "page", None)
-    top = getattr(ctx, "root_page", None) or page
     sources: List[Any] = [page]
     try:
         sources.extend(_ancestors(page))
@@ -642,19 +666,31 @@ async def manual_site_hit(ctx: Any, action: ActionType, params: Dict[str, Any], 
     try:
         opener_fn = getattr(top, "opener", None)
         opener = await opener_fn() if callable(opener_fn) else None
-    except Exception:  # noqa: BLE001 — 닫힌 opener 등: 판정에서 뺀다(대상·최상위는 그대로 본다)
+    except Exception:  # noqa: BLE001 — 닫힌 opener 등: 판정에서 뺀다(대상·최상위·lineage 는 그대로 본다)
         opener = None
     if opener is not None:
         sources.append(opener)
-    seen: List[int] = []
-    for src in sources:
-        if src is None or id(src) in seen:
-            continue
-        seen.append(id(src))
-        hit = await _source_hit(sites, src)
-        if hit is not None:
-            return hit
-    return None
+    probe = _origin_probe(EFFECTIVE_ORIGIN_TIMEOUT_S)
+    try:
+        seen: List[int] = []
+        unknown: Optional[str] = None
+        for src in sources:
+            if src is None or id(src) in seen:
+                continue
+            seen.append(id(src))
+            hit = await _source_hit(sites, src, probe, opener if src is opener else top)
+            if hit == "?":
+                unknown = hit  # 판정 불가(차단) — 다른 문서가 목록 항목으로 맞으면 그 항목을 알린다
+            elif hit is not None:
+                return hit
+        return unknown
+    finally:
+        closer = getattr(probe, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def manual_hit_sync(sites: Any, page: Any) -> Optional[str]:

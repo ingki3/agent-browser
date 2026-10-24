@@ -32,7 +32,6 @@ class _P:
         return self._opener
 
     async def evaluate(self, expr: str) -> Any:
-        assert expr == "location.origin"
         if isinstance(self._origin, Exception):
             raise self._origin
         return self._origin
@@ -236,7 +235,32 @@ async def test_blob_popup_hit_after_opener_left():
     assert await ms.manual_site_hit(_Ctx(popup), ActionType.CLICK, CLICK, store) == "srail.kr"
 
 
-async def test_about_blank_popup_uses_effective_origin():
+class _FakeProbe:
+    """R2: 실효 출처는 브라우저 값(CDP·격리 world) — 브라우저 없는 시험은 문서의 _origin 을 그 값으로 쓴다.
+
+    문자열이면 그 출처, 'null' 이면 불투명(이력 _lineage — 없으면 빈 집합 = 목록 밖 이력), 예외·None 이면 판정 불가.
+    """
+
+    def __init__(self, budget_s: float) -> None:
+        self.budget_s = budget_s
+
+    async def origins(self, src: Any) -> Any:
+        origin = getattr(src, "_origin", None)
+        return [origin] if isinstance(origin, str) else None
+
+    async def lineage(self, src: Any, top: Any) -> Any:
+        return getattr(src, "_lineage", set())
+
+    async def page_world(self, src: Any) -> List[str]:
+        return []
+
+
+@pytest.fixture
+def fake_probe(monkeypatch):
+    monkeypatch.setattr(ms, "_origin_probe", _FakeProbe)
+
+
+async def test_about_blank_popup_uses_effective_origin(fake_probe):
     store = ManualSites.of(["srail.kr"])
     popup = _P("about:blank", opener=_P("https://elsewhere.example/"), origin="https://srail.kr")
     assert await ms.manual_site_hit(_Ctx(popup), ActionType.TYPE_TEXT, CLICK, store) == "srail.kr"
@@ -246,15 +270,16 @@ async def test_about_blank_popup_uses_effective_origin():
 
 @pytest.mark.parametrize("url", ["about:srcdoc", "about:blank", "data:text/html,x"])
 @pytest.mark.parametrize("origin", ["null", RuntimeError("detached"), None])
-async def test_inherited_or_opaque_frame_blocked_by_listed_parent_chain(url, origin):
+async def test_inherited_or_opaque_frame_blocked_by_listed_parent_chain(fake_probe, url, origin):
     store = ManualSites.of(["srail.kr"])
     top = _P("https://outer.example/")
     listed_parent = _P("https://srail.kr/embed", parent=top)
     nested = _P(url, origin=origin, parent=listed_parent)
     assert await ms.manual_site_hit(_Ctx(nested, top), ActionType.CLICK, CLICK, store) == "srail.kr"
-    # 사슬에 목록 출처가 없으면 막지 않는다(과차단 방지).
+    # 사슬에 목록 출처가 없으면: 불투명(이력에 목록 없음)은 막지 않는다(과차단 방지), 판정 불가는 R2 부터 차단('?').
     nested2 = _P(url, origin=origin, parent=_P("https://ad.example/", parent=top))
-    assert await ms.manual_site_hit(_Ctx(nested2, top), ActionType.CLICK, CLICK, store) is None
+    expected = None if origin == "null" else "?"
+    assert await ms.manual_site_hit(_Ctx(nested2, top), ActionType.CLICK, CLICK, store) == expected
 
 
 async def test_effective_origin_eval_timeout_does_not_hang(monkeypatch):

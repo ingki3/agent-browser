@@ -1048,6 +1048,11 @@ class ActionDispatcher:
 
     def __init__(self, context: DispatchContext) -> None:
         self.ctx = context
+        if getattr(context, "manual_sites", None) is not None:
+            # WS-64 R2 B3: 탭·팝업 생성 이력(불투명 문서 판정) 기록을 가능한 한 일찍 켠다(서버는 첫 탭 전에 이미 켬).
+            from security.manual_origin import watch_lineage
+
+            watch_lineage(getattr(getattr(context, "page", None), "context", None))
         self._healing_attempts = 0
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
@@ -1862,6 +1867,16 @@ class ActionDispatcher:
         refused = await self._manual_site_refusal(action, params)
         if refused is not None:
             raise _ManualSiteRefused(refused)
+
+    def _manual_active(self) -> bool:
+        """WS-64 R2 B1: 목록(또는 판정 불가 목록)이 있어 다단계 입력을 단계별로 재판정해야 하는가. 빈 목록이면 기존 경로."""
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return False
+        try:
+            return not store.current().empty
+        except Exception:  # noqa: BLE001 — 목록을 못 읽음: 단계별로(관문이 판정 불가로 막는다)
+            return True
 
     def manual_target(self, params: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """인계 대상의 role·이름(관찰 핸들 — element_id 대상만). 없으면 None."""
@@ -2846,9 +2861,12 @@ class ActionDispatcher:
         # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
         # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
         target = pin.node if pin is not None else self._locator_for(handle)
-        await self._manual_guard(action, params)  # WS-64 R1 B1: 치유·대기 뒤 실제 입력 직전 재판정
+        # WS-64 R1 B1·R2 B1: 페이지를 바꾸는 **모든** 호출 바로 앞에 공통 관문(_manual_guard) — 앞선 await(민감 칸 판정·
+        # clear·글자 사이) 동안 페이지가 목록 사이트로 바뀌었을 수 있다. 관문과 그 호출 사이에는 await 가 없다.
+        guard = self._manual_guard
 
         if action is ActionType.CLICK:
+            await guard(action, params)
             await target.click(button=params.get("button", "left"), timeout=5000)
 
         elif action is ActionType.TYPE_TEXT:
@@ -2862,16 +2880,28 @@ class ActionDispatcher:
             # (과잉 가림 방지, 결정 A).
             await self._mark_sensitive_input(handle, params, text)
             if params.get("clear_before", True):
+                await guard(action, params)  # R2 B1: clear(fill("")) 도 페이지를 바꾼다 — 민감 칸 판정 await 뒤 재판정
                 await target.fill("", timeout=5000)
                 await self._mark_sensitive_input(handle, params, text)
-            await self._manual_guard(action, params)
-            await target.type(text, timeout=5000)
+            if self._manual_active():
+                # R2 B1: 목록이 있으면 포커스·글자마다 재판정(글자 사이에 목록 사이트로 바뀌면 남은 글자를 보내지 않음).
+                # Playwright type 과 같은 입력(포커스 + 키보드 type) — 프레임 안이어도 키보드는 최상위 Page 의 것.
+                await guard(action, params)
+                await (target.focus() if pin is not None else target.focus(timeout=5000))
+                keyboard = self._top_page().keyboard
+                for ch in text:
+                    await guard(action, params)
+                    await keyboard.type(ch)
+            else:
+                await guard(action, params)
+                await target.type(text, timeout=5000)
             await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
-                await self._manual_guard(action, params)
+                await guard(action, params)
                 await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
+            await guard(action, params)
             if params.get("value") is not None:
                 await target.select_option(value=params["value"], timeout=5000)
             else:
@@ -2880,15 +2910,18 @@ class ActionDispatcher:
                 )
 
         elif action is ActionType.CHECK_BOX:
+            await guard(action, params)
             if params.get("checked", True):
                 await target.check(timeout=5000)
             else:
                 await target.uncheck(timeout=5000)
 
         elif action is ActionType.HOVER:
+            await guard(action, params)
             await target.hover(timeout=5000)
 
         elif action is ActionType.UPLOAD_FILE:
+            await guard(action, params)
             await target.set_input_files(
                 params.get("file_paths", []), timeout=5000
             )
@@ -2897,6 +2930,7 @@ class ActionDispatcher:
             async with self.ctx.page.expect_download(
                 timeout=params.get("timeout_ms", 30000)
             ) as dl:
+                await guard(action, params)
                 await target.click(timeout=5000)
             download = await dl.value
             # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
@@ -3265,10 +3299,24 @@ class ActionDispatcher:
         watch = _NavWatch(page) if self.ctx.nav_settle else None
         stray: Optional[str] = None
         try:
-            if pin is None:
-                await page.mouse.click(x, y, button=button)
+            if pin is not None:
+                stray = await self._pinned_press(page, pin, button,
+                                                 before=lambda: self._manual_guard(action, params))
+            elif self._manual_active():
+                # WS-64 R2 B1: mouse.click 과 같은 입력(이동·누름·뗌)을 단계마다 재판정 — 앞 단계 await 동안 목록 사이트로
+                # 바뀌면 다음 단계를 보내지 않는다(이미 누른 버튼은 떼지 않는다: 뗌도 목록 문서로 가는 입력).
+                await self._manual_guard(action, params)
+                await page.mouse.move(x, y)
+                await self._manual_guard(action, params)
+                await page.mouse.down(button=button)
+                await self._manual_guard(action, params)
+                await page.mouse.up(button=button)
             else:
-                stray = await self._pinned_press(page, pin, button)
+                await page.mouse.click(x, y, button=button)
+        except _ManualSiteRefused as exc:
+            if watch is not None:
+                watch.close()
+            return exc.result
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
@@ -3330,16 +3378,22 @@ class ActionDispatcher:
         return f"마우스 이동 뒤 {mismatch}" if mismatch else None
 
     @staticmethod
-    async def _pinned_press(page: Any, pin: Any, button: str) -> Optional[str]:
+    async def _pinned_press(page: Any, pin: Any, button: str, before: Any = None) -> Optional[str]:
         """R3 B1: 승인 노드 감시를 건 채 누르고 뗀다. 실제 눌림 이벤트가 다른 노드로 갔으면(막았음) 또는 승인 노드에
-        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None."""
+        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None.
+
+        WS-64 R2 B1: before(공통 관문)가 있으면 누름·뗌 각각 바로 앞에서 부른다(감시 설치 await 뒤 재판정)."""
         try:
             guard = await pin.node.evaluate_handle(_POINT_GUARD_ARM_JS)
         except Exception as exc:  # noqa: BLE001 — 감시를 걸 수 없으면 누르지 않는다
             return f"실제 눌림 대상 감시 실패: {type(exc).__name__}"
         seen: Any = None
         try:
+            if before is not None:
+                await before()
             await page.mouse.down(button=button)
+            if before is not None:
+                await before()
             await page.mouse.up(button=button)
         finally:
             try:
