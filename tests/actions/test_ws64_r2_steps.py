@@ -46,6 +46,11 @@ class _Locator:
         await self._rec.hit("evaluate")
         return False
 
+    async def element_handle(self, *_a: Any, **_k: Any) -> Any:
+        """R3 B1: 목록이 있으면 관문 직전 노드를 고정한다(그 해석도 await 지점)."""
+        await self._rec.hit("resolve")
+        return _Node(self._rec)
+
     def __getattr__(self, name: str) -> Any:
         if name not in {"fill", "type", "focus", "press", "click", "select_option", "check", "uncheck", "hover",
                         "set_input_files"}:
@@ -54,6 +59,17 @@ class _Locator:
         async def call(*_a: Any, **_k: Any) -> None:
             await self._rec.hit(name)
         return call
+
+
+class _Node(_Locator):
+    """고정 노드(ElementHandle) 가짜: 같은 입력 호출 + isConnected 읽기(이 가짜 문서에서는 늘 붙어 있음)."""
+
+    async def evaluate(self, expr: Any = "", *_a: Any, **_k: Any) -> Any:
+        await self._rec.hit("evaluate")
+        return "isConnected" in str(expr)
+
+    async def element_handle(self, *_a: Any, **_k: Any) -> Any:
+        raise AttributeError("element_handle")
 
 
 class _Device:

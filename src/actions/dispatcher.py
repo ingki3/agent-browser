@@ -1034,6 +1034,14 @@ class _ManualSiteRefused(Exception):
         super().__init__("manual_site")
         self.result = result
 
+
+class _FixedNodeGone(Exception):
+    """WS-64 R3 B1: 관문을 통과한 문서에 고정한 노드가 입력 중 떨어짐(문서 교체 등) — 새 문서 노드로 넘어가지 않았다."""
+
+
+#: R3 B1: 고정 노드 실패 응답(기존 '대상 바뀜' 계열 — E_TOCTOU_MISMATCH + 재관찰).
+_FIXED_NODE_GONE_MESSAGE = "대상 요소가 사라졌거나 바뀌어(문서가 바뀜) 그 요소에 입력하지 않았습니다. 다시 관찰하세요."
+
 #: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
 _POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
 _POINT_SAME_JS = ("([x, y, pinned]) => { const el = (" + _POINT_TARGET_JS.strip()
@@ -2458,6 +2466,12 @@ class ActionDispatcher:
             if watch is not None:
                 watch.close()
             return exc.result
+        except _FixedNodeGone:
+            # WS-64 R3 B1: 관문을 통과한 문서의 고정 노드가 입력 중 떨어졌다 — 새 문서 노드에는 보내지 않았다.
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return self._fixed_node_gone(action, healed_flag)
         except _ProtectedSaveRefused as exc:
             # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
             self._off_popup(_on_popup)
@@ -2487,6 +2501,18 @@ class ActionDispatcher:
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
+
+    def _fixed_node_gone(self, action: ActionType, healed_flag: bool) -> ActionResult:
+        """R3 B1: 고정 노드가 떨어짐 — 기존 '대상 바뀜' 계열(E_TOCTOU_MISMATCH·재관찰), 새 오류 코드 없음."""
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,  # 새 문서에는 아무것도 보내지 않았다
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=_FIXED_NODE_GONE_MESSAGE,
+            reobserve_required=True,
+            healed=healed_flag,
+        )
 
     async def _observe_element_effect(
         self,
@@ -2622,6 +2648,8 @@ class ActionDispatcher:
             await self._execute_element_action(action, handle, params)
         except _ManualSiteRefused as exc:
             return exc.result
+        except _FixedNodeGone:
+            return self._fixed_node_gone(action, healed_flag)
         except Exception as exc:  # noqa: BLE001
             return self._result(
                 success=False,
@@ -2858,9 +2886,40 @@ class ActionDispatcher:
     ) -> None:
         """요소 대상 액션을 실제로 발송한다."""
         pin = self._current_pin()
+        if pin is None and self._manual_active():
+            # WS-64 R3 B1: 목록이 있으면 관문 **직전**에 노드를 잡아(ElementHandle) 그 노드로만 입력한다. Locator 는
+            # Playwright 의 actionability 대기(비활성·가려짐) 동안 문서가 바뀌면 같은 selector 의 **새 문서 노드**를 다시
+            # 풀어 입력한다(관문이 본 문서가 아님). 고정 노드는 그 문서와 함께 떨어지므로 Playwright 가 실패시키고(재시도로
+            # 새 노드를 잡지 않음), 응답은 '대상 바뀜'. 치유·재관찰이 새 핸들을 고르면 이 함수가 다시 불려 그 노드로 다시 관문.
+            node = await self._locator_for(handle).element_handle(timeout=5000)
+            try:
+                await self._send_to_target(action, handle, params, node, fixed=True)
+            except (_ManualSiteRefused, _ProtectedSaveRefused):
+                raise
+            except Exception as exc:  # noqa: BLE001 — 노드가 떨어졌으면 '대상 바뀜', 아니면 원래 실패 그대로
+                if not await self._node_connected(node):
+                    raise _FixedNodeGone(str(exc)) from exc
+                raise
+            return
         # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
         # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
-        target = pin.node if pin is not None else self._locator_for(handle)
+        if pin is not None:
+            await self._send_to_target(action, handle, params, pin.node, fixed=True)
+        else:
+            await self._send_to_target(action, handle, params, self._locator_for(handle), fixed=False)
+
+    @staticmethod
+    async def _node_connected(node: Any) -> bool:
+        """R3 B1: 고정 노드가 아직 그 문서에 붙어 있는가(문서가 사라졌으면 평가 자체가 실패 → False)."""
+        try:
+            return bool(await node.evaluate("n => n.isConnected"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _send_to_target(
+        self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool
+    ) -> None:
+        """target(Locator, 또는 fixed=True 면 고정 노드 Playwright ElementHandle — 승인 결속·R3 고정)으로 입력을 보낸다."""
         # WS-64 R1 B1·R2 B1: 페이지를 바꾸는 **모든** 호출 바로 앞에 공통 관문(_manual_guard) — 앞선 await(민감 칸 판정·
         # clear·글자 사이) 동안 페이지가 목록 사이트로 바뀌었을 수 있다. 관문과 그 호출 사이에는 await 가 없다.
         guard = self._manual_guard
@@ -2887,9 +2946,13 @@ class ActionDispatcher:
                 # R2 B1: 목록이 있으면 포커스·글자마다 재판정(글자 사이에 목록 사이트로 바뀌면 남은 글자를 보내지 않음).
                 # Playwright type 과 같은 입력(포커스 + 키보드 type) — 프레임 안이어도 키보드는 최상위 Page 의 것.
                 await guard(action, params)
-                await (target.focus() if pin is not None else target.focus(timeout=5000))
+                await (target.focus() if fixed else target.focus(timeout=5000))
                 keyboard = self._top_page().keyboard
                 for ch in text:
+                    if fixed and not await self._node_connected(target):
+                        # R3 B1: 앞 글자 사이 고정 노드가 떨어졌다(문서 교체) — 남은 글자를 새 문서의 포커스로 보내지 않는다.
+                        # 관문보다 앞에 둔다(관문과 키 사이에는 await 를 두지 않는다 — R2 B1).
+                        raise RuntimeError("Element is not attached to the DOM")
                     await guard(action, params)
                     await keyboard.type(ch)
             else:

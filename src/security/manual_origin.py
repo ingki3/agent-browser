@@ -7,10 +7,13 @@ CDP `Page.getFrameTree` 의 frame.securityOrigin(튜플 출처일 때) 1순위, 
 securityOrigin 은 '://' 이고 격리 world self.origin 이 상속 출처(목록 출처)를 준다. sandbox·blob:null 은 'null'(불투명).
 
 B3: 불투명 문서는 출처로 판정할 수 없다 — 탭·프레임 문서가 **생길 때** 이력을 적어 두고 끝까지 유지한다.
-* 팝업: 생성 순간 opener 탭의 이력 전체(그 탭 프레임들이 거친 출처 ∪ 그 탭이 물려받은 이력 ∪ 프레임 문서 이력) 를
-  물려받는다 — 어느 프레임이 열었는지 모르고, opener 의 이동 이벤트가 팝업 이벤트보다 먼저 올 수 있어(경합) 보수적으로.
-* 프레임 문서: 튜플 출처가 아닌 주소로 이동한 순간 그 탭의 프레임 출처들(직전 주소 포함)을 적는다. 호출자는 여기에
-  부모 프레임 사슬(지금)을 함께 본다.
+* 팝업(R3 B2): **생성 시점에 opener 탭에서 살아 있던 문서들**의 lineage 만 물려받는다(전체 방문 이력 상속 없음). 생성
+  순간은 opener 탭의 별도 CDP 세션 Page.windowOpen 으로 안다 — 같은 세션의 이동 이벤트와 순서가 보장되므로, opener 의
+  이동 이벤트가 팝업 이벤트보다 먼저 와도(경합) 그 순간의 문서를 적어 둔다. 기록이 없으면(판별 불가 — 세션 준비 전·다른
+  프로세스 프레임) 지금 문서 + 각 프레임의 직전 1개 문서까지만 보수 상속. 물려받은 lineage 는 팝업 문서에 남는다(opener
+  이동·닫힘 뒤에도).
+* 프레임 문서: 튜플 출처가 아닌 주소로 이동한 순간 그 탭에서 살아 있던 문서들(그 프레임의 직전 문서 포함)의 lineage 를
+  적는다. 호출자는 여기에 부모 프레임 사슬(지금)을 함께 본다.
 * 감시 설치 전부터 있던 탭은 브라우저가 opener 없음을 확인하고 탭 이동 기록(Page.getNavigationHistory)을 읽어야 앎 —
   opener 가 있던 탭·확인하지 못한 탭은 이력 모름 → 불투명 문서는 차단.
 """
@@ -51,7 +54,16 @@ def tuple_origin(url: Any) -> Optional[str]:
 
 
 class TabLineage:
-    """한 탭(Page)의 생성 이력. known=False 면 이력 모름(불투명 문서는 차단)."""
+    """한 탭(Page)의 생성 이력. known=False 면 이력 모름(불투명 문서는 차단).
+
+    R3 B2: 문서 lineage 는 **그 문서가 생길 때 이 탭에서 살아 있던 문서들**만(전체 방문 이력이 아니다). 튜플 출처 문서의
+    lineage 는 그 출처, 불투명 문서는 생길 때 적은 집합(docs). 팝업은 생성 순간(opener 세션 Page.windowOpen — 같은 세션의
+    이동 이벤트와 순서 보장) 적어 둔 살아 있는 문서를 물려받고, 그 기록이 없을 때(판별 불가 경합)만 지금 문서 + 각 프레임의
+    직전 1개 문서(떨어진 프레임은 가장 최근 1개)까지 보수 상속.
+    """
+
+    #: 생성 기록(Page.windowOpen) 보관 상한 — 넘치면 오래된 것부터 버린다(버려지면 그 팝업은 판별 불가 → 보수 상속).
+    OPEN_LIMIT = 16
 
     def __init__(self, known: bool, inherited: Iterable[str] = ()) -> None:
         self.known = known
@@ -59,51 +71,102 @@ class TabLineage:
         self.history: Set[str] = set()
         self.docs: "weakref.WeakKeyDictionary[Any, Set[str]]" = weakref.WeakKeyDictionary()
         self.last: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
-        #: opener 없음 확인(Target.getTargetInfo) 대기 — 끝나기 전 조회는 기다리거나 모름.
+        #: 프레임별 직전 1개 문서의 lineage(판별 불가 경합 때만 쓴다).
+        self.prev: "weakref.WeakKeyDictionary[Any, Set[str]]" = weakref.WeakKeyDictionary()
+        #: 가장 최근에 떨어진 프레임 문서의 lineage(판별 불가 경합 때만).
+        self.gone: Set[str] = set()
+        #: 생성 기록: (팝업 주소, 그 순간 살아 있던 문서들의 lineage). opener 세션 Page.windowOpen 이 채운다.
+        self.opens: List[Any] = []
+        #: opener 확인(Target.getTargetInfo) 대기 — 끝나기 전 조회는 기다리거나 모름.
         self.pending: Optional["asyncio.Future[Any]"] = None
+        #: Page.windowOpen 감시 세션(살아 있는 동안 유지).
+        self.open_session: Any = None
 
     def current(self) -> Set[str]:
         return {o for o in (tuple_origin(u) for u in list(self.last.values())) if o}
 
-    def see(self, frame: Any) -> None:
-        """프레임 이동(framenavigated) — 튜플 출처는 이력에, 아니면 그 순간 탭의 프레임 출처들을 그 문서 이력으로."""
+    def _doc_lineage(self, key: Any, url: Any) -> Set[str]:
+        """살아 있는 한 문서의 lineage — 튜플 출처면 그 출처, 불투명이면 생길 때 적은 집합(기록 없으면 전부·보수)."""
+        origin = tuple_origin(url)
+        if origin:
+            return {origin}
+        doc = self.docs.get(key)
+        return set(doc) if doc is not None else self.snapshot()
+
+    def live(self) -> Set[str]:
+        """지금 이 탭에서 살아 있는 문서들의 lineage 합집합."""
+        out: Set[str] = set()
+        for key, url in list(self.last.items()):
+            out |= self._doc_lineage(key, url)
+        return out
+
+    def see(self, frame: Any, base: Iterable[str] = ()) -> None:
+        """프레임 이동(framenavigated) — 불투명 문서면 그 순간 살아 있던 문서들(이 프레임의 직전 문서 포함)을 그 문서
+        lineage 로. base: 탭이 생길 때의 첫 문서가 물려받은 이력(팝업)."""
         try:
             url = str(getattr(frame, "url", "") or "")
             key = impl(frame)
+            if key in self.last:
+                self.prev[key] = self._doc_lineage(key, self.last.get(key))
             origin = tuple_origin(url)
             if origin:
                 self.history.add(origin)
                 self.docs.pop(key, None)
             else:
-                snap = self.current()
-                prev = tuple_origin(self.last.get(key, ""))
-                if prev:
-                    snap.add(prev)
-                self.docs[key] = snap
+                self.docs[key] = self.live() | set(base)
             self.last[key] = url
         except Exception:  # noqa: BLE001 — 기록 실패: 이력을 믿지 않게
             self.known = False
 
     def forget(self, frame: Any) -> None:
-        """떨어진 프레임(framedetached)은 '지금 탭의 프레임 출처'에서 뺀다(이력 history 에는 남는다)."""
+        """떨어진 프레임(framedetached)은 살아 있는 문서에서 뺀다(가장 최근 1개는 판별 불가 경합용으로 gone 에)."""
         try:
             key = impl(frame)
+            if key in self.last:
+                self.gone = self._doc_lineage(key, self.last.get(key))
             self.last.pop(key, None)
             self.docs.pop(key, None)
+            self.prev.pop(key, None)
         except TypeError:
             pass
 
+    def note_open(self, url: Any) -> None:
+        """opener 세션 Page.windowOpen(생성 순간): 그때 살아 있던 문서들의 lineage 를 적는다."""
+        try:
+            self.opens.append((str(url or ""), self.live()))
+            del self.opens[:-self.OPEN_LIMIT]
+        except Exception:  # noqa: BLE001 — 못 적음: 그 팝업은 판별 불가(보수 상속)
+            pass
+
+    def creation(self, url: Any) -> Set[str]:
+        """이 탭이 연 팝업(주소 url)이 물려받을 이력. 생성 기록이 맞으면 그 순간의 문서들, 아니면(판별 불가) 지금 문서 +
+        직전 1개 문서 + 남은 생성 기록 전부(보수)."""
+        text = str(url or "")
+        matched = [e for e in self.opens if e[0] == text and text]
+        if matched:
+            self.opens = [e for e in self.opens if e not in matched]
+            out: Set[str] = set()
+            for _, lineage in matched:
+                out |= lineage
+            return out
+        out = self.live() | set(self.gone)
+        for doc in list(self.prev.values()):
+            out |= doc
+        for _, lineage in self.opens:
+            out |= lineage
+        return out
+
     def snapshot(self) -> Set[str]:
-        """이 탭이 연 팝업이 물려받을 이력(보수적으로 전부)."""
+        """보수 상위집합(기록 없는 문서·판정 보조용): 이 탭이 거친 모든 출처 ∪ 물려받은 이력 ∪ 문서 기록."""
         out = set(self.history) | set(self.inherited) | self.current()
         for doc in list(self.docs.values()):
             out |= doc
         return out
 
     def of_document(self, frame_key: Any) -> Set[str]:
-        """그 프레임 문서의 이력 ∪ 물려받은 이력. 문서 기록이 없으면(초기 문서) 탭 이력 전체(상위집합)."""
+        """그 프레임 문서의 lineage. 문서 기록이 없으면 보수 상위집합(snapshot)."""
         doc = self.docs.get(frame_key) if frame_key is not None else None
-        return set(self.inherited) | (set(doc) if doc is not None else self.snapshot())
+        return set(doc) if doc is not None else self.snapshot()
 
 
 _LINEAGE: "weakref.WeakKeyDictionary[Any, TabLineage]" = weakref.WeakKeyDictionary()
@@ -128,13 +191,34 @@ def _track(page: Any, known: bool, inherited: Iterable[str] = ()) -> Optional[Ta
     except TypeError:  # weakref 불가 객체: 기록 없음(이력 모름)
         return None
     for frame in list(getattr(page, "frames", []) or []):
-        rec.see(frame)
+        rec.see(frame, base=rec.inherited)
     try:
         page.on("framenavigated", rec.see)
         page.on("framedetached", rec.forget)
     except Exception:  # noqa: BLE001 — 이동을 볼 수 없으면 이력을 믿지 않는다
         rec.known = False
+    try:
+        asyncio.ensure_future(_watch_opens(page, rec))
+    except Exception:  # noqa: BLE001 — 이벤트 루프 없음: 생성 기록 없음(팝업은 보수 상속)
+        pass
     return rec
+
+
+async def _watch_opens(page: Any, rec: TabLineage) -> None:
+    """R3 B2: 이 탭의 팝업 생성 순간(Page.windowOpen)을 적는 CDP 세션. 같은 세션의 이벤트 순서가 보장되므로 그 순간의
+    살아 있는 문서를 안다. 실패(가짜 페이지·닫힌 탭)는 조용히 — 생성 기록이 없으면 팝업은 보수 상속."""
+    session = None
+    try:
+        session = await page.context.new_cdp_session(page)
+        session.on("Page.windowOpen", lambda ev: rec.note_open((ev or {}).get("url")))
+        await session.send("Page.enable")
+        rec.open_session = session
+    except Exception:  # noqa: BLE001
+        if session is not None:
+            try:
+                await session.detach()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _confirm_no_opener(page: Any, rec: TabLineage, replay_history: bool = False) -> None:
@@ -184,7 +268,8 @@ def on_new_page(page: Any) -> None:
             _track(page, known=False)
             return
         waiting = parent.pending is not None and not parent.pending.done()
-        rec = _track(page, known=parent.known and not waiting, inherited=parent.snapshot())
+        # R3 B2: 생성 순간 opener 탭에서 살아 있던 문서들만(전체 방문 이력 아님).
+        rec = _track(page, known=parent.known and not waiting, inherited=parent.creation(getattr(page, "url", "")))
         if rec is not None and waiting:
             # opener 의 '모름→앎' 확인이 아직이면 그 결과를 따른다.
             rec.pending = asyncio.ensure_future(_follow(parent, rec))
@@ -385,4 +470,4 @@ class OriginProbe:
             key = impl(frame)
             return rec.of_document(key)
         except TypeError:
-            return rec.snapshot() | set(rec.inherited)
+            return rec.snapshot()

@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from contracts import ActionType
+from contracts import ActionType, ErrorCode
 
 from test_run_cli import requires_chromium  # noqa: F401
 from test_ws64_manual_server import _call, _eid, _epoch, _goto_observe, _server
@@ -111,7 +111,10 @@ async def test_clear_rechecks_origin_after_sensitive_field_await(tmp_path, mock,
             assert _reason(r) == "manual_site"
             assert state["value"] == "PreserveLocalValue" and state["events"] == 0, state
         else:
-            assert r.success and state["value"] == "SyntheticNewValue" and state["events"] > 0, state
+            # R3 B1: 목록이 있으면 입력은 관문을 통과한 문서의 고정 노드로만 — 문서가 바뀌었으니(목록 밖이어도) 새 문서에는
+            # 보내지 않고 '대상 바뀜'(재관찰). 목록 사이트 거부(manual_site)는 아니다(과잉 거부 대조).
+            assert _reason(r) != "manual_site" and r.error_code is ErrorCode.TOCTOU_MISMATCH, r.error_message
+            assert r.reobserve_required and state["value"] == "PreserveLocalValue" and state["events"] == 0, state
     finally:
         await srv.close()
 
