@@ -295,7 +295,7 @@ CHALLENGE_CHECK_ACTIONS = frozenset({
 CHALLENGE_NOTE = (
     " 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다"
     "(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태)"
-    " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오."
+    " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고)."
 )
 
 

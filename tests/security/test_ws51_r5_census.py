@@ -91,6 +91,7 @@ REVIEWED = {
     ("kind", "interface/on_demand.py", "str(challenge.get('kind') or '')"): "ChallengeKind",
     ("kind", "interface/run_cli.py", "challenge.kind.value"): "ChallengeKind",
     ("kind", "interface/server_signals.py", "found.kind.value"): "ChallengeKind",
+    ("reason", "interface/server_signals.py", "kind"): "ChallengeKind (WS-63 C data.handoff.reason = challenge kind)",
     ("kind", "llm/budget.py", "kind"): NOT_OUT,
     ("mode", "harness/tier2_som.py", "args.mode"): NOT_OUT,
     ("mode", "harness/tier2_som.py", "mode"): NOT_OUT,

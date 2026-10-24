@@ -25,7 +25,7 @@
 - **반복 묶음 대상 구분** — 두 달 달력의 같은 날짜·상품 행의 같은 '담기'처럼 같은 틀이 반복되면 관찰에 묶음 표제·위치(`data.repeated`)를 붙이고, 관찰 뒤 묶음(달)이 바뀐 대상은 누르지 않습니다. → [기능](docs/features.md#반복-묶음-대상-구분-datarepeated-ws-62)
 - **PDF 읽기·YouTube 영상 검색** — PDF 본문을 `data.document` 로, YouTube 검색을 공식 Data API v3 로. → [기능](docs/features.md)
 - **Egress 가드·출력 비밀 가림** — 검증 프록시로 사설망·메타데이터를 막고, 응답 주소·문장 속 비밀 값을 `[REDACTED]` 로 가립니다. → [보안](docs/security.md)
-- **우회하지 않습니다** — 캡차 자동 풀이·확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다. 막히면 사람에게 넘깁니다.
+- **우회하지 않습니다** — 캡차 자동 풀이·확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다. 막히면 사람에게 넘깁니다 — 보안 확인·차단 화면이면 결과의 `data.handoff` 가 사람 인계 절차(동의 → `browser_control_request` → `browser_control_wait` → 다시 읽기, 창 없는 serve 면 링크 직접 열기 안내)를 알려 주며 창을 자동으로 열거나 재시도하지 않습니다. → [차단 시 흐름](docs/signals.md#차단캡차-신호)
 
 ---
 
@@ -98,7 +98,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-6875개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+6906개가 통과해야 합니다(7개 건너뜀, 4개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](docs/llm-agent.md)를 보십시오.
 

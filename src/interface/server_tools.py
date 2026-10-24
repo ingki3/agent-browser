@@ -242,6 +242,10 @@ class ToolsMixin:
                 await self._attach_robots(result)
             if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
                 await self._attach_block_hint(result)
+            # WS-63 C R2: 최종 응답 기준 — robots 금지가 실렸으면 인계 안내를 뺀다(부착 순서 무관).
+            from interface.server_signals import settle_handoff
+
+            settle_handoff(result.data)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를

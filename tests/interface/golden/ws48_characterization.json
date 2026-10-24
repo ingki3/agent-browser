@@ -967,6 +967,17 @@
      "reason": "Cloudflare 브라우저 확인 화면",
      "vendor": "cloudflare"
     },
+    "handoff": {
+     "available": false,
+     "reason": "captcha",
+     "steps": [
+      "이 서버에는 사람이 볼 창이 없어 인계할 수 없습니다 — 우회하지 마세요.",
+      "사용자에게 이 링크를 직접 열어 확인하도록 안내하세요."
+     ],
+     "suggested": true,
+     "tool": "browser_control_request"
+    },
+    "hint": "보안 확인/차단 — 우회하지 않음. data.handoff 참고",
     "last_http_status": 403,
     "latency_ms": "<ms>",
     "retry_skipped": {
@@ -1619,7 +1630,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {
@@ -2116,7 +2127,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {
@@ -3006,7 +3017,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {
