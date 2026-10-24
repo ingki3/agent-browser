@@ -792,7 +792,8 @@ async def test_changed_omitted_when_pin_at_limit_and_pii_masked_end_to_end():
     assert len(h.group_heading) >= 1000
     assert res.error_code is ErrorCode.TOCTOU_MISMATCH and "changed" not in res.data["group_changed"], res.data
     pii = _limit_html(True).replace("안내 " + "가나다라마바사 " * 160, "문의 010-1234-5678")
-    res, h = await flow(pii, "document.querySelector('.inr p').textContent = '문의 010-9999-0000'")
+    # R13: 차이가 PII 안에만 있으면 마스킹 뒤 앞/뒤가 같아 그 쌍은 생략된다 — 보이는 글자도 함께 바꾼다.
+    res, h = await flow(pii, "document.querySelector('.inr p').textContent = '안내 바뀜 010-9999-0000'")
     blob = json.dumps(res.data["group_changed"]["changed"], ensure_ascii=False)
     assert res.error_code is ErrorCode.TOCTOU_MISMATCH and res.data["group_changed"]["changed"]["text"], blob
     assert "010-1234-5678" not in blob and "010-9999-0000" not in blob, blob
