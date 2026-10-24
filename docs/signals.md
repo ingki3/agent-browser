@@ -15,6 +15,8 @@
 
 agent-browser는 **캡차 자동 풀이·Cloudflare/Akamai 등의 확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다.** `challenge`가 `null`이 아니면 부르는 에이전트가 사람에게 넘길지 판단하십시오.
 
+**차단 시 흐름 — 사람 인계 안내(`data.handoff`, WS-63).** 보안 업체 차단·확인 화면(Cloudflare·Akamai·캡차 위젯·네이버 보안 확인 등)으로 판정된 응답에는 `data.handoff = {"suggested": true, "reason": "<challenge kind>", "tool": "browser_control_request", "available": <bool>, "steps": [...]}`가 붙고 `data.hint` 끝에 "보안 확인/차단 — 우회하지 않음. data.handoff 참고"가 한 번 덧붙습니다. `available`은 이 serve가 조작권 인계를 지원하는지(사람이 볼 창이 있는 `human`·`on-demand`·`user-chrome`)입니다. `true`면 사용자에게 사이트가 자동 브라우저를 막았다고 알리고 동의를 받은 뒤 `browser_control_request`(reason에 사이트·목적) → `browser_control_wait` → 사람이 창에서 직접 확인을 통과하고 release하면 같은 탭을 다시 관찰·추출합니다. `false`(창 없는 serve)면 우회하지 말고 사용자에게 링크를 직접 열어 확인하도록 안내합니다. 도구는 **창을 자동으로 열거나 재시도하지 않습니다** — 사람이 요청하기 전까지 headless 그대로입니다. 문장은 고정이고 페이지 글자는 싣지 않습니다(IPI 검사 제외 키). 상태 코드+짧은 본문만으로 잡은 일반 거부(`vendor: generic`, 이유 `HTTP …`)·401·429·robots 금지에는 붙지 않습니다(각자 기존 안내). 인계 절차는 [human-handoff.md](human-handoff.md).
+
 403의 짧은 차단 본문이나 401 응답이
 robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 필요를 알립니다(401 자체는 `challenge`가 아님). 429는 속도 제한 안내와
 `Retry-After`(있으면 상한 128자의 안전한 텍스트)를 돌려주며 자동 재요청하지 않습니다.

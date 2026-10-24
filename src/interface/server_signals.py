@@ -25,6 +25,41 @@ UNOBSERVED_HINT = (
     "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
 )
 
+#: WS-63 C: 보안 업체 차단·확인 화면 → 사람 인계 **안내만**(창을 열거나 재시도하지 않는다). 고정 문장만 —
+#: 페이지 글자는 싣지 않는다(IPI 스캔 제외 키 `handoff`).
+HANDOFF_TOOL = "browser_control_request"
+HANDOFF_HINT = "보안 확인/차단 — 우회하지 않음. data.handoff 참고"
+HANDOFF_STEPS_AVAILABLE = (
+    "사용자에게 이 사이트가 자동 브라우저를 막았다고 알리고, 사람이 창에서 직접 확인을 통과해 줄지 동의를 받으세요.",
+    "동의하면 browser_control_request(reason 에 사이트와 목적) → browser_control_wait 로 사람의 반납을 기다리세요.",
+    "사람이 release 하면 같은 탭을 browser_observe_page·browser_extract 로 다시 읽으세요.",
+)
+HANDOFF_STEPS_UNAVAILABLE = (
+    "이 서버에는 사람이 볼 창이 없어 인계할 수 없습니다 — 우회하지 마세요.",
+    "사용자에게 이 링크를 직접 열어 확인하도록 안내하세요.",
+)
+#: 각자 기존 안내가 있는 상태(401 로그인·429 속도 제한) — 인계 안내를 붙이지 않는다.
+_HANDOFF_EXCLUDED_STATUSES = frozenset({401, 429})
+
+
+def challenge_handoff(challenge: Optional[Dict[str, Any]], last_status: Optional[int], *,
+                      available: bool) -> Optional[Dict[str, Any]]:
+    """차단·확인 화면 판정(data.challenge)이면 구조화된 사람 인계 안내, 아니면 None.
+
+    상태 코드 + 짧은 본문만으로 잡은 일반 거부(vendor generic, 이유 "HTTP …")는 헤드리스 이름 재시도·robots
+    안내가 맡으므로 제외한다. available = 이 serve 가 조작권 인계(사람이 볼 창)를 지원하는가.
+    """
+    if not isinstance(challenge, dict) or last_status in _HANDOFF_EXCLUDED_STATUSES:
+        return None
+    kind = str(challenge.get("kind") or "")
+    if kind not in ("captcha", "blocked"):
+        return None
+    if challenge.get("vendor") == "generic" and str(challenge.get("reason") or "").startswith("HTTP "):
+        return None
+    steps = HANDOFF_STEPS_AVAILABLE if available else HANDOFF_STEPS_UNAVAILABLE
+    return {"suggested": True, "reason": kind, "tool": HANDOFF_TOOL, "available": bool(available),
+            "steps": list(steps)}
+
 
 @dataclass
 class _PageObservation:
@@ -537,3 +572,10 @@ class SignalsMixin:
                              "headless 에서 다시 차단/캡차 — 다음 조작권 요청 때 창을 열고 유지합니다")
             if self._window.sticky_pending is not None:
                 result.data.setdefault("window", dict(self._window.info(), hint=STICKY_PENDING_HINT))
+        # WS-63 C: 사람 인계 안내만 — 창을 열거나 재시도하지 않는다. 한 응답에 한 번(기존 값 유지).
+        handoff = challenge_handoff(challenge, last_status, available=self._human_can_see())
+        if handoff is not None and "handoff" not in result.data:
+            result.data["handoff"] = handoff
+            hint = str(result.data.get("hint") or "")
+            if HANDOFF_HINT not in hint:
+                result.data["hint"] = (hint + " " + HANDOFF_HINT).strip()
