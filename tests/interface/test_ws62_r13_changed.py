@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -44,7 +45,7 @@ def _strings(ch: Optional[Dict[str, Any]]) -> List[str]:
 
 
 def _assert_shape(ch: Optional[Dict[str, Any]]) -> None:
-    """모든 표시 조각: ≤80자, 앞/뒤가 다름, 짝 없는 서로게이트 없음(UTF-8 로 인코딩 가능)."""
+    """모든 표시 조각: ≤80자, 앞/뒤가 다름, 짝 없는 서로게이트 없음(UTF-8 로 인코딩 가능), 숫자 성격 글자 0(R15 — NFKC 전후)."""
     if not ch:
         return
     pairs = list(ch.get("text", [])) + ([ch["items"]] if "items" in ch else [])
@@ -53,6 +54,8 @@ def _assert_shape(ch: Optional[Dict[str, Any]]) -> None:
         for s in (p["before"], p["after"]):
             assert len(s) <= LIMIT, (len(s), s)
             s.encode("utf-8")
+            assert not [c for t in (s, unicodedata.normalize("NFKC", s)) for c in t
+                        if unicodedata.category(c)[0] == "N"], s
 
 
 # ------------------------------------------------------------------ 실제 DOM → MCP call_tool → 공개 봉투(검증 재현 편입)
@@ -110,11 +113,11 @@ async def test_mcp_items_pii_is_masked_before_window(sequence_site, tmp_path):
 
 @requires_chromium
 async def test_mcp_items_long_common_prefix_keeps_actual_difference(sequence_site, tmp_path):
-    """B2 재현: 공통 접두어 90자 뒤 12월→1월 — before≠after, 차이 글자가 창 안에, 앞은 '…'."""
+    """B2 재현: 공통 접두어 90자 뒤 12월→1월 — before≠after, 차이 글자가 창 안에, 앞은 '…'. R15: 숫자는 '#'('##월'→'#월')."""
     ch = await _mcp_refusal(sequence_site, tmp_path, "long")
     items = ch["items"]
     assert items["before"] != items["after"], ch
-    assert "12월" in items["before"] and "1월" in items["after"] and "12월" not in items["after"], items
+    assert "##월" in items["before"] and "#월" in items["after"] and "##월" not in items["after"], items
     assert items["before"].startswith("…") and items["after"].startswith("…"), items
     _assert_shape(ch)
 
@@ -231,8 +234,8 @@ def test_mask_failure_omits_items(monkeypatch):
 def test_items_common_prefix_window(n):
     ch = _parts(_pin([], ["t:" + "가" * n + "12월", "t:요일", "t:좌석"]), _pin([], ["t:" + "가" * n + "1월", "t:요일", "t:좌석"]))
     it = ch["items"]
-    assert "12월" in it["before"] and "1월 요일" in it["after"], it
-    assert it["before"].startswith("…") == (n + 1 > 20) == it["after"].startswith("…"), it  # 공통 접두 = n + "1"
+    assert "##월" in it["before"] and "#월 요일" in it["after"], it
+    assert it["before"].startswith("…") == (n + 1 > 20) == it["after"].startswith("…"), it  # 공통 접두 = n + "#"
     _assert_shape(ch)
 
 
@@ -240,7 +243,7 @@ def test_items_common_prefix_window(n):
 def test_outer_common_prefix_window(n):
     ch = _parts(_pin(["L:" + "가" * n + "12월 안내"], ["i:1"]), _pin(["L:" + "가" * n + "1월 안내"], ["i:1"]))
     (p,) = ch["text"]
-    assert "12월" in p["before"] and "1월 안내" in p["after"], p
+    assert "##월" in p["before"] and "#월 안내" in p["after"], p
     _assert_shape(ch)
 
 
@@ -284,6 +287,6 @@ def test_hangul_emoji_boundaries(unit, n):
         b, a = pre + "12월" + unit * 5, pre + "1월" + unit * 5
         ch = _parts(_pin([b], ["i:1"]), _pin([a], ["i:1"])) if outer else _parts(_pin([], ["t:" + b]), _pin([], ["t:" + a]))
         p = ch["text"][0] if outer else ch["items"]
-        assert "12월" in p["before"] and "1월" in p["after"] and "12월" not in p["after"], p
+        assert "##월" in p["before"] and "#월" in p["after"] and "##월" not in p["after"], p
         _assert_shape(ch)
         json.dumps(ch, ensure_ascii=False).encode("utf-8")

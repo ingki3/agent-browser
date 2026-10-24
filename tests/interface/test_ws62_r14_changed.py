@@ -9,6 +9,9 @@ changed 전용 보수적 숫자 가림(표시 전용이라 과잉 가림 허용)
 재현 4건은 검증 evidence/test_blocking_repros.py(실제 DOM → MCP call_tool → 공개 봉투)를 옮겼다. 경계 퍼즈는 검증
 evidence/boundary_fuzz.py·fuzz_changed.py 방식(5형태·항목 2~5·8변형·간격 0~80)을 표본 그대로 직접 함수로, DOM 은 축소 표본으로.
 모든 번호는 합성값이다.
+
+R15(사용자 결정 A): 숫자 사슬 가림·잔여 4자리 생략·단위 예외는 changed 숫자 전부 '#' 로 대체됐다 — 오라클 `_leak` 은 숫자 성격 글자
+하나라도 노출로 본다. 규칙 단위 시험(사슬 가림·달력 숫자 보임·짧은 숫자 보임·잔여 생략·창 끝 잔여·[REDACTED] 옆) 6개는 삭제했다.
 """
 
 from __future__ import annotations
@@ -51,10 +54,12 @@ def _tokens(kind: str, n: int, variant: str) -> List[str]:
 
 
 def _leak(ch: Any) -> tuple:
-    """독립 오라클(제품 마스킹 미사용): NFKC + 보이지 않는 글자 제거 뒤 숫자 4자리 이상 연속, 또는 이메일 로컬부 잔존."""
-    b = unicodedata.normalize("NFKC", json.dumps(ch, ensure_ascii=False))
-    b = "".join(c for c in b if unicodedata.category(c) not in ("Cf", "Cc"))
-    return bool(re.search(r"\d{4,}", b) or "audit" in b or "example.test" in b), b
+    """독립 오라클(제품 마스킹 미사용): text·items 쌍(원문·NFKC)에 숫자 성격 글자(범주 N*)가 하나라도(R15), 또는 이메일 로컬부 잔존."""
+    pairs = ((ch or {}).get("text") or []) + ([ch["items"]] if (ch or {}).get("items") else [])
+    shown = " ".join(p[k] for p in pairs for k in ("before", "after"))
+    b = unicodedata.normalize("NFKC", shown)
+    num = any(unicodedata.category(c)[0] == "N" for c in shown + b)
+    return bool(num or "audit" in b or "example.test" in b), b
 
 
 def _pin(outer: List[str], seq: List[str], k: int = 0) -> str:
@@ -247,18 +252,16 @@ def test_direct_window_boundary_fuzz_zero_exposure(kind, path, side):
 
 
 def test_fullwidth_phone_masked_via_nfkc_view():
-    """전각 전화 '０１０ ７３９４ ８２６１' — NFKC 검사 뷰에서 가려지고, 표시도 정규화 글자 기준(전각 숫자가 남지 않음)."""
+    """전각 전화 '０１０ ７３９４ ８２６１' — 표시는 정규화 글자 기준이고 숫자는 전부 '#'(R15). 전각 구분자·전각 글자도 정규화."""
     ch = _parts(_pin(["문의 ０１０ ７３９４ ８２６１ 이전"], ["i:1"]), _pin(["문의 ０１０ ７３９４ ８２６１ 이후"], ["i:1"]))
     (p,) = ch["text"]
-    assert "[REDACTED]" in p["before"] and p["before"].endswith("이전") and p["after"].endswith("이후"), p
-    assert not re.search(r"[０-９]", p["before"] + p["after"]), p
+    assert p["before"] == "문의 ### #### #### 이전" and p["after"] == "문의 ### #### #### 이후", p
     assert not _leak(ch)[0], ch
-    # 전각 구분자(／．－)로 이은 전각 번호 + 전각 글자 — 정규화 뷰에서만 한 사슬로 이어져 가려지고, 표시도 정규화 글자('ABC').
     for sep in ("／", "．", "－", "："):
         num = sep.join(["０１０", "７３９４", "８２６１"])
         ch = _parts(_pin([], ["t:ＡＢＣ", "t:" + num, "t:이전"]), _pin([], ["t:ＡＢＣ", "t:" + num, "t:이후"]))
         it = (ch or {}).get("items")
-        assert it and it["before"] == "ABC [REDACTED] 이전" and it["after"] == "ABC [REDACTED] 이후", (sep, ch)
+        assert it and it["before"].startswith("ABC ") and it["before"].endswith(" 이전") and not _leak(ch)[0], (sep, ch)
 
 
 def test_fullwidth_email_masked_via_nfkc_view():
@@ -267,70 +270,6 @@ def test_fullwidth_email_masked_via_nfkc_view():
                 _pin(["문의 ａｕｄｉｔ＠ｅｘａｍｐｌｅ．ｔｅｓｔ 이후"], ["i:1"]))
     blob = unicodedata.normalize("NFKC", json.dumps(ch, ensure_ascii=False))
     assert "audit" not in blob and "example" not in blob, blob
-
-
-@pytest.mark.parametrize("items", [
-    ["계좌", "110", "347928", "615"],
-    ["110-347-928615"],
-    ["110 / 347928 / 615"],
-    ["123-45-67890"],                # 사업자번호
-    ["010/", "7394/", "8261"],
-    ["4532", "0151", "1283", "0366"],
-    ["900101·1234567"],
-    ["010_7394_8261"],
-    ["010:7394:8261"],
-    ["010,7394,8261"],
-    ["010 - 7394 -- 8261"],
-])
-def test_digit_chain_six_or_more_is_redacted(items):
-    """숫자 사이 구분자(빈칸·/·-·.·'·'·_·,·: 반복·조합, 항목 경계 포함)만 있는 사슬은 숫자 합 6자리 이상이면 통째로 가린다."""
-    ch = _parts(_pin([], ["t:" + x for x in items + ["이전"]]), _pin([], ["t:" + x for x in items + ["이후"]]))
-    it = ch["items"]
-    assert "[REDACTED]" in it["before"] and it["before"].endswith("이전") and it["after"].endswith("이후"), it
-    assert not re.search(r"\d", it["before"] + it["after"]), it
-
-
-def test_hanatour_like_calendar_sequence_stays_visible():
-    """하나투어 달력 순서열('19 148만 20 127만 …') — 숫자 사이 비숫자 낱말이 사슬을 끊어 계속 보인다(기능 유지)."""
-    before = "일 월 화 수 목 금 토 19 148만 20 127만 21 133만 22 101만최저가".split()
-    after = "일 월 화 수 목 금 토 19 139만 20 107만 21 120만 22 114만".split()
-    ch = _parts(_pin([], ["t:" + x for x in before]), _pin([], ["t:" + x for x in after]))
-    it = ch["items"]
-    assert "148만" in it["before"] and "139만" in it["after"] and "[REDACTED]" not in it["before"] + it["after"], it
-
-
-def test_short_numbers_split_by_words_not_chained():
-    """5자리 이하 사슬·비숫자 사이 낱말은 가리지 않는다(과잉 가림이 기능을 지우지 않게)."""
-    ch = _parts(_pin(["10월 3일 12,500원 이전"], ["i:1"]), _pin(["10월 3일 12,500원 이후"], ["i:1"]))
-    (p,) = ch["text"]
-    assert p["before"] == "10월 3일 12,500원 이전" and p["after"] == "10월 3일 12,500원 이후", p
-
-
-def test_residual_four_digits_in_window_omits_pair_unit_exception_kept():
-    """잔여 검사: 창에 4~5자리 이음 숫자가 남으면 그 쌍 생략, 바로 뒤 고정 단위 글자(만·원·일…)면 예외(하나투어 '1138만')."""
-    def items(word: str) -> Optional[Dict[str, Any]]:
-        ch = _parts(_pin([], ["t:가", "t:" + word, "t:이전"]), _pin([], ["t:가", "t:" + word, "t:이후"]))
-        return (ch or {}).get("items")
-
-    assert items("1234") is None and items("12 34") is None and items("12/345") is None
-    for word in ("1138만", "12,500원", "2026년", "1234명"):
-        it = items(word)
-        assert it and word in it["before"] and it["after"].endswith("이후"), (word, it)
-
-
-def test_residual_digits_cut_by_window_end_still_omitted():
-    """창 끝에 잘려 3자리만 보이는 4자리 사슬도 사슬 전체 자릿수로 본다 — 쌍 생략."""
-    for n in range(50, 80):
-        ch = _parts(_pin([], ["t:이전" + "가" * n + " 7394 끝"]), _pin([], ["t:이후" + "가" * n + " 7394 끝"]))
-        assert not _leak(ch)[0] and not re.search(r"739", json.dumps(ch, ensure_ascii=False)), (n, ch)
-
-
-def test_digits_next_to_redacted_omitted_without_exception():
-    """[REDACTED] 바로 옆(구분자 사이 포함)의 4자리 이상은 예외 없이 생략 — 공유 규칙이 앞부분만 가린 번호."""
-    for tail in ("-9999", " 9999만", "/ 9999"):
-        ch = _parts(_pin(["문의 010-1234-5678" + tail + " 이전"], ["i:1"]), _pin(["문의 010-1234-5678" + tail + " 이후"], ["i:1"]))
-        assert not ch or not ch.get("text"), (tail, ch)
-        assert "9999" not in json.dumps(ch, ensure_ascii=False), ch
 
 
 def test_changed_parts_never_raises(monkeypatch):
@@ -349,7 +288,8 @@ def test_changed_parts_never_raises(monkeypatch):
 
 @requires_chromium
 async def test_hanatour_next_refusal_items_never_empty_5_of_5():
-    """하나투어 봇 정책 '다음달' 거부 5회(css — 무 CSS 는 거부 없이 진행) — 매번 changed.items 가 있고 앞뒤가 다르며 숫자(날짜·가격)가 보인다."""
+    """하나투어 봇 정책 '다음달' 거부 5회(css — 무 CSS 는 거부 없이 진행) — 매번 changed.items 가 있고 앞뒤가 다르다.
+    R15: 날짜·가격 숫자는 '#'(빈 칸 '_' 배치·'만'·'최저가' 가 달라 숫자만 다른 쌍이 아니다 — 생략되지 않음, 측정 5/5)."""
     from test_ws62_r12 import _hana_next_refusal
 
     for i in range(5):
@@ -358,7 +298,4 @@ async def test_hanatour_next_refusal_items_never_empty_5_of_5():
         ch = res.data["group_changed"].get("changed") or {}
         items = ch.get("items")
         assert items and items["before"] != items["after"], (i, ch)
-        assert re.search(r"\d", items["before"]) and re.search(r"\d", items["after"]), items
-        for side in (items["before"], items["after"]):  # 남은 4자리 이상은 단위가 바로 붙은 가격뿐(예: '1138만')
-            for m in re.finditer(r"\d{4,}", side):
-                assert len(m.group(0)) <= 5 and side[m.end():m.end() + 1] in set("만원일월년명개박시분"), (m.group(0), side)
+        assert "#" in items["before"] and "#" in items["after"] and not _leak(ch)[0], items

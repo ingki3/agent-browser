@@ -696,7 +696,8 @@ async def test_hanatour_next_refusal_shows_changed_items_in_data_only():
     items = ch["items"]
     assert items["before"] != items["after"] and 0 < len(items["before"]) <= 80 and 0 < len(items["after"]) <= 80
     assert "i:" not in items["before"] + items["after"] and "\x01" not in items["before"] + items["after"]
-    assert re.search(r"\d", items["before"]) and re.search(r"\d", items["after"])
+    # R15: 날짜·가격 숫자는 '#'(changed 에 숫자 성격 글자 0).
+    assert "#" in items["before"] and "#" in items["after"] and not re.search(r"\d", items["before"] + items["after"])
 
 
 @requires_chromium
@@ -731,17 +732,18 @@ def test_changed_parts_rules():
     old = _pin(["L:2026년 12월", "S:로 시작하는 정적 글자", "안내"], ["i:1", "i:2"], 3)
     new = _pin(["L:2027년 1월", "S:로 시작하는 정적 글자", "안내"], ["i:1", "i:2"], 3)
     got = changed_parts(old, new)
-    assert got == {"text": [{"before": "L:2026년 12월", "after": "L:2027년 1월"}]}
+    assert got == {"text": [{"before": "L:####년 ##월", "after": "L:####년 #월"}]}  # R15: 숫자는 '#'
     assert changed_parts(old, new.replace("#3", "#x")) is None
     assert changed_parts(old, new.replace("\nS:", "\nQ:")) is None
     assert changed_parts(old, None) is None
     long_ = _pin(["가" * PIN_LIMIT], ["i:1"], 0)[:PIN_LIMIT]
     assert changed_parts(long_, new) is None and changed_parts(old, long_) is None
     many_old = _pin([f"줄{i} " + "가" * 120 for i in range(6)], ["i:1"], 0)
-    many_new = _pin([f"줄{i} " + "가" * 119 + "나" for i in range(6)], ["i:2"], 1)
+    many_new = _pin([f"줄{i} " + "가" * 119 + "나" for i in range(6)], ["i:나"], 1)
     got = changed_parts(many_old, many_new)
     assert len(got["text"]) <= 3 and all(len(p["before"]) <= 80 and len(p["after"]) <= 80 for p in got["text"])
-    assert got["items"] == {"before": "1", "after": "2"} and got["position"] == {"before": "#0", "after": "#1"}
+    # R15: 숫자만 다른 순서열('1'→'2')은 '#' 뒤 같아 생략되므로 글자로 바꾼다. position(#k)은 페이지 글자가 아닌 순번.
+    assert got["items"] == {"before": "#", "after": "나"} and got["position"] == {"before": "#0", "after": "#1"}
 
 
 def test_changed_masks_pii_before_cut():

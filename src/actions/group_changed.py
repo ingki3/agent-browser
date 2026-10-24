@@ -18,15 +18,12 @@ R13(재검증 B1·B2):
 * 창 — 마스킹·표시 살균을 끝낸 before/after 의 **실제 첫 문자 차이**를 중심으로 앞 문맥 `_LEAD` 자 + 차이 부분, 각 80자.
   잘린 쪽은 '…'. 결과 before==after(차이가 PII 안에만 있었던 경우 등)면 그 쌍을 싣지 않는다.
 
-R14(재검증 B1 — 전각·구분자 변형·계좌 사각) — changed 전용 보수적 숫자 가림(표시 전용이라 과잉 가림 허용, 공유 마스킹은 불변):
-* 검사 뷰 — 공유 마스킹 뒤 글자를 NFKC 정규화 + 보이지 않는 글자 제거(줄바꿈은 줄 구분이라 둔다)하고 공유 마스킹을 한 번 더
-  (전각 @ 이메일·전각 번호). **표시도 이 뷰 글자 그대로** — 원문/정규화 위치를 오가지 않는다.
-* 숫자 사슬 — 숫자 덩어리 사이에 구분자(빈칸·/·-·.·'·'·_·,·: 와 유니코드 대시, 반복·조합)만 있으면 한 사슬. 숫자 합이 6자리 이상이면
-  사슬 전체를 [REDACTED](전화·카드·주민·계좌·사업자번호; 날짜·긴 가격 과잉 가림 허용). 바깥 마지막 줄과 순서열 첫 항목을
-  이은 것에서 고른다(경계 걸침). 비숫자 글자(만·원·요일 등)가 사이에 있으면 끊긴다 — 하나투어 '19 148만 20 127만' 은 남는다.
-* 잔여 — 창(보일 80자)에 걸치는 숫자 사슬이 4자리 이상(구분자 제외 이음, 창에 잘린 사슬은 전체 자릿수)이면 그 쌍 생략. 예외는 4~5자리 바로 뒤에 고정 단위 글자
-  (만·원·일·월·년·명·개·박·시·분)가 붙은 것뿐(하나투어 '1138만'). [REDACTED] 바로 옆(구분자 사이 포함)의 4자리 이상은 예외 없이
-  불확실 — 그 부분 생략(조정자 결정, R14).
+R15(R14 재검증 B1 FAIL — 단위 끼움·숫자 사이 결합문자 우회; 사용자 결정 A): changed 에 숫자를 하나도 내보내지 않는다.
+* 공유 마스킹(이메일 등 — 숫자 아닌 PII 포함) 뒤, NFKC 전 원문에서 숫자 성격(유니코드 범주 Nd·Nl·No) 글자를 '0' 으로 바꾸고
+  NFKC + 보이지 않는 글자 제거 + 숫자 바로 뒤 결합문자 제거 → 줄마다 공유 마스킹 한 번 더(전각 @ 이메일) → NFKC 뒤 숫자 성격 글자를
+  전부 '#'. 둘 중 하나라도 숫자면 '#'(NFKC 가 'Ⅻ'→'XII' 처럼 숫자를 글자로 바꾸거나 '㋀'→'1月' 처럼 숫자를 낳아도). '#' 연속은 둔다.
+* 창으로 자른 뒤에도 한 번 더 '#' 처리(살균 표기 등 어느 단계가 숫자를 들여와도). '#' 뒤 앞/뒤가 같으면 그 쌍 생략 — 숫자만
+  바뀐 쌍은 보이지 않는다(hint 의 재관찰 안내가 주 경로). R13·R14 의 숫자 사슬 가림·잔여 4자리 생략·단위 예외는 삭제했다.
 """
 
 from __future__ import annotations
@@ -48,22 +45,13 @@ _PUNCT_GAP = re.compile(r" *([@.\-]) *")
 _PLACEHOLDER = re.compile(r"(?:(?<= )|^)_(?= |$)")
 #: 번호·주소 글자 사이 빈칸(빈칸 여럿으로 쪼갠 번호·도메인) — 잔여 PII 검사에서 붙여 본다(한글 등 다른 글자 옆 빈칸은 둔다).
 _ASCII_GAP = re.compile(r"(?<=[A-Za-z0-9._%+@-])\s+(?=[A-Za-z0-9._%+@-])")
+#: 주소 글자 사이 구분자(빈칸·/·\\·_·,·:·가운뎃점류·대시류) — 구분자로 쪼갠 이메일을 잔여 검사에서 붙여 본다('.' 은 주소의 일부라 둔다).
+_JOIN_GAP = re.compile("(?<=[A-Za-z0-9_%+@.-])[\\s/\\\\_,:\u00b7\u30fb\u2027\u2022\u2010-\u2015\u2212\ufe58\ufe63\uff0d-]+"
+                       "(?=[A-Za-z0-9_%+@.-])")
 #: 잔여 PII 검사에서 지우는 보이지 않는 글자 범주.
 _HIDDEN = ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp")
-#: R14 숫자 사슬 구분자 — 빈칸·/·-·.·'·'·_·,·: 와 유니코드 대시(Pd: en/em dash·‐ 등 — NFKC 가 바꾸지 않는다)·가운뎃점류.
-_SEP_CHARS = "/\\-.\u00b7\u30fb\u2027\u2022_,:" + "".join(
-    re.escape(chr(c)) for c in range(0x2000, 0x2100) if unicodedata.category(chr(c)) == "Pd") + "\u2212\ufe58\ufe63"
-_SEP = "[\\s" + _SEP_CHARS + "]"
-#: 숫자 덩어리 사슬(구분자만 사이에 낀 숫자들). 앞뒤 구분자는 사슬에 넣지 않는다.
-_CHAIN = re.compile(r"\d+(?:" + _SEP + r"+\d+)*")
-#: 사슬 숫자 합이 이 이상이면 사슬 전체를 가린다.
-_CHAIN_DIGITS = 6
-#: 잔여 검사 — 4자리 이상 이음 숫자가 남으면 생략, 예외(4~5자리 바로 뒤 고정 단위 글자).
-_RESIDUAL_DIGITS = 4
-_UNITS = frozenset("만원일월년명개박시분")
-_REDACTED = "[REDACTED]"
-#: [REDACTED] 바로 옆(구분자 사이 포함)의 4자리 이상 숫자.
-_NEAR_MASK = re.compile(re.escape(_REDACTED) + _SEP + r"*\d{4}|\d{4}" + _SEP + "*" + re.escape(_REDACTED))
+#: R15 숫자 성격 범주 — 이 범주 글자는 changed 에 '#' 로만 나간다.
+_NUMERIC_CATS = ("Nd", "Nl", "No")
 
 
 def _split(pin: Any, limit: int) -> Optional[Dict[str, Any]]:
@@ -88,17 +76,16 @@ def _token(t: str) -> str:
 
 
 def _residual_pii(masked: str) -> bool:
-    """마스킹한 글자에 아직 PII 가 보이는가(불확실). 보이지 않는 글자·빈 항목 자리를 지우고, 줄바꿈을 빈칸으로 본 것과
-    번호·주소 글자 사이 빈칸을 지운 것(빈칸 여럿으로 쪼갠 번호) 둘 다에 같은 규칙을 다시 돌린다. 빈칸을 지운 쪽은 카드 규칙을 뺀다
-    (달력 날짜 숫자 이음이 Luhn 을 우연히 통과하는 과다 생략 방지 — 카드는 빈칸·하이픈 구분을 규칙이 직접 잡는다)."""
+    """표시 글자에 아직 숫자 아닌 PII(이메일 등)가 보이는가(불확실). 보이지 않는 글자·빈 항목 자리를 지우고, 줄바꿈을 빈칸으로 본 것·
+    주소 글자 사이 빈칸을 지운 것(빈칸 여럿으로 쪼갠 도메인)·주소 글자 사이 구분자(빈칸·/·_·,·:·대시류)를 지운 것(항목 경계·구분자로
+    쪼갠 이메일)에 공유 규칙을 다시 돌린다. 표시의 '#'(가린 숫자)는 글자 'x' 로 본다 — 숫자 든 이메일 로컬부('audit####@…')가 계속
+    이메일로 잡히고, 숫자 규칙(전화·카드·주민)은 숫자가 없어 걸지 않는다(긴 '#' 줄의 과다 생략 없음)."""
     from security.masking import mask_text
 
-    t = masked.replace("\n", " ")
+    t = masked.replace("\n", " ").replace("#", "x")
     t = "".join(ch for ch in t if unicodedata.category(ch) not in _HIDDEN)
     t = _PUNCT_GAP.sub(r"\1", " ".join(_PLACEHOLDER.sub("", t).split()))
-    if mask_text(t).hits:
-        return True
-    return bool({k for k in mask_text(_ASCII_GAP.sub("", t)).hits if k != "credit_card"})
+    return any(mask_text(v).hits for v in (t, _ASCII_GAP.sub("", t), _JOIN_GAP.sub("", t)))
 
 
 def _mask(text: str) -> str:
@@ -107,42 +94,35 @@ def _mask(text: str) -> str:
     return mask(text)
 
 
+def _is_numeric(ch: str) -> bool:
+    """숫자 성격 글자 — 그 글자 또는 그 NFKC 에 범주 Nd·Nl·No 가 있다."""
+    return unicodedata.category(ch) in _NUMERIC_CATS or any(
+        unicodedata.category(x) in _NUMERIC_CATS for x in unicodedata.normalize("NFKC", ch))
+
+
+def _premap(text: str) -> str:
+    """NFKC 전 판정: 원문의 숫자 성격 글자를 '0' 으로('Ⅻ'→'XII' 처럼 NFKC 가 숫자를 글자로 바꾸기 전에). '0' 이라 뒤의 공유
+    마스킹(숫자 든 전각 이메일 등)이 계속 맞는다 — 마지막에 '#' 가 된다."""
+    return "".join("0" if unicodedata.category(ch) in _NUMERIC_CATS else ch for ch in text)
+
+
+def _hash(text: str) -> str:
+    """숫자 성격 글자 전부 → '#'(연속 길이는 둔다)."""
+    return "".join("#" if _is_numeric(ch) else ch for ch in text)
+
+
 def _view(masked: str) -> str:
-    """R14 검사 뷰 = 표시 글자: NFKC + 보이지 않는 글자 제거(줄바꿈은 둠) + 줄마다 정리 + 공유 마스킹 한 번 더(전각 @·번호)."""
-    t = unicodedata.normalize("NFKC", masked)
-    t = "".join(ch for ch in t if ch == "\n" or unicodedata.category(ch) not in _HIDDEN)
-    return "\n".join(_mask(_norm(line)) for line in t.split("\n"))
-
-
-def _digits(chain: str) -> int:
-    return sum(ch.isdigit() for ch in chain)
-
-
-def _redact_chains(text: str) -> str:
-    """숫자 합 6자리 이상 사슬을 통째로 [REDACTED] — 사슬 안 줄바꿈 수는 둔다(바깥 줄 나눔 유지)."""
-    return _CHAIN.sub(lambda m: (_REDACTED + "\n" * m.group(0).count("\n")) if _digits(m.group(0)) >= _CHAIN_DIGITS
-                      else m.group(0), text)
-
-
-def _near_mask(text: str) -> bool:
-    """[REDACTED] 바로 옆(구분자 사이 포함)에 4자리 이상 숫자가 붙어 있는가(예외 없이 불확실 — 가린 번호의 덜 가린 끝)."""
-    return bool(_NEAR_MASK.search(text))
-
-
-def _residual_digits(text: str, start: int) -> bool:
-    """창(`start` 부터 80자)에 걸치는 숫자 사슬 중 4자리 이상 이음 숫자가 남았는가 — 창 끝에 잘려 일부만 보이는 사슬도 사슬 전체
-    자릿수로 본다. 4~5자리 바로 뒤 고정 단위 글자만 예외(하나투어 '1138만')."""
-    end = start + CHANGED_CHARS
-    for m in _CHAIN.finditer(text):
-        if m.end() <= start or m.start() >= end:
+    """표시 글자: NFKC 전 숫자 판정('0') + NFKC + 보이지 않는 글자 제거(줄바꿈은 둠) + 숫자 바로 뒤 결합문자 제거 + 줄마다 정리 +
+    공유 마스킹 한 번 더(전각 @) + 숫자 성격 글자 전부 '#'."""
+    t = unicodedata.normalize("NFKC", _premap(masked))
+    kept: List[str] = []
+    for ch in t:
+        if ch != "\n" and unicodedata.category(ch) in _HIDDEN:
             continue
-        n = _digits(m.group(0))
-        if n < _RESIDUAL_DIGITS:
-            continue
-        if n < _CHAIN_DIGITS and text[m.end():m.end() + 1] in _UNITS:
-            continue
-        return True
-    return False
+        if unicodedata.category(ch)[0] == "M" and kept and _is_numeric(kept[-1]):
+            continue  # 숫자 사이·뒤 결합문자(U+0301·U+20E3 등)는 지운다
+        kept.append(ch)
+    return _hash("\n".join(_mask(_norm(line)) for line in "".join(kept).split("\n")))
 
 
 def _escape(text: str) -> str:
@@ -162,13 +142,13 @@ def _cut(text: str, start: int) -> str:
 
 
 def _window(before: str, after: str) -> Optional[Dict[str, str]]:
-    """마스킹·살균을 끝낸 두 글자 — 실제 첫 문자 차이 앞 `_LEAD` 자부터 각 80자. 같으면 None(그 쌍 생략).
-    R14 잔여 검사에 걸려도 None(그 쌍 생략)."""
+    """마스킹·살균을 끝낸 두 글자 — 숫자 '#' 처리 뒤 실제 첫 문자 차이 앞 `_LEAD` 자부터 각 80자. 같으면 None(그 쌍 생략)."""
+    before, after = _hash(before), _hash(after)
     if before == after:
         return None
     start = _start(before, after)
     out = {"before": _cut(before, start), "after": _cut(after, start)}
-    if out["before"] == out["after"] or _residual_digits(before, start) or _residual_digits(after, start):
+    if out["before"] == out["after"]:
         return None
     return out
 
@@ -181,19 +161,15 @@ def _start(before: str, after: str) -> int:
 
 
 def _side(pin: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """한 쪽 지문 → 마스킹·검사 뷰·사슬 가림을 끝낸 바깥 줄들·순서열 이음 문자열과 각 불확실 여부. 마스킹 실패면 None."""
+    """한 쪽 지문 → 마스킹·표시 뷰('#')를 끝낸 바깥 줄들·순서열 이음 문자열과 각 불확실(숫자 아닌 잔여 PII) 여부. 마스킹 실패면 None."""
     outer_raw = "\n".join(_norm(line) for line in pin["outer"])
     seq_raw = _norm(" ".join(_token(t) for t in pin["seq"][2:].split("\x01")))
     try:
-        outer_v, seq_v = _view(_mask(outer_raw)), _view(_mask(seq_raw))
-        # 사슬은 바깥 마지막 줄과 순서열 첫 항목을 이은 것에서 고른다(경계 걸침) — 줄 수는 _redact_chains 가 둔다.
-        joint = _redact_chains(outer_v + "\n" + seq_v) if outer_raw else _redact_chains(seq_v)
-        outer, seq = (joint.rsplit("\n", 1) if outer_raw else ("", joint))
+        outer, seq = _view(_mask(outer_raw)), _view(_mask(seq_raw))
         return {"outer": outer.split("\n") if outer_raw else [], "seq": seq,
-                "outer_unsure": _residual_pii(outer) or _near_mask(outer),
-                "seq_unsure": _residual_pii(seq) or _near_mask(seq),
-                # 바깥 마지막 줄과 순서열 첫 항목에 걸친 PII — 가린 둘을 이어 다시 본다.
-                "joint_unsure": bool(outer_raw) and (_residual_pii(outer + " " + seq) or _near_mask(outer + " " + seq))}
+                "outer_unsure": _residual_pii(outer), "seq_unsure": _residual_pii(seq),
+                # 바깥 마지막 줄과 순서열 첫 항목에 걸친 PII(이메일 등) — 가린 둘을 이어 다시 본다.
+                "joint_unsure": bool(outer_raw) and _residual_pii(outer + " " + seq)}
     except Exception:  # noqa: BLE001 — 표시 전용: 마스킹이 실패하면 싣지 않는다(fail-closed)
         return None
 
