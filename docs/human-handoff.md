@@ -131,7 +131,7 @@ agent-browser handoff done                       # 사람: 표시된 단계를 �
 - **on-demand 미리 창**: 목록 사이트로 가는 `navigate`·`tab_control create` 를 **실행하기 전에** 창을 열고 서버 수명 동안 유지합니다(sticky, `data.window.notice.reason="manual_site"` — 브라우저를 다시 열어 이전 페이지 상태가 사라졌음을 함께 알림). 목록이 비면 창을 열지 않습니다.
 - **대화상자**: 사람이 볼 창이 있고 목록 사이트 프레임을 가진 탭의 alert·confirm 은 자동으로 닫지 않고 사람에게 둡니다(SRT '예매하시겠습니까?'). 그동안 그 탭의 허용 동작은 멈추지 않고 짧은 시간 안에 `E_TIMEOUT` + `data.dialog_open=true` 로 돌아옵니다 — 사람이 닫은 뒤 다시 하십시오. 창이 없거나 목록 밖 사이트는 지금처럼 자동 거절(`data.dialogs[].handled="dismissed"`)입니다.
 - **봇(텔레그램 등)에서 쓰기**: 사용자가 맥 터미널에서 `agent-browser manual-sites add <사이트>` 를 실행하면 실행 중인 serve 도 다음 동작부터 따릅니다(`--manual-site` 플래그로 넣었다면 serve 재시작). 에이전트는 막힌 응답의 `data.handoff.steps` 대로 "창에 표시한 대상을 직접 눌러 주세요"를 사용자에게 전하고 `browser_control_wait` 로 기다립니다.
-- **한계**: 허용된 `reload` 는 POST 결과 문서를 다시 보낼 수 있고, `navigate` 는 동작을 하는 GET 주소를 열 수 있습니다(읽기 보조로 허용). 팝업 자동 따라가기·opener 복귀·이름 있는 창 재사용은 WS-65 범위입니다(목록 사이트가 연 팝업은 사람이 직접 다룸 — `tab_control list`·`switch` 로 관찰은 가능).
+- **한계**: 허용된 `reload` 는 POST 결과 문서를 다시 보낼 수 있고, `navigate` 는 동작을 하는 GET 주소를 열 수 있습니다(읽기 보조로 허용). 팝업 자동 따라가기·opener 복귀·이름 있는 창 재사용은 WS-65 범위입니다(목록 사이트가 연 팝업은 사람이 직접 다룸 — `tab_control list`·`switch` 로 관찰은 가능). **위협 범위**: 목록 사이트 **자신이** 격리를 푸는 경우(목록 문서가 `document.domain` 을 완화하고 `Origin-Agent-Cluster: ?0` 을 보내 다른 문서가 자기 DOM 에 손대게 허용)는 막는 범위 밖입니다(사용자 결정 A — 매크로 방지 사이트가 스스로 매크로를 도울 이유가 없음). 이 조건에서 select 옵션 대기 중 노드 이동·ownerDocument 변조로 입력이 들어가는 경로가 확인돼 있습니다(#168).
 
 ## 로그인 유지 (`serve --profile NAME`)
 
