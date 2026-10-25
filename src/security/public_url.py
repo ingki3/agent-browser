@@ -655,12 +655,15 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "sabotage",  # harness.tier2_som(사보타주 표지)
         "captcha", "blocked",  # WS-63 C data.handoff.reason = browser.challenge.ChallengeKind
         "manual_site",  # WS-64 data.handoff.reason · window.notice.reason · 창 전환 사유 · 레시피 중단 사유
+        "load_timed_out",  # WS-69 headless_retry.SKIP_NOTES(부분 성공 navigate)
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
                               "mismatch"}),  # handoff.check_approval 사유 코드
     "kind": frozenset({"none", "captcha", "blocked",  # browser.challenge.ChallengeKind
                        "slot", "ui", "identity",  # recipes.keys 대상 종류
-                       "pdf", "positive", "negative"}),  # actions.pdf_document·browser.site_session
+                       "pdf", "positive", "negative",  # actions.pdf_document·browser.site_session
+                       # WS-69 actions.nav_failure data.nav_failure.kind(blocked 는 위 ChallengeKind 와 같은 낱말)
+                       "dns", "connect", "tls", "protocol", "timeout", "aborted", "other"}),
     "mode": frozenset({"interactive", "unattended",  # contracts.ExecutionMode
                        "on-demand",  # interface.on_demand.ON_DEMAND
                        "offline", "live", "after", "json"}),  # harness 보고 모드
@@ -679,6 +682,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                           "clicked", "page_changed", "done", "expired"}),
     # actions.dispatcher _NavWatch.aborted → data.nav_aborted (R6 — f"status_{status}" 는 _NO_DOCUMENT_STATUS 204·205)
     "nav_aborted": frozenset({"download", "request_failed", "status_204", "status_205"}),
+    # WS-69 actions.dispatcher navigate 부분 성공 data.load_state.reached(2단계 대기 전 확정된 상태)
+    "reached": frozenset({"domcontentloaded"}),
     # R7 — 리터럴 제어값 census(tests/security/test_ws51_r7_census.py, 소비자 표 독립 AST)로 드러난 키.
     "nav_frame": frozenset({"current_frame"}),  # actions.dispatcher _NavWatch (R6-B1)
     "resolved_from": frozenset({"current_frame", "root"}),  # actions.dispatcher switch_frame · server_schema 안내

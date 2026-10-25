@@ -1,4 +1,4 @@
-# 응답 신호 — 차단·캡차, 프롬프트 주입, robots.txt
+# 응답 신호 — 차단·캡차, 이동 결과, 프롬프트 주입, robots.txt
 
 [← 문서 목차](README.md)
 
@@ -23,6 +23,14 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 헤더 원문은 `data.retry_after`에도 실어 기존 IPI 신호 검사를 거칩니다.
 
 헤드리스 이름 재시도(`data.identity`·`data.retry_skipped`·`cookie_change`)와 재시도 쿠키 장부는 [headless-retry.md](headless-retry.md)에 있습니다.
+
+## 이동 결과 신호 — 부분 성공·실패 종류·선택자 문법 오류 (WS-69)
+
+**부분 성공(`data.load_state`).** `navigate` 는 먼저 `domcontentloaded` 까지 이동하고(문서 커밋 확인), `wait_until` 이 `load`·`networkidle` 이면 남은 시간(`timeout_ms`, 계약 기본 15초) 안에서 그 상태를 기다립니다. 이 두 번째 대기만 시간 초과로 끝나면 — 광고·추적 요청이 끝없이 이어지는 사이트 — `success: true` 와 `data.load_state = {"requested", "reached": "domcontentloaded", "timed_out": true}`, `data.hint`(문서는 열렸으니 바로 읽어도 됨)를 돌려줍니다. 에포크는 올라가고 차단·robots·egress 신호는 그대로 붙습니다. 첫 단계(커밋 전) 시간 초과·닫힌 탭은 전처럼 실패입니다(`E_NAVIGATE_TIMEOUT`·`E_PAGE_CRASHED`). 부분 성공은 이동 시작부터 주 프레임 새 문서 커밋이 정확히 1번이고(이동 전에 건 커밋 이벤트 계수 — 서버 3xx 리다이렉트는 1번, 같은 문서 안 이동 pushState·hash 는 세지 않음), 마지막 판독 뒤 주 프레임이 오류 문서가 아니고, `document.readyState` 가 `interactive`·`complete` 일 때만입니다(WS-69 R2). 이 판독은 `timeout_ms` + 50ms 안에서만 하고 넘기면 실패라 navigate 는 `timeout_ms` + 100ms 안에 돌아옵니다. 첫 단계 뒤 남은 시간이 1ms 미만이면 두 번째 대기 없이 실패입니다. 그 사이 다른 문서로 넘어갔으면 `E_NAVIGATE_TIMEOUT` + `nav_failure.kind="timeout"` + hint '이동 중 다른 문서로 바뀜' 입니다. 단계·`wait_until` 과 무관하게 이동이 끝난 주 프레임이 브라우저 오류 문서(`chrome-error://`)면 `E_NAVIGATE_TIMEOUT` 이고 `nav_failure` 는 실패한 문서 요청의 `net::ERR_*` 로 정합니다(WS-69 R1). 부분 성공에서는 헤드리스 이름 재시도를 하지 않고 `data.retry_skipped.reason="load_timed_out"` 을 남깁니다. 반쯤 그려진 SPA 일 수 있으니 비어 보이면 `wait_for` 로 요소를 기다리십시오.
+
+**이동 실패 종류(`data.nav_failure`).** `navigate`(`E_NAVIGATE_TIMEOUT`·egress 차단 `E_INVALID_URL`)와 `tab_control` `create` 의 이동 실패에 `{"kind"[, "net_error"]}` 와 종류별 `data.hint` 가 붙습니다. 오류 코드는 바뀌지 않습니다. 프록시 신호(`data.egress.code`)가 먼저입니다 — `resolve_failed`→`dns`, `connect_failed`→`connect`, `egress_blocked`→`blocked`. 그 밖은 브라우저 오류로 정합니다: 시간 초과→`timeout`, `ERR_NAME_NOT_RESOLVED`·`ERR_NAME_RESOLUTION_FAILED`→`dns`, `ERR_CONNECTION_REFUSED/RESET/CLOSED/TIMED_OUT`·`ERR_TUNNEL_CONNECTION_FAILED`·`ERR_PROXY_CONNECTION_FAILED` 등→`connect`, `ERR_CERT_*`·`ERR_SSL_*`→`tls`, `ERR_HTTP2_*`·`ERR_QUIC_*`→`protocol`, `ERR_ABORTED`→`aborted`, 나머지(`ERR_TOO_MANY_REDIRECTS` 포함, `net_error` 로 구분)→`other`. `dns`·`tls`·리다이렉트 고리는 같은 주소로 다시 시도해도 소용없습니다.
+
+**선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
 
 ## 프롬프트 주입 신호 (`data.injection_suspected`)
 
