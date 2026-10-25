@@ -39,6 +39,9 @@ ARCHIVE = "6e449e2"  # v1.16.0
 #: dispatcher 차이 검사의 비교 기준 — WS-62 를 뺀 dev(a081a91 = v1.16.0 + WS-63 C #160 + WS-67 #165).
 #: 다른 WS 가 dev 에 넣은 dispatcher 변경(WS-67 격리 world 판정 등)은 R12 판정표 대상이 아니다.
 DISPATCHER_DIFF_BASE = "a081a91"
+#: WS-62 가 dev 에 들어간 결과(#166 squash). 차이 검사는 두 고정 커밋 사이(= WS-62 가 실제로 바꾼 줄)만 본다 —
+#: 이후 다른 WS 의 dispatcher 변경(WS-64 관문 등)은 R12 판정표 대상이 아니다.
+DISPATCHER_WS62 = "4f7ff25"
 #: src/perception/repeated_v1160.py == `git show 6e449e2:src/perception/repeated.py` (바이트 동일).
 V1160_SHA256 = "d13c80f23092bfb40919afe5e6ce1953cbb9b5ff2d92bd2e7e8df21b34fc8257"
 FULL = {"force_full_tree": True, "prune_top_n": 2000}
@@ -171,9 +174,9 @@ def test_dispatcher_diff_vs_archive_is_only_r12_hunks():
 
     arch = _git_show("src/actions/dispatcher.py")
     base = _git_show("src/actions/dispatcher.py", DISPATCHER_DIFF_BASE)
-    if arch is None or base is None:
+    now = _git_show("src/actions/dispatcher.py", DISPATCHER_WS62)
+    if arch is None or base is None or now is None:
         pytest.skip("git archive 없음")
-    now = (ROOT / "src" / "actions" / "dispatcher.py").read_text(encoding="utf-8")
     spans = _func_spans(now, "ActionDispatcher")
     a, b = arch.splitlines(), now.splitlines()
     touched = set()
@@ -184,10 +187,12 @@ def test_dispatcher_diff_vs_archive_is_only_r12_hunks():
             owner = [n for n, (s, e) in spans.items() if s <= line <= e]
             touched.add(owner[0] if owner else f"<module:{line}>")
     assert touched <= DISPATCHER_ALLOWED, touched
-    # 승계·치유 거르기: 원문과 같은 줄(출처 모듈 이름만 다름)
+    # 승계·치유 거르기: 지금 코드에서도 원문과 같은 줄(출처 모듈 이름만 다름)
+    cur = (ROOT / "src" / "actions" / "dispatcher.py").read_text(encoding="utf-8")
+    cur_spans, b = _func_spans(cur, "ActionDispatcher"), cur.splitlines()
     for name in ("_repin_after_reobserve", "_same_group_candidates"):
         s, e = _func_spans(arch, "ActionDispatcher")[name]
-        s2, e2 = spans[name]
+        s2, e2 = cur_spans[name]
         old = [x.replace("perception.repeated ", "perception.repeated_v1160 ") for x in a[s - 1:e]]
         new = [x for x in b[s2 - 1:e2] if "WS-62 R12" not in x]
         assert [x for x in new if x not in old] == [], name

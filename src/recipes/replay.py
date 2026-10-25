@@ -25,7 +25,7 @@ from recipes.recorder import nav_kind, signal_kinds
 from recipes.store import RecipeError, RecipeStore, clean_text, render_args
 
 REASONS = ("page_changed", "target_not_found", "target_ambiguous", "not_ready",
-           "expect_mismatch", "approval_required", "action_failed")
+           "expect_mismatch", "approval_required", "action_failed", "manual_site")
 #: 준비 기준: 기록 당시 요소 수의 이 비율 이상.
 READY_RATIO = 0.5
 #: 준비 대기 상한(초)과 다시 보는 간격.
@@ -177,6 +177,12 @@ async def run_recipe(host: ReplayHost, store: RecipeStore, rid: str, params: Dic
             envelope = encode(result) if encode is not None else None
             if not result.success:
                 steps_out.append({"action": action, "ok": False})
+                from security.manual_sites import is_manual_handoff
+
+                if is_manual_handoff(getattr(result, "data", None)):
+                    # WS-64 R2-4: 직접 조작할 사이트 — 승인 판정보다 먼저, 실패로 세지 않는다(레시피가 꺼지지 않음).
+                    raise _Stop("manual_site", "직접 조작할 사이트의 단계(사람이 직접 해야 함 — 재생은 대신하지 않음)",
+                                envelope)
                 if _is_approval(result):
                     raise _Stop("approval_required", "사람 승인이 필요한 단계(재생은 승인을 대신하지 않음)",
                                 envelope)
@@ -189,7 +195,7 @@ async def run_recipe(host: ReplayHost, store: RecipeStore, rid: str, params: Dic
             steps_out.append({"action": action, "ok": True,
                               "ms": round((time.perf_counter() - t0) * 1000, 1)})
     except _Stop as stop:
-        stats = store.note_run(rid, ok=False, count_failure=stop.reason != "approval_required")
+        stats = store.note_run(rid, ok=False, count_failure=stop.reason not in ("approval_required", "manual_site"))
         info = {"id": rid, "name": rec["name"], "ran": i, "of": total, "stopped_at": i,
                 "reason": stop.reason, "detail": stop.detail, "steps": steps_out,
                 "disabled": bool((stats or {}).get("disabled"))}

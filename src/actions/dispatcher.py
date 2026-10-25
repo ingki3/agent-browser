@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
@@ -818,6 +818,19 @@ class DispatchContext:
     #: click/press_key 가 감지 창(NAV_DETECT_MS)만큼 빨라지는 대신, 이동 뒤 새 문서를
     #: 확인할 책임(wait_for/observe)이 호출자에게 있다. `serve --nav-settle off`.
     nav_settle: bool = True
+    #: WS-64 직접 조작할 사이트(security.manual_sites 의 ManualSites·ManualSiteStore). 목록 사이트의 부작용 액션은
+    #: dispatch 입구에서 거부만 한다(서버 관문과 같은 판정·같은 오류 모양). 기본 None = 빈 목록 — harness·시험은
+    #: 홈 파일을 읽지 않는다. `agent-browser run` 은 cli.main 이 넣는 프로세스 기본값(process_default)을 쓴다.
+    manual_sites: Any = field(default_factory=lambda: _manual_process_default())
+    #: WS-64 R2-3: 이 페이지의 네이티브 대화상자를 자동으로 닫지 않고 사람에게 둘지(서버가 headed + 목록 출처 탭에서만
+    #: True). None 이면 지금처럼 처리(handle_dialog 예약 또는 거절).
+    dialog_hold: Any = None
+
+
+def _manual_process_default() -> Any:
+    from security.manual_sites import process_default
+
+    return process_default()
 
 
 #: 자격증명으로 치환된 입력임을 사후조건 검증에 알리는 내부 표시.
@@ -1036,6 +1049,107 @@ _PROTECTED_SAVE_MESSAGE = (
 class _ProtectedSaveRefused(Exception):
     """다운로드 최종 경로가 보호 폴더 안이라 저장을 거부함(WS-56 R2 B1)."""
 
+
+class _ManualSiteRefused(Exception):
+    """WS-64 R1 B1: 실제 입력 직전 재판정에서 목록 사이트 — 입력을 보내지 않음(result 는 거부 응답)."""
+
+    def __init__(self, result: ActionResult) -> None:
+        super().__init__("manual_site")
+        self.result = result
+
+
+class _FixedNodeGone(Exception):
+    """WS-64 R3 B1: 관문을 통과한 문서에 고정한 노드가 입력 중 떨어짐(문서 교체 등) — 새 문서 노드로 넘어가지 않았다."""
+
+
+#: R3 B1: 고정 노드 실패 응답(기존 '대상 바뀜' 계열 — E_TOCTOU_MISMATCH + 재관찰).
+_FIXED_NODE_GONE_MESSAGE = "대상 요소가 사라졌거나 바뀌어(문서가 바뀜) 그 요소에 입력하지 않았습니다. 다시 관찰하세요."
+
+
+class _NodeDetached(Exception):
+    """WS-64 R4: 입력 전 노드가 떨어짐(같은 문서 재렌더 등) — 아직 입력을 보내지 않았으면 다시 해석한다."""
+
+
+class _TargetRefused(Exception):
+    """WS-64 R4: 같은 문서 재해석에서 기존 신원 검사(role·이름 등)가 거부 — result 는 거부 응답(입력 없음)."""
+
+    def __init__(self, result: ActionResult) -> None:
+        super().__init__("target_changed")
+        self.result = result
+
+
+@dataclass
+class _FrameCtx:
+    """R4 B2: 관문을 입력 노드의 실제 소유 프레임으로 돌리는 판정 문맥(manual_site_hit 가 읽는 page·root_page 만)."""
+
+    page: Any
+    root_page: Any
+
+
+#: R4: 목록이 있을 때 효과 없는 대기(trial·상태 확인) 한 조각 — 조각 사이마다 노드의 소유 문서 결속을 다시 본다.
+_WAIT_SLICE_MS = 250
+#: R4: 대기 + 입력 전체 기한(기존 액션 timeout 과 같은 5초).
+_BOUND_DEADLINE_S = 5.0
+#: R4: 노드의 문서 결속 — 0 떨어짐 · 1 관문 통과 문서에 붙어 있음 · 2 다른 문서(adoptNode 등)에 붙어 있음.
+_BIND_JS = "(n, d) => !n.isConnected ? 0 : (n.ownerDocument === d ? 1 : 2)"
+#: R4: 지금 _bound_input 이 입력 중인 노드(이 호출 문맥만) — 민감 칸 판정이 Locator 대신 그 노드를 본다.
+_BOUND_NODE: ContextVar[Any] = ContextVar("agent_browser_bound_node", default=None)
+#: R4: 액션별 actionability 종류(_ACTIONABLE_JS). 업로드는 없음(결속만).
+_ACTIONABLE_KIND: Dict[ActionType, str] = {
+    ActionType.CLICK: "pointer", ActionType.CHECK_BOX: "pointer", ActionType.DOWNLOAD_FILE: "pointer",
+    ActionType.HOVER: "hover", ActionType.TYPE_TEXT: "edit", ActionType.SELECT_OPTION: "select",
+}
+#: R4: 효과 없는 actionability 확인(페이지 안에서 조각 시간만큼 프레임마다 다시 봄). Playwright 의 trial=True 는 쓰지 않는다 —
+#: 이 버전의 trial 은 실제 마우스 이동·누름을 보내고 페이지 안 가로채기로만 막아 mouseover 등이 페이지에 닿는다(실측).
+#: 인자 [관문 통과 문서, 종류, ms]. 반환 'ok' | 'detached' | 'moved'(다른 문서 소유 — adoptNode) | 기다리는 사유.
+#: 종류: pointer(click·check·download — 보임·활성·안정·hit target) · hover(보임·안정·hit target) · edit(보임·편집 가능) ·
+#: select(보임·활성). 보이는 영역 밖이면 그 문서(결속 확인 직후, 같은 평가 안)에서 즉시 스크롤한다.
+_ACTIONABLE_JS = r"""
+async (n, [d, kind, ms]) => {
+  const end = performance.now() + ms;
+  const frame = () => new Promise(r => { let done = false; const f = () => { if (!done) { done = true; r(); } };
+    requestAnimationFrame(f); setTimeout(f, 50); });
+  let last = null;
+  for (;;) {
+    if (!n.isConnected) return 'detached';
+    if (n.ownerDocument !== d) return 'moved';
+    const el = n.nodeType === 1 ? n : n.parentElement;
+    let why = 'ok';
+    if (!el) return 'detached';
+    const st = getComputedStyle(el);
+    let r = el.getBoundingClientRect();
+    const disabled = (el.matches && el.matches(':disabled')) || !!el.closest('[aria-disabled="true"]');
+    if (!(r.width > 0 && r.height > 0) || st.visibility === 'hidden') why = 'not visible';
+    else if (kind !== 'hover' && disabled) why = 'not enabled';
+    else if (kind === 'edit' && (el.readOnly || el.getAttribute('aria-readonly') === 'true')) why = 'not editable';
+    else if (kind === 'pointer' || kind === 'hover') {
+      const key = [r.x, r.y, r.width, r.height].join(',');
+      if (key !== last) { last = key; why = 'not stable'; }
+      else {
+        const vw = d.defaultView.innerWidth, vh = d.defaultView.innerHeight;
+        let cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        if (cx < 0 || cy < 0 || cx >= vw || cy >= vh) {
+          el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+          r = el.getBoundingClientRect(); cx = r.x + r.width / 2; cy = r.y + r.height / 2; last = null;
+        }
+        const target = el.closest('button,a,[role=button],[role=link]') || el;
+        // shadow 안(열림·닫힘) 노드는 문서 elementFromPoint 가 host 로 바뀌어 나오므로 노드의 가장 안쪽 루트에서 본다.
+        const root = el.getRootNode();
+        const scope = (root && typeof root.elementFromPoint === 'function') ? root : d;
+        let hit = scope.elementFromPoint(cx, cy), ok = false;
+        for (let e = hit; e; e = e.parentNode || e.host) {
+          if (e === target || e === el || (e.tagName === 'LABEL' && e.control === el)) { ok = true; break; }
+        }
+        if (!ok) why = 'not hit target';
+      }
+    }
+    if (why === 'ok') return 'ok';
+    if (performance.now() >= end) return why;
+    await frame();
+  }
+}
+"""
+
 #: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
 _POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
 _POINT_SAME_JS = ("([x, y, pinned]) => { const el = (" + _POINT_TARGET_JS.strip()
@@ -1050,6 +1164,11 @@ class ActionDispatcher:
 
     def __init__(self, context: DispatchContext) -> None:
         self.ctx = context
+        if getattr(context, "manual_sites", None) is not None:
+            # WS-64 R2 B3: 탭·팝업 생성 이력(불투명 문서 판정) 기록을 가능한 한 일찍 켠다(서버는 첫 탭 전에 이미 켬).
+            from security.manual_origin import watch_lineage
+
+            watch_lineage(getattr(getattr(context, "page", None), "context", None))
         self._healing_attempts = 0
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
@@ -1202,8 +1321,31 @@ class ActionDispatcher:
             return
         self._dialog_pages.append(page)
 
+    def _manual_dialog_listed(self, page: Any) -> bool:
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return False
+        from security.manual_sites import manual_hit_sync
+
+        try:
+            return manual_hit_sync(store, page) is not None
+        except Exception:  # noqa: BLE001 — 판정 불가: 예약을 쓰지 않는다
+            return True
+
     def _on_dialog(self, dialog: Any) -> None:
+        hold = getattr(self.ctx, "dialog_hold", None)
+        if callable(hold):
+            try:
+                held = bool(hold(getattr(dialog, "page", None)))
+            except Exception:  # noqa: BLE001 — 판정 실패: 지금처럼 처리
+                held = False
+            if held:
+                # WS-64 R2-3: 사람이 보는 창의 목록 사이트 탭 — 닫지 않고 사람에게 둔다(예약도 쓰지 않는다).
+                return
         arm, self._dialog_arm = self._dialog_arm, None
+        if arm is not None and self._manual_dialog_listed(getattr(dialog, "page", None)):
+            # WS-64 R1 B1: 예약은 목록 밖에서 했지만 대화상자는 목록 사이트 탭에서 떴다 — 예약을 쓰지 않는다(기본 처리).
+            arm = None
         try:
             kind = str(dialog.type)
             message = str(dialog.message)[:300]
@@ -1881,6 +2023,9 @@ class ActionDispatcher:
         started = time.perf_counter()
         # WS-30: 계약 키(trigger_element_id 등)를 디스패처 키로 맞춘다.
         params = normalize_action_params(action, params)
+        refused = await self._manual_site_refusal(action, params)
+        if refused is not None:
+            return refused
         params, secret_resolved = self._resolve_secret(action, params)
         if action is ActionType.TYPE_TEXT and secret_resolved is not True:
             # WS-55 R2: 입력 중 민감 판정 표시(_CONCEAL_KEY)를 사본에만 붙인다 — 호출자 params(트레이스)엔 남기지 않는다.
@@ -1944,6 +2089,57 @@ class ActionDispatcher:
             # 사용자는 키 이름이 그대로 입력된 것을 눈치채지 못한다.
             result.data["secret_resolved"] = secret_resolved
         return result
+
+    async def _manual_site_refusal(self, action: ActionType, params: Dict[str, Any],
+                                   frame: Any = None) -> Optional[ActionResult]:
+        """WS-64 백스톱: 목록 사이트의 부작용 액션은 실행하지 않는다(서버 관문과 같은 판정·같은 오류 모양).
+
+        서버(MCP)는 _call_tool 관문이 먼저 막고 표시·인계를 한다 — 여기는 `agent-browser run` 처럼 디스패처를 직접
+        부르는 경로의 거부 전용(창·인계 없음 → available=false). frame 을 주면(R4 B2) 대상 문맥 대신 그 프레임(입력
+        노드의 실제 소유 프레임)과 그 부모 사슬·최상위로 판정한다.
+        """
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return None
+        from security.manual_sites import handoff_data, manual_site_hit, refusal_message
+
+        ctx = self.ctx if frame is None else _FrameCtx(frame, self._top_page())
+        if await manual_site_hit(ctx, action, params, store) is None:
+            return None
+        return self._result(success=False, action=action, retry_safe=False,
+                            error_code=ErrorCode.HITL_UNATTENDED_BLOCKED,
+                            error_message=refusal_message(store.current()),
+                            data=handoff_data(action, available=False, target=self.manual_target(params)))
+
+    async def _manual_guard(self, action: ActionType, params: Dict[str, Any]) -> None:
+        """WS-64 R1 B1: 실제 입력(포인터·키·값·파일·대화상자) **직전** 공통 관문 — dispatch 입구와 같은 판정 함수.
+
+        입구 판정 뒤의 치유(재관찰·새 핸들 채택)·대기·이동 감지 사이에 페이지가 목록 사이트로 바뀌었을 수 있다. 목록이면
+        _ManualSiteRefused(입력을 보내지 않음). 빈 목록이면 비용 없음.
+        """
+        refused = await self._manual_site_refusal(action, params)
+        if refused is not None:
+            raise _ManualSiteRefused(refused)
+
+    def _manual_active(self) -> bool:
+        """WS-64 R2 B1: 목록(또는 판정 불가 목록)이 있어 다단계 입력을 단계별로 재판정해야 하는가. 빈 목록이면 기존 경로."""
+        store = getattr(self.ctx, "manual_sites", None)
+        if store is None:
+            return False
+        try:
+            return not store.current().empty
+        except Exception:  # noqa: BLE001 — 목록을 못 읽음: 단계별로(관문이 판정 불가로 막는다)
+            return True
+
+    def manual_target(self, params: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """인계 대상의 role·이름(관찰 핸들 — element_id 대상만). 없으면 None."""
+        element_id = params.get("element_id")
+        engine = getattr(self.ctx, "engine", None)
+        getter = getattr(engine, "get_handle", None)
+        handle = getter(element_id) if element_id and callable(getter) else None
+        if handle is None:
+            return None
+        return {"role": str(handle.role or ""), "name": str(handle.name or "")}
 
     def _secret_allowed_here(self) -> bool:
         """현재 페이지에서 치환된 값을 입력해도 되는가.
@@ -2509,6 +2705,24 @@ class ActionDispatcher:
         )
         try:
             await self._execute_element_action(action, handle, params)
+        except _ManualSiteRefused as exc:
+            # WS-64 R1 B1: 입력 직전 재판정에서 목록 사이트 — 아무 입력도 보내지 않았다.
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return exc.result
+        except _TargetRefused as exc:
+            # WS-64 R4 B1: 같은 문서 재해석 대상이 관찰한 요소가 아님(기존 신원 검사) — 아무 입력도 보내지 않았다.
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return exc.result
+        except _FixedNodeGone:
+            # WS-64 R3 B1: 관문을 통과한 문서의 고정 노드가 입력 중 떨어졌다 — 새 문서 노드에는 보내지 않았다.
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return self._fixed_node_gone(action, healed_flag)
         except _ProtectedSaveRefused as exc:
             # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
             self._off_popup(_on_popup)
@@ -2538,6 +2752,18 @@ class ActionDispatcher:
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
+
+    def _fixed_node_gone(self, action: ActionType, healed_flag: bool) -> ActionResult:
+        """R3 B1: 고정 노드가 떨어짐 — 기존 '대상 바뀜' 계열(E_TOCTOU_MISMATCH·재관찰), 새 오류 코드 없음."""
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,  # 새 문서에는 아무것도 보내지 않았다
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=_FIXED_NODE_GONE_MESSAGE,
+            reobserve_required=True,
+            healed=healed_flag,
+        )
 
     async def _observe_element_effect(
         self,
@@ -2671,6 +2897,10 @@ class ActionDispatcher:
         # 멱등 액션만 1회 재시도
         try:
             await self._execute_element_action(action, handle, params)
+        except (_ManualSiteRefused, _TargetRefused) as exc:
+            return exc.result
+        except _FixedNodeGone:
+            return self._fixed_node_gone(action, healed_flag)
         except Exception as exc:  # noqa: BLE001
             return self._result(
                 success=False,
@@ -2846,7 +3076,10 @@ class ActionDispatcher:
         호출자가 알아야 한다.
         """
         try:
-            locator = self._locator_for(handle)
+            # R4: 목록이 있을 때의 입력(_bound_input) 중이면 입력할 그 노드로 — Locator 는 노드가 문서를 떠나면(adoptNode
+            # 등) 같은 selector 의 새 노드를 기다린다.
+            bound = _BOUND_NODE.get()
+            locator = bound if bound is not None else self._locator_for(handle)
             return bool(
                 await locator.evaluate(
                     "el => el.tagName === 'INPUT' "
@@ -2908,12 +3141,186 @@ class ActionDispatcher:
     ) -> None:
         """요소 대상 액션을 실제로 발송한다."""
         pin = self._current_pin()
+        if self._manual_active():
+            # WS-64 R4: 목록이 있으면 판정과 실행 사이에 대기를 두지 않는다(_bound_input) — 해석 → 효과 없는 대기 →
+            # 소유 프레임 관문·결속 → 대기 없는 즉시 입력. 승인 노드(pin)도 같은 순서(다시 해석하지 않음).
+            await self._bound_input(action, handle, params, pin)
+            return
         # WS-56 R1 B1: 승인으로 연 호출은 잡아 둔 그 노드 핸들로만 — 로케이터를 다시 풀면(같은 css 의 새 노드)
         # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
-        target = pin.node if pin is not None else self._locator_for(handle)
+        if pin is not None:
+            await self._send_to_target(action, handle, params, pin.node, fixed=True)
+        else:
+            await self._send_to_target(action, handle, params, self._locator_for(handle), fixed=False)
+
+    async def _bound_input(self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], pin: Any) -> None:
+        """WS-64 R4: 목록이 있을 때의 요소 입력 — 판정(관문)과 실행 사이에 actionability 대기를 두지 않는다.
+
+        R3 은 고정 노드로 Playwright 의 대기(비활성·가려짐)를 그대로 썼다: 대기 동안 같은 문서 SPA 재렌더로 노드가 바뀌면
+        정상 입력을 거부했고(B1), 노드가 adoptNode 로 목록 iframe 문서에 옮겨져도 연결돼 있으니 그대로 입력했다(B2).
+        여기서는 전체 기한(_BOUND_DEADLINE_S) 안에서 반복한다:
+          1. 해석: locator → 노드. 처음 해석한 노드의 문서를 관문 통과 문서로 둔다. 다시 해석한 노드가 다른 문서면(최상위·
+             대상 프레임 문서 교체) R3 대로 '대상 바뀜'. 같은 문서면 기존 신원 검사(role·이름·묶음)를 다시 적용한다.
+          2. 대기(효과 없음): 관문 한 번 뒤 페이지 안 actionability 확인(_ACTIONABLE_JS — 보임·활성·편집 가능·안정·hit
+             target; Playwright trial 은 실제 마우스 이벤트를 보내 쓰지 않음)을 짧은 조각으로, 같은 평가 안에서 소유 문서
+             결속도 본다(다른 문서면 _bind_or_gate). 노드가 떨어지면 1 로.
+          3·4. 입력 호출마다 공통 관문 → 결속(소유 문서가 바뀌었으면 실제 소유 프레임으로 관문: 목록이면 manual_site,
+             아니면 '대상 바뀜') → 대기 없는(force) 즉시 입력. 관문과 입력 사이에는 결속 확인 CDP 왕복 하나뿐이다.
+        입력을 하나도 보내기 전 노드가 떨어지면 1 로, 일부 보낸 뒤면 '대상 바뀜'(남은 단계를 새 노드로 보내지 않음).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BOUND_DEADLINE_S
+        first_doc: Any = None
+        progress: Dict[str, bool] = {"sent": False}
+        last: Optional[BaseException] = None
+        while True:
+            remaining_ms = (deadline - loop.time()) * 1000
+            if remaining_ms <= 0:
+                raise TimeoutError(f"{int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능한 대상을 찾지 못했습니다: {last}")
+            if pin is not None:
+                node = pin.node
+            else:
+                node = await self._locator_for(handle).element_handle(timeout=max(1, int(remaining_ms)))
+            try:
+                if first_doc is None:
+                    first_doc = await node.evaluate_handle("n => n.ownerDocument")
+                elif pin is None:
+                    await self._reresolved_check(action, handle, params, node, first_doc)
+                # 대기(스크롤 포함) 전에도 관문 — 치유·재해석 사이 목록 문서로 바뀌었으면 그 문서에서 기다리지도 않는다.
+                await self._manual_guard(action, params)
+                await self._wait_actionable(action, params, node, first_doc, deadline)
+                token = _BOUND_NODE.set(node)  # 민감 칸 판정도 입력할 그 노드로(is_sensitive_field)
+                try:
+                    await self._send_to_target(action, handle, params, node, fixed=True, bind=first_doc,
+                                               progress=progress)
+                finally:
+                    _BOUND_NODE.reset(token)
+                return
+            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused):
+                raise
+            except _NodeDetached as exc:
+                last = exc
+            except Exception as exc:  # noqa: BLE001 — 노드가 떨어졌으면 다시 해석, 아니면 원래 실패 그대로
+                if await self._node_connected(node):
+                    raise
+                last = exc
+            if pin is not None or progress["sent"]:
+                # 승인 노드는 다시 해석하지 않는다 / 일부 입력 뒤라 새 노드로 이어 보내지 않는다.
+                raise _FixedNodeGone(str(last)) from last
+
+    async def _reresolved_check(
+        self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], node: Any, first_doc: Any
+    ) -> None:
+        """R4 B1: 다시 해석한 노드 — 관문 통과 문서가 아니면 '대상 바뀜', 같은 문서면 기존 신원 검사를 다시 적용."""
+        try:
+            state = await node.evaluate(_BIND_JS, first_doc)
+        except Exception as exc:  # noqa: BLE001 — 다른 실행 문맥(문서 교체)·문서 소멸
+            raise _FixedNodeGone(str(exc)) from exc
+        if state == 0:
+            raise _NodeDetached("Element is not attached to the DOM")
+        if state != 1:
+            raise _FixedNodeGone("document changed")
+        st = await verify_staleness(
+            self.ctx.page, handle, handle.epoch,
+            expected_role=params.get("expected_role"), expected_name=params.get("expected_name"),
+        )
+        if st.fresh:
+            return
+        if st.reason is StalenessReason.NODE_DETACHED:
+            raise _NodeDetached(st.detail)
+        before_role = params.get("expected_role") or handle.role
+        before_name = params.get("expected_name") if params.get("expected_name") is not None else handle.name
+        raise _TargetRefused(self._identity_changed_result(
+            action, st.error_code or ErrorCode.TOCTOU_MISMATCH,
+            f"Staleness 검증 실패({st.reason.value}) — 다시 해석한 대상이 관찰한 요소가 아님",
+            (before_role, before_name), (st.observed_role, st.observed_name), {},
+        ))
+
+    async def _wait_actionable(
+        self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any, deadline: float
+    ) -> None:
+        """R4 2: 효과 없는 대기 — 조각마다 페이지 안에서 결속(소유 문서)과 actionability 를 함께 본다(_ACTIONABLE_JS).
+
+        다른 문서 소유(adoptNode)면 그 실제 소유 프레임으로 관문(_bind_or_gate), 떨어졌으면 _NodeDetached(다시 해석)."""
+        kind = _ACTIONABLE_KIND.get(action)
+        if kind is None:  # 업로드: set_input_files 는 actionability 대기가 없다 — 결속만
+            await self._bind_or_gate(action, params, node, first_doc)
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining_ms = (deadline - loop.time()) * 1000
+            if remaining_ms <= 0:
+                raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다")
+            try:
+                why = await node.evaluate(_ACTIONABLE_JS, [first_doc, kind, int(min(_WAIT_SLICE_MS, remaining_ms))])
+            except Exception as exc:  # noqa: BLE001 — 문서 소멸·문맥 교체
+                raise _NodeDetached(str(exc)) from exc
+            if why == "ok":
+                return
+            if why in ("detached", "moved"):
+                # moved → 실제 소유 프레임 관문(목록이면 manual_site)·'대상 바뀜', detached → 다시 해석(_NodeDetached)
+                await self._bind_or_gate(action, params, node, first_doc)
+                continue
+            if (deadline - loop.time()) <= 0:
+                raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다({why})")
+
+    async def _bind_or_gate(self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any) -> None:
+        """R4 3: 노드가 관문 통과 문서에 그대로 붙어 있는가. 다른 문서(adoptNode)면 그 실제 소유 프레임으로 관문 —
+        목록이면 manual_site 거부, 아니면 '대상 바뀜'. 떨어졌으면 _NodeDetached."""
+        try:
+            state = await node.evaluate(_BIND_JS, first_doc)
+        except Exception as exc:  # noqa: BLE001 — 문서 소멸·문맥 교체
+            raise _NodeDetached(str(exc)) from exc
+        if state == 1:
+            return
+        if state == 0:
+            raise _NodeDetached("Element is not attached to the DOM")
+        try:
+            owner = await node.owner_frame()
+        except Exception:  # noqa: BLE001 — 소유 프레임을 못 읽음: '대상 바뀜'
+            owner = None
+        if owner is not None:
+            refused = await self._manual_site_refusal(action, params, frame=owner)
+            if refused is not None:
+                raise _ManualSiteRefused(refused)
+        raise _FixedNodeGone("owner document changed")
+
+    @staticmethod
+    async def _node_connected(node: Any) -> bool:
+        """R3 B1: 고정 노드가 아직 그 문서에 붙어 있는가(문서가 사라졌으면 평가 자체가 실패 → False)."""
+        try:
+            return bool(await node.evaluate("n => n.isConnected"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _send_to_target(
+        self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
+        bind: Any = None, progress: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        """target(Locator, 또는 fixed=True 면 고정 노드 Playwright ElementHandle — 승인 결속·R3 고정)으로 입력을 보낸다.
+
+        bind(R4, 목록이 있을 때 — 관문 통과 문서의 JS 핸들)가 있으면 관문 직후 결속 확인(_bind_or_gate)을 하고 대기 없는
+        즉시 입력(force)을 보낸다 — actionability 대기는 _bound_input 이 효과 없이 먼저 끝냈다. progress 는 입력 호출이
+        하나라도 끝났는지(다시 해석해 새 노드로 이어 보내지 않기 위해).
+        """
+        # WS-64 R1 B1·R2 B1: 페이지를 바꾸는 **모든** 호출 바로 앞에 공통 관문(_manual_guard) — 앞선 await(민감 칸 판정·
+        # clear·글자 사이) 동안 페이지가 목록 사이트로 바뀌었을 수 있다. 관문과 그 호출 사이에는 (R4: 결속 확인 CDP 왕복
+        # 하나 말고는) await 가 없다.
+        fk: Dict[str, Any] = {"force": True} if bind is not None else {}
+
+        async def guard(act: ActionType, prm: Dict[str, Any]) -> None:
+            await self._manual_guard(act, prm)
+            if bind is not None:
+                await self._bind_or_gate(act, prm, target, bind)
+
+        def sent() -> None:
+            if progress is not None:
+                progress["sent"] = True
 
         if action is ActionType.CLICK:
-            await target.click(button=params.get("button", "left"), timeout=5000)
+            await guard(action, params)
+            await target.click(button=params.get("button", "left"), timeout=5000, **fk)
+            sent()
 
         elif action is ActionType.TYPE_TEXT:
             # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
@@ -2926,40 +3333,70 @@ class ActionDispatcher:
             # (과잉 가림 방지, 결정 A).
             await self._mark_sensitive_input(handle, params, text)
             if params.get("clear_before", True):
-                await target.fill("", timeout=5000)
+                await guard(action, params)  # R2 B1: clear(fill("")) 도 페이지를 바꾼다 — 민감 칸 판정 await 뒤 재판정
+                await target.fill("", timeout=5000, **fk)
+                sent()
                 await self._mark_sensitive_input(handle, params, text)
-            await target.type(text, timeout=5000)
+            if self._manual_active():
+                # R2 B1: 목록이 있으면 포커스·글자마다 재판정(글자 사이에 목록 사이트로 바뀌면 남은 글자를 보내지 않음).
+                # Playwright type 과 같은 입력(포커스 + 키보드 type) — 프레임 안이어도 키보드는 최상위 Page 의 것.
+                # R4: 글자마다 관문 뒤 소유 문서 결속(bind)도 다시 본다 — 떨어졌거나 다른 문서면 남은 글자를 보내지 않는다.
+                await guard(action, params)
+                await (target.focus() if fixed else target.focus(timeout=5000))
+                sent()
+                keyboard = self._top_page().keyboard
+                for ch in text:
+                    if bind is None and fixed and not await self._node_connected(target):
+                        # R3 B1: 앞 글자 사이 고정 노드가 떨어졌다(문서 교체) — 남은 글자를 새 문서의 포커스로 보내지 않는다.
+                        # 관문보다 앞에 둔다(관문과 키 사이에는 await 를 두지 않는다 — R2 B1).
+                        raise RuntimeError("Element is not attached to the DOM")
+                    await guard(action, params)
+                    await keyboard.type(ch)
+            else:
+                await guard(action, params)
+                await target.type(text, timeout=5000)
             await self._mark_sensitive_input(handle, params, text)
             if params.get("press_enter"):
+                await guard(action, params)
                 await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
+            await guard(action, params)
             if params.get("value") is not None:
-                await target.select_option(value=params["value"], timeout=5000)
+                await target.select_option(value=params["value"], timeout=5000, **fk)
             else:
                 await target.select_option(
-                    index=params.get("index", 0), timeout=5000
+                    index=params.get("index", 0), timeout=5000, **fk
                 )
+            sent()
 
         elif action is ActionType.CHECK_BOX:
+            await guard(action, params)
             if params.get("checked", True):
-                await target.check(timeout=5000)
+                await target.check(timeout=5000, **fk)
             else:
-                await target.uncheck(timeout=5000)
+                await target.uncheck(timeout=5000, **fk)
+            sent()
 
         elif action is ActionType.HOVER:
-            await target.hover(timeout=5000)
+            await guard(action, params)
+            await target.hover(timeout=5000, **fk)
+            sent()
 
         elif action is ActionType.UPLOAD_FILE:
+            await guard(action, params)
             await target.set_input_files(
                 params.get("file_paths", []), timeout=5000
             )
+            sent()
 
         elif action is ActionType.DOWNLOAD_FILE:
             async with self.ctx.page.expect_download(
                 timeout=params.get("timeout_ms", 30000)
             ) as dl:
-                await target.click(timeout=5000)
+                await guard(action, params)
+                await target.click(timeout=5000, **fk)
+                sent()
             download = await dl.value
             # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
             from security.secret_registry import register_url
@@ -3024,6 +3461,9 @@ class ActionDispatcher:
             return await self._switch_frame(params)
 
         if action is ActionType.HANDLE_DIALOG:
+            refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 예약 직전 재판정
+            if refused is not None:
+                return refused
             accept = params.get("accept", True)
             # WS-30: 다음 다이얼로그 처리를 예약한다. 실제 처리는 탭에 단 리스너
             # (_on_dialog)가 한다 — 같은 리스너가 다이얼로그 발생을 효과 신호로 기록한다.
@@ -3183,6 +3623,11 @@ class ActionDispatcher:
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
             watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
+        refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 키 입력 직전 재판정
+        if refused is not None:
+            if watch is not None:
+                watch.close()
+            return refused
         try:
             await top.keyboard.press(key)
         except Exception as exc:  # noqa: BLE001
@@ -3308,18 +3753,39 @@ class ActionDispatcher:
 
         before = await self._capture_state(page)
         button = params.get("button", "left")
+        refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 포인터 입력 직전 재판정
+        if refused is not None:
+            return refused
         if pin is not None:
             # R3 B1: 이동(hover)이 대상을 바꿀 수 있다 — 먼저 옮기고 반영된 뒤 그 지점 노드를 다시 본다(아직 안 누름).
             refused = self._elementless_pin_refusal(action, pin, await self._pin_after_move(page, pin, params))
             if refused is not None:
                 return refused
+        if pin is not None:
+            refused = await self._manual_site_refusal(action, params)  # 이동(hover) 뒤 누르기 직전 다시
+            if refused is not None:
+                return refused
         watch = _NavWatch(page) if self.ctx.nav_settle else None
         stray: Optional[str] = None
         try:
-            if pin is None:
-                await page.mouse.click(x, y, button=button)
+            if pin is not None:
+                stray = await self._pinned_press(page, pin, button,
+                                                 before=lambda: self._manual_guard(action, params))
+            elif self._manual_active():
+                # WS-64 R2 B1: mouse.click 과 같은 입력(이동·누름·뗌)을 단계마다 재판정 — 앞 단계 await 동안 목록 사이트로
+                # 바뀌면 다음 단계를 보내지 않는다(이미 누른 버튼은 떼지 않는다: 뗌도 목록 문서로 가는 입력).
+                await self._manual_guard(action, params)
+                await page.mouse.move(x, y)
+                await self._manual_guard(action, params)
+                await page.mouse.down(button=button)
+                await self._manual_guard(action, params)
+                await page.mouse.up(button=button)
             else:
-                stray = await self._pinned_press(page, pin, button)
+                await page.mouse.click(x, y, button=button)
+        except _ManualSiteRefused as exc:
+            if watch is not None:
+                watch.close()
+            return exc.result
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
@@ -3381,16 +3847,22 @@ class ActionDispatcher:
         return f"마우스 이동 뒤 {mismatch}" if mismatch else None
 
     @staticmethod
-    async def _pinned_press(page: Any, pin: Any, button: str) -> Optional[str]:
+    async def _pinned_press(page: Any, pin: Any, button: str, before: Any = None) -> Optional[str]:
         """R3 B1: 승인 노드 감시를 건 채 누르고 뗀다. 실제 눌림 이벤트가 다른 노드로 갔으면(막았음) 또는 승인 노드에
-        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None."""
+        닿은 눌림을 하나도 보지 못했으면 사유, 아니면 None.
+
+        WS-64 R2 B1: before(공통 관문)가 있으면 누름·뗌 각각 바로 앞에서 부른다(감시 설치 await 뒤 재판정)."""
         try:
             guard = await pin.node.evaluate_handle(_POINT_GUARD_ARM_JS)
         except Exception as exc:  # noqa: BLE001 — 감시를 걸 수 없으면 누르지 않는다
             return f"실제 눌림 대상 감시 실패: {type(exc).__name__}"
         seen: Any = None
         try:
+            if before is not None:
+                await before()
             await page.mouse.down(button=button)
+            if before is not None:
+                await before()
             await page.mouse.up(button=button)
         finally:
             try:

@@ -302,6 +302,8 @@ class WorkspaceMixin:
                     secrets=self.secrets,
                     som_enabled=self.som_enabled,
                     nav_settle=self.nav_settle,
+                    manual_sites=getattr(self, "_manual_store", None),  # WS-64 거부 백스톱(같은 판정)
+                    dialog_hold=getattr(self, "_manual_dialog_hold", None),  # WS-64 R2-3 대화상자 보류
                 )
             )
             if had_page:

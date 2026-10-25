@@ -276,6 +276,10 @@ class LifecycleMixin:
         from security.secret_registry import watch_browser_context
 
         watch_browser_context(context)
+        # WS-64 R2 B3: 탭·팝업 생성 이력(불투명 문서 판정)도 첫 탭 전에 — 이 뒤에 생기는 탭은 모두 이력을 안다.
+        from security.manual_origin import watch_lineage
+
+        watch_lineage(context)
         tab = await self._core.new_tab("mcp-session")
         self._page = tab.page
         self._cdp = await self._core.new_cdp_session(tab.tab_id)
@@ -290,6 +294,8 @@ class LifecycleMixin:
                 secrets=self.secrets,  # 자격증명 플레이스홀더 해석 (PRD 5.3)
                 som_enabled=self.som_enabled,  # Tier-2 SoM 게이트 (PRD §8-2)
                 nav_settle=self.nav_settle,  # 이동 대기 스위치 (WS-28)
+                manual_sites=getattr(self, "_manual_store", None),  # WS-64 거부 백스톱(같은 판정)
+                dialog_hold=getattr(self, "_manual_dialog_hold", None),  # WS-64 R2-3 대화상자 보류
             )
         )
         # WS-29b: 루프백만 기본 허용(이전 allow_loopback=True 는 사설 대역 전체를 열었다).

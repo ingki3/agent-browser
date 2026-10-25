@@ -13,6 +13,8 @@
     agent-browser approve <approval_id> [--server ID] [--code N|--deny]  # 사람: 고위험 행동 승인(창의 확인 코드)
     agent-browser profile list|remove NAME [--yes]     # serve --profile 영속 프로필 관리 (WS-32)
     agent-browser approve-policy add|list|remove --profile NAME ...  # 사람: 사이트별 상시 허용 (WS-56)
+    agent-browser manual-sites add|remove|list SITE     # 사람: 직접 조작할 사이트(에이전트는 표시만, WS-64)
+    agent-browser handoff done [--server ID]           # 사람: 표시된 단계를 직접 마쳤다고 알림 (WS-64)
 
 `--mode`는 PRD §3.3의 실행 모드 정책을 결정한다. 무인 모드가 기본값이며,
 고위험 액션은 `--pre-approve`로 명시한 것만 통과한다.
@@ -182,6 +184,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    serve.add_argument(
+        "--manual-site",
+        action="append",
+        default=[],
+        metavar="SITE",
+        help=(
+            "직접 조작할 사이트(WS-64, 반복 가능 — 예: srail.kr, *.srail.kr). 이 사이트에서는 누르기·입력·고르기·키·"
+            "대화상자·파일 동작을 실행하지 않고 대상을 창에 표시해 사람이 직접 한다(매크로 방지를 우회하지 않음). "
+            "`agent-browser manual-sites add` 의 목록(~/.agent-browser/manual_sites.json)과 합친다."
+        ),
+    )
+
     # --- control / approve (WS-29: 사람 쪽 신호 통로) ---
     control = sub.add_parser("control", help="사람: 실행 중인 serve 의 조작권을 가져오거나 돌려줍니다.")
     control.add_argument("op", choices=["take", "release", "status"])
@@ -205,6 +219,10 @@ def _build_parser() -> argparse.ArgumentParser:
     from interface import approve_policy_cli
 
     approve_policy_cli.add_parser(sub)
+    # --- manual-sites · handoff done (WS-64: 사람 전용 직접 조작할 사이트) ---
+    from interface import manual_sites_cli
+
+    manual_sites_cli.add_parser(sub)
     from interface import login_cli
 
     login_cli.add_parser(sub)
@@ -383,6 +401,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 **({} if getattr(args, "headless_retry", True) else {"headless_retry": False}),
                 **({"attach": True} if getattr(args, "attach", False) else {}),
                 **({"workspace": args.workspace} if getattr(args, "workspace", None) else {}),
+                manual_sites=_manual_store(args),
             )
         )
     except KeyboardInterrupt:
@@ -406,6 +425,22 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"agent-browser serve: 오류: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def _manual_store(args: argparse.Namespace) -> object:
+    """WS-64: serve 의 직접 조작할 사이트 = 목록 파일(판정마다 다시 읽음) + --manual-site. 파일 문제는 stderr 한 줄."""
+    from security import manual_sites as ms
+
+    store = ms.ManualSiteStore(ms.manual_sites_file(), extra=getattr(args, "manual_site", None) or ())
+    sites = store.current()
+    if store.error:
+        # WS-64 R1 B3: 처음부터 읽지 못하면 빈 목록이 아니라 판정 불가 — 모든 부작용 액션을 막는다(파일을 고치면 풀림).
+        print(f"agent-browser serve: 경고: 직접 조작할 사이트 목록을 읽지 못했습니다({store.error}) — {ms.FIX_HINT}.",
+              file=sys.stderr)
+    if sites.entries:
+        print(f"agent-browser serve: 직접 조작할 사이트 {len(sites.entries)}곳 — 그 사이트에서는 대상만 표시하고 "
+              "사람이 직접 조작합니다.", file=sys.stderr)
+    return store
 
 
 def _cmd_tui(args: argparse.Namespace) -> int:
@@ -486,6 +521,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 parser.exit(2, f"agent-browser serve: 오류: --workspace: {exc}\n")
         if getattr(args, "attach", False) and args.profile is None:
             parser.exit(2, "agent-browser serve: 오류: --attach 는 --profile NAME 과 함께 씁니다(같은 프로필끼리 붙는다).\n")
+        if args.manual_site:
+            from security.manual_sites import ManualSiteError, parse_entry
+
+            for raw in args.manual_site:
+                try:
+                    parse_entry(raw)
+                except ManualSiteError as exc:
+                    parser.exit(2, f"agent-browser serve: 오류: --manual-site {raw!r}: {exc}\n")
+            if getattr(args, "attach", False):
+                print("agent-browser serve: 경고: --attach 로 붙는 serve 의 --manual-site 는 무시됩니다(먼저 뜬 serve 의 "
+                      "목록을 씁니다 — manual-sites add 로 파일에 넣으세요).", file=sys.stderr)
         if args.profile is not None:
             if args.browser == "user-chrome":
                 parser.exit(2, "agent-browser serve: 오류: --profile 과 --browser user-chrome 은 "
@@ -508,6 +554,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from interface import approve_policy_cli
 
         return approve_policy_cli.run(args)
+    if args.command == "manual-sites":
+        from interface import manual_sites_cli
+
+        return manual_sites_cli.run(args)
+    if args.command == "handoff":
+        from interface import manual_sites_cli
+
+        return manual_sites_cli.run_handoff(args)
     if args.command == "login":
         from interface import login_cli
 
@@ -546,8 +600,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except ValueError as exc:
                 parser.exit(2, f"agent-browser run: 오류: {exc}\n")
         from interface import run_cli
+        from security import manual_sites as ms
 
-        return run_cli.run(args)
+        # WS-64: run 경로(고정 파일 run_cli·loop)는 디스패처가 같은 판정으로 거부만 한다 — 프로세스 기본 목록으로 넣는다
+        # (run 동안만 — 끝나면 원래대로, 같은 프로세스의 다른 코드에 새지 않게).
+        previous = ms.process_default()
+        ms.set_process_default(ms.ManualSiteStore(ms.manual_sites_file()))
+        try:
+            return run_cli.run(args)
+        finally:
+            ms.set_process_default(previous)
 
     parser.error(f"알 수 없는 명령: {args.command}")
     return 2

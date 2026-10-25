@@ -49,6 +49,12 @@ def _pu():
 
 #: (키, 속성) → (분류, 근거). (키, 속성, 파일) 은 같은 쌍의 파일별 예외.
 ATTRS = {
+    # --- WS-64 직접 조작할 사이트
+    ("changed", "ended"): (CONTROL, "interface/server_manual.py control_wait — security.manual_sites OUTCOMES"),
+    ("message", "banner"): (NOT_OUT, "interface/server_display.py 안내 띠(사람 창 CDP 오버레이 — 응답 아님, WS-64)"),
+    ("handoff_id", "handoff_id"): (FREE, "interface/server_manual.py mh-+hex8 — 면제하지 않음(모양이 바뀌지 않음)"),
+    ("manual_sites", "texts()"): (FREE, "interface/server_tools.py control_status — 사람이 넣은 사이트 문자열"),
+    ("site", "text"): (NOT_OUT, "security/manual_sites.py 목록 파일 행(사람 CLI)"),
     # --- CONTROL
     ("type", "type"): (CONTROL, "actions/dispatcher.py _on_dialog — Playwright Dialog.type → data.dialogs[].type (R7-B1)"),
     ("vendor", "vendor"): (CONTROL, "interface/server_signals.py data.challenge.vendor — browser.challenge 벤더 어휘(R8)"),
@@ -248,6 +254,7 @@ def _producer_values():
         ("action", "value"): {a.value for a in ActionType},
         ("code", "code"): {egress.UPSTREAM_RESOLVE_FAILED, egress.UPSTREAM_CONNECT_FAILED},
         ("changed", "last_event"): {"taken", "released"},  # server_handoff: last_event in ("taken", "released") 일 때만
+        ("changed", "ended"): set(__import__("security.manual_sites", fromlist=["OUTCOMES"]).OUTCOMES),  # WS-64
         ("status", "status"): {"pending", "approved", "denied", "expired", "used", "revoked", "opening", "ready"},
         ("outcome", "outcome"): {"succeeded", "failed", "outcome_unknown"},
         ("reason", "reason"): set(youtube_search._REASONS) | {"page_changed", "not_ready", "target_not_found",
