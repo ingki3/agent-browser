@@ -350,6 +350,14 @@ PERF_FIRST_ONLY = 3
 PERF_ALT_GROW = 256  #: 의심 시 재측정할 다른 입력 — 길이를 1/이만큼 늘려 캐시 키만 바꾼다(1MiB 에서 +4KiB; 줄이면 캐시 하한 아래로 갈 수 있다)
 PERF_ISOLATED_ENV = ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                      "PYTHONPYCACHEPREFIX")
+#: R2(B1-R1) — 제품 소스 사본: 저장소 고정 경로(`__file__`·저장소 루트 기준) 캐시는 위 격리로 못 비운다 — 다른 입력도
+#: 같은 공유 초기화·길이 버킷 표식을 써서 재측정까지 warm 이 된다(검증 실측 [2.48, 0.27, 0.26]초·재측정 0.26초 통과).
+#: 그래서 자식마다 새 임시 디렉터리에 `src/` 를 통째로 복사해 그 사본을 PYTHONPATH 맨 앞에 두고, 자식이 제품 모듈을 실제로
+#: 사본에서 import 했는지(모듈 `__file__` 이 사본 아래·원본 src 에서 읽은 모듈 0개) 보고받아 아니면 실패시킨다. 첫 측정·반복·
+#: 재측정 모두 각자 새 사본이다. 사본 생성은 자식 실행 전이라 측정(자식 안 public_payload 한 번)에 들어가지 않는다.
+#: 한계(NB): 절대 시스템 경로(`/tmp/고정` 등)·프로세스 밖 서비스(데몬·DB·네트워크)에 저장하는 캐시는 이 방식으로 격리할 수
+#: 없다 — 그런 경로는 위 '첫 실행만 느림' 재측정이 잡을 수 있는 범위(입력별 캐시)까지만 잡는다.
+PERF_CODE_COPY_IGNORE = ("__pycache__", "*.pyc")
 
 
 def _perf_child(case: str, n: int) -> None:
@@ -364,10 +372,16 @@ def _perf_child(case: str, n: int) -> None:
     # 조건 성립: 격리가 실제로 걸렸다 — 홈·임시·캐시 경로가 모두 이 자식의 빈 작업 디렉터리다
     here = os.path.realpath(os.getcwd())
     isolated = all(os.path.realpath(os.environ.get(k, "")) == here for k in PERF_ISOLATED_ENV)
+    # 조건 성립(R2): 제품 모듈을 원본 저장소 src 가 아니라 부모가 만든 사본에서 읽었다 — 부모가 사본 경로와 맞춰 본다
+    measured = sys.modules["security.public_url"]  # 패키지가 같은 이름의 함수를 재수출하므로 모듈은 sys.modules 에서
+    origin = Path(__file__).resolve().parents[2] / "src"
+    loaded = [os.path.realpath(f) for m in list(sys.modules.values()) if isinstance(f := getattr(m, "__file__", None), str)]
+    from_origin = [f for f in loaded if Path(f).is_relative_to(origin)]
     caches = [_public_text_long.cache_info(), _public_url_field_long.cache_info()]
     print(json.dumps({"case": case, "n": n, "seconds": seconds,
                       "hits": sum(c.hits for c in caches), "misses": [c.misses for c in caches],
-                      "isolated": isolated}))
+                      "isolated": isolated, "module": os.path.realpath(measured.__file__),
+                      "from_origin": from_origin}))
 
 
 def _best_of(case: str, n: int, runs: int = PERF_RUNS) -> float:
@@ -388,25 +402,36 @@ def _best_of(case: str, n: int, runs: int = PERF_RUNS) -> float:
 
 
 def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
+    """격리 자식 한 번의 측정(초). 자식마다 빈 홈·임시 디렉터리와 제품 소스 사본(R2)을 새로 만든다 — 사본 생성은 측정 밖.
+
+    한계(NB): 절대 시스템 경로·프로세스 밖 서비스에 저장하는 캐시는 사본으로도 격리되지 않는다(PERF_CODE_COPY_IGNORE 위 설명).
+    """
     env = dict(os.environ)
-    src = str(Path(__file__).resolve().parents[2] / "src")
+    src = Path(__file__).resolve().parents[2] / "src"
     # 작업 디렉터리를 옮기므로 상대 경로 항목은 절대 경로로
     rest = [os.path.abspath(p) for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
-    env["PYTHONPATH"] = os.pathsep.join([src, *rest])
-    box = os.path.realpath(tempfile.mkdtemp(prefix="ws66-perf-"))  # 자식마다 새 빈 디렉터리(R1 — 위 설명)
-    env.update(dict.fromkeys(PERF_ISOLATED_ENV, box))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ws66-perf-"))  # 자식마다 새 임시 디렉터리(R1·R2 — 위 설명)
+    box = os.path.join(root, "box")  # 빈 작업 디렉터리 = 홈·임시·캐시
+    code = os.path.join(root, "code", "src")  # 제품 소스 사본(R2) — 저장소 고정 경로 캐시도 사본마다 새로
     try:
-        proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), case, str(n)], capture_output=True,
-                              text=True, timeout=timeout, env=env, cwd=box)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
+        os.mkdir(box)
+        shutil.copytree(src, code, ignore=shutil.ignore_patterns(*PERF_CODE_COPY_IGNORE))
+        env["PYTHONPATH"] = os.pathsep.join([code, *rest])
+        env.update(dict.fromkeys(PERF_ISOLATED_ENV, box))
+        try:
+            proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), case, str(n)], capture_output=True,
+                                  text=True, timeout=timeout, env=env, cwd=box)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
     finally:
-        shutil.rmtree(box, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
     row = json.loads(proc.stdout.strip().splitlines()[-1])
     # 조건 성립: 잰 호출이 캐시를 거치지 않고 주소 칸·자유 문장을 실제로 계산했고, 격리된 환경에서 돌았다
     assert row["hits"] == 0 and min(row["misses"]) >= 1, (case, row)
     assert row["isolated"], (case, "자식 환경 격리 실패", row)
+    # 조건 성립(R2): 잰 제품 모듈이 이 자식의 사본에서 왔고, 원본 저장소 src 에서 읽은 모듈이 없다
+    assert Path(row["module"]).is_relative_to(code) and not row["from_origin"], (case, "제품 소스 사본 미사용", code, row)
     return row["seconds"]
 
 
