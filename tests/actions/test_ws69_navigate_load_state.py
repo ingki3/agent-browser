@@ -200,7 +200,10 @@ async def test_same_url_renavigate_does_not_mistake_previous_document(server):
 
 
 async def test_remaining_time_below_1ms_skips_stage_two(server, monkeypatch):
-    """남은 시간 <1ms 면 2단계를 부르지 않고(timeout=0 은 무한 대기) 부분 성공."""
+    """남은 시간 <1ms 면 2단계를 부르지 않는다(timeout=0 은 무한 대기).
+
+    R2 기대값 변경(부분 성공 → 보수 실패, 코디네이터 승인 A): 예산이 소진돼 부분 성공 판정(문서 커밋 계수·readyState
+    판독)을 예산 안에서 할 수 없으므로 E_NAVIGATE_TIMEOUT. 1단계는 끝났으므로 epoch 는 오른다."""
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
@@ -219,8 +222,10 @@ async def test_remaining_time_below_1ms_skips_stage_two(server, monkeypatch):
         r = await _nav(d, server + "/plain")
         after = engine.epoch
         await b.close()
-    assert r.success is True, r.error_message
-    assert r.data["load_state"]["timed_out"] is True
+    assert r.success is False
+    assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+    assert "load_state" not in r.data
+    assert r.data["nav_failure"] == {"kind": "timeout"}
     assert called == []
     assert after == before + 1
 

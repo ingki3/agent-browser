@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 #: WS-69: navigate 2단계 남은 시간 측정용 시계(시험이 이 이름만 바꿔 끼운다 — time.monotonic 전역 교체는 이벤트 루프를 깬다).
 _monotonic = time.monotonic
+#: navigate 추가 판독(readyState)이 쓸 수 있는 timeout_ms 너머 유예(WS-69 R2) — 반환 ≤ timeout_ms + 100ms.
+_NAV_READ_GRACE_S = 0.05
 
 #: 요소를 대상으로 하지 않는 액션 (staleness 검증 대상 아님)
 _ELEMENTLESS_ACTIONS = frozenset(
@@ -3533,13 +3535,19 @@ class ActionDispatcher:
         # WS-69: 2단계 — 1단계 goto(domcontentloaded) 가 커밋+DCL 을 증명하고(실패면 기존 오류), 요청이 load/networkidle
         # 이면 남은 시간으로 wait_for_load_state(요청값). 2단계의 **시간 초과만** 부분 성공(문서는 열림). 1단계가 새 문서를
         # 증명하므로 이전 문서(같은 주소 재이동)의 상태를 성공으로 오인하지 않는다(리뷰 B1).
-        # R1(검증 B1): 2단계 시간 초과의 부분 성공은 (a) 주 프레임이 오류 문서(chrome-error://)가 아니고 (b) 문서
-        # 신원(CDP 주 프레임 loaderId)이 1단계 직후와 같을 때만. 단계와 무관하게 끝난 주 프레임이 오류 문서면 실패다
-        # (형제 load/networkidle 완료·commit/DCL 경로의 거짓 성공 — 기준부터 있던 것).
+        # R2(검증 B1-a·B1-b·B2): 2단계 시간 초과의 부분 성공은 (a) 이동 시작 뒤 주 프레임 **새 문서 커밋이 정확히 1회**
+        # (goto 전에 건 이벤트 계수 — 서버 3xx 는 1회, 스크립트 이동·meta refresh·오류 문서 전환은 2회 이상), (b) 마지막
+        # await 뒤 **동기적으로** 주 프레임이 오류 문서(chrome-error://)가 아니고, (c) readyState ∈ {interactive, complete}
+        # (남은 예산 안에서 읽음 — 못 읽으면 실패)일 때만. 추가 판독은 시작+timeout_ms+유예 를 넘기지 않는다.
+        # 단계와 무관하게 끝난 주 프레임이 오류 문서면 실패다(마지막 await 뒤 동기 확인).
         requested = params.get("wait_until", "domcontentloaded")
         timeout_ms = params.get("timeout_ms", 30000)
         started = _monotonic()
+        loop = asyncio.get_running_loop()
+        # 추가 판독 상한(timeout_ms=0 은 Playwright 무한 대기 — 그때는 2단계 시간 초과가 없어 판독도 없다)
+        read_deadline = loop.time() + timeout_ms / 1000 + _NAV_READ_GRACE_S if timeout_ms else None
         failed_navs = self._watch_failed_navigations(page)
+        commits = self._watch_document_commits(page)  # goto 전 — 이동 전체의 문서 커밋을 센다
         try:
             try:
                 await page.goto(
@@ -3552,12 +3560,12 @@ class ActionDispatcher:
             self.ctx.engine.bump_epoch("navigate")  # 1단계 직후 — 부분 성공에서도 반드시 오른다(N2)
             data: Dict[str, Any] = {}
             if requested in ("load", "networkidle"):
-                doc_id = await self._main_document_id(page)  # 1단계가 증명한 문서
                 timed_out: Optional[BaseException] = None
                 remaining = timeout_ms - (_monotonic() - started) * 1000 if timeout_ms else 0
                 if timeout_ms and remaining < 1:
-                    # timeout=0 은 Playwright 의 무한 대기 — 부르지 않는다(N1)
-                    timed_out = PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded.")
+                    # timeout=0 은 Playwright 의 무한 대기 — 부르지 않는다(N1). R2: 예산 소진 — 부분 성공 판정(커밋 계수·
+                    # readyState)을 할 시간이 없으니 보수 실패(코디네이터 승인 A).
+                    return self._navigate_failure(action, PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded."))
                 else:
                     try:
                         await page.wait_for_load_state(requested, timeout=remaining)
@@ -3565,46 +3573,84 @@ class ActionDispatcher:
                         timed_out = exc  # 이것만 부분 성공 후보(N2) — 닫힘 등은 아래 기존 분류
                     except Exception as exc:  # noqa: BLE001
                         return self._navigate_failure(action, exc)
-                if _is_error_document(page.url):
-                    return self._error_document_failure(action, page.url, failed_navs)
                 if timed_out is not None:
-                    if doc_id is None or await self._main_document_id(page) != doc_id:
-                        # 1단계 문서가 사라졌다(또는 신원을 확인하지 못했다) — 새 문서의 DCL 은 증명되지 않았으니
-                        # 부분 성공으로 올리지 않는다(기준 동작과 같은 실패).
+                    ready = await self._bounded_ready_state(page, read_deadline, loop)
+                    # ── 마지막 await 뒤: 아래는 모두 동기 판정(그 사이 문서가 바뀔 수 없다) ──
+                    if _is_error_document(page.url):
+                        return self._error_document_failure(action, page.url, failed_navs)
+                    if commits["count"] != 1:
+                        # 이동 중 문서가 두 번 이상 커밋됐다(또는 셀 수 없었다) — 1단계 DCL 이 지금 문서의 것이라는
+                        # 증명이 없으니 부분 성공으로 올리지 않는다(기준 동작과 같은 실패).
                         from actions.nav_failure import DOCUMENT_CHANGED_HINT as _DOCUMENT_CHANGED_HINT
 
                         failure = self._navigate_failure(action, timed_out)
                         failure.data["hint"] = _DOCUMENT_CHANGED_HINT.format(requested=requested)
                         return failure
+                    if ready not in ("interactive", "complete"):
+                        return self._navigate_failure(action, timed_out)  # 못 읽음·예산 소진·아직 loading
                     from actions.nav_failure import LOAD_STATE_TIMED_OUT_HINT
 
                     data["load_state"] = {"requested": requested, "reached": "domcontentloaded", "timed_out": True}
                     data["hint"] = LOAD_STATE_TIMED_OUT_HINT.format(requested=requested)
+                elif _is_error_document(page.url):  # 2단계 완료 — 그 await 뒤 동기 확인
+                    return self._error_document_failure(action, page.url, failed_navs)
             elif _is_error_document(page.url):
                 return self._error_document_failure(action, page.url, failed_navs)
             return self._result(
                 success=True, action=action, retry_safe=True, data={"url": page.url, **data}
             )
         finally:
+            self._unwatch_document_commits(commits)
             self._unwatch_failed_navigations(page, failed_navs)
 
-    async def _main_document_id(self, page: Any) -> Optional[str]:
-        """주 프레임 현재 문서의 신원 — CDP Page.getFrameTree 의 loaderId (WS-69 R1).
-
-        loaderId 는 브라우저가 문서 로드마다 새로 붙이는 값이라 새 문서(오류 문서 포함)면 바뀌고, 같은 문서 안 이동
-        (pushState·hash)이면 그대로다. 페이지 JS 를 돌리지 않으므로 이동 중에도 막히지 않고 페이지가 꾸밀 수 없다.
-        Playwright 공개 API 에는 문서 식별자가 없다(main_frame 객체는 문서가 바뀌어도 같다). 최상위 Page 가 아니거나
-        (switch_frame 안) 읽지 못하면 None — 호출자는 '같음을 증명 못 함'으로 보아 부분 성공을 내지 않는다.
-        """
-        if not hasattr(page, "main_frame") or not hasattr(page, "context"):
+    async def _bounded_ready_state(self, page: Any, deadline: Optional[float], loop: Any) -> Optional[str]:
+        """주 프레임 readyState 를 navigate 예산(deadline, loop 시각) 안에서 읽는다 — 넘기거나 못 읽으면 None (WS-69 R2)."""
+        budget = None if deadline is None else deadline - loop.time()
+        if budget is not None and budget <= 0:
             return None
         try:
-            cdp = await self._gate_cdp_for(page)
-            tree = await cdp.send("Page.getFrameTree")
-            loader = tree["frameTree"]["frame"].get("loaderId")
-        except Exception:  # noqa: BLE001
+            value = await asyncio.wait_for(self._main_ready_state(page), budget)
+        except Exception:  # noqa: BLE001 — TimeoutError 포함: 보수 실패
             return None
-        return str(loader) if loader else None
+        return value if isinstance(value, str) else None
+
+    async def _main_ready_state(self, page: Any) -> Any:
+        """주 프레임 문서의 document.readyState (WS-69 R2 — 시험이 이 판독을 지연·고장으로 바꿔 끼운다)."""
+        return await page.evaluate("document.readyState")
+
+    def _watch_document_commits(self, page: Any) -> Dict[str, Any]:
+        """주 프레임 새 문서 커밋 계수기(WS-69 R2) — goto 전에 걸고 finally 에서 해제.
+
+        Playwright 공개 page 'framenavigated' 는 같은 문서 안 이동(pushState·hash)에도 발화해(실측) 문서 교체와 구분할
+        수 없다. 그래서 주 프레임 자신의 'navigated' 이벤트에서 newDocument 가 있고 error 가 없는 것(=새 문서 커밋)만
+        센다(Playwright 내부 이벤트 — 같은 메시지 처리에서 frame.url 도 갱신되므로 계수와 page.url 이 어긋나지 않는다).
+        최상위 Page 가 아니거나(switch_frame 안) 이벤트를 걸 수 없으면 count=None — 부분 성공을 내지 않는다.
+        """
+        state: Dict[str, Any] = {"count": None, "unwatch": None}
+        frame = getattr(page, "main_frame", None)
+        emitter = getattr(getattr(frame, "_impl_obj", None), "_event_emitter", None)
+        if frame is None or emitter is None or not callable(getattr(emitter, "on", None)):
+            return state
+
+        def handler(event: Any) -> None:
+            if isinstance(event, dict) and "newDocument" in event and "error" not in event:
+                state["count"] += 1
+
+        try:
+            emitter.on("navigated", handler)
+        except Exception:  # noqa: BLE001
+            return state
+        state["count"] = 0
+        state["unwatch"] = lambda: emitter.remove_listener("navigated", handler)
+        return state
+
+    def _unwatch_document_commits(self, state: Dict[str, Any]) -> None:
+        if state.get("unwatch") is None:
+            return
+        try:
+            state["unwatch"]()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _watch_failed_navigations(self, page: Any) -> Dict[str, Any]:
         """이동 중 실패한 주 프레임 문서 요청의 net 오류를 모은다 — 오류 문서 실패의 원인 kind 용 (WS-69 R1)."""
