@@ -295,6 +295,10 @@ class SignalsMixin:
             result.data["retry_skipped"] = skip_reason(code)
             return None
 
+        if (result.data.get("load_state") or {}).get("timed_out"):
+            # WS-69 N4: 부분 성공(요청한 load 상태 미도달)은 다시 이동하면 대기가 두 배 — 재시도하지 않고 이유를 남긴다.
+            return skip("load_timed_out")
+
         if not getattr(self._core, "headless", False):
             return skip("headed")
         if not self.headless_retry:
@@ -490,6 +494,39 @@ class SignalsMixin:
                    if p is not None)
 
     def _attach_upstream_failure(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+    ) -> ActionResult:
+        """업스트림 실패 부착(_attach_upstream_failure_core) 뒤 최종 결과에 이동 실패 종류를 붙인다 (WS-69 B3).
+
+        차단(_attach_egress_block)·업스트림 실패가 결과를 새로 만들면 디스패처가 붙인 nav_failure 가 사라지므로,
+        결과 재구성이 끝난 이 지점에서 data.egress.code(프록시 경유 — serve 는 항상)를 우선해 정한다.
+        """
+        return self._attach_nav_failure(
+            action, params, self._attach_upstream_failure_core(action, params, result, before))
+
+    def _attach_nav_failure(self, action: ActionType, params: Dict[str, Any], result: ActionResult) -> ActionResult:
+        """navigate·tab_control create 실패에 data.nav_failure={kind[, net_error]} + hint (WS-69). 오류 코드는 그대로.
+
+        navigate 는 이동 실패 코드(E_NAVIGATE_TIMEOUT)와 egress 차단(E_INVALID_URL + egress_blocked)만 — 닫힘
+        (E_PAGE_CRASHED)·다운로드·입력 거부는 이동 실패 종류가 아니다. create 는 디스패처가 이동 실패로 본 것만.
+        """
+        if result.success:
+            return result
+        egress = result.data.get("egress") if isinstance(result.data, dict) else None
+        code = egress.get("code") if isinstance(egress, dict) else None
+        if action is ActionType.NAVIGATE:
+            if not (result.error_code is ErrorCode.NAVIGATE_TIMEOUT
+                    or (result.error_code is ErrorCode.INVALID_URL and code == "egress_blocked")):
+                return result
+        elif not (action is ActionType.TAB_CONTROL and str(params.get("command", "")).lower() == "create"
+                  and "nav_failure" in result.data):
+            return result
+        from actions.nav_failure import attach_nav_failure
+
+        attach_nav_failure(result.data, result.error_message, code)
+        return result
+
+    def _attach_upstream_failure_core(
         self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
     ) -> ActionResult:
         """프록시가 업스트림에 닿지 못해 스스로 만든 502 문서를 이동 실패로 알린다 (WS-29b R1).

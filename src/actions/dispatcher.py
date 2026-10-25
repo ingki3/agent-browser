@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from perception.engine import ElementHandle, PerceptionEngine
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 from security.secrets import KEY_PATTERN as SECRET_KEY_PATTERN
@@ -55,6 +56,11 @@ from actions.verification import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: WS-69: navigate 2단계 남은 시간 측정용 시계(시험이 이 이름만 바꿔 끼운다 — time.monotonic 전역 교체는 이벤트 루프를 깬다).
+_monotonic = time.monotonic
+#: navigate 추가 판독(readyState)이 쓸 수 있는 timeout_ms 너머 유예(WS-69 R2) — 반환 ≤ timeout_ms + 100ms.
+_NAV_READ_GRACE_S = 0.05
 
 #: 요소를 대상으로 하지 않는 액션 (staleness 검증 대상 아님)
 _ELEMENTLESS_ACTIONS = frozenset(
@@ -115,6 +121,25 @@ _TARGET_CLOSED = "has been closed"
 def _is_target_closed(exc: BaseException) -> bool:
     """닫힌 페이지·컨텍스트·브라우저로 인한 실패인가(TargetClosedError 또는 같은 문구)."""
     return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
+
+
+def _is_error_document(url: Any) -> bool:
+    """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
+    return str(url or "").startswith("chrome-error://")
+
+
+#: WS-69 B4: extract·shadow_root_selector 의 표준 CSS(document.querySelector[All]) 문법 오류 안내.
+SELECTOR_SYNTAX_HINT = ("선택자 문법 오류 — 이 경로는 표준 CSS 만 받습니다(:has-text·text= 등 Playwright 전용 문법 불가). "
+                        "observe_page 의 element_id 나 표준 CSS 선택자를 쓰세요.")
+
+
+def _is_selector_syntax_error(exc: BaseException) -> bool:
+    """document.querySelector[All] 가 던진 '유효하지 않은 선택자' DOMException 인가(WS-69 B4).
+
+    SyntaxError·Unexpected token 일반 매칭은 하지 않는다 — evaluate 안 JS 버그를 '못 찾음'으로 숨기지 않게.
+    """
+    text = str(exc)
+    return "Failed to execute 'querySelector" in text and "is not a valid selector" in text
 
 #: WS-25 — 페이지를 옮길 수 있는 액션 뒤 메인 프레임 문서 요청이 시작되는지 보는 창.
 #: 실측(로컬 Chromium, 액션 반환 → 요청 시작, 각 30회): 유휴 Enter p95 21ms·max 23,
@@ -3585,26 +3610,191 @@ class ActionDispatcher:
         refused = self._refuse_redacted_url(action, params.get("url"))
         if refused is not None:
             return refused
+        # WS-69: 2단계 — 1단계 goto(domcontentloaded) 가 커밋+DCL 을 증명하고(실패면 기존 오류), 요청이 load/networkidle
+        # 이면 남은 시간으로 wait_for_load_state(요청값). 2단계의 **시간 초과만** 부분 성공(문서는 열림). 1단계가 새 문서를
+        # 증명하므로 이전 문서(같은 주소 재이동)의 상태를 성공으로 오인하지 않는다(리뷰 B1).
+        # R2(검증 B1-a·B1-b·B2): 2단계 시간 초과의 부분 성공은 (a) 이동 시작 뒤 주 프레임 **새 문서 커밋이 정확히 1회**
+        # (goto 전에 건 이벤트 계수 — 서버 3xx 는 1회, 스크립트 이동·meta refresh·오류 문서 전환은 2회 이상), (b) 마지막
+        # await 뒤 **동기적으로** 주 프레임이 오류 문서(chrome-error://)가 아니고, (c) readyState ∈ {interactive, complete}
+        # (남은 예산 안에서 읽음 — 못 읽으면 실패)일 때만. 추가 판독은 시작+timeout_ms+유예 를 넘기지 않는다.
+        # 단계와 무관하게 끝난 주 프레임이 오류 문서면 실패다(마지막 await 뒤 동기 확인).
+        requested = params.get("wait_until", "domcontentloaded")
+        timeout_ms = params.get("timeout_ms", 30000)
+        started = _monotonic()
+        loop = asyncio.get_running_loop()
+        # 추가 판독 상한(timeout_ms=0 은 Playwright 무한 대기 — 그때는 2단계 시간 초과가 없어 판독도 없다)
+        read_deadline = loop.time() + timeout_ms / 1000 + _NAV_READ_GRACE_S if timeout_ms else None
+        failed_navs = self._watch_failed_navigations(page)
+        commits = self._watch_document_commits(page)  # goto 전 — 이동 전체의 문서 커밋을 센다
         try:
-            await page.goto(
-                params["url"],
-                wait_until=params.get("wait_until", "domcontentloaded"),
-                timeout=params.get("timeout_ms", 30000),
-            )
-        except Exception as exc:  # noqa: BLE001
+            try:
+                await page.goto(
+                    params["url"],
+                    wait_until="commit" if requested == "commit" else "domcontentloaded",
+                    timeout=timeout_ms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return self._navigate_failure(action, exc)
+            self.ctx.engine.bump_epoch("navigate")  # 1단계 직후 — 부분 성공에서도 반드시 오른다(N2)
+            data: Dict[str, Any] = {}
+            if requested in ("load", "networkidle"):
+                timed_out: Optional[BaseException] = None
+                remaining = timeout_ms - (_monotonic() - started) * 1000 if timeout_ms else 0
+                if timeout_ms and remaining < 1:
+                    # timeout=0 은 Playwright 의 무한 대기 — 부르지 않는다(N1). R2: 예산 소진 — 부분 성공 판정(커밋 계수·
+                    # readyState)을 할 시간이 없으니 보수 실패(코디네이터 승인 A).
+                    return self._navigate_failure(action, PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded."))
+                else:
+                    try:
+                        await page.wait_for_load_state(requested, timeout=remaining)
+                    except PlaywrightTimeoutError as exc:
+                        timed_out = exc  # 이것만 부분 성공 후보(N2) — 닫힘 등은 아래 기존 분류
+                    except Exception as exc:  # noqa: BLE001
+                        return self._navigate_failure(action, exc)
+                if timed_out is not None:
+                    ready = await self._bounded_ready_state(page, read_deadline, loop)
+                    # ── 마지막 await 뒤: 아래는 모두 동기 판정(그 사이 문서가 바뀔 수 없다) ──
+                    if _is_error_document(page.url):
+                        return self._error_document_failure(action, page.url, failed_navs)
+                    if commits["count"] != 1:
+                        # 이동 중 문서가 두 번 이상 커밋됐다(또는 셀 수 없었다) — 1단계 DCL 이 지금 문서의 것이라는
+                        # 증명이 없으니 부분 성공으로 올리지 않는다(기준 동작과 같은 실패).
+                        from actions.nav_failure import DOCUMENT_CHANGED_HINT as _DOCUMENT_CHANGED_HINT
+
+                        failure = self._navigate_failure(action, timed_out)
+                        failure.data["hint"] = _DOCUMENT_CHANGED_HINT.format(requested=requested)
+                        return failure
+                    if ready not in ("interactive", "complete"):
+                        return self._navigate_failure(action, timed_out)  # 못 읽음·예산 소진·아직 loading
+                    from actions.nav_failure import LOAD_STATE_TIMED_OUT_HINT
+
+                    data["load_state"] = {"requested": requested, "reached": "domcontentloaded", "timed_out": True}
+                    data["hint"] = LOAD_STATE_TIMED_OUT_HINT.format(requested=requested)
+                elif _is_error_document(page.url):  # 2단계 완료 — 그 await 뒤 동기 확인
+                    return self._error_document_failure(action, page.url, failed_navs)
+            elif _is_error_document(page.url):
+                return self._error_document_failure(action, page.url, failed_navs)
             return self._result(
-                success=False,
-                action=action,
-                retry_safe=True,
-                error_code=(ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
-                            # WS-50: 닫힌 페이지·컨텍스트·브라우저는 이동 시간 초과가 아니다.
-                            else ErrorCode.PAGE_CRASHED if _is_target_closed(exc)
-                            else ErrorCode.NAVIGATE_TIMEOUT),
-                error_message=str(exc),
+                success=True, action=action, retry_safe=True, data={"url": page.url, **data}
             )
-        self.ctx.engine.bump_epoch("navigate")
+        finally:
+            self._unwatch_document_commits(commits)
+            self._unwatch_failed_navigations(page, failed_navs)
+
+    async def _bounded_ready_state(self, page: Any, deadline: Optional[float], loop: Any) -> Optional[str]:
+        """주 프레임 readyState 를 navigate 예산(deadline, loop 시각) 안에서 읽는다 — 넘기거나 못 읽으면 None (WS-69 R2)."""
+        budget = None if deadline is None else deadline - loop.time()
+        if budget is not None and budget <= 0:
+            return None
+        try:
+            value = await asyncio.wait_for(self._main_ready_state(page), budget)
+        except Exception:  # noqa: BLE001 — TimeoutError 포함: 보수 실패
+            return None
+        return value if isinstance(value, str) else None
+
+    async def _main_ready_state(self, page: Any) -> Any:
+        """주 프레임 문서의 document.readyState (WS-69 R2 — 시험이 이 판독을 지연·고장으로 바꿔 끼운다)."""
+        return await page.evaluate("document.readyState")
+
+    def _watch_document_commits(self, page: Any) -> Dict[str, Any]:
+        """주 프레임 새 문서 커밋 계수기(WS-69 R2) — goto 전에 걸고 finally 에서 해제.
+
+        Playwright 공개 page 'framenavigated' 는 같은 문서 안 이동(pushState·hash)에도 발화해(실측) 문서 교체와 구분할
+        수 없다. 그래서 주 프레임 자신의 'navigated' 이벤트에서 newDocument 가 있고 error 가 없는 것(=새 문서 커밋)만
+        센다(Playwright 내부 이벤트 — 같은 메시지 처리에서 frame.url 도 갱신되므로 계수와 page.url 이 어긋나지 않는다).
+        최상위 Page 가 아니거나(switch_frame 안) 이벤트를 걸 수 없으면 count=None — 부분 성공을 내지 않는다.
+        """
+        state: Dict[str, Any] = {"count": None, "unwatch": None}
+        frame = getattr(page, "main_frame", None)
+        emitter = getattr(getattr(frame, "_impl_obj", None), "_event_emitter", None)
+        if frame is None or emitter is None or not callable(getattr(emitter, "on", None)):
+            return state
+
+        def handler(event: Any) -> None:
+            if isinstance(event, dict) and "newDocument" in event and "error" not in event:
+                state["count"] += 1
+
+        try:
+            emitter.on("navigated", handler)
+        except Exception:  # noqa: BLE001
+            return state
+        state["count"] = 0
+        state["unwatch"] = lambda: emitter.remove_listener("navigated", handler)
+        return state
+
+    def _unwatch_document_commits(self, state: Dict[str, Any]) -> None:
+        if state.get("unwatch") is None:
+            return
+        try:
+            state["unwatch"]()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _watch_failed_navigations(self, page: Any) -> Dict[str, Any]:
+        """이동 중 실패한 주 프레임 문서 요청의 net 오류를 모은다 — 오류 문서 실패의 원인 kind 용 (WS-69 R1)."""
+        state: Dict[str, Any] = {"errors": [], "handler": None}
+        on = getattr(page, "on", None)
+        frame = getattr(page, "main_frame", page)
+        if not callable(on):
+            return state
+
+        def handler(request: Any) -> None:
+            try:
+                if request.is_navigation_request() and request.frame is frame and request.failure:
+                    state["errors"].append(str(request.failure))
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            on("requestfailed", handler)
+            state["handler"] = handler
+        except Exception:  # noqa: BLE001
+            pass
+        return state
+
+    def _unwatch_failed_navigations(self, page: Any, state: Dict[str, Any]) -> None:
+        if state.get("handler") is None:
+            return
+        try:
+            page.remove_listener("requestfailed", state["handler"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _error_document_failure(self, action: ActionType, url: str, failed_navs: Dict[str, Any]) -> ActionResult:
+        """주 프레임이 브라우저 오류 문서로 끝난 이동 — E_NAVIGATE_TIMEOUT + nav_failure(원인 net 오류가 있으면 그 kind)."""
+        cause = failed_navs["errors"][-1] if failed_navs.get("errors") else "원인 미상"
+        return self._navigate_failure(
+            action, RuntimeError(f"이동 후 주 프레임이 브라우저 오류 문서입니다({url}): {cause}"))
+
+    def _selector_syntax_result(self, action: ActionType, code: ErrorCode, selector: Any) -> ActionResult:
+        """표준 CSS 선택자 문법 오류 — 못 찾음 계열 코드 + data.selector_error + hint (WS-69 B4)."""
         return self._result(
-            success=True, action=action, retry_safe=True, data={"url": page.url}
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=code,
+            error_message=f"선택자 문법 오류(표준 CSS 아님): {selector}",
+            data={"selector_error": True, "hint": SELECTOR_SYNTAX_HINT},
+        )
+
+    def _navigate_failure(self, action: ActionType, exc: BaseException) -> ActionResult:
+        """navigate 실패 결과 — 코드는 기존 그대로, 이동 실패(E_NAVIGATE_TIMEOUT)에는 data.nav_failure + hint (WS-69)."""
+        code = (ErrorCode.DOWNLOAD_FAILED if "Download is starting" in str(exc)
+                # WS-50: 닫힌 페이지·컨텍스트·브라우저는 이동 시간 초과가 아니다.
+                else ErrorCode.PAGE_CRASHED if _is_target_closed(exc)
+                else ErrorCode.NAVIGATE_TIMEOUT)
+        data: Dict[str, Any] = {}
+        if code is ErrorCode.NAVIGATE_TIMEOUT:
+            from actions.nav_failure import attach_nav_failure
+
+            attach_nav_failure(data, str(exc))
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=code,
+            error_message=str(exc),
+            data=data or None,
         )
 
     def _refuse_redacted_url(self, action: ActionType, url: Any) -> Optional[ActionResult]:
@@ -4077,12 +4267,20 @@ class ActionDispatcher:
                     data=data,
                 )
         except Exception as exc:  # noqa: BLE001
+            fail_data: Optional[Dict[str, Any]] = None
+            if command == "create" and params.get("url") and not _is_target_closed(exc):
+                # WS-69: 새 탭 이동 실패의 종류(오류 코드는 그대로). 코어에 남은 새 탭과 디스패처 활성 페이지의
+                # 불일치는 이번 범위 밖(NB 이슈로 기록).
+                from actions.nav_failure import attach_nav_failure
+
+                fail_data = attach_nav_failure({}, str(exc))
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=False,
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"탭 제어 실패: {exc}",
+                data=fail_data,
             )
 
         return self._result(
@@ -4160,21 +4358,26 @@ class ActionDispatcher:
         attributes: Sequence[str] = params.get("attributes", [])
         extract_all = params.get("extract_all", False)
 
-        payload = await page.evaluate(
-            """
-            (args) => {
-              const nodes = args.all
-                ? Array.from(document.querySelectorAll(args.selector))
-                : [document.querySelector(args.selector)].filter(Boolean);
-              return nodes.map((el) => {
-                const item = { text: (el.innerText || el.textContent || '').trim() };
-                for (const attr of args.attrs) item[attr] = el.getAttribute(attr);
-                return item;
-              });
-            }
-            """,
-            {"selector": selector, "attrs": list(attributes), "all": extract_all},
-        )
+        try:
+            payload = await page.evaluate(
+                """
+                (args) => {
+                  const nodes = args.all
+                    ? Array.from(document.querySelectorAll(args.selector))
+                    : [document.querySelector(args.selector)].filter(Boolean);
+                  return nodes.map((el) => {
+                    const item = { text: (el.innerText || el.textContent || '').trim() };
+                    for (const attr of args.attrs) item[attr] = el.getAttribute(attr);
+                    return item;
+                  });
+                }
+                """,
+                {"selector": selector, "attrs": list(attributes), "all": extract_all},
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not _is_selector_syntax_error(exc):
+                raise  # 진짜 JS 오류는 기존 포괄 처리(WS-69 B4 — SyntaxError 일반 매칭 금지)
+            return self._selector_syntax_result(ActionType.EXTRACT, ErrorCode.ELEMENT_NOT_FOUND, selector)
         if not payload:
             return self._result(
                 success=False,
@@ -4340,11 +4543,17 @@ class ActionDispatcher:
             )
 
         shadow_selector = params.get("shadow_root_selector")
-        exists = await page.evaluate(
-            "(sel) => { const el = document.querySelector(sel); "
-            "return !!(el && el.shadowRoot); }",
-            shadow_selector,
-        )
+        try:
+            exists = await page.evaluate(
+                "(sel) => { const el = document.querySelector(sel); "
+                "return !!(el && el.shadowRoot); }",
+                shadow_selector,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not _is_selector_syntax_error(exc):
+                raise
+            return self._selector_syntax_result(ActionType.SWITCH_FRAME, ErrorCode.SHADOW_ROOT_NOT_FOUND,
+                                                shadow_selector)
         if not exists:
             return self._result(
                 success=False,
