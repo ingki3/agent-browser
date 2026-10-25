@@ -121,7 +121,7 @@ class _Doc:
         self.main_world_reads += 1
         return CLEAN
 
-    async def isolated_top_evaluate(self, expression: str) -> Any:
+    async def isolated_top_evaluate(self, expression: str, expect_loader: Any = None) -> Any:
         assert expression == ch.STRICT_PROBE_EXPRESSION
         v = self.probes[min(self.evals, len(self.probes) - 1)]
         self.evals += 1
@@ -233,13 +233,13 @@ def test_b2_second_strict_probe_catches_same_url_dom_swap():
 
 def test_b2_change_right_after_save_rolls_back_new_entry(tmp_path):
     path = tmp_path / sp.FILE_NAME
-    doc = _Doc(bindings=[("F", "L1", 1, PAGE_URL)] * 2 + [("F", "L9", 3, PAGE_URL)])
+    doc = _Doc(bindings=[("F", "L1", 1, PAGE_URL)] * 3 + [("F", "L9", 3, PAGE_URL)])  # R2: 4번째 = 저장 뒤 판정의 뒤쪽
     svc = _svc(doc, SavedPageStore(path))
     out = _run(svc)
     assert not out["success"] and out["error_message"] == sp.E_CHANGED
     assert len(svc.store) == 0
     assert json.loads(path.read_text(encoding="utf-8"))["pages"] == []
-    assert doc.binds == 3
+    assert doc.binds == 4
 
 
 def test_b2_swap_after_save_rolls_back_name_update(tmp_path):
@@ -262,7 +262,7 @@ def test_b2_stable_document_saves_with_three_bindings_and_three_probes():
     svc = _svc(doc)
     out = _run(svc)
     assert out["success"] and len(svc.store) == 1
-    assert doc.binds == 3 and doc.evals == 3 and doc.main_world_reads == 0
+    assert doc.binds == 4 and doc.evals == 3  # R2: 판정 3회 각각 결속값 샌드위치(앞·사이·사이·뒤) and doc.main_world_reads == 0
 
 
 # ---------------------------------------------------------------------------
@@ -438,16 +438,16 @@ async def test_b2_e2e_swap_right_after_save_rolls_back(script, message, tmp_path
 
             store.add = add_then_swap  # type: ignore[method-assign]
             disp = srv._dispatcher
-            native_bind = disp.top_document_binding
+            native_eval = disp.isolated_top_evaluate
             calls = {"n": 0}
 
-            async def bind_after_swap() -> Any:
+            async def eval_after_swap(*a: Any, **k: Any) -> Any:
                 calls["n"] += 1
-                if calls["n"] == 3:  # 저장 뒤 확인 — 교체가 끝난 뒤 읽게
+                if calls["n"] == 3:  # 저장 뒤 확인(R2: 판정 → 결속값) — 교체가 끝난 뒤 읽게
                     await page.wait_for_timeout(50)
-                return await native_bind()
+                return await native_eval(*a, **k)
 
-            disp.top_document_binding = bind_after_swap
+            disp.isolated_top_evaluate = eval_after_swap
             out, pages = await _remember_and_list(srv)
             assert not out["success"] and out["error_message"] == message, out
             assert pages == [] and json.loads(path.read_text(encoding="utf-8"))["pages"] == []
