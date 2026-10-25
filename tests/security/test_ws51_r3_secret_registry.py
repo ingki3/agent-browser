@@ -422,6 +422,14 @@ SHAPES = {
     "prefix_partial": lambda n: ("SYNTH0001abcdefXY " * (n // 18 + 1))[:n],
 }
 SIZES = [4 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20]
+#: WS-66(#149) 측정 방식 — 크기마다 PERF_ROUNDS 번 잰 최솟값으로 판정하고, 비율은 크기별 최솟값끼리 낸다. 기준(1.0초·2.5배·
+#: 바닥 5ms)은 그대로다(규칙 6 비해당): 최솟값은 부하가 가장 적은 순간의 실제 처리 시간이다. 예전에는 한 크기를 3번 연달아
+#: 재서 한 번의 부하 덩어리가 세 번을 다 덮으면 그 크기만 부풀어 비율이 깨졌다(R15 전체 실행 prefix_partial-128·
+#: quoted_repeat-0) — 이제 크기를 돌아가며(라운드마다 모든 크기) 재서 같은 크기의 측정이 서로 다른 순간에 놓인다.
+#: 재는 함수는 캐시를 거치지 않는 본체(_public_text)지만, 반복이 첫 측정의 1/PERF_SAME_WORK 미만이면(어딘가에서 결과를
+#: 기억해 같은 일을 다시 하지 않았다) 실패시킨다.
+PERF_ROUNDS = 5
+PERF_SAME_WORK = 20
 
 
 def _perf_child(shape: str, nvals: int) -> None:
@@ -429,15 +437,17 @@ def _perf_child(shape: str, nvals: int) -> None:
 
     for i in range(nvals):
         secret_registry.register_url(f"https://h.invalid/p?gateToken=SYNTH{i:04d}abcdefXYZ&sid=s{i:06d}x")
-    rows = {"variants": len(secret_registry.REGISTRY), "times": {}}
-    for n in SIZES:
-        text = SHAPES[shape](n)
-        best = float("inf")
-        for _ in range(3):
+    rows = {"variants": len(secret_registry.REGISTRY), "times": {}, "runs": {}}
+    texts = {n: SHAPES[shape](n) for n in SIZES}
+    runs = {n: [] for n in SIZES}
+    for _ in range(PERF_ROUNDS):
+        for n in SIZES:
             t = time.perf_counter()
-            _public_text(text)
-            best = min(best, time.perf_counter() - t)
-        rows["times"][n] = best
+            _public_text(texts[n])
+            runs[n].append(time.perf_counter() - t)
+    for n in SIZES:
+        rows["times"][n] = min(runs[n])
+        rows["runs"][n] = runs[n]
     print(json.dumps(rows))
 
 
@@ -460,6 +470,9 @@ def test_performance_linear_and_under_a_second(shape, nvals):
     if nvals:
         assert rows["variants"] == secret_registry.MAX_VALUES  # 레지스트리를 값 상한까지 채운 조건 성립(R4 §5)
     times = {int(k): v for k, v in rows["times"].items()}
+    for n in SIZES[2:]:  # 판정에 쓰는 크기: 반복도 첫 측정과 같은 일을 했다(캐시 적중이면 수십분의 일로 떨어진다)
+        first, *again = rows["runs"][str(n)]
+        assert min(again) * PERF_SAME_WORK >= first, (shape, n, rows["runs"][str(n)])
     assert times[1 << 20] < 1.0, (shape, times)
     # 2배 입력 → 시간 ≤ 2.5배 (잡음이 큰 아주 짧은 측정은 바닥 5ms 로 본다)
     for small, big in zip(SIZES[2:], SIZES[3:]):

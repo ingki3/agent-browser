@@ -20,8 +20,10 @@ import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -328,33 +330,115 @@ PERF_CASES = {
 }
 
 
+#: WS-66(#149) 측정 방식 — 판정은 '자식 프로세스 PERF_RUNS 번 측정의 최솟값 < 1.0초'. 기준(1.0초)은 그대로다(규칙 6
+#: 비해당): 최솟값은 부하가 가장 적은 순간의 실제 처리 시간이라 CI 러너의 순간 부하(3회 실패, 로컬 ≈0.45초)만 걸러내고,
+#: 이차시간 회귀는 세 번 모두 넘어 그대로 잡힌다. 긴 문자열 결과는 lru_cache(public_url._public_text_long·
+#: _public_url_field_long)에 남으므로 한 프로세스에서 되풀이하면 캐시를 재게 된다 — 매 측정을 새 자식 프로세스에서 하고,
+#: 자식이 캐시 적중 0·계산 1회 이상을 보고하며, 반복 측정이 첫 측정의 1/PERF_SAME_WORK 미만이면 같은 일을 다시 한 것이
+#: 아닐 수 있으므로 아래(R1) 재측정을 거친다.
+PERF_BUDGET_S = 1.0  # 기준(그대로) — 아래 시험과 '첫 실행만 느림' 단정이 함께 쓴다
+PERF_RUNS = 3
+PERF_SAME_WORK = 20
+#: R1(B1) — '같은 일'의 증명은 LRU 통계·시간비가 아니라 환경 격리다: 자식마다 새 빈 임시 디렉터리를 만들어 홈·임시·
+#: XDG 캐시/데이터/상태·바이트코드 경로와 작업 디렉터리를 모두 그리로 돌리고 측정 뒤 지운다 — 앞 자식이 남긴 파일 캐시를
+#: 다음 자식이 읽을 길이 없다. 저장소·고정 경로 캐시는 격리로 못 막으므로 보조 단정: 첫 측정만 기준을 넘고 최솟값은 기준
+#: 아래이며 첫/최솟값이 PERF_FIRST_ONLY 배 이상이면 '첫 실행만 느림 = 캐시성 회귀 의심' — 캐시 키가 다른 같은 크기 입력의
+#: 첫 측정을 새 격리 자식에서 한 번 더 하고, 그것도 기준을 넘으면 실패(순간 부하는 되풀이되지 않는다; 실측 load 63/12코어
+#: 스파이크에서 [3.01, 0.59, 0.61]초가 나온 적이 있어 비율만으로는 실패시키지 않는다). 실패 문구에 표본 전부·최댓값을 남긴다.
+#: 반복이 첫 측정의 1/PERF_SAME_WORK 미만인 경우도 같은 재측정을 거친다(R1 — 스파이크 표본 [2.10, 0.10, 0.10]초 실측).
+PERF_FIRST_ONLY = 3
+PERF_ALT_GROW = 256  #: 의심 시 재측정할 다른 입력 — 길이를 1/이만큼 늘려 캐시 키만 바꾼다(1MiB 에서 +4KiB; 줄이면 캐시 하한 아래로 갈 수 있다)
+PERF_ISOLATED_ENV = ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                     "PYTHONPYCACHEPREFIX")
+#: R2(B1-R1) — 제품 소스 사본: 저장소 고정 경로(`__file__`·저장소 루트 기준) 캐시는 위 격리로 못 비운다 — 다른 입력도
+#: 같은 공유 초기화·길이 버킷 표식을 써서 재측정까지 warm 이 된다(검증 실측 [2.48, 0.27, 0.26]초·재측정 0.26초 통과).
+#: 그래서 자식마다 새 임시 디렉터리에 `src/` 를 통째로 복사해 그 사본을 PYTHONPATH 맨 앞에 두고, 자식이 제품 모듈을 실제로
+#: 사본에서 import 했는지(모듈 `__file__` 이 사본 아래·원본 src 에서 읽은 모듈 0개) 보고받아 아니면 실패시킨다. 첫 측정·반복·
+#: 재측정 모두 각자 새 사본이다. 사본 생성은 자식 실행 전이라 측정(자식 안 public_payload 한 번)에 들어가지 않는다.
+#: 한계(NB): 절대 시스템 경로(`/tmp/고정` 등)·프로세스 밖 서비스(데몬·DB·네트워크)에 저장하는 캐시는 이 방식으로 격리할 수
+#: 없다 — 그런 경로는 위 '첫 실행만 느림' 재측정이 잡을 수 있는 범위(입력별 캐시)까지만 잡는다.
+PERF_CODE_COPY_IGNORE = ("__pycache__", "*.pyc")
+
+
 def _perf_child(case: str, n: int) -> None:
+    from security.public_url import _public_text_long, _public_url_field_long
+
     secret_registry.register_url(SEEN_URL)  # R3: 공백 표본의 SHORT 는 도구가 본 값
     text = PERF_CASES[case](n)
     t = time.perf_counter()
     out = public_payload({"message": text, "url": text})
     seconds = time.perf_counter() - t
     assert SHORT not in out["message"], case
-    print(json.dumps({"case": case, "n": n, "seconds": seconds}))
+    # 조건 성립: 격리가 실제로 걸렸다 — 홈·임시·캐시 경로가 모두 이 자식의 빈 작업 디렉터리다
+    here = os.path.realpath(os.getcwd())
+    isolated = all(os.path.realpath(os.environ.get(k, "")) == here for k in PERF_ISOLATED_ENV)
+    # 조건 성립(R2): 제품 모듈을 원본 저장소 src 가 아니라 부모가 만든 사본에서 읽었다 — 부모가 사본 경로와 맞춰 본다
+    measured = sys.modules["security.public_url"]  # 패키지가 같은 이름의 함수를 재수출하므로 모듈은 sys.modules 에서
+    origin = Path(__file__).resolve().parents[2] / "src"
+    loaded = [os.path.realpath(f) for m in list(sys.modules.values()) if isinstance(f := getattr(m, "__file__", None), str)]
+    from_origin = [f for f in loaded if Path(f).is_relative_to(origin)]
+    caches = [_public_text_long.cache_info(), _public_url_field_long.cache_info()]
+    print(json.dumps({"case": case, "n": n, "seconds": seconds,
+                      "hits": sum(c.hits for c in caches), "misses": [c.misses for c in caches],
+                      "isolated": isolated, "module": os.path.realpath(measured.__file__),
+                      "from_origin": from_origin}))
+
+
+def _best_of(case: str, n: int, runs: int = PERF_RUNS) -> float:
+    """새 자식 프로세스 `runs` 번 측정의 최솟값(WS-66 — 위 설명)."""
+    samples = [_run_perf(case, n) for _ in range(runs)]
+    record = {"samples": samples, "min": min(samples), "max": max(samples)}
+    first, rest = samples[0], min(samples[1:])
+    over_budget = first >= PERF_BUDGET_S > min(samples) and first >= PERF_FIRST_ONLY * min(samples)
+    not_same = rest * PERF_SAME_WORK < first  # 반복이 첫 측정의 1/PERF_SAME_WORK 미만
+    if over_budget or not_same:
+        # 첫 실행만 느림 — 캐시성 회귀인지 순간 부하인지 가른다: 캐시 키가 다른 같은 크기 입력의 '첫' 측정을 새 자식에서
+        # 한 번 더. 캐시라면 새 입력마다 첫 실행이 다시 느리고, 순간 부하라면 되풀이되지 않는다.
+        record["recheck"] = recheck = _run_perf(case, n + n // PERF_ALT_GROW)
+        assert not (over_budget and recheck >= PERF_BUDGET_S) and not (not_same and recheck > rest * PERF_SAME_WORK), (
+            f"{case}: 첫 실행만 느림(첫≥기준·첫/최솟값≥{PERF_FIRST_ONLY}배 또는 반복<첫의 1/{PERF_SAME_WORK})이 "
+            "다른 입력의 첫 실행에서도 되풀이 — 캐시성 회귀", record)
+    return min(samples)
 
 
 def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
+    """격리 자식 한 번의 측정(초). 자식마다 빈 홈·임시 디렉터리와 제품 소스 사본(R2)을 새로 만든다 — 사본 생성은 측정 밖.
+
+    한계(NB): 절대 시스템 경로·프로세스 밖 서비스에 저장하는 캐시는 사본으로도 격리되지 않는다(PERF_CODE_COPY_IGNORE 위 설명).
+    """
     env = dict(os.environ)
-    src = str(Path(__file__).resolve().parents[2] / "src")
-    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+    src = Path(__file__).resolve().parents[2] / "src"
+    # 작업 디렉터리를 옮기므로 상대 경로 항목은 절대 경로로
+    rest = [os.path.abspath(p) for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ws66-perf-"))  # 자식마다 새 임시 디렉터리(R1·R2 — 위 설명)
+    box = os.path.join(root, "box")  # 빈 작업 디렉터리 = 홈·임시·캐시
+    code = os.path.join(root, "code", "src")  # 제품 소스 사본(R2) — 저장소 고정 경로 캐시도 사본마다 새로
     try:
-        proc = subprocess.run([sys.executable, __file__, case, str(n)], capture_output=True, text=True,
-                              timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
+        os.mkdir(box)
+        shutil.copytree(src, code, ignore=shutil.ignore_patterns(*PERF_CODE_COPY_IGNORE))
+        env["PYTHONPATH"] = os.pathsep.join([code, *rest])
+        env.update(dict.fromkeys(PERF_ISOLATED_ENV, box))
+        try:
+            proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), case, str(n)], capture_output=True,
+                                  text=True, timeout=timeout, env=env, cwd=box)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
-    return json.loads(proc.stdout.strip().splitlines()[-1])["seconds"]
+    row = json.loads(proc.stdout.strip().splitlines()[-1])
+    # 조건 성립: 잰 호출이 캐시를 거치지 않고 주소 칸·자유 문장을 실제로 계산했고, 격리된 환경에서 돌았다
+    assert row["hits"] == 0 and min(row["misses"]) >= 1, (case, row)
+    assert row["isolated"], (case, "자식 환경 격리 실패", row)
+    # 조건 성립(R2): 잰 제품 모듈이 이 자식의 사본에서 왔고, 원본 저장소 src 에서 읽은 모듈이 없다
+    assert Path(row["module"]).is_relative_to(code) and not row["from_origin"], (case, "제품 소스 사본 미사용", code, row)
+    return row["seconds"]
 
 
 @pytest.mark.parametrize("case", sorted(PERF_CASES))
 def test_b6_one_mib_under_a_second(case):
-    seconds = _run_perf(case, 1 << 20)
-    assert seconds < 1.0, f"{case}: 1MiB {seconds:.3f}s"
+    seconds = _best_of(case, 1 << 20)
+    assert seconds < PERF_BUDGET_S, f"{case}: 1MiB {seconds:.3f}s (자식 프로세스 {PERF_RUNS}회 최솟값)"
 
 
 if __name__ == "__main__":
