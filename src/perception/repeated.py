@@ -754,11 +754,13 @@ def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]
     return block
 
 
-def fit_repeated(result: Any, max_chars: int, finalize: Optional[Callable[[Any], Any]] = None) -> None:
+def fit_repeated(result: Any, max_chars: int, finalize: Optional[Callable[[Any], Any]] = None, *,
+                 limit: Optional[int] = None) -> None:
     """최종 응답(주입 신호 + 요소 자르기 뒤)이 상한을 넘으면 반복 묶음을 뒤(우선순위 낮은 쪽)부터 통째로 뺀다.
 
     요소는 cap_result_size 가 자른다 — 그래도 못 들어가는 경우(작은 --max-result-chars)에만 뺀다. 뺀 수는
     `omitted` 에 더한다. 다 빼도 넘으면 블록을 지운다. saved_pages 는 호출자가 먼저 맞춘다(fit_saved_pages).
+    limit(WS-68 R1) = 최종 자르기(cap_result_size)에 넘기는 표시용 설정 상한 — 같은 값으로 재야 hint 길이까지 든다.
     """
     data = getattr(result, "data", None)
     if not isinstance(data, dict) or not isinstance(data.get("repeated"), dict):
@@ -769,7 +771,7 @@ def fit_repeated(result: Any, max_chars: int, finalize: Optional[Callable[[Any],
         trial = result.model_copy(deep=True)
         if finalize is not None:
             finalize(trial)
-        cap_result_size(trial, max_chars)
+        cap_result_size(trial, max_chars, limit=limit)
         return len(envelope_json(trial)) <= max_chars
 
     block = data["repeated"]

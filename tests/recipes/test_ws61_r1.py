@@ -169,6 +169,11 @@ def _tool(svc: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 
     return asyncio.run(svc.tool(args))
 
+async def _fake_binding_of(page: Any) -> Any:
+    """WS-68 R1: 가짜 문서 결속값(바뀌지 않는 문서) — 주소는 지금 page.url."""
+    return ("F", "L1", 1, str(page.url))
+
+
 class FakeServer:
     def __init__(self) -> None:
         self.profile = None
@@ -179,7 +184,9 @@ class FakeServer:
 
     @property
     def _dispatcher(self) -> Any:
-        return NS(ctx=NS(page=self.page, root_page=self.root_page))
+        # WS-68 R1: 엄격 판정은 격리 world 판독기로, 결속값은 문서 판독기로 — 가짜 페이지 evaluate 를 그대로 쓴다.
+        return NS(ctx=NS(page=self.page, root_page=self.root_page), isolated_top_evaluate=self.page.evaluate,
+                  top_document_binding=lambda: _fake_binding_of(self.page))
 
 
 def _svc() -> tuple:

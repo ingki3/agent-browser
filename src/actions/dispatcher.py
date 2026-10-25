@@ -1952,6 +1952,46 @@ class ActionDispatcher:
             return None
         return {"name": str(info.get("name") or ""), "info": info}
 
+    # -- WS-68 R1 (#140): 기억해 저장의 문서 결속·격리 world 판독 ------------------------
+
+    async def top_document_binding(self) -> Optional[Tuple[str, str, int, str]]:
+        """최상위 문서의 결속값 (frameId, loaderId, 방문 기록 현재 항목 id, 그 항목 주소). 못 읽으면 None.
+
+        CDP Page.getFrameTree(주 프레임 id·loaderId — 새 문서면 바뀜) + Page.getNavigationHistory 현재 항목
+        (pushState 는 새 항목 id, replaceState 는 같은 항목의 주소가 바뀜). 페이지 JS 가 위조할 수 없는 값이다.
+        예외는 그대로 올린다 — 부르는 쪽(saved_pages)이 판정 불가로 거부한다.
+        """
+        cdp = await self._gate_cdp_for(self._top_page())
+        frame = ((await cdp.send("Page.getFrameTree")).get("frameTree") or {}).get("frame") or {}
+        history = await cdp.send("Page.getNavigationHistory")
+        entries = history.get("entries") or []
+        index = history.get("currentIndex")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
+            return None
+        entry = entries[index] or {}
+        frame_id, loader, entry_id, url = frame.get("id"), frame.get("loaderId"), entry.get("id"), entry.get("url")
+        if not frame_id or not loader or not isinstance(entry_id, int) or not isinstance(url, str):
+            return None
+        return str(frame_id), str(loader), int(entry_id), url
+
+    async def isolated_top_evaluate(self, expression: str) -> Any:
+        """최상위 문서의 **격리 world** 에서 expression 을 평가해 값을 돌려준다 (WS-68 R1, B1).
+
+        WS-67 의 게이트 CDP 세션·(frameId, loaderId) 캐시를 그대로 쓴다. 격리 world 는 DOM 은 공유하고 JS
+        전역·prototype 은 원본이라 페이지가 바꾼 querySelectorAll·innerText 등이 보이지 않는다. 생성·평가
+        실패와 스크립트 예외는 RuntimeError 로 올린다(부르는 쪽이 판정 불가로 거부 — fail-closed).
+        """
+        cdp = await self._gate_cdp_for(self._top_page())
+
+        async def run(context_id: int) -> Any:
+            return await cdp.send("Runtime.evaluate", {
+                "expression": expression, "contextId": context_id, "returnByValue": True})
+
+        res = await self._in_gate_world(cdp, "", run)
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            raise RuntimeError("격리 world 평가 실패")
+        return (res.get("result") or {}).get("value")
+
     @staticmethod
     async def _scroll_once(page: Any, delta: int) -> Tuple[bool, Optional[int]]:
         """한 번 스크롤하고 (문서 높이가 바뀌었는지(동적 로드), 실제 세로 이동 px) 를 돌려준다.

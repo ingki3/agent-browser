@@ -284,7 +284,8 @@ class ToolsMixin:
                 # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
                 # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
                 fit_repeated(result, max_chars,
-                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                             limit=self.max_result_chars)
 
             attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.

@@ -53,6 +53,10 @@ class FakeStatus:
     def judge_status_for(self, page: Any) -> Optional[int]:
         return self.status
 
+async def _fake_binding_of(page: Any) -> Any:
+    """WS-68 R1: 가짜 문서 결속값(바뀌지 않는 문서) — 주소는 지금 page.url."""
+    return ("F", "L1", 1, str(page.url))
+
 
 class FakeServer:
     def __init__(self, page: Any) -> None:
@@ -64,7 +68,9 @@ class FakeServer:
 
     @property
     def _dispatcher(self) -> Any:
-        return NS(ctx=NS(page=self.page, root_page=None))
+        # WS-68 R1: 엄격 판정은 격리 world 판독기로, 결속값은 문서 판독기로 — 가짜 페이지 evaluate 를 그대로 쓴다.
+        return NS(ctx=NS(page=self.page, root_page=None), isolated_top_evaluate=self.page.evaluate,
+                  top_document_binding=lambda: _fake_binding_of(self.page))
 
 
 def _svc(page: Any = None) -> tuple:
@@ -209,9 +215,10 @@ def test_strict_probe_vs_lenient_probe_on_exception():
     """같은 규칙 — 다른 점은 판정 불가뿐(detect_challenge 는 NONE, 엄격판은 None)."""
     page = FakePage(boom=True)
     assert asyncio.run(ch.detect_challenge(page)) is ch.NO_CHALLENGE
-    assert asyncio.run(ch.detect_challenge_strict(page)) is None
+    assert asyncio.run(ch.detect_challenge_strict(page, isolated=page.evaluate)) is None
     ok = FakePage(probe=dict(NORMAL, widget="cloudflare"))
-    assert asyncio.run(ch.detect_challenge_strict(ok)) == asyncio.run(ch.detect_challenge(ok))
+    # R1: 엄격판은 격리 world 평가기로만 읽는다(여기선 가짜 평가기) — 같은 규칙이라 결과는 같다.
+    assert asyncio.run(ch.detect_challenge_strict(ok, isolated=ok.evaluate)) == asyncio.run(ch.detect_challenge(ok))
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +326,7 @@ async def test_e2e_url_changed_after_403_saves_only_on_strict_pass(site):
         async def boom(*a: Any, **k: Any) -> Any:
             raise RuntimeError("context destroyed")
 
-        page.evaluate = boom  # 탐지 중 예외 주입 → 판정 불가 → 거부
+        srv._dispatcher.isolated_top_evaluate = boom  # 격리 world 판정 중 예외 주입 → 판정 불가 → 거부(R1)
         out = await _recipe(srv, op="remember_page", name="앱 다시")
         assert not out["success"] and out["error_message"] == sp.E_UNJUDGED
 
