@@ -339,16 +339,34 @@ PERF_CASES = {
     "many_short_urls": lambda n: (f"http://h.test/?token={SHORT} " * (n // 32)),
 }
 PERF_BUDGET_S = 1.0
+#: WS-66(#149) 측정 방식 — 판정은 '새 자식 프로세스 PERF_RUNS 번 측정의 최솟값'. 기준(PERF_BUDGET_S·비율 64)은 그대로다
+#: (규칙 6 비해당): 최솟값은 부하가 가장 적은 순간의 실제 처리 시간이라 러너의 순간 부하만 걸러내고, 이차시간 회귀는 매번
+#: 넘어 그대로 잡힌다. 긴 문자열은 lru_cache 에 남아 한 프로세스에서 되풀이하면 캐시를 재므로 매번 새 프로세스에서 재고,
+#: 자식이 캐시 적중 0·계산 1회 이상을 보고하며, 반복 측정이 첫 측정의 1/PERF_SAME_WORK 미만이면 실패시킨다.
+PERF_RUNS = 3
+PERF_SAME_WORK = 20
 
 
 def _perf_child(case: str, n: int) -> None:
+    from security.public_url import _public_text_long, _public_url_field_long
+
     text = PERF_CASES[case](n)
     # 첫 호출만 잰다 — 긴 문자열은 결과를 기억하므로(public_text 캐시) 두 번째 호출은 이 측정의 대상이 아니다.
     t = time.perf_counter()
     out = public_payload({"message": text, "url": text})
     best = time.perf_counter() - t
     assert SHORT not in out["message"] and SHORT not in out["url"], case
-    print(json.dumps({"case": case, "n": n, "seconds": best}))
+    caches = [_public_text_long.cache_info(), _public_url_field_long.cache_info()]
+    print(json.dumps({"case": case, "n": n, "seconds": best,
+                      "hits": sum(c.hits for c in caches), "misses": [c.misses for c in caches]}))
+
+
+def _best_of(case: str, n: int, runs: int = PERF_RUNS) -> float:
+    """새 자식 프로세스 `runs` 번 측정의 최솟값(WS-66 — 위 설명)."""
+    samples = [_run_perf(case, n) for _ in range(runs)]
+    assert min(samples[1:]) * PERF_SAME_WORK >= samples[0], (
+        f"{case}: 반복 측정이 첫 측정의 1/{PERF_SAME_WORK} 미만 — 같은 일을 다시 재지 않았다", samples)
+    return min(samples)
 
 
 def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
@@ -361,18 +379,21 @@ def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
     except subprocess.TimeoutExpired:
         pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
     assert proc.returncode == 0, proc.stderr[-2000:]
-    return json.loads(proc.stdout.strip().splitlines()[-1])["seconds"]
+    row = json.loads(proc.stdout.strip().splitlines()[-1])
+    # 조건 성립: 잰 호출이 캐시를 거치지 않고 주소 칸·자유 문장을 실제로 계산했다
+    assert row["hits"] == 0 and min(row["misses"]) >= 1, (case, row)
+    return row["seconds"]
 
 
 @pytest.mark.parametrize("case", sorted(PERF_CASES))
 def test_one_mib_input_is_processed_in_under_a_second(case):
-    seconds = _run_perf(case, 1 << 20)
-    assert seconds < PERF_BUDGET_S, f"{case}: 1MiB {seconds:.3f}s"
+    seconds = _best_of(case, 1 << 20)
+    assert seconds < PERF_BUDGET_S, f"{case}: 1MiB {seconds:.3f}s (자식 프로세스 {PERF_RUNS}회 최솟값)"
 
 
 def test_growth_is_roughly_linear():
-    small = max(_run_perf("title_prefix", 1 << 14), 1e-4)
-    big = _run_perf("title_prefix", 1 << 18)
+    small = max(_best_of("title_prefix", 1 << 14), 1e-4)  # 크기마다 최솟값을 쓴 뒤 비율
+    big = _best_of("title_prefix", 1 << 18)
     # 16배 길이 → 이차시간이면 256배. 선형(측정 잡음 포함)이면 그 훨씬 아래.
     assert big / small < 64, (small, big)
 

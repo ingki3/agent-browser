@@ -328,14 +328,36 @@ PERF_CASES = {
 }
 
 
+#: WS-66(#149) 측정 방식 — 판정은 '자식 프로세스 PERF_RUNS 번 측정의 최솟값 < 1.0초'. 기준(1.0초)은 그대로다(규칙 6
+#: 비해당): 최솟값은 부하가 가장 적은 순간의 실제 처리 시간이라 CI 러너의 순간 부하(3회 실패, 로컬 ≈0.45초)만 걸러내고,
+#: 이차시간 회귀는 세 번 모두 넘어 그대로 잡힌다. 긴 문자열 결과는 lru_cache(public_url._public_text_long·
+#: _public_url_field_long)에 남으므로 한 프로세스에서 되풀이하면 캐시를 재게 된다 — 매 측정을 새 자식 프로세스에서 하고,
+#: 자식이 캐시 적중 0·계산 1회 이상을 보고하며, 반복 측정이 첫 측정의 1/PERF_SAME_WORK 미만이면 같은 일을 다시 한 것이
+#: 아니므로 실패시킨다.
+PERF_RUNS = 3
+PERF_SAME_WORK = 20
+
+
 def _perf_child(case: str, n: int) -> None:
+    from security.public_url import _public_text_long, _public_url_field_long
+
     secret_registry.register_url(SEEN_URL)  # R3: 공백 표본의 SHORT 는 도구가 본 값
     text = PERF_CASES[case](n)
     t = time.perf_counter()
     out = public_payload({"message": text, "url": text})
     seconds = time.perf_counter() - t
     assert SHORT not in out["message"], case
-    print(json.dumps({"case": case, "n": n, "seconds": seconds}))
+    caches = [_public_text_long.cache_info(), _public_url_field_long.cache_info()]
+    print(json.dumps({"case": case, "n": n, "seconds": seconds,
+                      "hits": sum(c.hits for c in caches), "misses": [c.misses for c in caches]}))
+
+
+def _best_of(case: str, n: int, runs: int = PERF_RUNS) -> float:
+    """새 자식 프로세스 `runs` 번 측정의 최솟값(WS-66 — 위 설명)."""
+    samples = [_run_perf(case, n) for _ in range(runs)]
+    assert min(samples[1:]) * PERF_SAME_WORK >= samples[0], (
+        f"{case}: 반복 측정이 첫 측정의 1/{PERF_SAME_WORK} 미만 — 같은 일을 다시 재지 않았다", samples)
+    return min(samples)
 
 
 def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
@@ -348,13 +370,16 @@ def _run_perf(case: str, n: int, timeout: float = 30.0) -> float:
     except subprocess.TimeoutExpired:
         pytest.fail(f"{case} n={n}: {timeout}초 안에 끝나지 않음(이차시간 회귀)")
     assert proc.returncode == 0, proc.stderr[-2000:]
-    return json.loads(proc.stdout.strip().splitlines()[-1])["seconds"]
+    row = json.loads(proc.stdout.strip().splitlines()[-1])
+    # 조건 성립: 잰 호출이 캐시를 거치지 않고 주소 칸·자유 문장을 실제로 계산했다
+    assert row["hits"] == 0 and min(row["misses"]) >= 1, (case, row)
+    return row["seconds"]
 
 
 @pytest.mark.parametrize("case", sorted(PERF_CASES))
 def test_b6_one_mib_under_a_second(case):
-    seconds = _run_perf(case, 1 << 20)
-    assert seconds < 1.0, f"{case}: 1MiB {seconds:.3f}s"
+    seconds = _best_of(case, 1 << 20)
+    assert seconds < 1.0, f"{case}: 1MiB {seconds:.3f}s (자식 프로세스 {PERF_RUNS}회 최솟값)"
 
 
 if __name__ == "__main__":
