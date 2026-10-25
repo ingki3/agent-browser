@@ -117,7 +117,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=(
             "observe_page·extract 응답 크기 상한(글자, 기본 20000 — Claude Code MCP 결과 한도 "
-            "25,000토큰, 한글 1자≈1토큰 기준). 넘으면 항목 경계에서 자르고 data.truncated 로 알림."
+            "25,000토큰, 한글 1자≈1토큰 기준). 넘으면 항목 경계에서 자르고 data.truncated 로 알림 — 창 보고가 "
+            "붙는 응답은 그 몫을 뺀 실효 예산으로 자르고 hint 에 두 값을 함께 적음."
         ),
     )
 

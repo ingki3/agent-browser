@@ -68,6 +68,8 @@ PRESERVED = (
     "_SERIAL_STACK", "_SerialPause",
     # WS-67 격리 world 판정(포커스·좌표 판정 분리 + 높은 위험 고르기)
     "_focus_verdict", "_gate_rank", "_isolated", "_point_verdict",
+    # WS-68 잘림 안내 숫자(설정 상한·실효 예산, 최종 봉투 returned_chars)
+    "_limit_text", "settle_returned_chars",
 )
 
 

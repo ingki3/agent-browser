@@ -1584,7 +1584,7 @@
  "tool_schemas": {
   "build_all_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {
@@ -2081,7 +2081,7 @@
   ],
   "build_listed_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {
@@ -2971,7 +2971,7 @@
   ],
   "list_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {

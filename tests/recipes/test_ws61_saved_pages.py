@@ -232,10 +232,27 @@ class FakeGuard:
         return SimpleNamespace(allowed=not any(b in url for b in self.blocked))
 
 
+
+class _ProbePage:
+    """WS-68: remember_page 가 지금 화면을 엄격 판정(evaluate)한다 — 정상 화면을 돌려주는 가짜 페이지."""
+
+    def __init__(self, url: str = "about:blank") -> None:
+        self.url = url
+
+    async def evaluate(self, _js: str) -> Any:
+        return {"title": "", "text": "정상 페이지", "len": 6, "widget": "", "url": self.url}
+
+
+def _tool(svc: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """WS-68: SavedPagesService.tool 은 async — 동기 시험에서 부른다."""
+    import asyncio
+
+    return asyncio.run(svc.tool(args))
+
 class FakeServer:
     def __init__(self) -> None:
         self.profile = None
-        self.page = SimpleNamespace(url="about:blank")
+        self.page = _ProbePage()
         self.root_page = None
         self._recipes = SimpleNamespace(running=False)
         self._egress = FakeGuard()
@@ -274,7 +291,7 @@ def _navigate(srv: FakeServer, svc: SavedPagesService, requested: str, landed: s
 
 def _remember(srv: FakeServer, svc: SavedPagesService, url: str, name: str) -> Dict[str, Any]:
     srv.page.url = url
-    out = svc.tool({"op": "remember_page", "name": name})
+    out = _tool(svc, {"op": "remember_page", "name": name})
     assert out["success"], out
     return out["data"]["saved_page"]
 
@@ -303,7 +320,7 @@ def test_candidates_exclude_current_page_egress_blocked_and_long_urls_but_pages_
     srv._egress = FakeGuard(blocked=("/blocked/",))
     res = _observe(srv, svc, "https://shop.test/orders")
     assert [c["id"] for c in res.data["saved_pages"]["candidates"]] == [ok["id"]]
-    listed = {p["id"] for p in svc.tool({"op": "pages"})["data"]["pages"]}
+    listed = {p["id"] for p in _tool(svc, {"op": "pages"})["data"]["pages"]}
     assert {here["id"], blocked["id"], long_one["id"], ok["id"]} == listed
 
 
@@ -344,7 +361,7 @@ def test_registry_value_registered_after_saving_hides_entry():
         _remember(srv, svc, "https://shop.test/view/latesecretwordvalue", "나중에 비밀")
         secret_registry.register_url("https://idp.test/cb?code=latesecretwordvalue")
         assert "saved_pages" not in _observe(srv, svc, "https://shop.test/").data
-        assert svc.tool({"op": "pages"})["data"]["pages"] == []
+        assert _tool(svc, {"op": "pages"})["data"]["pages"] == []
     finally:
         secret_registry.REGISTRY.clear()
 
@@ -354,15 +371,15 @@ def test_workspaces_are_separate_for_candidates_pages_and_forget():
     a = _remember(srv, svc, "https://shop.test/orders", "주문")
     with workspace_scope("watch"):
         assert "saved_pages" not in _observe(srv, svc, "https://shop.test/").data
-        assert svc.tool({"op": "pages"})["data"]["pages"] == []
-        out = svc.tool({"op": "forget_page", "id": a["id"]})
+        assert _tool(svc, {"op": "pages"})["data"]["pages"] == []
+        out = _tool(svc, {"op": "forget_page", "id": a["id"]})
         assert not out["success"] and out["error_message"] == sp.E_NOT_FOUND
         srv.page.url = "https://shop.test/"
-        assert svc.tool({"op": "forget_page", "all": True})["data"]["forgotten"] == 0
+        assert _tool(svc, {"op": "forget_page", "all": True})["data"]["forgotten"] == 0
         w = _remember(srv, svc, "https://shop.test/watch", "감시")
     res = _observe(srv, svc, "https://shop.test/")
     assert [c["id"] for c in res.data["saved_pages"]["candidates"]] == [a["id"]]
-    assert w["id"] not in json.dumps(svc.tool({"op": "pages"}))
+    assert w["id"] not in json.dumps(_tool(svc, {"op": "pages"}))
 
 
 def test_forget_all_only_current_origin_and_workspace():
@@ -373,12 +390,12 @@ def test_forget_all_only_current_origin_and_workspace():
     with workspace_scope("watch"):
         keep = _remember(srv, svc, "https://shop.test/c", "감시 쪽")
     srv.page.url = "https://shop.test/"
-    out = svc.tool({"op": "forget_page", "all": True})
+    out = _tool(svc, {"op": "forget_page", "all": True})
     assert out == {"success": True, "data": {"forgotten": 2}}
-    assert [p["id"] for p in svc.tool({"op": "pages"})["data"]["pages"]] == [other["id"]]
+    assert [p["id"] for p in _tool(svc, {"op": "pages"})["data"]["pages"]] == [other["id"]]
     with workspace_scope("watch"):
-        assert [p["id"] for p in svc.tool({"op": "pages"})["data"]["pages"]] == [keep["id"]]
-    bad = svc.tool({"op": "forget_page"})
+        assert [p["id"] for p in _tool(svc, {"op": "pages"})["data"]["pages"]] == [keep["id"]]
+    bad = _tool(svc, {"op": "forget_page"})
     assert not bad["success"] and bad["error_message"] == sp.E_FORGET_ARGS
 
 
@@ -386,16 +403,16 @@ def test_remember_in_frame_or_without_page_is_refused():
     srv, svc = _svc()
     srv.page.url = "https://shop.test/orders"
     srv.root_page = SimpleNamespace(url="https://shop.test/orders")
-    out = svc.tool({"op": "remember_page", "name": "프레임"})
+    out = _tool(svc, {"op": "remember_page", "name": "프레임"})
     assert not out["success"] and out["error_message"] == sp.E_FRAME
     srv.root_page = None
     srv.page = None
-    out = svc.tool({"op": "remember_page", "name": "없음"})
+    out = _tool(svc, {"op": "remember_page", "name": "없음"})
     assert not out["success"] and out["error_message"] == sp.E_NO_PAGE
 
 
 def _uses(svc: SavedPagesService, pid: str) -> int:
-    return next(p["uses"] for p in svc.tool({"op": "pages"})["data"]["pages"] if p["id"] == pid)
+    return next(p["uses"] for p in _tool(svc, {"op": "pages"})["data"]["pages"] if p["id"] == pid)
 
 
 def test_uses_counts_once_per_navigate_on_first_observe():
@@ -485,7 +502,7 @@ def test_logs_never_carry_address_or_name(caplog):
     with caplog.at_level(logging.DEBUG):
         _remember(srv, svc, f"https://shop.test/{SENTINEL.lower()}", f"이름 {SENTINEL}")
         srv.page.url = f"https://shop.test/a?token={SENTINEL}"
-        out = svc.tool({"op": "remember_page", "name": "x"})
+        out = _tool(svc, {"op": "remember_page", "name": "x"})
         assert not out["success"] and SENTINEL not in json.dumps(out)
         _observe(srv, svc, "https://shop.test/")
     log = " ".join(r.getMessage() for r in caplog.records)

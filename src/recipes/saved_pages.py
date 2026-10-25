@@ -7,7 +7,8 @@
   블록 2,500자 상한. 고르는 것은 에이전트이고 이동은 평소 관문(승인·차단)을 그대로 지난다.
 * 저장 거부(fail-closed, 고정 문구 — 주소·이름 원문을 메시지·로그에 넣지 않는다): http(s) 아님, 사용자 정보,
   주소 칸 가림(public_url·JWT·비밀 값 레지스트리)이 일어나는 주소, 경로·호스트·쿼리 키 토큰(레시피 규칙),
-  url·name 의 이메일·전화번호, 이름의 토큰, 2KB 초과.
+  url·name 의 이메일·전화번호, 이름의 토큰, 2KB 초과. WS-68(#140): 지금 화면을 엄격히 다시 판정해 확인·차단 화면,
+  판정 불가, 지금 문서 상태 ≥ 400, egress 불허, 같은 주소의 마지막 navigate 실패도 거부(_check_screen).
 * uses: 저장 주소로 navigate 성공(리다이렉트·challenge·오류·재생 중이 아님) 뒤 **첫** observe 가 같은 주소(정규화)에서
   성공하면 +1 — navigate 1회당 최대 1.
 * 저장소: `serve --profile NAME` 이면 프로필 폴더 saved_pages.json(0600, 임시 파일 + rename, 손상 시 `.corrupt-…`
@@ -79,6 +80,14 @@ E_LIMIT_SITE = f"이 작업 공간에서 이 사이트(출처)에 기억한 페�
 E_LIMIT_TOTAL = f"기억한 페이지가 전체 {MAX_TOTAL}개라 더 기억하지 않습니다 — forget_page 로 정리하세요."
 E_NOT_FOUND = "그 id 의 기억한 페이지가 이 작업 공간에 없습니다."
 E_FORGET_ARGS = "forget_page 에는 id 또는 all: true(현재 사이트 항목 전부)가 필요합니다."
+# WS-68(#140): 지금 화면 엄격 재판정 거부(고정 문구).
+E_CHALLENGE = ("지금 화면이 차단·확인(캡차) 화면이라 기억하지 않습니다 — 확인을 끝내고 원래 페이지가 뜬 뒤 "
+               "다시 하세요.")
+E_UNJUDGED = ("지금 화면이 차단·확인 화면인지 판정하지 못해 기억하지 않습니다 — 페이지가 다 뜬 뒤 다시 "
+              "하세요.")
+E_STATUS = "지금 페이지가 오류 응답(HTTP 4xx·5xx)이라 기억하지 않습니다."
+E_EGRESS = "지금 주소는 이동 허용 범위(egress)에서 막히는 주소라 기억하지 않습니다."
+E_LAST_NAV = "이 주소로의 마지막 이동이 차단·확인·오류 화면으로 끝나 기억하지 않습니다."
 
 
 class SavedPageError(ValueError):
@@ -413,6 +422,18 @@ def _navigation_failed(result: Any, *, navigate: bool = False) -> bool:
     return isinstance(status, int) and status >= 400
 
 
+def _navigation_screen_bad(result: Any) -> bool:
+    """remember_page 보조 판정(WS-68): navigate 가 실패·challenge·egress·업스트림·재시도 실패로 끝났는가.
+
+    상태 코드는 보지 않는다 — 403 문서 뒤 pushState 로 URL 이 바뀐 화면을 구분하는 judge_status_for 가 주 판정이다.
+    """
+    data = getattr(result, "data", None) or {}
+    identity = data.get("identity")
+    return (not getattr(result, "success", False) or data.get("challenge") is not None or bool(data.get("egress"))
+            or any(str(k).startswith("upstream") for k in data)
+            or (isinstance(identity, dict) and bool(identity.get("retry_failed"))))
+
+
 class SavedPagesService:
     """MCP 서버와 저장소를 잇는 얇은 층(서버당 하나 — 항목은 작업 공간 이름으로 나눈다)."""
 
@@ -421,6 +442,8 @@ class SavedPagesService:
         self._store: Optional[SavedPageStore] = None
         #: 작업 공간 → 직전 navigate 가 연 기억한 페이지 (id, 정규화 주소) — 첫 observe 에서 소비.
         self._pending: Dict[str, Tuple[str, str]] = {}
+        #: WS-68: 작업 공간 → 마지막 navigate 가 닿은 정규화 주소와 실패 여부(remember_page 보조 판정).
+        self._last_nav: Dict[str, Tuple[str, bool]] = {}
 
     @property
     def store(self) -> SavedPageStore:
@@ -460,25 +483,57 @@ class SavedPagesService:
 
         return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value, "error_message": message}
 
-    def tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
         op = str(args.get("op") or "")
         try:
             if op == "remember_page":
-                return self._remember(args)
+                return await self._remember(args)
             if op == "pages":
                 return self._pages()
             return self._forget(args)
         except SavedPageError as exc:
             return self._error(str(exc))
 
-    def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
         name = check_name(args.get("name"))
         page = self._top_page()
-        url = str(getattr(page, "url", "") or "")
+        url = check_url(str(getattr(page, "url", "") or ""))
+        await self._check_screen(page, url)
         entry, created = self.store.add(self._workspace(), url, name)
         return {"success": True, "data": {
             "saved_page": {"id": entry["id"], "name": entry["name"], "url": entry["url"], "updated": not created},
             "storage": "profile" if self.store.persistent else "memory"}}
+
+    async def _check_screen(self, page: Any, url: str) -> None:
+        """WS-68(#140): 지금 화면을 엄격히 다시 판정한다 — 확인·차단·오류·egress 불허·판정 불가면 SavedPageError.
+
+        detect_challenge·_attach_challenge 는 판정 불가를 '없음'으로 삼아(fail-open) 쓰지 않는다 — 같은 규칙의
+        엄격판(detect_challenge_strict)으로 본다. 상태는 judge_status_for(지금 URL 이 그 응답 URL 일 때만) ≥ 400 이면
+        거부, None(URL 바뀜·기록 없음)이면 엄격 판정 통과만으로 저장. 마지막 navigate 결과는 보조(같은 주소에서
+        실패였으면 거부 — 클릭·JS 이동 뒤 다른 주소면 낡은 값이라 보지 않는다).
+        """
+        from browser.challenge import detect_challenge_strict
+
+        status: Optional[int] = None
+        tracker = getattr(self.server, "_page_status", None)
+        if tracker is not None:
+            try:
+                status = tracker.judge_status_for(page)
+            except Exception:  # noqa: BLE001 - 상태를 모르면 판정 불가(fail-closed)
+                raise SavedPageError(E_UNJUDGED) from None
+        found = await detect_challenge_strict(page, last_status=status)
+        if found is None:
+            raise SavedPageError(E_UNJUDGED)
+        if found.detected:
+            raise SavedPageError(E_CHALLENGE)
+        if isinstance(status, int) and not isinstance(status, bool) and status >= 400:
+            raise SavedPageError(E_STATUS)
+        guard = getattr(self.server, "_egress", None)
+        if guard is not None and not _egress_allows(guard, url):
+            raise SavedPageError(E_EGRESS)
+        last = self._last_nav.get(self._workspace())
+        if last is not None and last[1] and last[0] == normalize(url):
+            raise SavedPageError(E_LAST_NAV)
 
     def _pages(self) -> Dict[str, Any]:
         out = [{"id": p["id"], "name": clean_text(p["name"], NAME_LIMIT), "url": p["url"], "site": p["origin"],
@@ -506,6 +561,11 @@ class SavedPagesService:
         """navigate 1회 → 그 주소가 기억한 페이지면 다음 observe 한 번에서 +1 후보(리다이렉트·실패·재생은 없음)."""
         ws = self._workspace()
         self._pending.pop(ws, None)
+        landed = normalize(str(getattr(result, "current_url", "") or ""))
+        if landed:
+            self._last_nav[ws] = (landed, _navigation_screen_bad(result))
+        else:
+            self._last_nav.pop(ws, None)
         if self._replaying() or _navigation_failed(result, navigate=True):
             return
         requested = normalize(str(params.get("url") or ""))

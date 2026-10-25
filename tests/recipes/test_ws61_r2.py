@@ -20,7 +20,7 @@ from recipes import store as rs
 from recipes.saved_pages import SavedPageError, check_name, check_url
 
 from test_ws38b_autosave import _desc, _entry, _nav
-from test_ws61_r1 import URL, _route_server, _svc
+from test_ws61_r1 import URL, _route_server, _svc, _tool
 
 POISONS = ["%FF", "%00", "%E2%80%8B", "%C3%28", "%7F", "%E2%80%AE"]
 
@@ -70,7 +70,7 @@ def test_r2_remember_page_keeps_nothing_for_bad_neighbor(tmp_path):
     svc._store = SavedPageStore(path)
     for poison in ("%FF", "%00", "%E2%80%8B"):
         srv.page.url = "https://shop.test/?q=010+1234+5678&x=" + poison
-        out = svc.tool({"op": "remember_page", "name": "검색"})
+        out = _tool(svc, {"op": "remember_page", "name": "검색"})
         assert not out["success"]
     assert len(svc.store) == 0
     assert not path.exists() or "1234" not in path.read_text(encoding="utf-8")
