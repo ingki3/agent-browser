@@ -62,11 +62,30 @@ class _Locator:
 
 
 class _Node(_Locator):
-    """고정 노드(ElementHandle) 가짜: 같은 입력 호출 + isConnected 읽기(이 가짜 문서에서는 늘 붙어 있음)."""
+    """고정 노드(ElementHandle) 가짜: 같은 입력 호출 + isConnected·소유 문서 결속 읽기.
+
+    R4: 실제 브라우저에서 문서가 바뀌면(목록 사이트로 이동) 그 노드의 실행 문맥이 사라진다 — 해석 뒤 주소가 바뀌었으면
+    이 노드의 평가는 실패한다(결속 확인이 문서 교체를 잡는 근거)."""
+
+    def __init__(self, rec: _Recorder) -> None:
+        super().__init__(rec)
+        self._url0 = rec.page.url
 
     async def evaluate(self, expr: Any = "", *_a: Any, **_k: Any) -> Any:
         await self._rec.hit("evaluate")
+        if self._rec.page.url != self._url0:
+            raise RuntimeError("Execution context was destroyed")
+        if "elementFromPoint" in str(expr):
+            return "ok"  # R4 효과 없는 actionability 확인: 입력 가능
+        if "ownerDocument" in str(expr):
+            return 1  # R4 결속: 관문 통과 문서에 그대로
         return "isConnected" in str(expr)
+
+    async def evaluate_handle(self, *_a: Any, **_k: Any) -> Any:
+        """R4: 관문 통과 문서 핸들(읽기)."""
+        await self._rec.hit("evaluate")
+        return object()
+
 
     async def element_handle(self, *_a: Any, **_k: Any) -> Any:
         raise AttributeError("element_handle")
@@ -95,6 +114,11 @@ class _Page:
     def locator(self, _selector: str) -> _Locator:
         return _Locator(self._rec)
 
+    async def evaluate(self, *_a: Any, **_k: Any) -> Any:
+        """R4: 같은 문서 재해석의 신원 검사(verify_staleness) — 관찰한 그 요소."""
+        await self._rec.hit("evaluate")
+        return {"connected": True, "role": "textbox", "name": "q"}
+
 
 def _dispatcher(rec: _Recorder) -> ActionDispatcher:
     page = _Page(rec)
@@ -104,7 +128,7 @@ def _dispatcher(rec: _Recorder) -> ActionDispatcher:
     return ActionDispatcher(ctx)
 
 
-HANDLE: Any = SimpleNamespace(css_path="#q", is_shadow=False, name="q", role="textbox")
+HANDLE: Any = SimpleNamespace(css_path="#q", is_shadow=False, name="q", role="textbox", epoch=0)
 
 ELEMENT_CASES: List[Tuple[ActionType, Dict[str, Any]]] = [
     (ActionType.TYPE_TEXT, {"text": "abc", "clear_before": True, "press_enter": True}),
@@ -125,7 +149,8 @@ async def _run_element(action: ActionType, params: Dict[str, Any], flip_at: Opti
     refused = False
     try:
         await disp._execute_element_action(action, HANDLE, dict(params))
-    except dmod._ManualSiteRefused:
+    except (dmod._ManualSiteRefused, dmod._FixedNodeGone):
+        # R4: 입력 일부 뒤 노드 문서가 바뀌면 '대상 바뀜'(남은 단계를 보내지 않음) — 이것도 거부다.
         refused = True
     return rec, refused
 
