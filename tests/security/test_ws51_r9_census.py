@@ -58,6 +58,10 @@ CONTAINERS = {
     ("<expr>", "interface/handoff.py"): (NOT_OUT, "_process_start_time — ps argv"),
     ("<expr>", "browser/user_chrome.py"): (NOT_OUT, "launch_user_chrome — Chrome argv"),
     ("<expr>", "browser/serve_profile.py"): (FREE, "safe_reason — 사람용 사유 문장 조각 결합"),
+    ("<return:changed_kinds>", "actions/group_changed.py"): (FREE, "WS-62 R17 data.group_changed.changed.kinds — "
+                                                                  "group_changed.KINDS 고정 어휘만(목록 경로 어휘 아님 "
+                                                                  "→ public_text 정제, 어휘 낱말은 그대로)"),
+    ("<expr>", "actions/group_changed.py"): (FREE, "WS-62 R17 changed_kinds 의 KINDS 거르기·hint 의 종류 낱말 결합"),
     ("<expr>", "security/egress_proxy.py"): (NOT_OUT, "_relay_response_head — 프록시 HTTP 응답 머리"),
     ("<expr>", "interface/server_elicit.py"): (NOT_OUT, "WS-56 elicitation_message — 클라이언트 사람 확인 문구 줄"
                                                   "(도구 응답 출구 아님, 표시 살균·가림 적용)"),

@@ -25,8 +25,6 @@ from ws62_corpus import page_html  # noqa: E402
 
 FULL = {"force_full_tree": True, "prune_top_n": 50}
 MAX_CHARS = 20000
-HINT = ("관찰 뒤 이 버튼이 속한 화면 부분이 바뀌어(data.group_changed.changed) 누르지 않았습니다 — "
-        "observe_page 로 다시 관찰한 뒤 같은 버튼을 새 id 로 누르세요.")
 
 
 @pytest.fixture
@@ -78,7 +76,12 @@ class Bot:
         start = self.calls
         res = await self.click(name, _named(obs, name), obs.snapshot_epoch)
         if not res.success:
-            assert res.reobserve_required and res.data.get("hint") == HINT, (res.error_code, res.data)
+            from actions.group_changed import HINT_TEMPLATE
+
+            kinds = res.data.get("group_changed", {}).get("changed", {}).get("kinds") or []
+            # R17: hint 는 틀 + 종류 어휘(페이지 글자 0).
+            assert res.reobserve_required and res.data.get("hint") == HINT_TEMPLATE.format(kinds=", ".join(kinds)), (
+                res.error_code, res.data)
             assert "group_changed" in res.data and "retry_element_id" not in res.data["group_changed"]
             if "changed" in res.data["group_changed"]:
                 from interface.server_envelope import envelope_dict

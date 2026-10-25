@@ -2001,18 +2001,12 @@ class ActionDispatcher:
         if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
             # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
-            # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — 무엇이 바뀌었나(changed, data 에만 — 페이지 글자는
-            # error_message 에 넣지 않는다)와 '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고 재관찰도 하지 않는다.
-            from actions.group_changed import changed_parts, display_pair
+            # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고
+            # 재관찰도 하지 않는다. R17(사용자 결정 A, #136·#158): changed 는 바뀐 종류(고정 어휘)만, before/after 는 고정
+            # 표식 — 페이지 글자는 data·hint·error_message 어디에도 싣지 않는다.
+            from actions.group_changed import refusal_data
 
-            # WS-62 R16(#158): before/after(묶음 표제)도 changed 와 같은 마스킹·숫자 '#'·80자(값만 가림, 필드 그대로).
-            before, after = display_pair(handle.group_heading, staleness.observed_group)
-            group_changed: Dict[str, Any] = {"before": before, "after": after}
-            changed = changed_parts(handle.group_heading, staleness.observed_group)
-            if changed is not None:
-                group_changed["changed"] = changed
-            hint = ("관찰 뒤 이 버튼이 속한 화면 부분이 바뀌어(data.group_changed.changed) 누르지 않았습니다 — "
-                    "observe_page 로 다시 관찰한 뒤 같은 버튼을 새 id 로 누르세요.")
+            group_changed, hint = refusal_data(handle.group_heading, staleness.observed_group)
             return self._result(
                 success=False,
                 action=action,

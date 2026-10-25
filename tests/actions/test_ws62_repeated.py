@@ -260,9 +260,9 @@ async def test_month_moved_same_node_reused_is_refused():
     assert res.reobserve_required is True
     assert "healing_attempts" not in res.data  # 치유로 다른 대상을 찾지 않는다
     changed = res.data.get("group_changed")
-    # 내부 지문(묶음 정적 글자 전체, R1 R3)을 한 줄로 — 달 이름이 앞에 온다. R16(#158): 숫자 '#'·마스킹·80자(값만 가림).
-    assert changed["before"].startswith("####년 ##월") and changed["after"].startswith("####년 #월"), res.data
-    assert len(changed["before"]) <= 80 and len(changed["after"]) <= 80, res.data
+    # R17(#158): before/after 필드는 그대로, 값은 고정 표식(페이지 글자 0). 달 표제 바뀜 → 종류 number.
+    assert changed["before"] == changed["after"] == "(바뀜)", res.data
+    assert "number" in changed["changed"]["kinds"], res.data
 
 
 @requires_chromium

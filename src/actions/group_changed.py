@@ -1,36 +1,24 @@
-"""WS-62 R12: GROUP_CHANGED 거부 응답의 '무엇이 바뀌었나'(data.group_changed.changed) — 표시 전용.
+"""WS-62 R17: GROUP_CHANGED 거부 응답의 '무엇이 바뀌었나' — 바뀐 **종류**만(페이지 글자 0, 사용자 결정 A · #136 · #158).
 
-하나투어 '다음달' 처럼 기준 고정이 바깥 레이아웃이면 지문에 바깥 글자 줄이 없고(달 표제는 반복 항목 안) 순서열만 바뀐다 —
-그때는 순서열 첫 차이 앞/뒤(items)만 보이고, 달 표제는 hint 대로 다시 관찰한 data.repeated 에서 본다(조정자 결정 1).
+R13~R16 은 changed/before/after 에 원문 조각(마스킹·숫자 '#'·80자 창)을 실었고, 네 번 연속 새 형태의 비밀·PII 노출이
+나왔다(줄·요소 경계로 나뉜 Cookie/Bearer 등). R17 은 원문을 싣지 않는다:
 
-거부 판정은 v1.16.0 원문(`perception.repeated_v1160` 의 groupCheck)이 이미 끝냈다. 여기서는 그 판정에 쓴 옛(관찰 때)·지금
-지문을 사람이 읽을 조각으로 나눌 뿐이며 판정·고정에 쓰지 않는다(안전과 무관 — 계획 R3 결정 B).
+* `data.group_changed.changed = {"kinds": [...]}` — 값은 고정 어휘 `KINDS` 에서만(페이지 유래 문자열 0).
+  - `number`  : 숫자 성격 글자(유니코드 Nd·Nl·No, NFKC 뒤 숫자 포함)만 다르거나, 숫자·빈 칸뿐인 항목이 생기거나 없어짐
+                (날짜·가격·달 이동의 날짜 칸).
+  - `text`    : 글자 내용이 바뀜(바깥 글자 줄, 또는 숫자를 빼고도 다른 항목).
+  - `order`   : 항목 순서만 바뀜(같은 항목들의 재배열) 또는 대상 항목 순번만 바뀜.
+  - `added` / `removed` : 글자가 있는 묶음 항목이 생김 / 없어짐.
+  - `unknown` : 판정 불가(지문 상한 도달·형식 불일치·처리 실패·차이 없음).
+* `data.group_changed.before/after`(#158) — 필드 계약 유지, 값은 고정 표식 `MARK_CHANGED`/`MARK_SAME`(그 쪽 지문이 없으면 None).
+* hint 는 종류 어휘만 인용한다(`hint_for`).
 
-분해 규칙(계획 R2-1): 저장 지문은 줄바꿈으로 이은 [L:…][A:…][바깥 정적 글자…]['S:'+항목 순서열] + '\\n#k'.
-마지막 줄이 `#k`, 그 앞 줄이 `S:` 로 시작해야 형식이 맞고, 나머지 줄이 바깥 글자다(바깥 글자도 'S:' 로 시작할 수 있으므로
-'S: 로 시작하는 줄 찾기'를 쓰지 않는다). 옛·지금 지문 중 하나라도 상한(PIN_LIMIT)에 닿았거나(잘린 본문 — 순서열이 사라졌을 수
-있다) 형식이 맞지 않으면 changed 를 내지 않는다.
+판정은 v1.16.0 원문(`perception.repeated_v1160` 의 groupCheck)이 이미 끝냈다. 여기서는 그 판정에 쓴 옛(관찰 때)·지금
+지문을 안에서만 비교해 종류를 고를 뿐이며 판정·고정에 쓰지 않는다(안전과 무관 — 계획 R3 결정 B).
 
-R13(재검증 B1·B2):
-* PII — 자르기 전에 **바깥 글자 전체(줄바꿈으로 이은 것)와 순서열 전체(항목을 빈칸으로 이은 '항목 이음 문자열')** 를 마스킹한다.
-  항목·줄 경계로 나뉜 번호도 이음 문자열에서는 한 덩어리다. 마스킹 뒤에도 PII 가 남아 보이면(보이지 않는 글자로 쪼갬·빈칸 여럿·
-  바깥과 순서열에 걸침 — 불확실) 그 부분을 싣지 않는다(fail-closed). 마스킹 자체가 실패해도 마찬가지.
-* 창 — 마스킹·표시 살균을 끝낸 before/after 의 **실제 첫 문자 차이**를 중심으로 앞 문맥 `_LEAD` 자 + 차이 부분, 각 80자.
-  잘린 쪽은 '…'. 결과 before==after(차이가 PII 안에만 있었던 경우 등)면 그 쌍을 싣지 않는다.
-
-R15(R14 재검증 B1 FAIL — 단위 끼움·숫자 사이 결합문자 우회; 사용자 결정 A): changed 에 숫자를 하나도 내보내지 않는다.
-* 공유 마스킹(이메일 등 — 숫자 아닌 PII 포함) 뒤, NFKC 전 원문에서 숫자 성격(유니코드 범주 Nd·Nl·No) 글자를 '0' 으로 바꾸고
-  NFKC + 보이지 않는 글자 제거 + 숫자 바로 뒤 결합문자 제거 → 줄마다 공유 마스킹 한 번 더(전각 @ 이메일) → NFKC 뒤 숫자 성격 글자를
-  전부 '#'. 둘 중 하나라도 숫자면 '#'(NFKC 가 'Ⅻ'→'XII' 처럼 숫자를 글자로 바꾸거나 '㋀'→'1月' 처럼 숫자를 낳아도). '#' 연속은 둔다.
-* 창으로 자른 뒤에도 한 번 더 '#' 처리(살균 표기 등 어느 단계가 숫자를 들여와도). '#' 뒤 앞/뒤가 같으면 그 쌍 생략 — 숫자만
-  바뀐 쌍은 보이지 않는다(hint 의 재관찰 안내가 주 경로). R13·R14 의 숫자 사슬 가림·잔여 4자리 생략·단위 예외는 삭제했다.
-
-R16(R15 재검증 B1 — NFKC 전 Nl→'0' 선치환이 'pwⅾ'·'Authorⅰzation' 같은 민감 키를 깨 비밀 값 노출; #158):
-* 순서: 원문 → NFKC + 보이지 않는 글자 제거 + 숫자 뒤 결합문자 제거(**숫자 치환 없이**, `_nfkc`) → 공유 마스킹 → 숫자 성격
-  글자 '#'(NFKC 전 숫자 범주 글자에서 나온 글자 전부 + NFKC 뒤 숫자, `_carry` 가 자리를 옮김) → 잔여 검사 → 창 80자.
-  원문 선마스킹은 없앴다(보이지 않는 글자로 쪼갠 이메일을 부분만 가려 앞부분을 남겼다).
-* 잔여 검사는 '#' 뷰와 함께 공유 마스킹 직후 뷰(숫자는 'x')에서도 — 민감 키 패턴이 남으면 그 쌍(바깥 글자면 changed 전체) 생략.
-* before/after(묶음 표제 pin_display)도 같은 함수(`display_pair`): 값만 가리고 필드는 그대로(같아져도 생략 안 함, 잔여·실패는 가림 표시).
+지문 분해(계획 R2-1): 저장 지문은 줄바꿈으로 이은 [L:…][A:…][바깥 정적 글자…]['S:'+항목 순서열] + '\\n#k'. 마지막 줄이
+`#k`, 그 앞 줄이 `S:` 로 시작해야 형식이 맞고 나머지 줄이 바깥 글자다. 옛·지금 지문 중 하나라도 상한(PIN_LIMIT)에 닿았거나
+형식이 맞지 않으면 `unknown`.
 """
 
 from __future__ import annotations
@@ -38,26 +26,18 @@ from __future__ import annotations
 import difflib
 import re
 import unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-#: 바깥 글자 앞/뒤 쌍 최대 수·각 글자 상한.
-CHANGED_PAIRS = 3
-CHANGED_CHARS = 80
-#: 창에서 첫 차이 앞에 남길 문맥 글자 수.
-_LEAD = 20
+#: 종류 어휘(출력 순서). changed.kinds 의 값은 이 안에서만 나온다.
+KINDS = ("number", "text", "order", "added", "removed", "unknown")
+#: before/after 고정 표식 — 페이지 글자 대신.
+MARK_CHANGED = "(바뀜)"
+MARK_SAME = "(같음)"
+#: 거부 안내 — {kinds} 자리에 종류 어휘만 들어간다.
+HINT_TEMPLATE = ("관찰 뒤 이 버튼이 속한 화면 부분이 바뀌어(종류: {kinds} — data.group_changed.changed.kinds) "
+                 "누르지 않았습니다 — observe_page 로 다시 관찰한 뒤 같은 버튼을 새 id 로 누르세요.")
+
 _TAIL_RE = re.compile(r"^#-?\d+$")
-#: '@ . -' 옆 빈칸(항목 이음에서 생긴 것) — 이메일·하이픈 번호가 항목 경계로 쪼개져도 이어지게.
-_PUNCT_GAP = re.compile(r" *([@.\-]) *")
-#: 빈 항목 자리 표시('_') — 잔여 PII 검사에서는 없는 것으로 본다.
-_PLACEHOLDER = re.compile(r"(?:(?<= )|^)_(?= |$)")
-#: 번호·주소 글자 사이 빈칸(빈칸 여럿으로 쪼갠 번호·도메인) — 잔여 PII 검사에서 붙여 본다(한글 등 다른 글자 옆 빈칸은 둔다).
-_ASCII_GAP = re.compile(r"(?<=[A-Za-z0-9._%+@-])\s+(?=[A-Za-z0-9._%+@-])")
-#: 주소 글자 사이 구분자(빈칸·/·\\·_·,·:·가운뎃점류·대시류) — 구분자로 쪼갠 이메일을 잔여 검사에서 붙여 본다('.' 은 주소의 일부라 둔다).
-_JOIN_GAP = re.compile("(?<=[A-Za-z0-9_%+@.-])[\\s/\\\\_,:\u00b7\u30fb\u2027\u2022\u2010-\u2015\u2212\ufe58\ufe63\uff0d-]+"
-                       "(?=[A-Za-z0-9_%+@.-])")
-#: 잔여 PII 검사에서 지우는 보이지 않는 글자 범주.
-_HIDDEN = ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp")
-#: R15 숫자 성격 범주 — 이 범주 글자는 changed 에 '#' 로만 나간다.
 _NUMERIC_CATS = ("Nd", "Nl", "No")
 
 
@@ -70,223 +50,85 @@ def _split(pin: Any, limit: int) -> Optional[Dict[str, Any]]:
     return {"outer": lines[:-2], "seq": lines[-2], "k": lines[-1]}
 
 
-def _norm(text: str) -> str:
-    """한 줄 정리: 항목 구분(\\x01)·연속 공백 → 빈칸 하나, '@ . -' 옆 빈칸 제거."""
-    return _PUNCT_GAP.sub(r"\1", " ".join(text.replace("\x01", " ").split()))
-
-
-def _token(t: str) -> str:
-    """순서열 낱말 하나 — 구조 접두(i: 대상 이름 첫 낱말·t: 항목 글자)를 떼고, 빈 낱말은 '_'(빈칸)."""
-    if t[:2] in ("i:", "t:"):
-        t = t[2:]
-    return t or "_"
-
-
-def _residual_pii(masked: str) -> bool:
-    """표시 글자에 아직 숫자 아닌 PII(이메일 등)가 보이는가(불확실). 보이지 않는 글자·빈 항목 자리를 지우고, 줄바꿈을 빈칸으로 본 것·
-    주소 글자 사이 빈칸을 지운 것(빈칸 여럿으로 쪼갠 도메인)·주소 글자 사이 구분자(빈칸·/·_·,·:·대시류)를 지운 것(항목 경계·구분자로
-    쪼갠 이메일)에 공유 규칙을 다시 돌린다. 표시의 '#'(가린 숫자)는 글자 'x' 로 본다 — 숫자 든 이메일 로컬부('audit####@…')가 계속
-    이메일로 잡히고, 숫자 규칙(전화·카드·주민)은 숫자가 없어 걸지 않는다(긴 '#' 줄의 과다 생략 없음)."""
-    from security.masking import mask_text
-
-    t = masked.replace("\n", " ").replace("#", "x")
-    t = "".join(ch for ch in t if unicodedata.category(ch) not in _HIDDEN)
-    t = _PUNCT_GAP.sub(r"\1", " ".join(_PLACEHOLDER.sub("", t).split()))
-    return any(mask_text(v).hits for v in (t, _ASCII_GAP.sub("", t), _JOIN_GAP.sub("", t)))
-
-
-def _mask(text: str) -> str:
-    from security.masking import mask
-
-    return mask(text)
+def _tokens(seq: str) -> List[str]:
+    """순서열 낱말들 — 구조 접두(i:·t:)를 떼고, 빈 항목 자리('_')는 빈 글자."""
+    out = []
+    for t in seq[2:].split("\x01"):
+        if t[:2] in ("i:", "t:"):
+            t = t[2:]
+        out.append("" if t == "_" else t)
+    return out
 
 
 def _is_numeric(ch: str) -> bool:
-    """숫자 성격 글자 — 그 글자 또는 그 NFKC 에 범주 Nd·Nl·No 가 있다."""
     return unicodedata.category(ch) in _NUMERIC_CATS or any(
         unicodedata.category(x) in _NUMERIC_CATS for x in unicodedata.normalize("NFKC", ch))
 
 
-def _pre_numeric(ch: str) -> bool:
-    """NFKC 전 판정: 원문 글자 자체가 숫자 범주('Ⅻ'→'XII'·'ⅾ'→'d' 처럼 NFKC 가 글자로 바꿔도 그 결과 전부 '#')."""
-    return unicodedata.category(ch) in _NUMERIC_CATS
+def _shape(text: str) -> str:
+    """숫자 성격 글자 연속 → '0' 하나, 공백 정리(NFKC) — 숫자만 다른 두 글자는 같은 모양."""
+    t = "".join("0" if _is_numeric(c) else c for c in unicodedata.normalize("NFKC", text))
+    return " ".join(re.sub("0+", "0", t).split())
 
 
-def _hash(text: str) -> str:
-    """숫자 성격 글자 전부 → '#'(연속 길이는 둔다)."""
-    return "".join("#" if _is_numeric(ch) else ch for ch in text)
+def _letters(text: str) -> str:
+    """숫자 성격 글자·공백을 뺀 나머지 — 비면 숫자·빈칸뿐인 항목."""
+    return "".join(c for c in unicodedata.normalize("NFKC", text) if not _is_numeric(c) and not c.isspace())
 
 
-def _nfkc(text: str) -> Tuple[str, List[bool]]:
-    """R16 검사 뷰(숫자 치환 없음): 보이지 않는 글자 제거(줄바꿈은 둠) + 글자 묶음(기본 글자 + 뒤 결합문자)마다 NFKC — 기본 글자가
-    숫자 성격이면 뒤 결합문자(U+0301·U+20E3 등)는 지운다. 돌려주는 표시는 뷰 글자마다 '숫자 성격 원천'(NFKC 전 숫자 범주 글자에서
-    나왔거나 그 자체가 숫자 성격) — 공유 마스킹 뒤 '#' 로 바꿀 자리."""
-    clusters: List[List[str]] = []
-    for ch in text:
-        if ch != "\n" and unicodedata.category(ch) in _HIDDEN:
-            continue
-        if unicodedata.category(ch)[0] == "M" and clusters:
-            clusters[-1].append(ch)
-        else:
-            clusters.append([ch])
-    kept: List[str] = []
-    flags: List[bool] = []
-    for cl in clusters:
-        base = cl[0]
-        pre = _pre_numeric(base)
-        if _is_numeric(base):
-            cl = [base]
-        for x in unicodedata.normalize("NFKC", "".join(cl)):
-            if x != "\n" and unicodedata.category(x) in _HIDDEN:
-                continue
-            kept.append(x)
-            flags.append(pre or _is_numeric(x))
-    return "".join(kept), flags
-
-
-def _carry(src: str, flags: List[bool], dst: str) -> str:
-    """공유 마스킹(+줄 정리)을 거친 dst 에 src 의 '숫자 성격 원천' 표시를 옮겨 '#'. 가림 표시([REDACTED])는 그대로.
-    원천 표시 글자가 가림 바깥에서 짝을 잃으면(정리·가림이 예상 밖으로 글자를 바꿈) 예외 — 호출 쪽이 싣지 않는다(fail-closed)."""
-    from security.masking import MASK
-
-    hide = [_is_numeric(c) for c in dst]
-    masked = [False] * len(dst)
-    pos = dst.find(MASK)
-    while pos >= 0:
-        for k in range(pos, pos + len(MASK)):
-            masked[k] = True
-        pos = dst.find(MASK, pos + len(MASK))
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=src, b=dst, autojunk=False).get_opcodes():
+def _diff(a: List[str], b: List[str], extra_add: str, extra_remove: str) -> Set[str]:
+    """두 목록(바깥 줄 또는 항목)의 바뀐 종류. 모양(_shape)으로 맞춘 뒤 맞지 않는 구간을 낱낱이 본다."""
+    out: Set[str] = set()
+    if a == b:
+        return out
+    if sorted(a) == sorted(b):
+        return {"order"}
+    sa, sb = [_shape(x) for x in a], [_shape(x) for x in b]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).get_opcodes():
         if tag == "equal":
-            for k in range(i2 - i1):
-                if flags[i1 + k] and not masked[j1 + k]:
-                    hide[j1 + k] = True
-        elif any(flags[i1:i2]) and any(not masked[j] and not dst[j].isspace() and not hide[j]
-                                       for j in range(j1, j2)):
-            raise ValueError("숫자 원천 글자의 자리를 잃음")
-    return "".join(c if m or not h else "#" for c, h, m in zip(dst, hide, masked))
-
-
-def _view(text: str) -> Tuple[str, str]:
-    """R16 순서: NFKC 검사 뷰(숫자 치환 없음) → 줄마다 정리 + 공유 마스킹 → (마스킹 직후 뷰, 숫자 성격 글자 '#' 표시 뷰)."""
-    v, flags = _nfkc(text)
-    m = "\n".join(_mask(_norm(line)) for line in v.split("\n"))
-    return m, _carry(v, flags, m)
-
-
-def _unsure(m: str, d: str) -> bool:
-    """잔여 검사 — 공유 마스킹 직후 뷰(민감 키·이메일 등이 남았나; 숫자는 'x' 로 보아 숫자 규칙은 걸지 않는다)와 '#' 표시 뷰 둘 다."""
-    return _residual_pii("".join("x" if _is_numeric(c) else c for c in m)) or _residual_pii(d)
-
-
-def _escape(text: str) -> str:
-    """보이지 않는·화면 조작 글자를 보이는 표기로(여기서는 자르지 않음 — 창은 다음 단계)."""
-    from actions.verification import safe_page_text
-
-    return safe_page_text(text, 8 * len(text) + 16)
-
-
-def _cut(text: str, start: int) -> str:
-    head = "…" if start > 0 else ""
-    room = CHANGED_CHARS - len(head)
-    body = text[start:]
-    if len(body) > room:
-        body = body[:room - 1] + "…"
-    return head + body
-
-
-def _window(before: str, after: str) -> Optional[Dict[str, str]]:
-    """마스킹·살균을 끝낸 두 글자 — 숫자 '#' 처리 뒤 실제 첫 문자 차이 앞 `_LEAD` 자부터 각 80자. 같으면 None(그 쌍 생략)."""
-    before, after = _hash(before), _hash(after)
-    if before == after:
-        return None
-    start = _start(before, after)
-    out = {"before": _cut(before, start), "after": _cut(after, start)}
-    if out["before"] == out["after"]:
-        return None
+            if a[i1:i2] != b[j1:j2]:
+                out.add("number")
+            continue
+        old, new = a[i1:i2], b[j1:j2]
+        for x, y in zip(old, new):
+            out.add("number" if _letters(x) == _letters(y) else "text")
+        for x in old[len(new):]:
+            out.add("number" if not _letters(x) else extra_remove)
+        for y in new[len(old):]:
+            out.add("number" if not _letters(y) else extra_add)
     return out
 
 
-def _start(before: str, after: str) -> int:
-    p = 0
-    while p < min(len(before), len(after)) and before[p] == after[p]:
-        p += 1
-    return max(0, p - _LEAD)
-
-
-def _side(pin: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """한 쪽 지문 → 마스킹·표시 뷰('#')를 끝낸 바깥 줄들·순서열 이음 문자열과 각 불확실(숫자 아닌 잔여 PII) 여부. 마스킹 실패면 None."""
-    outer_raw = "\n".join(_norm(line) for line in pin["outer"])
-    seq_raw = _norm(" ".join(_token(t) for t in pin["seq"][2:].split("\x01")))
+def changed_kinds(old_pin: Any, new_pin: Any) -> List[str]:
+    """옛·지금 지문 → 바뀐 종류 목록(KINDS 순서, 비지 않음). 판정 불가·실패는 ['unknown']."""
     try:
-        (om, outer), (sm, seq) = _view(outer_raw), _view(seq_raw)  # R16: 원문 선마스킹 없음 — NFKC 뷰에서 한 번
-        return {"outer": outer.split("\n") if outer_raw else [], "seq": seq,
-                "outer_unsure": _unsure(om, outer), "seq_unsure": _unsure(sm, seq),
-                # 바깥 마지막 줄과 순서열 첫 항목에 걸친 PII(이메일 등) — 가린 둘을 이어 다시 본다.
-                "joint_unsure": bool(outer_raw) and _unsure(om + " " + sm, outer + " " + seq)}
-    except Exception:  # noqa: BLE001 — 표시 전용: 마스킹이 실패하면 싣지 않는다(fail-closed)
-        return None
+        from perception.repeated_v1160 import PIN_LIMIT
+
+        old, new = _split(old_pin, PIN_LIMIT), _split(new_pin, PIN_LIMIT)
+        if old is None or new is None:
+            return ["unknown"]
+        kinds = _diff(old["outer"], new["outer"], "text", "text")
+        kinds |= _diff(_tokens(old["seq"]), _tokens(new["seq"]), "added", "removed")
+        if old["k"] != new["k"] and old["seq"] == new["seq"]:
+            kinds.add("order")
+        out = [k for k in KINDS if k in kinds]
+        return out or ["unknown"]
+    except Exception:  # noqa: BLE001 — 표시 전용: 어느 단계든 실패하면 unknown(거부 응답은 그대로)
+        return ["unknown"]
 
 
-def changed_parts(old_pin: Any, new_pin: Any) -> Optional[Dict[str, Any]]:
-    """옛·지금 지문 → {text: [{before, after}, ≤3], items?: {before, after}, position?: {before, after}}. 분해 불가면 None.
-
-    text = 바깥 글자 줄의 바뀐 부분(줄 단위 차이, 실제 첫 문자 차이 조금 앞부터 80자). items = 항목 순서열이 바뀌었을 때
-    이음 문자열의 첫 문자 차이 조금 앞부터(접두 뗌). position = 대상 항목 순번(#k)이 바뀌었을 때. 마스킹 실패·바깥 또는
-    바깥/순서열에 걸친 잔여 PII 면 None, 순서열에만 잔여 PII 면 items 생략. 마스킹 뒤 앞/뒤가 같은 쌍은 생략.
-    """
-    try:
-        return _changed_parts(old_pin, new_pin)
-    except Exception:  # noqa: BLE001 — 표시 전용: 어느 단계든 실패하면 싣지 않는다(fail-closed, 거부 응답은 그대로)
-        return None
+def display_pair(old_pin: Any, new_pin: Any) -> Tuple[Optional[str], Optional[str]]:
+    """#158: data.group_changed.before/after — 필드 계약은 그대로, 값은 고정 표식(페이지 글자 0). 없는 쪽은 None."""
+    mark = MARK_SAME if old_pin == new_pin else MARK_CHANGED
+    return (None if old_pin is None else mark, None if new_pin is None else mark)
 
 
-def _changed_parts(old_pin: Any, new_pin: Any) -> Optional[Dict[str, Any]]:
-    from perception.repeated_v1160 import PIN_LIMIT
-
-    old, new = _split(old_pin, PIN_LIMIT), _split(new_pin, PIN_LIMIT)
-    if old is None or new is None:
-        return None
-    a, b = _side(old), _side(new)
-    if a is None or b is None or a["outer_unsure"] or b["outer_unsure"] or a["joint_unsure"] or b["joint_unsure"]:
-        return None
-    pairs: List[Dict[str, str]] = []
-    ops = difflib.SequenceMatcher(a=a["outer"], b=b["outer"], autojunk=False).get_opcodes()
-    for tag, i1, i2, j1, j2 in ops:
-        if tag == "equal":
-            continue
-        if len(pairs) >= CHANGED_PAIRS:
-            break
-        pair = _window(_escape(" ".join(a["outer"][i1:i2])), _escape(" ".join(b["outer"][j1:j2])))
-        if pair is not None:
-            pairs.append(pair)
-    out: Dict[str, Any] = {"text": pairs}
-    if old["seq"] != new["seq"] and not a["seq_unsure"] and not b["seq_unsure"]:
-        items = _window(_escape(a["seq"]), _escape(b["seq"]))
-        if items is not None:
-            out["items"] = items
-    if old["k"] != new["k"]:
-        out["position"] = {"before": old["k"], "after": new["k"]}
-    return out
+def hint_for(kinds: List[str]) -> str:
+    return HINT_TEMPLATE.format(kinds=", ".join(k for k in kinds if k in KINDS) or "unknown")
 
 
-def display_pair(old_pin: Any, new_pin: Any) -> "Tuple[Optional[str], Optional[str]]":
-    """#158: data.group_changed.before/after(묶음 표제 pin_display) — changed 와 같은 처리(NFKC 검사 뷰 → 공유 마스킹 → 숫자 '#' →
-    잔여 검사 → 80자 창). 필드 계약은 그대로: 없는 쪽은 None, 앞/뒤가 같아져도 생략하지 않는다. 잔여 PII 가 보이거나 처리가
-    실패하면 그 값은 가림 표시 하나(fail-closed)."""
-    from security.masking import MASK
-
-    def one(pin: Any) -> Optional[str]:
-        if pin is None:
-            return None
-        try:
-            from perception.repeated_v1160 import pin_display
-
-            m, d = _view(pin_display(pin))
-            return MASK if _unsure(m, d) else _hash(_escape(d))
-        except Exception:  # noqa: BLE001 — 표시 전용: 실패하면 값을 가린다(fail-closed)
-            return MASK
-
-    before, after = one(old_pin), one(new_pin)
-    start = _start(before, after) if before is not None and after is not None and before != after else 0
-    return (None if before is None else _cut(before, start), None if after is None else _cut(after, start))
+def refusal_data(old_pin: Any, new_pin: Any) -> Tuple[Dict[str, Any], str]:
+    """GROUP_CHANGED 거부 응답의 (data.group_changed, hint). 문자열 값은 전부 고정 어휘·표식·안내 틀에서만 나온다."""
+    before, after = display_pair(old_pin, new_pin)
+    kinds = changed_kinds(old_pin, new_pin)
+    return {"before": before, "after": after, "changed": {"kinds": kinds}}, hint_for(kinds)
