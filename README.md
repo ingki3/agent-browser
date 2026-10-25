@@ -99,7 +99,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-7343개가 통과해야 합니다(8개 건너뜀, 10개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+7393개가 통과해야 합니다(10개 건너뜀, 10개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](docs/llm-agent.md)를 보십시오.
 
@@ -144,7 +144,7 @@ LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](do
 | :--- | :--- |
 | [docs/README.md](docs/README.md) | 문서 목차 |
 | [docs/mcp-integration.md](docs/mcp-integration.md) | MCP 연동 상세 — `serve --browser`·`--nav-settle`·`--pre-approve`/`--mode`, 관찰 → 액션 흐름, 응답 형식 |
-| [docs/signals.md](docs/signals.md) | 차단·캡차, 프롬프트 주입, robots.txt 신호 |
+| [docs/signals.md](docs/signals.md) | 차단·캡차, 이동 결과(부분 성공·실패 종류), 프롬프트 주입, robots.txt 신호 |
 | [docs/headless-retry.md](docs/headless-retry.md) | 헤드리스 이름 재시도, `data.identity`·`retry_skipped`·`cookie_change`, 쿠키 장부(WS-47·WS-52) |
 | [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피), 도착 페이지 기억 |
 | [docs/human-handoff.md](docs/human-handoff.md) | 미리 로그인, 사람 인계(조작권·승인), 직접 조작할 사이트(`manual-sites`), 로그인 유지(`--profile`), 필요할 때만 창(`on-demand`) |

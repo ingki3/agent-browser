@@ -64,6 +64,10 @@ NOT_OUT_FILES = {
 TABLES = {
     ("actions/dispatcher.py", "_KEY_ALIASES"): (NOT_OUT, "키 이름 정규화 조회표(Playwright 로 넘기는 입력)"),
     ("actions/dispatcher.py", "_PARAM_ALIASES"): (NOT_OUT, "계약 입력 키 → 디스패처 키 조회표"),
+    ("actions/nav_failure.py", "_EGRESS_KINDS"): (NOT_OUT, "WS-69 egress.code → kind 조회표(값은 data.nav_failure.kind — "
+                                                         "어휘는 test_ws69 test_kinds_are_control_vocabulary)"),
+    ("actions/nav_failure.py", "_EXACT_KINDS"): (NOT_OUT, "WS-69 net::ERR_* → kind 조회표(값은 data.nav_failure.kind)"),
+    ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
@@ -89,6 +93,7 @@ KEYS = {
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),
     "resolved_from": (CONTROL, "actions/dispatcher.py switch_frame — current_frame|root(server_schema 안내, R6-B1)"),
     "nav_aborted": (CONTROL, "actions/dispatcher.py _NavWatch.aborted(R6)"),
+    "reached": (CONTROL, "actions/dispatcher.py navigate 부분 성공 data.load_state.reached(WS-69)"),
     "captured": (CONTROL, "actions/dispatcher.py 프레임 안 screenshot data.captured"),
     "handled": (CONTROL, "actions/dispatcher.py data.dialogs[].handled"),
     "coordinate_target": (CONTROL, "interface/server_hitl.py 좌표 대상 근거(gate_basis)"),

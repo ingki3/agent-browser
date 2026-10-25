@@ -96,6 +96,9 @@ REVIEWED = {
     ("kind", "interface/server_signals.py", "found.kind.value"): "ChallengeKind",
     ("reason", "interface/server_signals.py", "kind"): "ChallengeKind (WS-63 C data.handoff.reason = challenge kind)",
     ("kind", "llm/budget.py", "kind"): NOT_OUT,
+    ("kind", "actions/nav_failure.py", "_EGRESS_KINDS[egress_code]"): "WS-69 nav_failure.kind — dns·connect·blocked",
+    ("kind", "actions/nav_failure.py", "_net_error_kind(m.group(1))"):
+        "WS-69 nav_failure.kind — _EXACT_KINDS 값·tls·protocol·other",
     ("mode", "harness/tier2_som.py", "args.mode"): NOT_OUT,
     ("mode", "harness/tier2_som.py", "mode"): NOT_OUT,
     ("mode", "interface/cli.py", "ExecutionMode(args.mode)"): "ExecutionMode",

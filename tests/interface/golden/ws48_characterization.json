@@ -1006,6 +1006,9 @@
      "reason": "private_network"
     },
     "last_http_status": 403,
+    "nav_failure": {
+     "kind": "blocked"
+    },
     "url": "http://SITE_C/blocked"
    },
    "error_code": "E_INVALID_URL",
@@ -1200,7 +1203,11 @@
        "code": "connect_failed",
        "host": "127.0.0.1"
       },
+      "hint": "서버에 접속하지 못함(연결 거부·끊김) — 주소·포트를 확인하거나 잠시 뒤 다시 시도하세요.",
       "last_http_status": 502,
+      "nav_failure": {
+       "kind": "connect"
+      },
       "url": "http://127.0.0.1:CLOSED/"
      },
      "error_code": "E_NAVIGATE_TIMEOUT",
@@ -1220,7 +1227,11 @@
        "code": "connect_failed",
        "host": "127.0.0.1"
       },
+      "hint": "서버에 접속하지 못함(연결 거부·끊김) — 주소·포트를 확인하거나 잠시 뒤 다시 시도하세요.",
       "last_http_status": 502,
+      "nav_failure": {
+       "kind": "connect"
+      },
       "url": "chrome-error://chromewebdata/"
      },
      "error_code": "E_NAVIGATE_TIMEOUT",

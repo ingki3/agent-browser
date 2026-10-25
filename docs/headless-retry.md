@@ -74,6 +74,7 @@ egress 프록시는 실제로 연결할 해석된 IP·포트가 자기 리스너
 | `vendor_challenge` | 보안 업체의 확인·차단 화면이라 이름을 바꿔 다시 시도하지 않았습니다 |
 | `disabled` | 헤드리스 이름 재시도가 꺼져 있어(--no-headless-retry) 다시 시도하지 않았습니다 |
 | `headed` | 창 모드 브라우저라 헤드리스 이름 문제가 아니어서 다시 시도하지 않았습니다 |
+| `load_timed_out` | 문서는 열렸지만 요청한 로드 상태까지 기다리지 못한 이동이라(부분 성공) 이름을 바꿔 다시 열지 않았습니다 |
 
 `new_server_cookie`에는 세부 필드 `cookie_change`와 고정 문구 `cookie_change_note`가 붙습니다(WS-52).
 쿠키 이름·값은 싣지 않습니다.
