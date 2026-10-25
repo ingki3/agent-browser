@@ -55,6 +55,9 @@ _REDIRECT_HINT = "리다이렉트가 끝없이 이어짐 — 같은 주소 재�
 #: 2단계(load/networkidle 대기) 시간 초과 — 문서는 열렸다(부분 성공).
 LOAD_STATE_TIMED_OUT_HINT = ("네트워크 요청이 계속돼 {requested} 까지 기다리지 못했지만 문서는 열렸습니다"
                              "(domcontentloaded) — 바로 읽어도 됩니다.")
+#: 2단계 시간 초과인데 1단계 문서가 다른 문서로 바뀜(R1) — 새 문서의 열림은 증명되지 않아 실패로 둔다.
+DOCUMENT_CHANGED_HINT = ("이동 중 다른 문서로 바뀜 — 처음 열린 문서가 {requested} 전에 다른 문서로 넘어갔습니다"
+                         "(리다이렉트·스크립트 이동). observe_page 로 지금 페이지를 확인하세요.")
 
 
 def _net_error_kind(net_error: str) -> str:

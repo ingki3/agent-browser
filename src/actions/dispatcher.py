@@ -121,6 +121,11 @@ def _is_target_closed(exc: BaseException) -> bool:
     return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 
+def _is_error_document(url: Any) -> bool:
+    """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
+    return str(url or "").startswith("chrome-error://")
+
+
 #: WS-69 B4: extract·shadow_root_selector 의 표준 CSS(document.querySelector[All]) 문법 오류 안내.
 SELECTOR_SYNTAX_HINT = ("선택자 문법 오류 — 이 경로는 표준 CSS 만 받습니다(:has-text·text= 등 Playwright 전용 문법 불가). "
                         "observe_page 의 element_id 나 표준 CSS 선택자를 쓰세요.")
@@ -3528,39 +3533,114 @@ class ActionDispatcher:
         # WS-69: 2단계 — 1단계 goto(domcontentloaded) 가 커밋+DCL 을 증명하고(실패면 기존 오류), 요청이 load/networkidle
         # 이면 남은 시간으로 wait_for_load_state(요청값). 2단계의 **시간 초과만** 부분 성공(문서는 열림). 1단계가 새 문서를
         # 증명하므로 이전 문서(같은 주소 재이동)의 상태를 성공으로 오인하지 않는다(리뷰 B1).
+        # R1(검증 B1): 2단계 시간 초과의 부분 성공은 (a) 주 프레임이 오류 문서(chrome-error://)가 아니고 (b) 문서
+        # 신원(CDP 주 프레임 loaderId)이 1단계 직후와 같을 때만. 단계와 무관하게 끝난 주 프레임이 오류 문서면 실패다
+        # (형제 load/networkidle 완료·commit/DCL 경로의 거짓 성공 — 기준부터 있던 것).
         requested = params.get("wait_until", "domcontentloaded")
         timeout_ms = params.get("timeout_ms", 30000)
         started = _monotonic()
+        failed_navs = self._watch_failed_navigations(page)
         try:
-            await page.goto(
-                params["url"],
-                wait_until="commit" if requested == "commit" else "domcontentloaded",
-                timeout=timeout_ms,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return self._navigate_failure(action, exc)
-        self.ctx.engine.bump_epoch("navigate")  # 1단계 직후 — 부분 성공에서도 반드시 오른다(N2)
-        data: Dict[str, Any] = {}
-        if requested in ("load", "networkidle"):
-            timed_out = False
-            remaining = timeout_ms - (_monotonic() - started) * 1000 if timeout_ms else 0
-            if timeout_ms and remaining < 1:
-                timed_out = True  # timeout=0 은 Playwright 의 무한 대기 — 부르지 않는다(N1)
-            else:
-                try:
-                    await page.wait_for_load_state(requested, timeout=remaining)
-                except PlaywrightTimeoutError:
-                    timed_out = True  # 이것만 부분 성공(N2) — 닫힘 등은 아래 기존 분류
-                except Exception as exc:  # noqa: BLE001
-                    return self._navigate_failure(action, exc)
-            if timed_out:
-                from actions.nav_failure import LOAD_STATE_TIMED_OUT_HINT
+            try:
+                await page.goto(
+                    params["url"],
+                    wait_until="commit" if requested == "commit" else "domcontentloaded",
+                    timeout=timeout_ms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return self._navigate_failure(action, exc)
+            self.ctx.engine.bump_epoch("navigate")  # 1단계 직후 — 부분 성공에서도 반드시 오른다(N2)
+            data: Dict[str, Any] = {}
+            if requested in ("load", "networkidle"):
+                doc_id = await self._main_document_id(page)  # 1단계가 증명한 문서
+                timed_out: Optional[BaseException] = None
+                remaining = timeout_ms - (_monotonic() - started) * 1000 if timeout_ms else 0
+                if timeout_ms and remaining < 1:
+                    # timeout=0 은 Playwright 의 무한 대기 — 부르지 않는다(N1)
+                    timed_out = PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded.")
+                else:
+                    try:
+                        await page.wait_for_load_state(requested, timeout=remaining)
+                    except PlaywrightTimeoutError as exc:
+                        timed_out = exc  # 이것만 부분 성공 후보(N2) — 닫힘 등은 아래 기존 분류
+                    except Exception as exc:  # noqa: BLE001
+                        return self._navigate_failure(action, exc)
+                if _is_error_document(page.url):
+                    return self._error_document_failure(action, page.url, failed_navs)
+                if timed_out is not None:
+                    if doc_id is None or await self._main_document_id(page) != doc_id:
+                        # 1단계 문서가 사라졌다(또는 신원을 확인하지 못했다) — 새 문서의 DCL 은 증명되지 않았으니
+                        # 부분 성공으로 올리지 않는다(기준 동작과 같은 실패).
+                        from actions.nav_failure import DOCUMENT_CHANGED_HINT as _DOCUMENT_CHANGED_HINT
 
-                data["load_state"] = {"requested": requested, "reached": "domcontentloaded", "timed_out": True}
-                data["hint"] = LOAD_STATE_TIMED_OUT_HINT.format(requested=requested)
-        return self._result(
-            success=True, action=action, retry_safe=True, data={"url": page.url, **data}
-        )
+                        failure = self._navigate_failure(action, timed_out)
+                        failure.data["hint"] = _DOCUMENT_CHANGED_HINT.format(requested=requested)
+                        return failure
+                    from actions.nav_failure import LOAD_STATE_TIMED_OUT_HINT
+
+                    data["load_state"] = {"requested": requested, "reached": "domcontentloaded", "timed_out": True}
+                    data["hint"] = LOAD_STATE_TIMED_OUT_HINT.format(requested=requested)
+            elif _is_error_document(page.url):
+                return self._error_document_failure(action, page.url, failed_navs)
+            return self._result(
+                success=True, action=action, retry_safe=True, data={"url": page.url, **data}
+            )
+        finally:
+            self._unwatch_failed_navigations(page, failed_navs)
+
+    async def _main_document_id(self, page: Any) -> Optional[str]:
+        """주 프레임 현재 문서의 신원 — CDP Page.getFrameTree 의 loaderId (WS-69 R1).
+
+        loaderId 는 브라우저가 문서 로드마다 새로 붙이는 값이라 새 문서(오류 문서 포함)면 바뀌고, 같은 문서 안 이동
+        (pushState·hash)이면 그대로다. 페이지 JS 를 돌리지 않으므로 이동 중에도 막히지 않고 페이지가 꾸밀 수 없다.
+        Playwright 공개 API 에는 문서 식별자가 없다(main_frame 객체는 문서가 바뀌어도 같다). 최상위 Page 가 아니거나
+        (switch_frame 안) 읽지 못하면 None — 호출자는 '같음을 증명 못 함'으로 보아 부분 성공을 내지 않는다.
+        """
+        if not hasattr(page, "main_frame") or not hasattr(page, "context"):
+            return None
+        try:
+            cdp = await self._gate_cdp_for(page)
+            tree = await cdp.send("Page.getFrameTree")
+            loader = tree["frameTree"]["frame"].get("loaderId")
+        except Exception:  # noqa: BLE001
+            return None
+        return str(loader) if loader else None
+
+    def _watch_failed_navigations(self, page: Any) -> Dict[str, Any]:
+        """이동 중 실패한 주 프레임 문서 요청의 net 오류를 모은다 — 오류 문서 실패의 원인 kind 용 (WS-69 R1)."""
+        state: Dict[str, Any] = {"errors": [], "handler": None}
+        on = getattr(page, "on", None)
+        frame = getattr(page, "main_frame", page)
+        if not callable(on):
+            return state
+
+        def handler(request: Any) -> None:
+            try:
+                if request.is_navigation_request() and request.frame is frame and request.failure:
+                    state["errors"].append(str(request.failure))
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            on("requestfailed", handler)
+            state["handler"] = handler
+        except Exception:  # noqa: BLE001
+            pass
+        return state
+
+    def _unwatch_failed_navigations(self, page: Any, state: Dict[str, Any]) -> None:
+        if state.get("handler") is None:
+            return
+        try:
+            page.remove_listener("requestfailed", state["handler"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _error_document_failure(self, action: ActionType, url: str, failed_navs: Dict[str, Any]) -> ActionResult:
+        """주 프레임이 브라우저 오류 문서로 끝난 이동 — E_NAVIGATE_TIMEOUT + nav_failure(원인 net 오류가 있으면 그 kind)."""
+        cause = failed_navs["errors"][-1] if failed_navs.get("errors") else "원인 미상"
+        return self._navigate_failure(
+            action, RuntimeError(f"이동 후 주 프레임이 브라우저 오류 문서입니다({url}): {cause}"))
 
     def _selector_syntax_result(self, action: ActionType, code: ErrorCode, selector: Any) -> ActionResult:
         """표준 CSS 선택자 문법 오류 — 못 찾음 계열 코드 + data.selector_error + hint (WS-69 B4)."""
