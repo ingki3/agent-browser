@@ -1978,10 +1978,22 @@ class ActionDispatcher:
         CDP Page.getFrameTree(주 프레임 id·loaderId — 새 문서면 바뀜) + Page.getNavigationHistory 현재 항목
         (pushState 는 새 항목 id, replaceState 는 같은 항목의 주소가 바뀜). 페이지 JS 가 위조할 수 없는 값이다.
         예외는 그대로 올린다 — 부르는 쪽(saved_pages)이 판정 불가로 거부한다.
+        R3: 두 값은 따로 await 하므로 그 사이 reload 되면 이전 loader + 현재 history 가 섞인다 — frame → history →
+        frame 으로 읽어 앞뒤 (frameId, loaderId) 가 같을 때만 인정, 다르면 1회 다시 읽고 그래도 다르면 None.
         """
         cdp = await self._gate_cdp_for(self._top_page())
-        frame = ((await cdp.send("Page.getFrameTree")).get("frameTree") or {}).get("frame") or {}
-        history = await cdp.send("Page.getNavigationHistory")
+
+        async def frame_now() -> Dict[str, Any]:
+            return ((await cdp.send("Page.getFrameTree")).get("frameTree") or {}).get("frame") or {}
+
+        for _ in range(2):
+            frame = await frame_now()
+            history = await cdp.send("Page.getNavigationHistory")
+            again = await frame_now()
+            if (frame.get("id"), frame.get("loaderId")) == (again.get("id"), again.get("loaderId")):
+                break
+        else:
+            return None  # 읽는 동안 문서가 계속 바뀜 — 혼합 스냅샷을 결속값으로 내지 않는다
         entries = history.get("entries") or []
         index = history.get("currentIndex")
         if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
