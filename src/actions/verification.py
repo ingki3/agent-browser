@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from contracts import ErrorCode
 from perception.engine import ElementHandle
-from perception.repeated import GROUP_CHECK_JS, pin_display
+from perception.repeated_v1160 import GROUP_CHECK_JS, pin_display
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: shadow DOM을 관통하는 요소 조회 헬퍼 (JS).

@@ -2158,20 +2158,20 @@ class ActionDispatcher:
         if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
             # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
-            from perception.repeated import pin_display
+            # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고
+            # 재관찰도 하지 않는다. R17(사용자 결정 A, #136·#158): changed 는 바뀐 종류(고정 어휘)만, before/after 는 고정
+            # 표식 — 페이지 글자는 data·hint·error_message 어디에도 싣지 않는다.
+            from actions.group_changed import refusal_data
 
-            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
-            after = (safe_page_text(pin_display(staleness.observed_group))
-                     if staleness.observed_group is not None else None)
-            hint = "관찰 뒤 묶음(달·행)이 바뀌어 누르지 않았습니다 — 다시 관찰해 data.repeated 에서 고르세요"
+            group_changed, hint = refusal_data(handle.group_heading, staleness.observed_group)
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.TOCTOU_MISMATCH,
-                error_message=f"Staleness 검증 실패({staleness.detail}) — 치유하지 않음: {hint}",
+                error_message=f"Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: {hint}",
                 reobserve_required=True,
-                data={"group_changed": {"before": before, "after": after}, "hint": hint},
+                data={"group_changed": group_changed, "hint": hint},
             )
         if not staleness.fresh and identity_change_refused(staleness.reason, action):
             # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
@@ -2790,8 +2790,9 @@ class ActionDispatcher:
         1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
         고정돼 있었다면 그 선택 근거(구분 조상·지문)를 같은 id 의 새 핸들에 이어 준다 — id 는 이전 관찰을 보고 고른
         것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다.
+        WS-62 R12: 고정은 v1.16.0 원문(perception.repeated_v1160)만 — 승계도 v1.16.0 그대로(같은 id 면 css 와 무관).
         """
-        from perception.repeated import annotate_repeated
+        from perception.repeated_v1160 import annotate_repeated
 
         engine = self.ctx.engine
         try:
@@ -2812,7 +2813,7 @@ class ActionDispatcher:
         """
         if not getattr(handle, "group_path", None) or not candidates:
             return candidates
-        from perception.repeated import GROUP_FILTER_JS
+        from perception.repeated_v1160 import GROUP_FILTER_JS
 
         try:
             keep = await self.ctx.page.evaluate(GROUP_FILTER_JS, {
@@ -3045,8 +3046,12 @@ class ActionDispatcher:
         )
         data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
+        # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
+        # 관찰 정보 전용이라 핸들을 건드리지 않는다.
+        from perception import repeated_v1160
         from perception.repeated import annotate_repeated
 
+        await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
         if repeated is not None:
             data["repeated"] = repeated

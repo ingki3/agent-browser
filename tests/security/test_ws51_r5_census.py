@@ -117,6 +117,9 @@ REVIEWED = {
      "f\"{pending.get('domain')} 에서 창에서 해결한 뒤 headless 복귀 후 {pending.get('kind') or '차단'} 재감지 — 서버 수명 동안 창 유지\""): FREE,
     ("sticky_reason", "interface/on_demand.py", "self.sticky_reason"): FREE,
     ("changed", "interface/server_handoff.py", "changed"): "released·taken·timeout",
+    ("changed", "actions/group_changed.py", "{'kinds': kinds}"): "WS-62 R17 data.group_changed.changed — dict(문자열 "
+                                                                  "아님: 제어 값 판정 밖, kinds 는 group_changed.KINDS "
+                                                                  "고정 어휘만 — 페이지 글자 0)",
     ("nav_aborted", "actions/dispatcher.py", "self.aborted"): "_NavWatch.aborted — download·request_failed·"
                                                               "status_204·status_205 (R6)",
     # R7 — 리터럴 제어값 census(test_ws51_r7_census.py)로 어휘에 들어온 키의 동적 생산자.
