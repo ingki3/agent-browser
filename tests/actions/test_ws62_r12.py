@@ -36,6 +36,9 @@ import ws62_corpus as corpus
 
 ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = "6e449e2"  # v1.16.0
+#: dispatcher 차이 검사의 비교 기준 — WS-62 를 뺀 dev(a081a91 = v1.16.0 + WS-63 C #160 + WS-67 #165).
+#: 다른 WS 가 dev 에 넣은 dispatcher 변경(WS-67 격리 world 판정 등)은 R12 판정표 대상이 아니다.
+DISPATCHER_DIFF_BASE = "a081a91"
 #: src/perception/repeated_v1160.py == `git show 6e449e2:src/perception/repeated.py` (바이트 동일).
 V1160_SHA256 = "d13c80f23092bfb40919afe5e6ce1953cbb9b5ff2d92bd2e7e8df21b34fc8257"
 FULL = {"force_full_tree": True, "prune_top_n": 2000}
@@ -44,9 +47,9 @@ HANA = {"force_full_tree": True, "prune_top_n": 50}
 ERR_PREFIX = "Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: "
 
 
-def _git_show(rel: str) -> Optional[str]:
+def _git_show(rel: str, rev: str = ARCHIVE) -> Optional[str]:
     try:
-        out = subprocess.run(["git", "-C", str(ROOT), "show", f"{ARCHIVE}:{rel}"], capture_output=True, timeout=30)
+        out = subprocess.run(["git", "-C", str(ROOT), "show", f"{rev}:{rel}"], capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.decode("utf-8") if out.returncode == 0 else None
@@ -167,13 +170,14 @@ def test_dispatcher_diff_vs_archive_is_only_r12_hunks():
     import difflib
 
     arch = _git_show("src/actions/dispatcher.py")
-    if arch is None:
+    base = _git_show("src/actions/dispatcher.py", DISPATCHER_DIFF_BASE)
+    if arch is None or base is None:
         pytest.skip("git archive 없음")
     now = (ROOT / "src" / "actions" / "dispatcher.py").read_text(encoding="utf-8")
     spans = _func_spans(now, "ActionDispatcher")
     a, b = arch.splitlines(), now.splitlines()
     touched = set()
-    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=base.splitlines(), b=b, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
         for line in range(j1 + 1, max(j2, j1 + 1) + 1):
