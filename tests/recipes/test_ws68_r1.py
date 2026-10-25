@@ -129,6 +129,9 @@ class _Doc:
             raise v
         return v
 
+    def watch_top_document_commits(self) -> Any:  # R4: 새 문서 커밋 계수기(가짜 — 커밋 없음)
+        return NS(commits=0, close=lambda: None)
+
     async def top_document_binding(self) -> Any:
         v = self.bindings[min(self.binds, len(self.bindings) - 1)]
         self.binds += 1
@@ -152,6 +155,8 @@ class _Server:
         if self.extra:
             ns.isolated_top_evaluate = self.doc.isolated_top_evaluate
             ns.top_document_binding = self.doc.top_document_binding
+            if hasattr(self.doc, "watch_top_document_commits"):
+                ns.watch_top_document_commits = self.doc.watch_top_document_commits
         return ns
 
 

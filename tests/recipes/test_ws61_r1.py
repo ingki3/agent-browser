@@ -186,7 +186,8 @@ class FakeServer:
     def _dispatcher(self) -> Any:
         # WS-68 R1: 엄격 판정은 격리 world 판독기로, 결속값은 문서 판독기로 — 가짜 페이지 evaluate 를 그대로 쓴다.
         return NS(ctx=NS(page=self.page, root_page=self.root_page), isolated_top_evaluate=lambda e, **_: self.page.evaluate(e),
-                  top_document_binding=lambda: _fake_binding_of(self.page))
+                  top_document_binding=lambda: _fake_binding_of(self.page),
+                  watch_top_document_commits=lambda: NS(commits=0, close=lambda: None))
 
 
 def _svc() -> tuple:

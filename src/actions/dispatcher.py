@@ -2004,6 +2004,12 @@ class ActionDispatcher:
             return None
         return str(frame_id), str(loader), int(entry_id), url
 
+    def watch_top_document_commits(self) -> Any:
+        """최상위 문서 주 프레임의 새 문서 커밋 계수기(WS-68 R4) — browser.document_commits. 걸 수 없으면 None."""
+        from browser.document_commits import watch_document_commits
+
+        return watch_document_commits(self._top_page())
+
     async def isolated_top_evaluate(self, expression: str, expect_loader: Optional[str] = None) -> Any:
         """최상위 문서의 **격리 world** 에서 expression 을 평가해 값을 돌려준다 (WS-68 R1, B1).
 

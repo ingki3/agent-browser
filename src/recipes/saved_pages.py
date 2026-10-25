@@ -11,7 +11,9 @@
   판정 불가, 지금 문서 상태 ≥ 400, egress 불허, 같은 주소의 마지막 navigate 실패도 거부(_check_screen).
   R1: 엄격 판정은 격리 world 에서만, 저장은 문서 결속 트랜잭션(판정 전·저장 전·저장 뒤 결속값 + 엄격 판정 —
   바뀌면 거부, 저장 뒤면 방금 쓴 항목을 되돌림). R2: 모든 엄격 판정은 결속값 샌드위치(읽기 → 판정 → 다시 읽기)이고
-  판독기는 시작 문서(loaderId)에 묶여 다른 문서를 판정하지 않는다.
+  판독기는 시작 문서(loaderId)에 묶여 다른 문서를 판정하지 않는다. R4: 첫 결속값 읽기 전에 주 프레임 새 문서 커밋
+  계수기(browser.document_commits)를 걸어 저장 직전·성공 반환 직전(마지막 await 뒤, 동기)에 본다 — 커밋이 있었으면
+  E_CHANGED(저장 뒤면 되돌림), 계수기를 못 걸면 E_UNJUDGED. 결속값 표본은 이중 방어로 남는다.
 * uses: 저장 주소로 navigate 성공(리다이렉트·challenge·오류·재생 중이 아님) 뒤 **첫** observe 가 같은 주소(정규화)에서
   성공하면 +1 — navigate 1회당 최대 1.
 * 저장소: `serve --profile NAME` 이면 프로필 폴더 saved_pages.json(0600, 임시 파일 + rename, 손상 시 `.corrupt-…`
@@ -520,23 +522,59 @@ class SavedPagesService:
         raw_url = str(getattr(page, "url", "") or "")
         url = check_url(raw_url)
         reader = self._document_reader()
-        before = await self._binding(reader)
-        if before[3] != raw_url:
-            raise SavedPageError(E_CHANGED)  # page.url 이 실제 문서 주소와 다름 — 저장할 주소를 믿지 않는다
-        status = await self._check_screen(page, url, reader, before)
-        await self._strict(page, reader, before, status)
-        ws = self._workspace()
-        prior = self.store.find(ws, url)
-        prior_name = prior["name"] if prior is not None else None
-        entry, created = self.store.add(ws, url, name)
+        watch = self._watch_commits(reader)  # R4: 첫 결속값 읽기 전에 — 이후 새 문서 커밋은 하나도 놓치지 않는다
         try:
+            before = await self._binding(reader)
+            if before[3] != raw_url:
+                raise SavedPageError(E_CHANGED)  # page.url 이 실제 문서 주소와 다름 — 저장할 주소를 믿지 않는다
+            status = await self._check_screen(page, url, reader, before)
             await self._strict(page, reader, before, status)
-        except SavedPageError:
-            self.store.undo_add(ws, entry["id"], created, prior_name)
-            raise
-        return {"success": True, "data": {
-            "saved_page": {"id": entry["id"], "name": entry["name"], "url": entry["url"], "updated": not created},
-            "storage": "profile" if self.store.persistent else "memory"}}
+            ws = self._workspace()
+            prior = self.store.find(ws, url)
+            prior_name = prior["name"] if prior is not None else None
+            self._no_commits(watch)  # 저장 직전(동기) — 커밋이 있었으면 저장하지 않는다
+            entry, created = self.store.add(ws, url, name)
+            try:
+                await self._strict(page, reader, before, status)
+                # 마지막 await 뒤·성공 반환 직전(동기) — 이 뒤로는 이벤트 루프에 양보하지 않는다.
+                self._no_commits(watch)
+            except SavedPageError:
+                self.store.undo_add(ws, entry["id"], created, prior_name)
+                raise
+            return {"success": True, "data": {
+                "saved_page": {"id": entry["id"], "name": entry["name"], "url": entry["url"], "updated": not created},
+                "storage": "profile" if self.store.persistent else "memory"}}
+        finally:
+            watch.close()
+
+    @staticmethod
+    def _watch_commits(reader: Any) -> Any:
+        """주 프레임 새 문서 커밋 계수기(R4). 없음·연결 실패·계수 0 아님이면 판정 불가(E_UNJUDGED, fail-closed)."""
+        make = getattr(reader, "watch_top_document_commits", None)
+        if not callable(make):
+            raise SavedPageError(E_UNJUDGED)
+        try:
+            watch = make()
+        except Exception:  # noqa: BLE001 - 계수기를 못 걸면 판정 불가(fail-closed)
+            raise SavedPageError(E_UNJUDGED) from None
+        if watch is None:
+            raise SavedPageError(E_UNJUDGED)
+        count = getattr(watch, "commits", None)
+        if not isinstance(count, int) or isinstance(count, bool) or count != 0:
+            close = getattr(watch, "close", None)
+            if callable(close):
+                close()
+            raise SavedPageError(E_UNJUDGED)
+        return watch
+
+    @staticmethod
+    def _no_commits(watch: Any) -> None:
+        """시작 이후 새 문서 커밋이 1회라도 있었으면 E_CHANGED, 계수를 못 읽으면 E_UNJUDGED (동기 — await 없음)."""
+        count = getattr(watch, "commits", None)
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise SavedPageError(E_UNJUDGED)
+        if count != 0:
+            raise SavedPageError(E_CHANGED)
 
     def _document_reader(self) -> Any:
         """격리 world 판독기·결속값 판독기가 있는 디스패처(WS-68 R1). 없으면 판정 불가."""
