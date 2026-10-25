@@ -60,6 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # WS-62 기준 동일성 시험이 git show 6e449e2/a081a91 을 씀 — 얕은 clone 이면 skip 됨
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

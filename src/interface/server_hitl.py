@@ -65,6 +65,86 @@ _ENTER_SUBMITS_INPUT_TYPES = frozenset({
 _BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 
 
+def _gate_rank(action: ActionType, domain: str, name: str, submits_form: bool, unresolved: str,
+               signals: tuple) -> tuple:
+    """한 판정 결과의 위험 순위 (WS-67). 판정 불가 > 폼 제출 > 신호(키워드) > 없음.
+
+    격리 world 판정과 페이지 world 판정을 **각각** 기존 `assess_risk` 로 분류한 뒤 이 순위로 높은
+    쪽을 고른다(필드 단위 OR 아님). (등급, 근거 범주) 튜플 — 같으면 기존 판정을 쓴다.
+    """
+    from security import ActionContext, RiskLevel
+    from security.hitl import assess_risk
+
+    assessed = assess_risk(ActionContext(
+        action=action, element_name=name, domain=domain, submits_form=submits_form,
+        unresolved_target=unresolved, signals=signals,
+    ))
+    level = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}[assessed.risk]
+    source = assessed.basis.get("source")
+    if source == "unresolved":
+        category = 3
+    elif source == "form_submit":
+        category = 2
+    elif assessed.basis.get("matched_keyword"):
+        category = 1
+    else:
+        category = 0
+    return level, category
+
+
+async def _isolated(reader: Any, *args: Any) -> Optional[Dict[str, Any]]:
+    """격리 world 판정 호출 (WS-67). 판정기가 없거나 실패하면 None — 기존 판정만 쓴다(강화만)."""
+    if reader is None:
+        return None
+    try:
+        out = await reader(*args)
+    except Exception:  # noqa: BLE001 — 의도된 fail-safe: 격리 판정 실패 = 지금 동작 그대로
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _focus_verdict(kind: str, info: Dict[str, Any]) -> tuple:
+    """포커스 요소 정보 → (폼 제출, 대상 이름, 판정 불가 사유, 문맥 신호) (WS-30 R1, WS-67 에서 분리)."""
+    tag = str(info.get("tag") or "")
+    itype = str(info.get("type") or "")
+    in_form = bool(info.get("in_form"))
+    name = str(info.get("name") or "")
+    # WS-31: 키가 그 요소를 **누르는** 경우에만 문맥 신호를 본다(클릭과 같은 판정).
+    signals = _signals_of(info)
+    if kind == "enter":
+        if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES:
+            # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출(버튼형이면 그 버튼 이름도).
+            return True, name if itype in _BUTTON_INPUT_TYPES else "", "", ()
+        if in_form and tag == "SELECT":
+            return True, "", "", ()
+    if in_form and (
+        (tag == "BUTTON" and itype in ("", "submit"))
+        or (tag == "INPUT" and itype in ("submit", "image"))
+    ):
+        # 폼 안 제출 버튼을 키로 누름 = 폼 제출(이름이 '다음' 이어도).
+        return True, name, "", signals
+    if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in _BUTTON_INPUT_TYPES):
+        # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름·문맥 게이트를 탄다.
+        return False, name, "", signals
+    if info.get("unknown_tag") and info.get("inside_form"):
+        # 폼 안 사용자 정의 요소(폼 연계 요소일 수 있음) — 키 동작을 확정할 수 없다.
+        return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스", ()
+    return False, "", "", ()
+
+
+def _point_verdict(target: Dict[str, Any]) -> tuple:
+    """좌표 대상 해석 결과({name, info}) → (이름, 신호, 판정 불가 사유, 근거 부가정보) (WS-31)."""
+    info = target.get("info") or {}
+    extra = {
+        "coordinate_target": "interactive" if info.get("interactive") else "non_interactive",
+        "tag": str(info.get("tag") or ""),
+    }
+    unresolved = ""
+    if not info.get("interactive") and info.get("inside_form"):
+        unresolved = "좌표가 폼 안의 비상호작용 요소 위(무엇이 일어날지 판정 불가)"
+    return str(target.get("name") or ""), _signals_of(info), unresolved, extra
+
+
 #: 승인 증표로 실행했는데 결과가 이 코드면 실행 여부가 불확실하다(outcome_unknown, 재시도 금지).
 _UNCERTAIN_CODES = frozenset({
     ErrorCode.TIMEOUT, ErrorCode.PAGE_CRASHED, ErrorCode.NAVIGATE_TIMEOUT,
@@ -433,31 +513,19 @@ class HitlMixin:
             return False, "", "포커스 요소를 읽을 수 없음", ()
         if info.get("opaque"):
             return False, "", "포커스가 다른 출처 프레임 안에 있음", ()
-        tag = str(info.get("tag") or "")
-        itype = str(info.get("type") or "")
-        in_form = bool(info.get("in_form"))
-        name = str(info.get("name") or "")
-        # WS-31: 키가 그 요소를 **누르는** 경우에만 문맥 신호를 본다(클릭과 같은 판정).
-        signals = _signals_of(info)
-        if kind == "enter":
-            if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES:
-                # 한 줄 입력칸·체크박스 등에서 Enter = 암묵적 폼 제출(버튼형이면 그 버튼 이름도).
-                return True, name if itype in _BUTTON_INPUT_TYPES else "", "", ()
-            if in_form and tag == "SELECT":
-                return True, "", "", ()
-        if in_form and (
-            (tag == "BUTTON" and itype in ("", "submit"))
-            or (tag == "INPUT" and itype in ("submit", "image"))
-        ):
-            # 폼 안 제출 버튼을 키로 누름 = 폼 제출(이름이 '다음' 이어도).
-            return True, name, "", signals
-        if tag in ("BUTTON", "A", "SUMMARY") or (tag == "INPUT" and itype in _BUTTON_INPUT_TYPES):
-            # 포커스된 버튼·링크에서 Enter/Space = 그 요소 클릭 — 이름·문맥 게이트를 탄다.
-            return False, name, "", signals
-        if info.get("unknown_tag") and info.get("inside_form"):
-            # 폼 안 사용자 정의 요소(폼 연계 요소일 수 있음) — 키 동작을 확정할 수 없다.
-            return False, name, f"폼 안의 알 수 없는 요소({tag.lower()})에 포커스", ()
-        return False, "", "", ()
+        verdict = _focus_verdict(kind, info)
+        # WS-67 (#141): 같은 포커스를 격리 world 에서도 읽어(페이지가 form getter 등을 지워도 원본)
+        # 각각 위험 분류한 뒤 높은 쪽을 쓴다. 격리 판정이 없으면(실패·OOPIF) 기존 판정 그대로.
+        reader = getattr(dispatcher, "isolated_focus_target", None)
+        isolated = await _isolated(reader)
+        if isinstance(isolated, dict):
+            other = _focus_verdict(kind, isolated)
+            domain = self._current_domain()
+            if (_gate_rank(ActionType.PRESS_KEY, domain, other[1], other[0], other[2], other[3])
+                    > _gate_rank(ActionType.PRESS_KEY, domain, verdict[1], verdict[0], verdict[2],
+                                 verdict[3])):
+                return other
+        return verdict
 
     async def _point_target(self, params: Dict[str, Any]) -> tuple:
         """좌표 클릭의 대상 해석 (WS-31). 반환: (이름, 신호, 판정 불가 사유, 근거 부가정보).
@@ -474,18 +542,22 @@ class HitlMixin:
             return "", (), "좌표 대상을 읽을 수 없음", {}
         if not dispatcher.coordinates_dispatchable(params):
             return "", (), "", {"coordinate_target": "rejected_by_dispatcher"}
-        target = await dispatcher.describe_point(int(params["x"]), int(params["y"]))
+        x, y = int(params["x"]), int(params["y"])
+        target = await dispatcher.describe_point(x, y)
         if target.get("unresolved"):
             return "", (), str(target["unresolved"]), {"coordinate_target": "unresolved"}
-        info = target.get("info") or {}
-        extra = {
-            "coordinate_target": "interactive" if info.get("interactive") else "non_interactive",
-            "tag": str(info.get("tag") or ""),
-        }
-        unresolved = ""
-        if not info.get("interactive") and info.get("inside_form"):
-            unresolved = "좌표가 폼 안의 비상호작용 요소 위(무엇이 일어날지 판정 불가)"
-        return str(target.get("name") or ""), _signals_of(info), unresolved, extra
+        verdict = _point_verdict(target)
+        # WS-67 (#141): 같은 좌표를 격리 world 에서도 판정해(DOM.getNodeForLocation → 원본 prototype)
+        # 각각 위험 분류한 뒤 높은 쪽을 쓴다. 격리 판정이 없으면(IFRAME 위·실패) 기존 판정 그대로.
+        reader = getattr(dispatcher, "isolated_point_target", None)
+        isolated = await _isolated(reader, x, y)
+        if isinstance(isolated, dict):
+            other = _point_verdict(isolated)
+            domain = self._current_domain()
+            if (_gate_rank(ActionType.CLICK, domain, other[0], False, other[2], other[1])
+                    > _gate_rank(ActionType.CLICK, domain, verdict[0], False, verdict[2], verdict[1])):
+                return other
+        return verdict
 
     def _current_domain(self) -> str:
         try:

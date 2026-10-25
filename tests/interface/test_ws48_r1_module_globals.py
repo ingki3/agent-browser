@@ -66,6 +66,8 @@ PRESERVED = (
     "_SERIAL_HELD", "_WorkspaceSerial",
     # WS-56 R4 사람 응답 대기 동안 직렬화 구간 잠시 놓기
     "_SERIAL_STACK", "_SerialPause",
+    # WS-67 격리 world 판정(포커스·좌표 판정 분리 + 높은 위험 고르기)
+    "_focus_verdict", "_gate_rank", "_isolated", "_point_verdict",
 )
 
 

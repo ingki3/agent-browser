@@ -675,6 +675,29 @@ _FOCUS_INFO_JS = (
 """.replace("__INFO__", _TARGET_INFO_JS.strip())
 )
 
+#: WS-67 (#141): 게이트 판정을 다시 하는 CDP 격리 world 이름. 격리 world 는 DOM 은 공유하고 JS
+#: 전역·prototype 은 원본이라, 페이지가 `HTMLInputElement.prototype.form`·`Element.prototype.closest`
+#: 등을 지우거나 바꿔도(인스턴스 expando 포함) 그 판정에는 보이지 않는다.
+_GATE_WORLD_NAME = "__agent_browser_gate__"
+
+#: 격리 world 의 포커스 판정 — `_FOCUS_INFO_JS` 그대로(같은 출처 iframe 은 원본
+#: contentDocument.activeElement, open shadow 는 원본 shadowRoot.activeElement 로 내려간다).
+_ISOLATED_FOCUS_EXPR = f"({_FOCUS_INFO_JS.strip()})()"
+
+#: 격리 world 의 좌표 판정 — `DOM.getNodeForLocation` 이 맞힌 노드(this)에서 `_POINT_INFO_JS` 처럼
+#: 클릭을 받는 상호작용 조상으로 올라가 판정한다. 맞힌 노드가 IFRAME/FRAME 이면(다른 프로세스
+#: iframe 의 소유자) iframe 자체를 판정하지 않고 {frame: true} — 호출부가 격리 판정을 생략한다.
+_ISOLATED_POINT_JS = (
+    """
+function () {
+  const el = this.nodeType === 1 ? this : this.parentElement;
+  if (!el) return null;
+  if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') return { frame: true };
+  return (__POINT__).call(el);
+}
+""".replace("__POINT__", _POINT_INFO_JS.strip())
+)
+
 #: iframe 요소를 다시 가리킬 수 있는 짧은 셀렉터 (switch_frame 안내용).
 _FRAME_HINT_JS = """
 (el) => {
@@ -1795,6 +1818,140 @@ class ActionDispatcher:
             return None
         return info
 
+    # -- WS-67 (#141): 격리 world 판정 -------------------------------------------------
+
+    async def _gate_world(self, cdp: Any, frame_id: str, fresh: bool = False) -> Optional[int]:
+        """그 프레임의 게이트 격리 world 실행 컨텍스트 id. 프레임을 못 찾으면 None.
+
+        (세션, frameId, loaderId) 로 캐시한다 — 이동하면 loaderId 가 바뀌어 새로 만든다. 같은 문서에서
+        컨텍스트가 사라진 경우(document.open 등)는 `Runtime.executionContextDestroyed`(세션에 Runtime
+        이벤트가 올 때) 또는 호출부의 'context 없음' 재시도(fresh=True)로 버린다. 게이트 세션에서
+        Runtime.enable 은 켜지 않는다 — 켜면 페이지 console 인자가 이 세션의 원격 객체로 쌓인다.
+        """
+        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
+        if not frame_id:  # 빈 값 = 최상위 프레임
+            frame_id = str((tree.get("frame") or {}).get("id") or "")
+        loader = None
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            frame = node.get("frame") or {}
+            if frame_id and frame.get("id") == frame_id:
+                loader = frame.get("loaderId")
+                break
+            stack.extend(node.get("childFrames") or [])
+        if not loader:
+            return None
+        worlds = self.__dict__.setdefault("_gate_worlds", {})
+        hooked = self.__dict__.setdefault("_gate_world_hooked", set())
+        if id(cdp) not in hooked:
+            hooked.add(id(cdp))
+
+            def destroyed(event: Dict[str, Any]) -> None:
+                gone = event.get("executionContextId")
+                for k in [k for k, v in worlds.items() if v == gone]:
+                    worlds.pop(k, None)
+
+            try:
+                cdp.on("Runtime.executionContextDestroyed", destroyed)
+            except Exception:  # noqa: BLE001 — 가짜 세션: 재시도 경로만 남는다
+                pass
+        key = (id(cdp), frame_id, loader)
+        if not fresh and key in worlds:
+            return worlds[key]
+        for k in [k for k in worlds if k[0] == id(cdp) and k[1] == frame_id]:
+            worlds.pop(k, None)  # 같은 프레임의 이전 문서 것
+        world = await cdp.send("Page.createIsolatedWorld",
+                               {"frameId": frame_id, "worldName": _GATE_WORLD_NAME})
+        worlds[key] = int(world["executionContextId"])
+        return worlds[key]
+
+    async def _in_gate_world(self, cdp: Any, frame_id: str, run: Any) -> Any:
+        """격리 world 컨텍스트로 run(context_id) 을 실행한다. 컨텍스트가 사라졌으면 한 번 새로 만든다."""
+        for fresh in (False, True):
+            context_id = await self._gate_world(cdp, frame_id, fresh=fresh)
+            if context_id is None:
+                return None
+            try:
+                return await run(context_id)
+            except Exception as exc:  # noqa: BLE001
+                if fresh or "context" not in str(exc).lower():
+                    raise
+        return None
+
+    async def isolated_focus_target(self) -> Optional[Dict[str, Any]]:
+        """키 입력을 받을 요소를 **격리 world** 에서 읽는다 (WS-67). 못 읽으면 None.
+
+        None(격리 world 생성 실패·다른 출처 iframe(OOPIF) 안 포커스·예외)이면 게이트는 기존(페이지
+        world) 판정만 쓴다 — 지금 동작 그대로. 페이지 world 판정과 각각 위험 분류해 높은 쪽을 쓴다.
+        """
+        top = self._top_page()
+        try:
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": _ISOLATED_FOCUS_EXPR, "contextId": context_id, "returnByValue": True})
+
+            res = await self._in_gate_world(cdp, "", run)
+        except Exception:  # noqa: BLE001
+            # 의도된 fail-safe: 격리 판정을 못 하면 기존 판정만(과잉 거부 0, 지금 동작).
+            return None
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            return None
+        info = (res.get("result") or {}).get("value")
+        if not isinstance(info, dict) or info.get("opaque") or not info.get("tag"):
+            return None
+        return info
+
+    async def isolated_point_target(self, x: int, y: int) -> Optional[Dict[str, Any]]:
+        """좌표 클릭이 누를 요소를 **격리 world** 에서 판정한다 (WS-67). 반환: {"name", "info"} 또는 None.
+
+        CDP `DOM.getNodeForLocation`(includeUserAgentShadowDOM=false — input type=image·submit 의 UA
+        shadow 가 아니라 그 요소로) → 응답 frameId 의 격리 world 에 `DOM.resolveNode` → 클릭을 받는
+        상호작용 조상까지 올라가 판정. getNodeForLocation 은 문서 좌표라 레이아웃 뷰포트 스크롤만큼
+        더한다. 맞힌 노드가 IFRAME/FRAME(OOPIF)·노드 없음·실패면 None(기존 판정만).
+        """
+        top = self._top_page()
+        try:
+            cdp = await self._gate_cdp_for(top)
+            metrics = await cdp.send("Page.getLayoutMetrics")
+            vp = metrics.get("cssLayoutViewport") or metrics.get("layoutViewport") or {}
+            hit = await cdp.send("DOM.getNodeForLocation", {
+                "x": int(x) + int(vp.get("pageX") or 0), "y": int(y) + int(vp.get("pageY") or 0),
+                "includeUserAgentShadowDOM": False})
+            backend = hit.get("backendNodeId")
+            frame_id = str(hit.get("frameId") or "")
+            if not backend or not frame_id:
+                return None
+
+            async def run(context_id: int) -> Any:
+                node = await cdp.send("DOM.resolveNode",
+                                      {"backendNodeId": backend, "executionContextId": context_id})
+                object_id = (node.get("object") or {}).get("objectId")
+                if not object_id:
+                    return None
+                try:
+                    return await cdp.send("Runtime.callFunctionOn", {
+                        "objectId": object_id, "functionDeclaration": _ISOLATED_POINT_JS.strip(),
+                        "returnByValue": True})
+                finally:
+                    try:
+                        await cdp.send("Runtime.releaseObject", {"objectId": object_id})
+                    except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                        pass
+
+            called = await self._in_gate_world(cdp, frame_id, run)
+        except Exception:  # noqa: BLE001
+            # 의도된 fail-safe: 격리 판정을 못 하면 기존 판정만(과잉 거부 0, 지금 동작).
+            return None
+        if not isinstance(called, dict) or called.get("exceptionDetails"):
+            return None
+        info = (called.get("result") or {}).get("value")
+        if not isinstance(info, dict) or info.get("frame") or not info.get("tag"):
+            return None
+        return {"name": str(info.get("name") or ""), "info": info}
+
     @staticmethod
     async def _scroll_once(page: Any, delta: int) -> Tuple[bool, Optional[int]]:
         """한 번 스크롤하고 (문서 높이가 바뀌었는지(동적 로드), 실제 세로 이동 px) 를 돌려준다.
@@ -2197,20 +2354,20 @@ class ActionDispatcher:
         if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
             # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
-            from perception.repeated import pin_display
+            # WS-62 R12(결정 B): 판정은 v1.16.0 그대로. 안내만 — '다시 관찰 → 같은 버튼을 새 id 로'. 새 id 를 싣지 않고
+            # 재관찰도 하지 않는다. R17(사용자 결정 A, #136·#158): changed 는 바뀐 종류(고정 어휘)만, before/after 는 고정
+            # 표식 — 페이지 글자는 data·hint·error_message 어디에도 싣지 않는다.
+            from actions.group_changed import refusal_data
 
-            before = safe_page_text(pin_display(handle.group_heading)) if handle.group_heading is not None else None
-            after = (safe_page_text(pin_display(staleness.observed_group))
-                     if staleness.observed_group is not None else None)
-            hint = "관찰 뒤 묶음(달·행)이 바뀌어 누르지 않았습니다 — 다시 관찰해 data.repeated 에서 고르세요"
+            group_changed, hint = refusal_data(handle.group_heading, staleness.observed_group)
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.TOCTOU_MISMATCH,
-                error_message=f"Staleness 검증 실패({staleness.detail}) — 치유하지 않음: {hint}",
+                error_message=f"Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: {hint}",
                 reobserve_required=True,
-                data={"group_changed": {"before": before, "after": after}, "hint": hint},
+                data={"group_changed": group_changed, "hint": hint},
             )
         if not staleness.fresh and identity_change_refused(staleness.reason, action):
             # WS-37 R1(사용자 결정 A): 부작용 액션인데 관찰한 그 자리 요소의 role/name 이
@@ -2863,8 +3020,9 @@ class ActionDispatcher:
         1) 새 관찰에도 반복 묶음 주석(내부 고정)을 적용한다(새 핸들 전부). 2) 에이전트가 이전 관찰에서 받은 id 가
         고정돼 있었다면 그 선택 근거(구분 조상·지문)를 같은 id 의 새 핸들에 이어 준다 — id 는 이전 관찰을 보고 고른
         것이므로, 같은 id 가 다른 묶음의 대상이 됐으면 실행 직전 검증이 거부한다.
+        WS-62 R12: 고정은 v1.16.0 원문(perception.repeated_v1160)만 — 승계도 v1.16.0 그대로(같은 id 면 css 와 무관).
         """
-        from perception.repeated import annotate_repeated
+        from perception.repeated_v1160 import annotate_repeated
 
         engine = self.ctx.engine
         try:
@@ -2885,7 +3043,7 @@ class ActionDispatcher:
         """
         if not getattr(handle, "group_path", None) or not candidates:
             return candidates
-        from perception.repeated import GROUP_FILTER_JS
+        from perception.repeated_v1160 import GROUP_FILTER_JS
 
         try:
             keep = await self.ctx.page.evaluate(GROUP_FILTER_JS, {
@@ -3328,8 +3486,12 @@ class ActionDispatcher:
         )
         data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
+        # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
+        # 관찰 정보 전용이라 핸들을 건드리지 않는다.
+        from perception import repeated_v1160
         from perception.repeated import annotate_repeated
 
+        await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
         if repeated is not None:
             data["repeated"] = repeated

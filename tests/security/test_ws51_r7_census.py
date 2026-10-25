@@ -134,6 +134,7 @@ KEYS = {
     "role": (NOT_OUT, "VLM 요청 메시지"),
     "requestStage": (NOT_OUT, "CDP Fetch.enable 인자"),
     "urlPattern": (NOT_OUT, "CDP Fetch.enable 인자"),
+    "worldName": (NOT_OUT, "CDP Page.createIsolatedWorld 인자(WS-67 게이트 격리 world 이름)"),
     "password": (NOT_OUT, "security/credentials.placeholders — 호출처 없음(모델 지시문용 자리표시자 이름)"),
     "username": (NOT_OUT, "security/credentials.placeholders — 호출처 없음(모델 지시문용 자리표시자 이름)"),
     "nav": (NOT_OUT, "recipes/recorder.py 레시피 파일 expect.nav(응답에는 단계 수만)"),
