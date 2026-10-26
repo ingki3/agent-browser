@@ -55,6 +55,7 @@ NOT_OUT_FILES = {
     "browser/chrome_cookies.py": "WS-59 profile import-cookies 전용(사람 CLI — MCP·서버 도구에서 import 하지 않음)",
     "interface/login_cli.py": "login CLI",
     "interface/cli.py": "CLI 진입점",
+    "interface/manual_sites_cli.py": "WS-64 manual-sites·handoff CLI stdout(사람 CLI)",
     "interface/server_schema.py": "도구 스키마(정적 — 응답 data 아님, WS-48 골든 고정)",
     "security/public_url.py": "소비자 자신(제어 표 — 생산자 아님)",
 }
@@ -63,6 +64,10 @@ NOT_OUT_FILES = {
 TABLES = {
     ("actions/dispatcher.py", "_KEY_ALIASES"): (NOT_OUT, "키 이름 정규화 조회표(Playwright 로 넘기는 입력)"),
     ("actions/dispatcher.py", "_PARAM_ALIASES"): (NOT_OUT, "계약 입력 키 → 디스패처 키 조회표"),
+    ("actions/nav_failure.py", "_EGRESS_KINDS"): (NOT_OUT, "WS-69 egress.code → kind 조회표(값은 data.nav_failure.kind — "
+                                                         "어휘는 test_ws69 test_kinds_are_control_vocabulary)"),
+    ("actions/nav_failure.py", "_EXACT_KINDS"): (NOT_OUT, "WS-69 net::ERR_* → kind 조회표(값은 data.nav_failure.kind)"),
+    ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
@@ -81,10 +86,14 @@ TABLES = {
 
 #: 키 → (분류, 근거). (키, 파일) 은 같은 키의 파일별 예외.
 KEYS = {
+    "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
+    "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
+    "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
     # --- CONTROL: 도구 열거 어휘
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),
     "resolved_from": (CONTROL, "actions/dispatcher.py switch_frame — current_frame|root(server_schema 안내, R6-B1)"),
     "nav_aborted": (CONTROL, "actions/dispatcher.py _NavWatch.aborted(R6)"),
+    "reached": (CONTROL, "actions/dispatcher.py navigate 부분 성공 data.load_state.reached(WS-69)"),
     "captured": (CONTROL, "actions/dispatcher.py 프레임 안 screenshot data.captured"),
     "handled": (CONTROL, "actions/dispatcher.py data.dialogs[].handled"),
     "coordinate_target": (CONTROL, "interface/server_hitl.py 좌표 대상 근거(gate_basis)"),
@@ -95,6 +104,7 @@ KEYS = {
     "storage": (CONTROL, "recipes/service.py list data.storage"),
     "source": (CONTROL, "interface/youtube_search.py data.youtube.source · security/hitl.py gate_basis.source"),
     "how_to_wait": (CONTROL, "interface/handoff.py 조작권 요청 안내 — 도구 이름"),
+    "tool": (CONTROL, "interface/server_signals.py data.handoff.tool — 인계 도구 이름(WS-63 C)"),
     "changed": (CONTROL, "interface/server_handoff.py control_wait"),
     "holder": (CONTROL, "interface/handoff.py control_status"),
     "outcome": (CONTROL, "interface/server_hitl.py 승인 결과"),
@@ -129,6 +139,7 @@ KEYS = {
     "role": (NOT_OUT, "VLM 요청 메시지"),
     "requestStage": (NOT_OUT, "CDP Fetch.enable 인자"),
     "urlPattern": (NOT_OUT, "CDP Fetch.enable 인자"),
+    "worldName": (NOT_OUT, "CDP Page.createIsolatedWorld 인자(WS-67 게이트 격리 world 이름)"),
     "password": (NOT_OUT, "security/credentials.placeholders — 호출처 없음(모델 지시문용 자리표시자 이름)"),
     "username": (NOT_OUT, "security/credentials.placeholders — 호출처 없음(모델 지시문용 자리표시자 이름)"),
     "nav": (NOT_OUT, "recipes/recorder.py 레시피 파일 expect.nav(응답에는 단계 수만)"),
@@ -236,7 +247,7 @@ def public_text_masks(value: str) -> bool:
 
 #: R7 에 새로 넣은 제어 키(어휘 + 불변 테스트 대상).
 R7_KEYS = ("nav_frame", "resolved_from", "captured", "handled", "coordinate_target", "blocked_by", "code",
-           "category", "scope", "storage", "source", "how_to_wait")
+           "category", "scope", "storage", "source", "how_to_wait", "tool")
 
 
 def _r7_pairs():

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from contracts import ActionResult, ActionType
 
@@ -148,7 +148,29 @@ def _safe_cut(text: str, n: int) -> str:
     return text[:i]
 
 
-def cap_result_size(result: ActionResult, max_chars: int) -> None:
+def _limit_text(max_chars: int, limit: Optional[int]) -> str:
+    """hint 의 {limit} 자리(WS-68, #140) — 설정 상한과 실효 예산이 다르면 둘 다, 같으면 하나."""
+    if limit is None or limit == max_chars:
+        return str(max_chars)
+    return f"설정 {limit}자 중 창 보고 등을 뺀 {max_chars}"
+
+
+def settle_returned_chars(result: ActionResult) -> None:
+    """data.truncated.returned_chars 를 지금 봉투 길이로 맞춘다(자기 길이를 담는 값 — 자릿수가 바뀌면 다시 잰다).
+
+    WS-68(#140): 자르기 뒤에 창 보고 등이 붙으면 부착 뒤 다시 부른다 — 최종 봉투 기준.
+    """
+    trunc = (result.data or {}).get("truncated")
+    if not isinstance(trunc, dict) or "returned_chars" not in trunc:
+        return
+    for _ in range(5):  # 고정점
+        n = len(envelope_json(result))
+        if trunc["returned_chars"] == n:
+            break
+        trunc["returned_chars"] = n
+
+
+def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int] = None) -> None:
     """observe_page·extract 결과 봉투를 max_chars 이하로 줄인다 (WS-30b, 제자리 수정).
 
     * 자르는 단위는 항목 경계(관찰 요소 — 점수 순, 추출 행 — 문서 순). 앞쪽을 남긴다.
@@ -156,6 +178,9 @@ def cap_result_size(result: ActionResult, max_chars: int) -> None:
       (`text_truncated: true`, `text_chars` = 원래 글자 수).
     * 잘랐으면 `data.truncated = {total_items, returned_items, total_chars, returned_chars, hint}`
       (+ 텍스트를 잘랐으면 `item_text_truncated: true`). 상한 이하면 아무것도 바꾸지 않는다.
+    * limit(WS-68) = 설정 상한(표시용). 자르는 기준은 max_chars(실효 예산 — 창 보고 등을 뺀 값) 그대로이고, 둘이
+      다르면 hint 에 둘 다 적는다. returned_chars 는 이 함수 끝의 봉투 길이 — 뒤에 무엇을 더 붙이면
+      settle_returned_chars 로 다시 맞춘다.
     """
     if result.action not in (ActionType.OBSERVE_PAGE, ActionType.EXTRACT) or not result.success:
         return
@@ -199,12 +224,15 @@ def cap_result_size(result: ActionResult, max_chars: int) -> None:
             return
         total, hint = len(all_items), _TRUNC_HINT_EXTRACT
 
+    placeholder = max(max_chars, limit or 0)
+
     def _fits(k: int) -> bool:
         _set(k)
         data["truncated"] = {
             "total_items": total, "returned_items": k, "total_chars": total_chars,
-            # 자리 표시값 = max_chars: 실제 값(≤ max_chars)은 자릿수가 같거나 적다 — 채운 뒤에도 상한 이하.
-            "returned_chars": max_chars, "hint": hint.format(limit=max_chars),
+            # 자리 표시값 = max(설정 상한, 실효 예산): 최종 값(창 보고를 붙여도 ≤ 설정 상한)은 자릿수가 같거나
+            # 적다 — 채운 뒤에도 상한 이하.
+            "returned_chars": placeholder, "hint": hint.format(limit=_limit_text(max_chars, limit)),
         }
         if item_text_cut:
             data["truncated"]["item_text_truncated"] = True
@@ -241,9 +269,4 @@ def cap_result_size(result: ActionResult, max_chars: int) -> None:
             else:
                 all_items_ref[0], hint, item_text_cut = first, _TRUNC_HINT_EXTRACT, False
     _fits(k)
-    trunc = data["truncated"]
-    for _ in range(5):  # 자기 길이를 담는 값 — 자릿수가 바뀌면 다시 잰다(고정점)
-        n = len(envelope_json(result))
-        if trunc["returned_chars"] == n:
-            break
-        trunc["returned_chars"] = n
+    settle_returned_chars(result)

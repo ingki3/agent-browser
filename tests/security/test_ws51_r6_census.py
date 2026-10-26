@@ -34,6 +34,10 @@ NOT_OUT = "MCP 응답 출구 아님"
 
 #: (파일, 식) → (분류·근거, 형식 이름(TOOL_ID_FORMATS) 또는 (제어 키, None), 표본 생성기 또는 None).
 CANDIDATES = {
+    # WS-64
+    ("browser/manual_watch.py", "f'__ab_manual_{tag}'"): (NOT_OUT + " (WS-64 직접 조작 감지 CDP 바인딩 이름)", None, None),
+    ("interface/server_manual.py", "f'mh-{secrets.token_hex(4)}'"): ("WS-64 인계 handoff_id — 면제하지 않음(public_text 를 "
+                                                                     "지나며 모양이 바뀌지 않음, 등록 대상 아님)", None, None),
     # --- 도구 식별자(등록 제외 + 제어 면제)
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{10 + secrets.randbelow(9990)}"),

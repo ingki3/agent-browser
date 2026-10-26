@@ -92,21 +92,35 @@ from interface.server_envelope import (  # noqa: E402,F401
     _TRUNC_HINT_TEXT,
     _compact_observation,
     _field_default,
+    _limit_text,
     _safe_cut,
     cap_result_size,
     envelope_dict,
     envelope_json,
+    settle_returned_chars,
 )
 from interface.server_signals import (  # noqa: E402,F401
+    HANDOFF_HINT,
+    HANDOFF_STEPS_AVAILABLE,
+    HANDOFF_STEPS_UNAVAILABLE,
+    HANDOFF_TOOL,
     SignalsMixin,
     UNOBSERVED_HINT,
+    _HANDOFF_EXCLUDED_STATUSES,
     _PageObservation,
+    challenge_handoff,
+    robots_disallowed,
+    settle_handoff,
 )
 from interface.server_hitl import (  # noqa: E402,F401
     HitlMixin,
     _BUTTON_INPUT_TYPES,
     _ENTER_SUBMITS_INPUT_TYPES,
     _UNCERTAIN_CODES,
+    _focus_verdict,
+    _gate_rank,
+    _isolated,
+    _point_verdict,
     _signals_of,
     approve_hint_text,
     blocked_hint_text,
@@ -132,6 +146,7 @@ from interface.server_tools import (  # noqa: E402,F401
     ToolsMixin,
 )
 # WS-56: 새 모듈(분리 모듈 아님 — 전역 이전 대상이 아니다). 이름은 여기서도 재수출한다.
+from interface.server_manual import ManualSiteMixin  # noqa: E402,F401
 from interface.server_elicit import (  # noqa: E402,F401
     CURRENT_ELICITOR,
     ELICIT_TIMEOUT_S,
@@ -180,7 +195,7 @@ RELEASE_RECOVERY_WAIT_S = 10.0
 
 
 class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin,
-                       WindowMixin, LifecycleMixin):
+                       WindowMixin, LifecycleMixin, ManualSiteMixin):
     """19종 툴을 노출하는 MCP 서버.
 
     실제 MCP SDK 바인딩은 `create_server()`에서 수행하고, 본 클래스는
@@ -209,7 +224,15 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         profile: Optional[str] = None,
         recipes: bool = True,
         headless_retry: bool = True,
+        manual_sites: Any = None,
     ) -> None:
+        #: WS-64 직접 조작할 사이트 목록(ManualSiteStore·ManualSites). None = 빈 목록(홈 파일을 읽지 않음 — serve CLI 가
+        #: 파일·--manual-site 로 만든 저장소를 넘긴다).
+        if manual_sites is None:
+            from security.manual_sites import ManualSites
+
+            manual_sites = ManualSites()
+        self._manual_store = manual_sites
         #: 이름 붙인 영속 프로필(WS-32, serve --profile). None 이면 기존 동작(빈 컨텍스트).
         if profile is not None:
             from browser import serve_profile
@@ -431,6 +454,7 @@ def create_server(
     profile: Optional[str] = None,
     recipes: bool = True,
     headless_retry: bool = True,
+    manual_sites: Any = None,
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -457,6 +481,7 @@ def create_server(
         profile=profile,
         recipes=recipes,
         headless_retry=headless_retry,
+        **({"manual_sites": manual_sites} if manual_sites is not None else {}),
     )
     instructions = _server_instructions(recipes)
 
@@ -592,6 +617,7 @@ async def run_stdio(
     headless_retry: bool = True,
     attach: bool = False,
     workspace: Optional[str] = None,
+    manual_sites: Any = None,
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -625,6 +651,7 @@ async def run_stdio(
         **({"profile": profile} if profile is not None else {}),
         **({} if recipes else {"recipes": False}),
         **({} if headless_retry else {"headless_retry": False}),
+        **({"manual_sites": manual_sites} if manual_sites is not None else {}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None

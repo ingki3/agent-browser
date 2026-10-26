@@ -27,3 +27,13 @@ def _isolated_profile_root(tmp_path_factory, monkeypatch):
     root = tmp_path_factory.mktemp("ab-profiles") / "profiles"
     monkeypatch.setenv(PROFILE_ROOT_ENV, str(root))
     yield root
+
+
+@pytest.fixture(autouse=True)
+def _isolated_manual_sites(tmp_path_factory, monkeypatch):
+    """WS-64: 직접 조작할 사이트 목록 파일도 임시 위치로(실제 ~/.agent-browser/manual_sites.json 무접촉)."""
+    from security.manual_sites import MANUAL_SITES_ENV
+
+    path = tmp_path_factory.mktemp("ab-manual") / "manual_sites.json"
+    monkeypatch.setenv(MANUAL_SITES_ENV, str(path))
+    yield path

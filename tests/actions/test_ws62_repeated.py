@@ -78,8 +78,10 @@ async def test_hana_two_month_panels_are_told_apart():
     assert "입력칸 값" in rep["how"]
     left = {m["name"] for m in groups[0]["members"]}
     right = {m["name"] for m in groups[1]["members"]}
-    assert "19" in left and "이전달" in left and "다음달" not in left
-    assert "19 148만" in right and "다음달" in right   # 가격 섞인 이름(줄바꿈 접기)
+    # R4(의도된 기대 변경): 행 밖 대상(이전/다음달 링크)은 묶음 대상이 아니다 — 행(ul.day>li) 안 날짜만 담고 고정한다.
+    # 달이 바뀌어도 뜻이 같은 단추라 같은 id 로 다시 눌러야 한다(실사용 2026-10-23 '다음달' 2회째 거부).
+    assert "19" in left and "이전달" not in left and "다음달" not in left
+    assert "19 148만" in right and "다음달" not in right   # 가격 섞인 이름(줄바꿈 접기)
     # 요일 머리글·이름 없는 링크·캐러셀 카드·푸터 링크는 묶음에 없다.
     names = left | right
     assert not names & set("일월화수목금토")
@@ -150,7 +152,8 @@ async def test_only_link_text_candidate_gives_null():
     r = await _observe_html(twin_panels("", "", names_b=("1", "2", "3", "5"), prefix_link="이전달"))
     groups = _groups(r)
     assert [g["group"] for g in groups] == [None, None]
-    assert all("이전달" in {m["name"] for m in g["members"]} for g in groups)
+    # R4(의도된 기대 변경): '이전달' 링크는 행 밖 대상이라 묶음 대상에서 빠진다(표제 후보도 아니다 — 위 null).
+    assert all("이전달" not in {m["name"] for m in g["members"]} and "1" in {m["name"] for m in g["members"]} for g in groups)
 
 
 @requires_chromium
@@ -257,8 +260,9 @@ async def test_month_moved_same_node_reused_is_refused():
     assert res.reobserve_required is True
     assert "healing_attempts" not in res.data  # 치유로 다른 대상을 찾지 않는다
     changed = res.data.get("group_changed")
-    # 내부 지문(묶음 정적 글자 전체, R1 R3)을 한 줄로 — 달 이름이 앞에 온다.
-    assert changed["before"].startswith("2026년 12월") and changed["after"].startswith("2027년 1월"), res.data
+    # R17(#158): before/after 필드는 그대로, 값은 고정 표식(페이지 글자 0). 달 표제 바뀜 → 종류 number.
+    assert changed["before"] == changed["after"] == "(바뀜)", res.data
+    assert "number" in changed["changed"]["kinds"], res.data
 
 
 @requires_chromium
@@ -296,8 +300,11 @@ async def test_next_month_link_can_be_pressed_twice_with_same_id():
     async with async_playwright() as pw:
         browser, page, engine, d = await _open(pw, HANA_HTML)
         try:
-            groups = _groups(await _observe(d))
-            nxt = _member(groups, "2027년 1월", "다음달")["id"]
+            r = await _observe(d)
+            groups = _groups(r)
+            # R4(의도된 기대 변경): 다음달은 행 밖 대상이라 data.repeated 에 없다 — 관찰 요소에서 찾는다.
+            nxt = next(e["element_id"] for e in r.data["observation"]["elements"] if e["name"] == "다음달")
+            assert engine.get_handle(nxt).group_path is None
             day = _member(groups, "2026년 12월", "19")["id"]
             first = await d.dispatch(ActionType.CLICK, {"element_id": nxt})
             second = await d.dispatch(ActionType.CLICK, {"element_id": nxt})

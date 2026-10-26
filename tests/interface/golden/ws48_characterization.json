@@ -967,6 +967,17 @@
      "reason": "Cloudflare 브라우저 확인 화면",
      "vendor": "cloudflare"
     },
+    "handoff": {
+     "available": false,
+     "reason": "captcha",
+     "steps": [
+      "이 서버에는 사람이 볼 창이 없어 인계할 수 없습니다 — 우회하지 마세요.",
+      "사용자에게 이 링크를 직접 열어 확인하도록 안내하세요."
+     ],
+     "suggested": true,
+     "tool": "browser_control_request"
+    },
+    "hint": "보안 확인/차단 — 우회하지 않음. data.handoff 참고",
     "last_http_status": 403,
     "latency_ms": "<ms>",
     "retry_skipped": {
@@ -995,6 +1006,9 @@
      "reason": "private_network"
     },
     "last_http_status": 403,
+    "nav_failure": {
+     "kind": "blocked"
+    },
     "url": "http://SITE_C/blocked"
    },
    "error_code": "E_INVALID_URL",
@@ -1189,7 +1203,11 @@
        "code": "connect_failed",
        "host": "127.0.0.1"
       },
+      "hint": "서버에 접속하지 못함(연결 거부·끊김) — 주소·포트를 확인하거나 잠시 뒤 다시 시도하세요.",
       "last_http_status": 502,
+      "nav_failure": {
+       "kind": "connect"
+      },
       "url": "http://127.0.0.1:CLOSED/"
      },
      "error_code": "E_NAVIGATE_TIMEOUT",
@@ -1209,7 +1227,11 @@
        "code": "connect_failed",
        "host": "127.0.0.1"
       },
+      "hint": "서버에 접속하지 못함(연결 거부·끊김) — 주소·포트를 확인하거나 잠시 뒤 다시 시도하세요.",
       "last_http_status": 502,
+      "nav_failure": {
+       "kind": "connect"
+      },
       "url": "chrome-error://chromewebdata/"
      },
      "error_code": "E_NAVIGATE_TIMEOUT",
@@ -1573,7 +1595,7 @@
  "tool_schemas": {
   "build_all_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {
@@ -1619,7 +1641,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {
@@ -2070,7 +2092,7 @@
   ],
   "build_listed_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {
@@ -2116,7 +2138,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {
@@ -2960,7 +2982,7 @@
   ],
   "list_tools": [
    {
-    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
+    "description": "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. 각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. 모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). 이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint). data.challenge: null 아니면 캡차/차단 → 사람에게(browser_navigate 참조).",
     "inputSchema": {
      "properties": {
       "force_full_tree": {
@@ -3006,7 +3028,7 @@
     "name": "browser_take_screenshot"
    },
    {
-    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오.",
+    "description": "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다. 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태) — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고).",
     "inputSchema": {
      "properties": {
       "timeout_ms": {

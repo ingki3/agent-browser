@@ -242,7 +242,7 @@ _DESCRIPTIONS: Dict[ActionType, str] = {
         "현재 페이지를 관찰해 상호작용 가능한 요소 목록을 반환합니다. "
         "각 요소에는 이후 액션에서 사용할 element_id가 부여됩니다. "
         "모든 툴 응답에서 빠진 필드=계약 기본값(null/false/{}). "
-        "이 툴·extract 결과는 2만 자 초과 시 앞쪽만(data.truncated)."
+        "이 툴·extract 결과는 설정 상한 초과 시 앞쪽만(data.truncated.hint)."
     ),
     ActionType.TAKE_SCREENSHOT: "현재 페이지의 스크린샷을 캡처합니다.",
     ActionType.NAVIGATE: "지정한 URL로 이동합니다. snapshot_epoch가 증가합니다.",
@@ -295,7 +295,7 @@ CHALLENGE_CHECK_ACTIONS = frozenset({
 CHALLENGE_NOTE = (
     " 결과 data.challenge 가 null 이 아니면 캡차/차단 화면입니다"
     "(kind=captcha|blocked, vendor, reason; data.last_http_status 는 이 탭의 마지막 메인 문서 HTTP 상태)"
-    " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오."
+    " — 풀려고 하지 말고 사람에게 넘길지 판단하십시오(보안 확인·차단 화면이면 data.handoff 참고)."
 )
 
 

@@ -14,7 +14,7 @@ from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
 from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
-from interface.server_envelope import cap_result_size
+from interface.server_envelope import cap_result_size, settle_returned_chars
 from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
@@ -102,6 +102,13 @@ class ToolsMixin:
                 data["window"] = self._window.info()
             if self._tab_notice is not None:
                 data["tab_closed_by_human"] = self._tab_notice
+            sites = self._manual_list()
+            if not sites.empty:
+                # WS-64: 목록은 읽기만(사람이 CLI 로 바꾼다) — 대기 중인 사람 인계도 함께.
+                data["manual_sites"] = sites.texts()
+            pending = self._manual_pending_view()
+            if pending is not None:
+                data["manual_handoff"] = pending
             return {"success": True, "data": data}
         if short == "control_request":
             result = await self._control_request(args)
@@ -121,7 +128,7 @@ class ToolsMixin:
         from recipes.saved_pages import OPS as SAVED_PAGE_OPS
 
         if saved is not None and str(args.get("op") or "") in SAVED_PAGE_OPS:
-            payload = saved.tool(args)  # WS-61 도착 페이지 기억
+            payload = await saved.tool(args)  # WS-61 도착 페이지 기억(WS-68: 지금 화면 엄격 재판정 — async)
         else:
             payload = await self._recipes.tool(args)
         data = payload.get("data")
@@ -218,6 +225,9 @@ class ToolsMixin:
             if blocked is not None:
                 self._note_saved_pages(action_from_tool(name), arguments, blocked)
                 return blocked
+            # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
+            # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
+            await self._manual_pre_switch(action_from_tool(name), arguments)
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
         navigation_scope = AsyncExitStack()
@@ -234,7 +244,10 @@ class ToolsMixin:
             self._note_saved_pages(action, arguments, result)
             if action is ActionType.TAB_CONTROL and result.success and "tabs" in result.data:
                 self._note_other_workspaces(result)  # WS-57: 다른 작업 공간 탭은 개수만
-            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED:
+            from security.manual_sites import is_manual_handoff
+
+            if result.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED and not is_manual_handoff(result.data):
+                # WS-64: 직접 조작할 사이트 인계에는 로그인 안내를 붙이지 않는다(로그인 문제가 아니다).
                 result.data["login_hint"] = self._login_hint()
             if action is not None:
                 await self._attach_observation_guidance(action, arguments or {}, result)
@@ -242,6 +255,10 @@ class ToolsMixin:
                 await self._attach_robots(result)
             if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
                 await self._attach_block_hint(result)
+            # WS-63 C R2: 최종 응답 기준 — robots 금지가 실렸으면 인계 안내를 뺀다(부착 순서 무관).
+            from interface.server_signals import settle_handoff
+
+            settle_handoff(result.data)
             # WS-36: 결과에 실린 웹 유래 텍스트(관찰 요소 이름·제목, 추출 텍스트·속성, 다이얼로그
             # 문구, 차단 결과의 대상 이름·오류 문구 …)에 주입 문구가 있으면 data.injection_suspected
             # 신호를 붙인다 — 차단·수정하지 않는다. 모든 반환 경로(HITL 차단 등 조기 반환 포함)를
@@ -267,12 +284,15 @@ class ToolsMixin:
                 # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
                 # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
                 fit_repeated(result, max_chars,
-                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                             limit=self.max_result_chars)
 
             attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-            cap_result_size(result, max_chars)
+            # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
+            cap_result_size(result, max_chars, limit=self.max_result_chars)
             self._attach_window_notices(result)
+            settle_returned_chars(result)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result
@@ -383,6 +403,11 @@ class ToolsMixin:
                 if refused is not None:
                     return refused
             self._observation_state()
+            # WS-64: 직접 조작할 사이트 — 사람 조작 거부·입력 검증 뒤, HITL 앞(승인 증표를 소비하지 않고 elicitation 을
+            # 띄우지 않는다). 레시피 재생·작업 공간·attach 도 모두 이 경로를 지난다.
+            manual = await self._manual_site_gate(action, params)
+            if manual is not None:
+                return manual
 
             # HITL 게이트: 고위험 액션은 모드에 따라 차단하거나 승인을 요구한다.
             self._pending_gate_basis = None

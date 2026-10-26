@@ -60,6 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # WS-62 기준 동일성 시험이 git show 6e449e2/a081a91 을 씀 — 얕은 clone 이면 skip 됨
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -105,6 +107,8 @@ jobs:
     needs: [integrity, unit-tests]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 기준 동일성 시험(git show <커밋>:) — 얕은 clone 이면 13개 skip 되어 check_readme 불일치(v1.17.0)
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

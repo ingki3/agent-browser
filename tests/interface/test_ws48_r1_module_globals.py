@@ -55,6 +55,9 @@ PRESERVED = (
     "blocked_hint_text", "build_all_tools", "build_server_tools", "build_tool_schema", "cap_result_size",
     "code_overlay_text", "compact_schema", "envelope_dict", "envelope_json", "logger", "os",
     "pre_approve_hint", "time", "tool_name", "unicodedata",
+    # WS-63 C 사람 인계 안내
+    "HANDOFF_HINT", "HANDOFF_STEPS_AVAILABLE", "HANDOFF_STEPS_UNAVAILABLE", "HANDOFF_TOOL", "_HANDOFF_EXCLUDED_STATUSES",
+    "challenge_handoff", "robots_disallowed",  # R1: robots 금지 시 인계 안내 제외
     # WS-57 작업 공간
     "DEFAULT_WORKSPACE", "WORKSPACE_ARG", "WorkspaceNameError", "WorkspaceRuntime", "_CALL_STATE", "_CallScope",
     "_all_tabs", "_closed", "_snapshot_tabs", "current_workspace", "pop_workspace_arg", "validate_workspace",
@@ -63,6 +66,10 @@ PRESERVED = (
     "_SERIAL_HELD", "_WorkspaceSerial",
     # WS-56 R4 사람 응답 대기 동안 직렬화 구간 잠시 놓기
     "_SERIAL_STACK", "_SerialPause",
+    # WS-67 격리 world 판정(포커스·좌표 판정 분리 + 높은 위험 고르기)
+    "_focus_verdict", "_gate_rank", "_isolated", "_point_verdict",
+    # WS-68 잘림 안내 숫자(설정 상한·실효 예산, 최종 봉투 returned_chars)
+    "_limit_text", "settle_returned_chars",
 )
 
 

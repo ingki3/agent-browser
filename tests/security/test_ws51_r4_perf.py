@@ -1,5 +1,10 @@
-"""WS-51 R4 — 성능 행렬(계획 §1.5·§3 R3-B6·B5). 측정 조건 고정: 같은 Mac, 새 프로세스, 5회 중앙값, 매회 캐시를
+"""WS-51 R4 — 성능 행렬(계획 §1.5·§3 R3-B6·B5). 측정 조건 고정: 같은 Mac, 새 프로세스, 5회 최솟값, 매회 캐시를
 거치지 않는 본체(`_public_text`·주소 칸 본체), 2배 비율(≤ 2.5)은 256KiB 이상 구간에서만.
+
+WS-66(#149): 5회 중앙값 → 5회 **최솟값**, 크기를 돌아가며(라운드마다 모든 크기·종류) 잰다. 기준(1.0초·2.5배·바닥 5ms)은
+그대로다(규칙 6 비해당) — 최솟값은 부하가 가장 적은 순간의 실제 처리 시간이라 전체 실행 중 순간 부하(WS-64 R1 검증
+short256_alnum_dense·short256_other_dense, 단독 통과)만 걸러내고, 이차시간 회귀는 다섯 번 모두 넘어 잡힌다. 반복이 첫 측정의
+1/PERF_SAME_WORK 미만이면(결과를 기억해 같은 일을 다시 하지 않았다) 실패시킨다.
 
 실 observe+wire 경로는 tests/interface/test_ws51_r4_e2e.py. 값은 합성 값.
 """
@@ -9,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import statistics
 import string
 import subprocess
 import sys
@@ -20,6 +24,8 @@ import pytest
 
 MiB = 1 << 20
 SIZES = [256 << 10, 512 << 10, 1 << 20]
+PERF_ROUNDS = 5
+PERF_SAME_WORK = 20
 
 
 def _rand(n: int, seed: int) -> str:
@@ -86,19 +92,22 @@ def _child(case: str) -> None:
 
     values = _values(case)
     secret_registry.REGISTRY.add_values(values)
-    rows = {"values": len(secret_registry.REGISTRY), "chars": secret_registry.REGISTRY.chars, "text": {}, "url": {}}
-    for n in SIZES:
-        text = _text(case, n, values)
-        for kind, fn in (("text", _public_text), ("url", lambda t: _public_url_field_uncached("/p?" + t))):
-            runs = []
-            out = ""
-            for _ in range(5):
+    rows = {"values": len(secret_registry.REGISTRY), "chars": secret_registry.REGISTRY.chars, "text": {}, "url": {},
+            "runs": {"text": {}, "url": {}}}
+    kinds = (("text", _public_text), ("url", lambda t: _public_url_field_uncached("/p?" + t)))
+    texts = {n: _text(case, n, values) for n in SIZES}
+    runs = {(kind, n): [] for kind, _ in kinds for n in SIZES}
+    for _ in range(PERF_ROUNDS):
+        for n in SIZES:
+            for kind, fn in kinds:
                 t = time.perf_counter()
-                out = fn(text)
-                runs.append(time.perf_counter() - t)
-            rows[kind][n] = statistics.median(runs)
-            if kind == "text" and n == SIZES[-1]:
-                rows["masked"] = out.count("[REDACTED]") > 0
+                out = fn(texts[n])
+                runs[kind, n].append(time.perf_counter() - t)
+                if kind == "text" and n == SIZES[-1]:
+                    rows["masked"] = out.count("[REDACTED]") > 0
+    for (kind, n), got in runs.items():
+        rows[kind][n] = min(got)
+        rows["runs"][kind][n] = got
     print(json.dumps(rows))
 
 
@@ -121,6 +130,8 @@ def test_one_mib_under_a_second_and_linear(case):
     assert rows["masked"], case  # 조건 성립: 일치가 실제로 있었다(경계 실패 표본도 구분자 쪽 일치 1개 이상)
     for kind in ("text", "url"):
         times = {int(k): v for k, v in rows[kind].items()}
+        for n, got in rows["runs"][kind].items():  # 반복도 첫 측정과 같은 일을 했다(캐시 적중이면 수십분의 일)
+            assert min(got[1:]) * PERF_SAME_WORK >= got[0], (case, kind, n, got)
         assert times[MiB] < 1.0, (case, kind, times)
         for small, big in zip(SIZES, SIZES[1:]):
             assert times[big] <= 2.5 * max(times[small], 0.005), (case, kind, small, big, times)

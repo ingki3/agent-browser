@@ -73,7 +73,7 @@ def test_r1_decoded_forms_are_bounded():
 def test_r1_remember_page_refuses_form_encoded_phone_and_keeps_nothing():
     srv, svc = _svc()
     srv.page.url = "https://shop.test/?q=010+1234+5678"
-    out = svc.tool({"op": "remember_page", "name": "검색"})
+    out = _tool(svc, {"op": "remember_page", "name": "검색"})
     assert not out["success"] and out["error_message"] == sp.E_PII
     assert len(svc.store) == 0
 
@@ -124,7 +124,7 @@ def test_r2_remember_page_never_persists_raw_token_in_name(tmp_path):
     srv, svc = _svc()
     svc._store = SavedPageStore(path)
     srv.page.url = "https://shop.test/orders"
-    out = svc.tool({"op": "remember_page", "name": f"https://shop.test/?token={TOKEN}"})
+    out = _tool(svc, {"op": "remember_page", "name": f"https://shop.test/?token={TOKEN}"})
     assert not out["success"] and out["error_message"] == sp.E_NAME_TOKEN
     assert not path.exists() or TOKEN not in path.read_text(encoding="utf-8")
 
@@ -152,17 +152,42 @@ class Clock:
         return self.t
 
 
+
+class _ProbePage:
+    """WS-68: remember_page 가 지금 화면을 엄격 판정(evaluate)한다 — 정상 화면을 돌려주는 가짜 페이지."""
+
+    def __init__(self, url: str = "about:blank") -> None:
+        self.url = url
+
+    async def evaluate(self, _js: str) -> Any:
+        return {"title": "", "text": "정상 페이지", "len": 6, "widget": "", "url": self.url}
+
+
+def _tool(svc: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """WS-68: SavedPagesService.tool 은 async — 동기 시험에서 부른다."""
+    import asyncio
+
+    return asyncio.run(svc.tool(args))
+
+async def _fake_binding_of(page: Any) -> Any:
+    """WS-68 R1: 가짜 문서 결속값(바뀌지 않는 문서) — 주소는 지금 page.url."""
+    return ("F", "L1", 1, str(page.url))
+
+
 class FakeServer:
     def __init__(self) -> None:
         self.profile = None
-        self.page = NS(url="about:blank")
+        self.page = _ProbePage()
         self.root_page = None
         self._recipes = NS(running=False)
         self._egress = None
 
     @property
     def _dispatcher(self) -> Any:
-        return NS(ctx=NS(page=self.page, root_page=self.root_page))
+        # WS-68 R1: 엄격 판정은 격리 world 판독기로, 결속값은 문서 판독기로 — 가짜 페이지 evaluate 를 그대로 쓴다.
+        return NS(ctx=NS(page=self.page, root_page=self.root_page), isolated_top_evaluate=lambda e, **_: self.page.evaluate(e),
+                  top_document_binding=lambda: _fake_binding_of(self.page),
+                  watch_top_document_commits=lambda: NS(commits=0, close=lambda: None))
 
 
 def _svc() -> tuple:
@@ -196,7 +221,7 @@ def test_r5_navigation_outcome_judgement(data, counted):
     srv, svc = _svc()
     url = "https://shop.test/orders"
     srv.page.url = url
-    svc.tool({"op": "remember_page", "name": "주문"})
+    _tool(svc, {"op": "remember_page", "name": "주문"})
     pid = svc.store.list("default")[0]["id"]
     svc.note_navigate({"url": url}, _result(ActionType.NAVIGATE, url, **data))
     svc.observe(_result(ActionType.OBSERVE_PAGE, url))
@@ -456,4 +481,4 @@ def test_nb_load_drops_non_finite_or_huge_numbers(tmp_path):
     assert "7개" in " ".join(st.warnings)
     srv, svc = _svc()
     svc._store = st
-    assert [p["id"] for p in svc.tool({"op": "pages"})["data"]["pages"]] == ["p_0000000a"]
+    assert [p["id"] for p in _tool(svc, {"op": "pages"})["data"]["pages"]] == ["p_0000000a"]

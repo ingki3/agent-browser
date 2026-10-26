@@ -25,6 +25,69 @@ UNOBSERVED_HINT = (
     "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
 )
 
+#: WS-63 C: 보안 업체 차단·확인 화면 → 사람 인계 **안내만**(창을 열거나 재시도하지 않는다). 고정 문장만 —
+#: 페이지 글자는 싣지 않는다(IPI 스캔 제외 키 `handoff`).
+HANDOFF_TOOL = "browser_control_request"
+HANDOFF_HINT = "보안 확인/차단 — 우회하지 않음. data.handoff 참고"
+HANDOFF_STEPS_AVAILABLE = (
+    "사용자에게 이 사이트가 자동 브라우저를 막았다고 알리고, 사람이 창에서 직접 확인을 통과해 줄지 동의를 받으세요.",
+    "동의하면 browser_control_request(reason 에 사이트와 목적) → browser_control_wait 로 사람의 반납을 기다리세요.",
+    "사람이 release 하면 같은 탭을 browser_observe_page·browser_extract 로 다시 읽으세요.",
+)
+HANDOFF_STEPS_UNAVAILABLE = (
+    "이 서버에는 사람이 볼 창이 없어 인계할 수 없습니다 — 우회하지 마세요.",
+    "사용자에게 이 링크를 직접 열어 확인하도록 안내하세요.",
+)
+#: 각자 기존 안내가 있는 상태(401 로그인·429 속도 제한) — 인계 안내를 붙이지 않는다.
+_HANDOFF_EXCLUDED_STATUSES = frozenset({401, 429})
+
+
+def challenge_handoff(challenge: Optional[Dict[str, Any]], last_status: Optional[int], *,
+                      available: bool) -> Optional[Dict[str, Any]]:
+    """차단·확인 화면 판정(data.challenge)이면 구조화된 사람 인계 안내, 아니면 None.
+
+    상태 코드 + 짧은 본문만으로 잡은 일반 거부(vendor generic, 이유 "HTTP …")는 헤드리스 이름 재시도·robots
+    안내가 맡으므로 제외한다. available = 이 serve 가 조작권 인계(사람이 볼 창)를 지원하는가.
+    """
+    if not isinstance(challenge, dict) or last_status in _HANDOFF_EXCLUDED_STATUSES:
+        return None
+    kind = str(challenge.get("kind") or "")
+    if kind not in ("captcha", "blocked"):
+        return None
+    if challenge.get("vendor") == "generic" and str(challenge.get("reason") or "").startswith("HTTP "):
+        return None
+    steps = HANDOFF_STEPS_AVAILABLE if available else HANDOFF_STEPS_UNAVAILABLE
+    return {"suggested": True, "reason": kind, "tool": HANDOFF_TOOL, "available": bool(available),
+            "steps": list(steps)}
+
+
+def robots_disallowed(data: Dict[str, Any]) -> bool:
+    """이 응답에 robots.txt 전체 금지(data.robots.disallowed)가 실렸는가."""
+    robots = data.get("robots")
+    return isinstance(robots, dict) and robots.get("disallowed") is True
+
+
+def settle_handoff(data: Dict[str, Any]) -> None:
+    """최종 응답 기준 정리(WS-63 C R1 R2): robots 금지가 실렸으면 인계 안내와 그 hint 문장을 뺀다.
+
+    금지 경로 방문을 사람 인계로 권하지 않는다 — robots 안내가 우선한다. 부착 순서와 무관하게 응답을
+    돌려주기 직전에 한 번 부른다. 기존 hint 문장은 그대로 둔다.
+    """
+    if not robots_disallowed(data) or "handoff" not in data:
+        return
+    from security.manual_sites import is_manual_handoff
+
+    if is_manual_handoff(data):
+        return  # WS-64: 직접 조작할 사이트 인계는 robots 와 무관하다(사람이 하는 단계) — 지우지 않는다
+    data.pop("handoff", None)
+    hint = str(data.get("hint") or "")
+    if HANDOFF_HINT in hint:
+        rest = hint.replace(HANDOFF_HINT, "").strip()
+        if rest:
+            data["hint"] = rest
+        else:
+            data.pop("hint", None)
+
 
 @dataclass
 class _PageObservation:
@@ -232,6 +295,10 @@ class SignalsMixin:
             result.data["retry_skipped"] = skip_reason(code)
             return None
 
+        if (result.data.get("load_state") or {}).get("timed_out"):
+            # WS-69 N4: 부분 성공(요청한 load 상태 미도달)은 다시 이동하면 대기가 두 배 — 재시도하지 않고 이유를 남긴다.
+            return skip("load_timed_out")
+
         if not getattr(self._core, "headless", False):
             return skip("headed")
         if not self.headless_retry:
@@ -429,6 +496,39 @@ class SignalsMixin:
     def _attach_upstream_failure(
         self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
     ) -> ActionResult:
+        """업스트림 실패 부착(_attach_upstream_failure_core) 뒤 최종 결과에 이동 실패 종류를 붙인다 (WS-69 B3).
+
+        차단(_attach_egress_block)·업스트림 실패가 결과를 새로 만들면 디스패처가 붙인 nav_failure 가 사라지므로,
+        결과 재구성이 끝난 이 지점에서 data.egress.code(프록시 경유 — serve 는 항상)를 우선해 정한다.
+        """
+        return self._attach_nav_failure(
+            action, params, self._attach_upstream_failure_core(action, params, result, before))
+
+    def _attach_nav_failure(self, action: ActionType, params: Dict[str, Any], result: ActionResult) -> ActionResult:
+        """navigate·tab_control create 실패에 data.nav_failure={kind[, net_error]} + hint (WS-69). 오류 코드는 그대로.
+
+        navigate 는 이동 실패 코드(E_NAVIGATE_TIMEOUT)와 egress 차단(E_INVALID_URL + egress_blocked)만 — 닫힘
+        (E_PAGE_CRASHED)·다운로드·입력 거부는 이동 실패 종류가 아니다. create 는 디스패처가 이동 실패로 본 것만.
+        """
+        if result.success:
+            return result
+        egress = result.data.get("egress") if isinstance(result.data, dict) else None
+        code = egress.get("code") if isinstance(egress, dict) else None
+        if action is ActionType.NAVIGATE:
+            if not (result.error_code is ErrorCode.NAVIGATE_TIMEOUT
+                    or (result.error_code is ErrorCode.INVALID_URL and code == "egress_blocked")):
+                return result
+        elif not (action is ActionType.TAB_CONTROL and str(params.get("command", "")).lower() == "create"
+                  and "nav_failure" in result.data):
+            return result
+        from actions.nav_failure import attach_nav_failure
+
+        attach_nav_failure(result.data, result.error_message, code)
+        return result
+
+    def _attach_upstream_failure_core(
+        self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int
+    ) -> ActionResult:
         """프록시가 업스트림에 닿지 못해 스스로 만든 502 문서를 이동 실패로 알린다 (WS-29b R1).
 
         프록시 없이는 브라우저가 이름 해석·접속 실패로 이동 자체를 실패시킨다(base 실측:
@@ -537,3 +637,12 @@ class SignalsMixin:
                              "headless 에서 다시 차단/캡차 — 다음 조작권 요청 때 창을 열고 유지합니다")
             if self._window.sticky_pending is not None:
                 result.data.setdefault("window", dict(self._window.info(), hint=STICKY_PENDING_HINT))
+        # WS-63 C: 사람 인계 안내만 — 창을 열거나 재시도하지 않는다. 한 응답에 한 번(기존 값 유지).
+        # R1: 401/429 제외는 판정용 상태로(SPA 로 옮긴 화면에 옛 문서 상태를 쓰지 않는다 — challenge 판정과 같은 값).
+        # R2: robots 금지가 이미 실렸으면 붙이지 않는다(나중에 실리는 경우는 call_tool 의 settle_handoff).
+        handoff = challenge_handoff(challenge, judge_status, available=self._human_can_see())
+        if handoff is not None and "handoff" not in result.data and not robots_disallowed(result.data):
+            result.data["handoff"] = handoff
+            hint = str(result.data.get("hint") or "")
+            if HANDOFF_HINT not in hint:
+                result.data["hint"] = (hint + " " + HANDOFF_HINT).strip()

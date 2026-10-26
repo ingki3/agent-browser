@@ -627,7 +627,7 @@ _ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\
 #: 사유·sticky_reason 등)은 이 어휘에 없는 값이면 정제한다.
 _APPROVAL_STATUS = ("pending", "approved", "used", "denied", "revoked", "expired", "unknown")  # handoff.Approval·_FINISHED
 _REPLAY_STOP = ("page_changed", "not_ready", "target_not_found", "target_ambiguous", "approval_required",
-                "action_failed", "expect_mismatch")  # recipes.replay._Stop · recipes.keys found.reason
+                "action_failed", "expect_mismatch", "manual_site")  # recipes.replay._Stop · recipes.keys found.reason
 _PDF_REASONS = ("egress_unavailable", "user_agent_unavailable", "egress_blocked", "redirect_origin", "redirect_limit",
                 "content_encoding", "file_size_limit", "invalid_length", "not_pdf", "fetch_timeout", "fetch_failed",
                 "encrypted", "page_range", "chars_limit", "pages_limit", "resource_limit", "parse_error",
@@ -653,12 +653,17 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "fresh", "epoch_mismatch", "node_detached", "role_changed", "name_changed",  # actions.verification.StalenessReason
         "group_changed",  # WS-62 StalenessReason.GROUP_CHANGED
         "sabotage",  # harness.tier2_som(사보타주 표지)
+        "captcha", "blocked",  # WS-63 C data.handoff.reason = browser.challenge.ChallengeKind
+        "manual_site",  # WS-64 data.handoff.reason · window.notice.reason · 창 전환 사유 · 레시피 중단 사유
+        "load_timed_out",  # WS-69 headless_retry.SKIP_NOTES(부분 성공 navigate)
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
                               "mismatch"}),  # handoff.check_approval 사유 코드
     "kind": frozenset({"none", "captcha", "blocked",  # browser.challenge.ChallengeKind
                        "slot", "ui", "identity",  # recipes.keys 대상 종류
-                       "pdf", "positive", "negative"}),  # actions.pdf_document·browser.site_session
+                       "pdf", "positive", "negative",  # actions.pdf_document·browser.site_session
+                       # WS-69 actions.nav_failure data.nav_failure.kind(blocked 는 위 ChallengeKind 와 같은 낱말)
+                       "dns", "connect", "tls", "protocol", "timeout", "aborted", "other"}),
     "mode": frozenset({"interactive", "unattended",  # contracts.ExecutionMode
                        "on-demand",  # interface.on_demand.ON_DEMAND
                        "offline", "live", "after", "json"}),  # harness 보고 모드
@@ -667,13 +672,18 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                           "unresolved", "resolved", "force"}),  # agent.loop.HandoffOutcome
     "op": frozenset({"save", "run", "list", "delete",  # browser_recipe op
                      "take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish",
-                     "cookie_sites", "status"}),  # handoff._OPS · cli status
+                     "cookie_sites", "status", "done"}),  # handoff._OPS · cli status (done: WS-64)
     "risk": frozenset({"low", "medium", "high"}),  # security.hitl.RiskLevel
     "presented_as": frozenset({"chrome"}),  # server_signals identity
     "sticky_reason": frozenset(),  # 자유 문장(on_demand — 도메인·사유 문장) — 늘 정제
-    "changed": frozenset({"none_pending", "released", "taken", "timeout"}),  # server_handoff._control_wait
+    # server_handoff._control_wait + WS-64 직접 조작 인계 결과(security.manual_sites OUTCOMES). cancelled 는 쓰지 않는다 —
+    # 사용자가 그만두면 done(사람 CLI) 또는 expired(15분)로 끝난다.
+    "changed": frozenset({"none_pending", "released", "taken", "timeout",
+                          "clicked", "page_changed", "done", "expired"}),
     # actions.dispatcher _NavWatch.aborted → data.nav_aborted (R6 — f"status_{status}" 는 _NO_DOCUMENT_STATUS 204·205)
     "nav_aborted": frozenset({"download", "request_failed", "status_204", "status_205"}),
+    # WS-69 actions.dispatcher navigate 부분 성공 data.load_state.reached(2단계 대기 전 확정된 상태)
+    "reached": frozenset({"domcontentloaded"}),
     # R7 — 리터럴 제어값 census(tests/security/test_ws51_r7_census.py, 소비자 표 독립 AST)로 드러난 키.
     "nav_frame": frozenset({"current_frame"}),  # actions.dispatcher _NavWatch (R6-B1)
     "resolved_from": frozenset({"current_frame", "root"}),  # actions.dispatcher switch_frame · server_schema 안내
@@ -697,6 +707,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                          "keyring", "prompt", "ci_env",  # browser.session_store KeyResolution.source(응답 출구 아님)
                          "chrome_import", "login_flow", "human_control"}),  # browser.login_ledger SOURCE_*(WS-59, 기록 파일)
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
+    # WS-63 C server_signals data.handoff.tool(도구 이름) + WS-64 security.manual_sites WAIT_TOOL
+    "tool": frozenset({"browser_control_request", "browser_control_wait"}),
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
     # healing_attempts 는 R9 부터 목록 경로 어휘(CONTROL_LIST_VOCABULARY — 복합 코드는 낱말 모양이 아니다)

@@ -34,6 +34,9 @@ NOT_OUT = "MCP 응답 출구 아님(에이전트 루프·LLM·하네스 내부·
 
 #: (키, 파일, 식) → 분류. 어휘 출처면 그 집합이 CONTROL_VOCABULARY[키] 에 든다(아래 enum 테스트).
 REVIEWED = {
+    # WS-64 직접 조작할 사이트
+    ("changed", "interface/server_manual.py", "h.ended"): "security.manual_sites OUTCOMES(clicked·page_changed·done·expired)",
+    ("sticky_reason", "interface/server_manual.py", "f'직접 조작할 사이트 {hit}'"): FREE + " (on-demand 미리 창 sticky 사유 — 늘 정제)",
     ("status", "interface/handoff.py", "ap.status"): "handoff Approval.status — _APPROVAL_STATUS",
     ("status", "interface/handoff.py", "self.login.status"): "LoginJob.status — opening·ready",
     ("status", "interface/handoff.py", "status"): "handoff._set_status 인자 — _APPROVAL_STATUS",
@@ -91,7 +94,11 @@ REVIEWED = {
     ("kind", "interface/on_demand.py", "str(challenge.get('kind') or '')"): "ChallengeKind",
     ("kind", "interface/run_cli.py", "challenge.kind.value"): "ChallengeKind",
     ("kind", "interface/server_signals.py", "found.kind.value"): "ChallengeKind",
+    ("reason", "interface/server_signals.py", "kind"): "ChallengeKind (WS-63 C data.handoff.reason = challenge kind)",
     ("kind", "llm/budget.py", "kind"): NOT_OUT,
+    ("kind", "actions/nav_failure.py", "_EGRESS_KINDS[egress_code]"): "WS-69 nav_failure.kind — dns·connect·blocked",
+    ("kind", "actions/nav_failure.py", "_net_error_kind(m.group(1))"):
+        "WS-69 nav_failure.kind — _EXACT_KINDS 값·tls·protocol·other",
     ("mode", "harness/tier2_som.py", "args.mode"): NOT_OUT,
     ("mode", "harness/tier2_som.py", "mode"): NOT_OUT,
     ("mode", "interface/cli.py", "ExecutionMode(args.mode)"): "ExecutionMode",
@@ -116,6 +123,9 @@ REVIEWED = {
      "f\"{pending.get('domain')} 에서 창에서 해결한 뒤 headless 복귀 후 {pending.get('kind') or '차단'} 재감지 — 서버 수명 동안 창 유지\""): FREE,
     ("sticky_reason", "interface/on_demand.py", "self.sticky_reason"): FREE,
     ("changed", "interface/server_handoff.py", "changed"): "released·taken·timeout",
+    ("changed", "actions/group_changed.py", "{'kinds': kinds}"): "WS-62 R17 data.group_changed.changed — dict(문자열 "
+                                                                  "아님: 제어 값 판정 밖, kinds 는 group_changed.KINDS "
+                                                                  "고정 어휘만 — 페이지 글자 0)",
     ("nav_aborted", "actions/dispatcher.py", "self.aborted"): "_NavWatch.aborted — download·request_failed·"
                                                               "status_204·status_205 (R6)",
     # R7 — 리터럴 제어값 census(test_ws51_r7_census.py)로 어휘에 들어온 키의 동적 생산자.
@@ -215,6 +225,12 @@ def test_vocabulary_is_closed_words_only():
 EXEMPT = "등록 제외 + 제어 키 면제"
 #: (파일, 식) → (분류, TOOL_ID_FORMATS 이름 또는 None, 표본 생성기).
 ID_PRODUCERS = {
+    # WS-64: 감지 바인딩·격리 world 이름(CDP 내부), 인계 id(mh-hex8 — 모양이 바뀌지 않음, 면제하지 않음), 목록 임시 파일 이름
+    ("browser/manual_watch.py", "secrets.token_hex(6)"): ("WS-64 직접 조작 감지 바인딩·격리 world 이름(CDP 내부) — 출구 아님",
+                                                         None, None),
+    ("interface/server_manual.py", "secrets.token_hex(4)"): ("WS-64 인계 handoff_id(mh-+hex8) — 면제하지 않음(public_text 를 "
+                                                            "지나며 모양이 바뀌지 않음)", None, None),
+    ("security/manual_sites.py", "_secrets.token_hex(6)"): ("WS-64 목록 임시 파일 이름(.tmp-manual-) — 출구 아님", None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{secrets.randbelow(9999)}"),

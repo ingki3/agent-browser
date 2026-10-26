@@ -7,7 +7,13 @@
   블록 2,500자 상한. 고르는 것은 에이전트이고 이동은 평소 관문(승인·차단)을 그대로 지난다.
 * 저장 거부(fail-closed, 고정 문구 — 주소·이름 원문을 메시지·로그에 넣지 않는다): http(s) 아님, 사용자 정보,
   주소 칸 가림(public_url·JWT·비밀 값 레지스트리)이 일어나는 주소, 경로·호스트·쿼리 키 토큰(레시피 규칙),
-  url·name 의 이메일·전화번호, 이름의 토큰, 2KB 초과.
+  url·name 의 이메일·전화번호, 이름의 토큰, 2KB 초과. WS-68(#140): 지금 화면을 엄격히 다시 판정해 확인·차단 화면,
+  판정 불가, 지금 문서 상태 ≥ 400, egress 불허, 같은 주소의 마지막 navigate 실패도 거부(_check_screen).
+  R1: 엄격 판정은 격리 world 에서만, 저장은 문서 결속 트랜잭션(판정 전·저장 전·저장 뒤 결속값 + 엄격 판정 —
+  바뀌면 거부, 저장 뒤면 방금 쓴 항목을 되돌림). R2: 모든 엄격 판정은 결속값 샌드위치(읽기 → 판정 → 다시 읽기)이고
+  판독기는 시작 문서(loaderId)에 묶여 다른 문서를 판정하지 않는다. R4: 첫 결속값 읽기 전에 주 프레임 새 문서 커밋
+  계수기(browser.document_commits)를 걸어 저장 직전·성공 반환 직전(마지막 await 뒤, 동기)에 본다 — 커밋이 있었으면
+  E_CHANGED(저장 뒤면 되돌림), 계수기를 못 걸면 E_UNJUDGED. 결속값 표본은 이중 방어로 남는다.
 * uses: 저장 주소로 navigate 성공(리다이렉트·challenge·오류·재생 중이 아님) 뒤 **첫** observe 가 같은 주소(정규화)에서
   성공하면 +1 — navigate 1회당 최대 1.
 * 저장소: `serve --profile NAME` 이면 프로필 폴더 saved_pages.json(0600, 임시 파일 + rename, 손상 시 `.corrupt-…`
@@ -79,6 +85,16 @@ E_LIMIT_SITE = f"이 작업 공간에서 이 사이트(출처)에 기억한 페�
 E_LIMIT_TOTAL = f"기억한 페이지가 전체 {MAX_TOTAL}개라 더 기억하지 않습니다 — forget_page 로 정리하세요."
 E_NOT_FOUND = "그 id 의 기억한 페이지가 이 작업 공간에 없습니다."
 E_FORGET_ARGS = "forget_page 에는 id 또는 all: true(현재 사이트 항목 전부)가 필요합니다."
+# WS-68(#140): 지금 화면 엄격 재판정 거부(고정 문구).
+E_CHALLENGE = ("지금 화면이 차단·확인(캡차) 화면이라 기억하지 않습니다 — 확인을 끝내고 원래 페이지가 뜬 뒤 "
+               "다시 하세요.")
+E_UNJUDGED = ("지금 화면이 차단·확인 화면인지 판정하지 못해 기억하지 않습니다 — 페이지가 다 뜬 뒤 다시 "
+              "하세요.")
+E_STATUS = "지금 페이지가 오류 응답(HTTP 4xx·5xx)이라 기억하지 않습니다."
+E_EGRESS = "지금 주소는 이동 허용 범위(egress)에서 막히는 주소라 기억하지 않습니다."
+E_LAST_NAV = "이 주소로의 마지막 이동이 차단·확인·오류 화면으로 끝나 기억하지 않습니다."
+#: WS-68 R1 (B2): 판정~저장 사이 문서·주소가 바뀜(주소 원문 없음).
+E_CHANGED = "판정하는 동안 화면(문서·주소)이 바뀌어 기억하지 않습니다 — 화면이 멈춘 뒤 다시 하세요."
 
 
 class SavedPageError(ValueError):
@@ -329,6 +345,17 @@ class SavedPageStore:
         self._write()
         return page, True
 
+    def undo_add(self, workspace: str, pid: str, created: bool, prior_name: Optional[str]) -> None:
+        """방금 한 add 를 되돌린다(WS-68 R1) — 새 항목이면 지우고, 이름 갱신이면 이전 이름으로. 파일은 원자적으로 다시 쓴다."""
+        page = self.get(workspace, pid)
+        if page is None:
+            return
+        if created:
+            del self._pages[pid]
+        elif prior_name is not None:
+            page["name"] = prior_name
+        self._write()
+
     def forget(self, workspace: str, pid: str) -> bool:
         if self.get(workspace, pid) is None:
             return False
@@ -413,6 +440,18 @@ def _navigation_failed(result: Any, *, navigate: bool = False) -> bool:
     return isinstance(status, int) and status >= 400
 
 
+def _navigation_screen_bad(result: Any) -> bool:
+    """remember_page 보조 판정(WS-68): navigate 가 실패·challenge·egress·업스트림·재시도 실패로 끝났는가.
+
+    상태 코드는 보지 않는다 — 403 문서 뒤 pushState 로 URL 이 바뀐 화면을 구분하는 judge_status_for 가 주 판정이다.
+    """
+    data = getattr(result, "data", None) or {}
+    identity = data.get("identity")
+    return (not getattr(result, "success", False) or data.get("challenge") is not None or bool(data.get("egress"))
+            or any(str(k).startswith("upstream") for k in data)
+            or (isinstance(identity, dict) and bool(identity.get("retry_failed"))))
+
+
 class SavedPagesService:
     """MCP 서버와 저장소를 잇는 얇은 층(서버당 하나 — 항목은 작업 공간 이름으로 나눈다)."""
 
@@ -421,6 +460,8 @@ class SavedPagesService:
         self._store: Optional[SavedPageStore] = None
         #: 작업 공간 → 직전 navigate 가 연 기억한 페이지 (id, 정규화 주소) — 첫 observe 에서 소비.
         self._pending: Dict[str, Tuple[str, str]] = {}
+        #: WS-68: 작업 공간 → 마지막 navigate 가 닿은 정규화 주소와 실패 여부(remember_page 보조 판정).
+        self._last_nav: Dict[str, Tuple[str, bool]] = {}
 
     @property
     def store(self) -> SavedPageStore:
@@ -460,25 +501,150 @@ class SavedPagesService:
 
         return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value, "error_message": message}
 
-    def tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
         op = str(args.get("op") or "")
         try:
             if op == "remember_page":
-                return self._remember(args)
+                return await self._remember(args)
             if op == "pages":
                 return self._pages()
             return self._forget(args)
         except SavedPageError as exc:
             return self._error(str(exc))
 
-    def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """문서 결속 트랜잭션(WS-68 R1·R2, B2) — 모든 엄격 판정은 결속값 샌드위치(읽기 → 판정 → 다시 읽기):
+        결속값 → [엄격 판정·상태·egress → 결속값] → [엄격 판정 → 결속값] → 저장 → [엄격 판정 → 결속값]
+        (저장 뒤 단계가 실패하면 방금 쓴 항목을 되돌림). 각 판정의 '앞' 읽기는 직전 단계의 '뒤' 읽기다.
+        """
         name = check_name(args.get("name"))
         page = self._top_page()
-        url = str(getattr(page, "url", "") or "")
-        entry, created = self.store.add(self._workspace(), url, name)
-        return {"success": True, "data": {
-            "saved_page": {"id": entry["id"], "name": entry["name"], "url": entry["url"], "updated": not created},
-            "storage": "profile" if self.store.persistent else "memory"}}
+        raw_url = str(getattr(page, "url", "") or "")
+        url = check_url(raw_url)
+        reader = self._document_reader()
+        watch = self._watch_commits(reader)  # R4: 첫 결속값 읽기 전에 — 이후 새 문서 커밋은 하나도 놓치지 않는다
+        try:
+            before = await self._binding(reader)
+            if before[3] != raw_url:
+                raise SavedPageError(E_CHANGED)  # page.url 이 실제 문서 주소와 다름 — 저장할 주소를 믿지 않는다
+            status = await self._check_screen(page, url, reader, before)
+            await self._strict(page, reader, before, status)
+            ws = self._workspace()
+            prior = self.store.find(ws, url)
+            prior_name = prior["name"] if prior is not None else None
+            self._no_commits(watch)  # 저장 직전(동기) — 커밋이 있었으면 저장하지 않는다
+            entry, created = self.store.add(ws, url, name)
+            try:
+                await self._strict(page, reader, before, status)
+                # 마지막 await 뒤·성공 반환 직전(동기) — 이 뒤로는 이벤트 루프에 양보하지 않는다.
+                self._no_commits(watch)
+            except SavedPageError:
+                self.store.undo_add(ws, entry["id"], created, prior_name)
+                raise
+            return {"success": True, "data": {
+                "saved_page": {"id": entry["id"], "name": entry["name"], "url": entry["url"], "updated": not created},
+                "storage": "profile" if self.store.persistent else "memory"}}
+        finally:
+            watch.close()
+
+    @staticmethod
+    def _watch_commits(reader: Any) -> Any:
+        """주 프레임 새 문서 커밋 계수기(R4). 없음·연결 실패·계수 0 아님이면 판정 불가(E_UNJUDGED, fail-closed)."""
+        make = getattr(reader, "watch_top_document_commits", None)
+        if not callable(make):
+            raise SavedPageError(E_UNJUDGED)
+        try:
+            watch = make()
+        except Exception:  # noqa: BLE001 - 계수기를 못 걸면 판정 불가(fail-closed)
+            raise SavedPageError(E_UNJUDGED) from None
+        if watch is None:
+            raise SavedPageError(E_UNJUDGED)
+        count = getattr(watch, "commits", None)
+        if not isinstance(count, int) or isinstance(count, bool) or count != 0:
+            close = getattr(watch, "close", None)
+            if callable(close):
+                close()
+            raise SavedPageError(E_UNJUDGED)
+        return watch
+
+    @staticmethod
+    def _no_commits(watch: Any) -> None:
+        """시작 이후 새 문서 커밋이 1회라도 있었으면 E_CHANGED, 계수를 못 읽으면 E_UNJUDGED (동기 — await 없음)."""
+        count = getattr(watch, "commits", None)
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise SavedPageError(E_UNJUDGED)
+        if count != 0:
+            raise SavedPageError(E_CHANGED)
+
+    def _document_reader(self) -> Any:
+        """격리 world 판독기·결속값 판독기가 있는 디스패처(WS-68 R1). 없으면 판정 불가."""
+        disp = getattr(self.server, "_dispatcher", None)
+        if not callable(getattr(disp, "isolated_top_evaluate", None)) \
+                or not callable(getattr(disp, "top_document_binding", None)):
+            raise SavedPageError(E_UNJUDGED)
+        return disp
+
+    @staticmethod
+    async def _binding(reader: Any) -> Tuple[Any, ...]:
+        try:
+            got = await reader.top_document_binding()
+        except Exception:  # noqa: BLE001 - 결속값을 못 읽으면 판정 불가(fail-closed)
+            raise SavedPageError(E_UNJUDGED) from None
+        if not isinstance(got, tuple) or len(got) != 4 or not isinstance(got[3], str):
+            raise SavedPageError(E_UNJUDGED)
+        return got
+
+    async def _same_document(self, page: Any, reader: Any, before: Tuple[Any, ...]) -> None:
+        """지금도 같은 문서인가(결속값 그대로 + page.url 그대로). 아니면 E_CHANGED, 못 읽으면 E_UNJUDGED."""
+        if await self._binding(reader) != before or str(getattr(page, "url", "") or "") != before[3]:
+            raise SavedPageError(E_CHANGED)
+
+    async def _strict(self, page: Any, reader: Any, before: Tuple[Any, ...], status: Optional[int]) -> None:
+        """결속값 샌드위치의 판정·뒤쪽 읽기(R2) — 앞쪽은 직전 단계에서 before 와 같음을 확인한 읽기.
+
+        판정은 시작 문서(before 의 loaderId)에 묶어 부른다 — 판독기가 다른 문서를 판정하면(재시도 포함) 판정 불가.
+        판정이 끝난 뒤 결속값을 다시 읽어 다르면 그 판정(정상·캡차 무엇이든)은 무효 = E_CHANGED.
+        """
+        from browser.challenge import detect_challenge_strict
+
+        loader = before[1]
+
+        async def bound(expression: str) -> Any:
+            return await reader.isolated_top_evaluate(expression, expect_loader=loader)
+
+        found = await detect_challenge_strict(page, last_status=status, isolated=bound)
+        await self._same_document(page, reader, before)
+        if found is None:
+            raise SavedPageError(E_UNJUDGED)
+        if found.detected:
+            raise SavedPageError(E_CHALLENGE)
+
+    async def _check_screen(self, page: Any, url: str, reader: Any, before: Tuple[Any, ...]) -> Optional[int]:
+        """WS-68(#140): 지금 화면을 엄격히 다시 판정한다 — 확인·차단·오류·egress 불허·판정 불가면 SavedPageError.
+
+        detect_challenge·_attach_challenge 는 판정 불가를 '없음'으로 삼아(fail-open) 쓰지 않는다 — 같은 규칙의
+        엄격판(detect_challenge_strict)으로 본다. 상태는 judge_status_for(지금 URL 이 그 응답 URL 일 때만) ≥ 400 이면
+        거부, None(URL 바뀜·기록 없음)이면 엄격 판정 통과만으로 저장. 마지막 navigate 결과는 보조(같은 주소에서
+        실패였으면 거부 — 클릭·JS 이동 뒤 다른 주소면 낡은 값이라 보지 않는다).
+        R1: 엄격 판정은 reader 의 격리 world 에서(B1), R2: 결속값 샌드위치(before). 반환: 판정에 쓴 상태(같은 값으로 재판정).
+        """
+        status: Optional[int] = None
+        tracker = getattr(self.server, "_page_status", None)
+        if tracker is not None:
+            try:
+                status = tracker.judge_status_for(page)
+            except Exception:  # noqa: BLE001 - 상태를 모르면 판정 불가(fail-closed)
+                raise SavedPageError(E_UNJUDGED) from None
+        await self._strict(page, reader, before, status)
+        if isinstance(status, int) and not isinstance(status, bool) and status >= 400:
+            raise SavedPageError(E_STATUS)
+        guard = getattr(self.server, "_egress", None)
+        if guard is not None and not _egress_allows(guard, url):
+            raise SavedPageError(E_EGRESS)
+        last = self._last_nav.get(self._workspace())
+        if last is not None and last[1] and last[0] == normalize(url):
+            raise SavedPageError(E_LAST_NAV)
+        return status
 
     def _pages(self) -> Dict[str, Any]:
         out = [{"id": p["id"], "name": clean_text(p["name"], NAME_LIMIT), "url": p["url"], "site": p["origin"],
@@ -506,6 +672,11 @@ class SavedPagesService:
         """navigate 1회 → 그 주소가 기억한 페이지면 다음 observe 한 번에서 +1 후보(리다이렉트·실패·재생은 없음)."""
         ws = self._workspace()
         self._pending.pop(ws, None)
+        landed = normalize(str(getattr(result, "current_url", "") or ""))
+        if landed:
+            self._last_nav[ws] = (landed, _navigation_screen_bad(result))
+        else:
+            self._last_nav.pop(ws, None)
         if self._replaying() or _navigation_failed(result, navigate=True):
             return
         requested = normalize(str(params.get("url") or ""))

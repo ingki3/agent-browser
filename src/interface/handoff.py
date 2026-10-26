@@ -82,7 +82,9 @@ _FINISHED = frozenset({"used", "denied", "expired", "revoked"})
 _CMD_RE = re.compile(r"^cmd-([A-Za-z0-9_-]{4,64})\.json$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _CODE_RE = re.compile(r"^\d{%d}$" % CODE_DIGITS)
-_OPS = frozenset({"take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish", "cookie_sites"})
+#: WS-64: "done" = 사람이 직접 조작할 사이트 인계를 마쳤다는 신호(조작권·창·비밀 입력 보호는 바꾸지 않는다).
+_OPS = frozenset({"take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish", "cookie_sites",
+                  "done"})
 #: describe 요청의 challenge(사람 CLI 가 요청마다 새로 만든 16바이트 hex).
 _CHALLENGE_RE = re.compile(r"^[0-9a-f]{32,128}$")
 
@@ -960,6 +962,9 @@ class HandoffHub:
         if op == "release":
             self.release_by_server()
             return True, "조작권을 에이전트에게 돌려줬습니다.", "released"
+        if op == "done":
+            # WS-64: 상태(holder·requested·secret_wanted·version)를 바꾸지 않는다 — 에이전트에게 '다시 관찰' 신호만.
+            return True, "직접 조작을 마쳤다고 에이전트에게 알렸습니다.", "handoff_done"
         approval_id = str(data.get("approval_id") or "")
         ap = self.approvals.get(approval_id)
         if ap is None:
