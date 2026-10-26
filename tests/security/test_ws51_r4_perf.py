@@ -9,9 +9,11 @@ short256_alnum_dense·short256_other_dense, 단독 통과)만 걸러내고, 이�
 WS-70(#180): v1.17.0 릴리스 게이트(Linux CI)에서 long_dense_prefix url 512KiB 0.0512초 → 1MiB 0.181초(3.55배)로 실패했다.
 원인은 제품이 아니라 러너 CPU 경합이다 — 로컬 실측(10회)에서 그 경로는 256KiB~2MiB 모두 2배 입력에 1.97~2.03배로 선형이고,
 코어보다 바쁜 프로세스가 많을 때(24·48개/12코어)만 큰 크기의 다섯 번이 모두 선점돼 최솟값끼리의 비율이 4~6배로 튄다(긴
-측정일수록 한 번도 선점되지 않을 확률이 낮다). 그래서 판정 하나가 어긋나면(비율·1초 상한·같은 일) 그 (표본, 종류, 크기)만
-**새 격리 자식**에서 PERF_RECHECK_ROUNDS 번 다시 재고, 같은 위반이 되풀이될 때만 실패시킨다 — 이차시간·상수 지연·결과
-캐시는 다시 재도 그대로라 잡히고(사보타주 표는 .hermes/state/ws70/report.md), 한 자식 동안의 부하 덩어리만 걸러진다.
+측정일수록 한 번도 선점되지 않을 확률이 낮다). 그래서 판정 하나가 어긋나면(비율·1초 상한·같은 일) **새 격리 자식**에서 원래와 같은 크기 집합·라운드 순서(라운드마다
+모든 크기·종류)로 PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용해 하나라도 어긋나면 실패시킨다(R1:
+원래 판정만 다시 보거나 크기를 줄여 재면, 크기가 바뀔 때마다 생기는 지연처럼 측정 순서에 따라 모양이 바뀌는 회귀를 놓친다).
+이차시간·상수 지연·결과 캐시·크기 전환 지연은 다시 재도 그대로라 잡히고(사보타주 표는 .hermes/state/ws70/), 한 자식
+동안의 부하 덩어리만 걸러진다.
 기준(1.0초·2.5배·바닥 5ms·PERF_SAME_WORK)은 그대로다(규칙 6 비해당). 자식 격리는 r1·r2 의 `_run_perf`(WS-66 #173)와 같다.
 
 실 observe+wire 경로는 tests/interface/test_ws51_r4_e2e.py. 값은 합성 값.
@@ -39,7 +41,7 @@ PERF_SAME_WORK = 20
 PERF_BUDGET_S = 1.0
 PERF_GROWTH = 2.5
 PERF_FLOOR_S = 0.005
-#: WS-70 — 위반 하나를 새 격리 자식에서 다시 잴 때의 라운드 수(그 종류·그 크기들만 돌아가며)
+#: WS-70 — 위반 하나를 새 격리 자식에서 다시 잴 때의 라운드 수(원래와 같은 모든 크기·종류를 돌아가며)
 PERF_RECHECK_ROUNDS = 9
 #: 자식마다 새 빈 임시 디렉터리로 돌리는 환경 변수(r1 PERF_ISOLATED_ENV 와 같다)
 PERF_ISOLATED_ENV = ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
@@ -181,20 +183,34 @@ def _violations(rows: dict, kind: str, sizes: tuple) -> list:
     return found
 
 
+def _all_violations(case: str, rows: dict) -> list:
+    """한 측정의 모든 판정(조건 성립·1초 상한·2.5배 비율·같은 일 1/20)을 두 종류 모두에 적용한 위반 목록."""
+    found = []
+    if rows["values"] != len(_values(case)):  # 조건 성립: 모든 값을 기억했다(밀려남 없음)
+        found.append(("values", rows["values"]))
+    if not rows.get("masked"):  # 조건 성립: 일치가 실제로 있었다(경계 실패 표본도 구분자 쪽 일치 1개 이상)
+        found.append(("masked",))
+    for kind in ("text", "url"):
+        found += [(kind, *verdict) for verdict, _ in _violations(rows, kind, tuple(SIZES))]
+    return found
+
+
 @pytest.mark.parametrize("case", CASES)
 def test_one_mib_under_a_second_and_linear(case):
     rows = _run(case)
     print(json.dumps({"case": case, **rows}))
     assert rows["values"] == len(_values(case))  # 조건 성립: 모든 값을 기억했다(밀려남 없음)
     assert rows["masked"], case  # 조건 성립: 일치가 실제로 있었다(경계 실패 표본도 구분자 쪽 일치 1개 이상)
-    for kind in ("text", "url"):
-        for verdict, sizes in _violations(rows, kind, tuple(SIZES)):
-            # WS-70: 위반 하나 — 그 종류·그 크기만 새 격리 자식에서 더 많이 다시 잰다. 같은 위반이 되풀이되면 실패.
-            again = _run(case, PERF_RECHECK_ROUNDS, sizes, (kind,))
-            record = {"case": case, "kind": kind, "verdict": verdict, "first": {"times": rows[kind], "runs": rows["runs"][kind]},
-                      "recheck": {"times": again[kind], "runs": again["runs"][kind]}}
-            print("WS-70 재측정", json.dumps(record))
-            assert verdict not in [v for v, _ in _violations(again, kind, sizes)], ("재측정에서도 위반", record)
+    first = _all_violations(case, rows)
+    if first:
+        # WS-70: 위반이 하나라도 있으면 새 격리 자식에서 원래와 같은 크기 집합·라운드 순서(라운드마다 모든 크기·종류)로
+        # PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용한다 — 원래 위반이 사라져도 다른 위반이
+        # 하나라도 나면 실패(WS-70 R1 B1: 재측정이 원래 판정만 보면 크기가 바뀔 때마다 생기는 지연 같은 회귀를 놓친다).
+        again = _run(case, PERF_RECHECK_ROUNDS)
+        record = {"case": case, "first_violations": first, "first": {k: rows[k] for k in ("text", "url", "runs")},
+                  "recheck": {k: again[k] for k in ("text", "url", "runs")}}
+        print("WS-70 재측정", json.dumps(record))
+        assert not _all_violations(case, again), ("재측정에서도 위반", _all_violations(case, again), record)
 
 
 if __name__ == "__main__":

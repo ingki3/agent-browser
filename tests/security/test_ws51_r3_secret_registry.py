@@ -432,9 +432,9 @@ SIZES = [4 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20]
 #: 기억해 같은 일을 다시 하지 않았다) 실패시킨다.
 PERF_ROUNDS = 5
 PERF_SAME_WORK = 20
-#: WS-70(#180) — 판정 하나가 어긋나면(비율·1초 상한·같은 일) 그 (모양, 값 수, 크기)만 새 격리 자식에서 PERF_RECHECK_ROUNDS
-#: 번 다시 재고 같은 위반이 되풀이될 때만 실패시킨다(r4 test_ws51_r4_perf 와 같은 방식·같은 근거 — 러너 CPU 경합은 긴 측정을
-#: 다섯 번 모두 선점할 수 있지만 다음 자식까지 이어지지 않고, 이차시간·상수 지연·결과 캐시는 다시 재도 그대로다). 자식 격리는
+#: WS-70(#180) — 판정 하나가 어긋나면(비율·1초 상한·같은 일) 새 격리 자식에서 원래와 같은 크기 집합·라운드 순서로
+#: PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용해 하나라도 어긋나면 실패시킨다(r4 test_ws51_r4_perf
+#: 와 같은 방식·같은 근거 — 러너 CPU 경합은 긴 측정을 다섯 번 모두 선점할 수 있지만 다음 자식까지 이어지지 않고, 이차시간·상수 지연·결과 캐시는 다시 재도 그대로다). 자식 격리는
 #: r1 `_run_perf`(WS-66 #173)와 같다. 기준(1.0초·2.5배·바닥 5ms·PERF_SAME_WORK)은 그대로.
 PERF_RECHECK_ROUNDS = 9
 PERF_ISOLATED_ENV = ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
@@ -519,12 +519,18 @@ def test_performance_linear_and_under_a_second(shape, nvals):
     rows = _run_perf(shape, nvals)
     if nvals:
         assert rows["variants"] == secret_registry.MAX_VALUES  # 레지스트리를 값 상한까지 채운 조건 성립(R4 §5)
-    for verdict, sizes in _perf_violations(rows, tuple(SIZES[2:])):
-        # WS-70: 위반 하나 — 그 크기만 새 격리 자식에서 더 많이 다시 잰다. 같은 위반이 되풀이되면 실패.
-        again = _run_perf(shape, nvals, PERF_RECHECK_ROUNDS, sizes)
-        record = {"shape": shape, "nvals": nvals, "verdict": verdict, "first": rows, "recheck": again}
+    first = [v for v, _ in _perf_violations(rows, tuple(SIZES[2:]))]
+    if first:
+        # WS-70: 위반이 하나라도 있으면 새 격리 자식에서 원래와 같은 크기 집합·라운드 순서(라운드마다 모든 크기)로
+        # PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용한다 — 원래 위반이 사라져도 다른 위반이
+        # 하나라도 나면 실패(WS-70 R1 B1).
+        again = _run_perf(shape, nvals, PERF_RECHECK_ROUNDS)
+        if nvals:
+            assert again["variants"] == secret_registry.MAX_VALUES
+        still = [v for v, _ in _perf_violations(again, tuple(SIZES[2:]))]
+        record = {"shape": shape, "nvals": nvals, "first_violations": first, "first": rows, "recheck": again}
         print("WS-70 재측정", json.dumps(record))
-        assert verdict not in [v for v, _ in _perf_violations(again, sizes)], ("재측정에서도 위반", record)
+        assert not still, ("재측정에서도 위반", still, record)
 
 
 if __name__ == "__main__":
