@@ -1845,28 +1845,36 @@ class ActionDispatcher:
 
     # -- WS-67 (#141): 격리 world 판정 -------------------------------------------------
 
-    async def _gate_world(self, cdp: Any, frame_id: str, fresh: bool = False) -> Optional[int]:
+    @staticmethod
+    async def _frame_loader(cdp: Any, frame_id: str) -> Tuple[str, Optional[str]]:
+        """(frameId, 그 프레임의 지금 loaderId). frame_id 가 빈 값이면 최상위 프레임. 못 찾으면 loaderId None."""
+        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
+        if not frame_id:  # 빈 값 = 최상위 프레임
+            frame_id = str((tree.get("frame") or {}).get("id") or "")
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            frame = node.get("frame") or {}
+            if frame_id and frame.get("id") == frame_id:
+                return frame_id, frame.get("loaderId")
+            stack.extend(node.get("childFrames") or [])
+        return frame_id, None
+
+    async def _gate_world(self, cdp: Any, frame_id: str, fresh: bool = False,
+                          expect_loader: Optional[str] = None) -> Optional[int]:
         """그 프레임의 게이트 격리 world 실행 컨텍스트 id. 프레임을 못 찾으면 None.
 
         (세션, frameId, loaderId) 로 캐시한다 — 이동하면 loaderId 가 바뀌어 새로 만든다. 같은 문서에서
         컨텍스트가 사라진 경우(document.open 등)는 `Runtime.executionContextDestroyed`(세션에 Runtime
         이벤트가 올 때) 또는 호출부의 'context 없음' 재시도(fresh=True)로 버린다. 게이트 세션에서
         Runtime.enable 은 켜지 않는다 — 켜면 페이지 console 인자가 이 세션의 원격 객체로 쌓인다.
+        expect_loader(WS-68 R2 엄격 모드): 지금 문서가 그 loaderId 가 아니면 만들지 않고 RuntimeError.
         """
-        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
-        if not frame_id:  # 빈 값 = 최상위 프레임
-            frame_id = str((tree.get("frame") or {}).get("id") or "")
-        loader = None
-        stack = [tree]
-        while stack:
-            node = stack.pop()
-            frame = node.get("frame") or {}
-            if frame_id and frame.get("id") == frame_id:
-                loader = frame.get("loaderId")
-                break
-            stack.extend(node.get("childFrames") or [])
+        frame_id, loader = await self._frame_loader(cdp, frame_id)
         if not loader:
             return None
+        if expect_loader is not None and loader != expect_loader:
+            raise RuntimeError("결속 문서가 바뀜 — 판정 불가")
         worlds = self.__dict__.setdefault("_gate_worlds", {})
         hooked = self.__dict__.setdefault("_gate_world_hooked", set())
         if id(cdp) not in hooked:
@@ -1891,17 +1899,27 @@ class ActionDispatcher:
         worlds[key] = int(world["executionContextId"])
         return worlds[key]
 
-    async def _in_gate_world(self, cdp: Any, frame_id: str, run: Any) -> Any:
-        """격리 world 컨텍스트로 run(context_id) 을 실행한다. 컨텍스트가 사라졌으면 한 번 새로 만든다."""
+    async def _in_gate_world(self, cdp: Any, frame_id: str, run: Any,
+                             expect_loader: Optional[str] = None) -> Any:
+        """격리 world 컨텍스트로 run(context_id) 을 실행한다. 컨텍스트가 사라졌으면 한 번 새로 만든다.
+
+        expect_loader(WS-68 R2 엄격 모드 — 기억해 저장 판정만): 첫 시도·재시도 모두 그 loaderId 문서에서만
+        만들고, 결과를 받은 뒤 지금도 그 문서인지 다시 본다 — 다르면(재시도가 새 문서를 판정함 등) RuntimeError
+        (판정 불가). 없으면(WS-67 포커스·좌표 판정) 지금 동작 그대로.
+        """
         for fresh in (False, True):
-            context_id = await self._gate_world(cdp, frame_id, fresh=fresh)
+            context_id = await self._gate_world(cdp, frame_id, fresh=fresh, expect_loader=expect_loader)
             if context_id is None:
                 return None
             try:
-                return await run(context_id)
+                out = await run(context_id)
             except Exception as exc:  # noqa: BLE001
                 if fresh or "context" not in str(exc).lower():
                     raise
+                continue
+            if expect_loader is not None and (await self._frame_loader(cdp, frame_id))[1] != expect_loader:
+                raise RuntimeError("판정 도중 결속 문서가 바뀜 — 판정 불가")
+            return out
         return None
 
     async def isolated_focus_target(self) -> Optional[Dict[str, Any]]:
@@ -1976,6 +1994,66 @@ class ActionDispatcher:
         if not isinstance(info, dict) or info.get("frame") or not info.get("tag"):
             return None
         return {"name": str(info.get("name") or ""), "info": info}
+
+    # -- WS-68 R1 (#140): 기억해 저장의 문서 결속·격리 world 판독 ------------------------
+
+    async def top_document_binding(self) -> Optional[Tuple[str, str, int, str]]:
+        """최상위 문서의 결속값 (frameId, loaderId, 방문 기록 현재 항목 id, 그 항목 주소). 못 읽으면 None.
+
+        CDP Page.getFrameTree(주 프레임 id·loaderId — 새 문서면 바뀜) + Page.getNavigationHistory 현재 항목
+        (pushState 는 새 항목 id, replaceState 는 같은 항목의 주소가 바뀜). 페이지 JS 가 위조할 수 없는 값이다.
+        예외는 그대로 올린다 — 부르는 쪽(saved_pages)이 판정 불가로 거부한다.
+        R3: 두 값은 따로 await 하므로 그 사이 reload 되면 이전 loader + 현재 history 가 섞인다 — frame → history →
+        frame 으로 읽어 앞뒤 (frameId, loaderId) 가 같을 때만 인정, 다르면 1회 다시 읽고 그래도 다르면 None.
+        """
+        cdp = await self._gate_cdp_for(self._top_page())
+
+        async def frame_now() -> Dict[str, Any]:
+            return ((await cdp.send("Page.getFrameTree")).get("frameTree") or {}).get("frame") or {}
+
+        for _ in range(2):
+            frame = await frame_now()
+            history = await cdp.send("Page.getNavigationHistory")
+            again = await frame_now()
+            if (frame.get("id"), frame.get("loaderId")) == (again.get("id"), again.get("loaderId")):
+                break
+        else:
+            return None  # 읽는 동안 문서가 계속 바뀜 — 혼합 스냅샷을 결속값으로 내지 않는다
+        entries = history.get("entries") or []
+        index = history.get("currentIndex")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
+            return None
+        entry = entries[index] or {}
+        frame_id, loader, entry_id, url = frame.get("id"), frame.get("loaderId"), entry.get("id"), entry.get("url")
+        if not frame_id or not loader or not isinstance(entry_id, int) or not isinstance(url, str):
+            return None
+        return str(frame_id), str(loader), int(entry_id), url
+
+    def watch_top_document_commits(self) -> Any:
+        """최상위 문서 주 프레임의 새 문서 커밋 계수기(WS-68 R4) — browser.document_commits. 걸 수 없으면 None."""
+        from browser.document_commits import watch_document_commits
+
+        return watch_document_commits(self._top_page())
+
+    async def isolated_top_evaluate(self, expression: str, expect_loader: Optional[str] = None) -> Any:
+        """최상위 문서의 **격리 world** 에서 expression 을 평가해 값을 돌려준다 (WS-68 R1, B1).
+
+        WS-67 의 게이트 CDP 세션·(frameId, loaderId) 캐시를 그대로 쓴다. 격리 world 는 DOM 은 공유하고 JS
+        전역·prototype 은 원본이라 페이지가 바꾼 querySelectorAll·innerText 등이 보이지 않는다. 생성·평가
+        실패와 스크립트 예외는 RuntimeError 로 올린다(부르는 쪽이 판정 불가로 거부 — fail-closed).
+        R2: expect_loader(시작 결속값의 loaderId)를 주면 엄격 모드 — 그 문서가 아닌 곳의 판정(재시도 포함)은
+        RuntimeError(_in_gate_world).
+        """
+        cdp = await self._gate_cdp_for(self._top_page())
+
+        async def run(context_id: int) -> Any:
+            return await cdp.send("Runtime.evaluate", {
+                "expression": expression, "contextId": context_id, "returnByValue": True})
+
+        res = await self._in_gate_world(cdp, "", run, expect_loader=expect_loader)
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            raise RuntimeError("격리 world 평가 실패")
+        return (res.get("result") or {}).get("value")
 
     @staticmethod
     async def _scroll_once(page: Any, delta: int) -> Tuple[bool, Optional[int]]:

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 #: 이보다 긴 본문에서는 문구 일치만으로 차단/캡차로 보지 않는다.
@@ -148,6 +148,38 @@ def classify(title: str, text: str, length: int, widget: str,
         return Challenge(ChallengeKind.BLOCKED,
                          f"HTTP {last_status} + 짧은 본문({length}자)", "generic")
     return NO_CHALLENGE
+
+
+#: WS-68 R1 (#140 B1): 격리 world 에서 그대로 평가할 엄격 판정 식 — 같은 프로브(_PROBE_JS)를 즉시 호출한다.
+STRICT_PROBE_EXPRESSION = f"({_PROBE_JS.strip()})()"
+
+
+async def detect_challenge_strict(page: Any, *, last_status: Optional[int] = None,
+                                  isolated: Optional[Callable[[str], Awaitable[Any]]] = None) -> Optional[Challenge]:
+    """detect_challenge 의 엄격판(WS-68, #140) — 같은 프로브·같은 규칙(classify), 판정 불가는 None.
+
+    detect_challenge 는 읽기 실패를 NONE(막지 않음)으로 삼는다 — 관찰 흐름에는 맞지만 '이 화면을 저장해도
+    되는가'처럼 통과가 곧 기록이 되는 판단에는 fail-open 이다. 여기서는 평가 예외·dict 아님·필드 모양이
+    틀림을 모두 None 으로 돌려 부르는 쪽이 거부하게 한다.
+
+    R1 (B1): 프로브는 **격리 world** 에서만 평가한다 — isolated(expression) 는 CDP 격리 world 평가기
+    (Page.createIsolatedWorld + Runtime.evaluate contextId). 페이지 world(page.evaluate)는 페이지 JS 가
+    querySelectorAll·innerText·prototype 을 바꿔 결과를 위조할 수 있어 쓰지 않는다. 평가기가 없으면 판정 불가.
+    """
+    if isolated is None:
+        return None
+    try:
+        s = await isolated(STRICT_PROBE_EXPRESSION)
+    except Exception:  # noqa: BLE001 - 판정 불가(격리 world 생성·평가 실패) — 부르는 쪽이 거부한다
+        return None
+    if not isinstance(s, dict):
+        return None
+    title, text, length, widget = s.get("title"), s.get("text"), s.get("len"), s.get("widget")
+    if (not isinstance(title, str) or not isinstance(text, str) or not isinstance(widget, str)
+            or not isinstance(length, int) or isinstance(length, bool) or length < 0):
+        return None
+    return classify(title, text, length, widget, last_status,
+                    url=str(s.get("url") or getattr(page, "url", "") or ""))
 
 
 async def detect_challenge(page: Any, *, last_status: Optional[int] = None) -> Challenge:

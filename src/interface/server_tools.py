@@ -14,7 +14,7 @@ from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
 from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
-from interface.server_envelope import cap_result_size
+from interface.server_envelope import cap_result_size, settle_returned_chars
 from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
@@ -128,7 +128,7 @@ class ToolsMixin:
         from recipes.saved_pages import OPS as SAVED_PAGE_OPS
 
         if saved is not None and str(args.get("op") or "") in SAVED_PAGE_OPS:
-            payload = saved.tool(args)  # WS-61 도착 페이지 기억
+            payload = await saved.tool(args)  # WS-61 도착 페이지 기억(WS-68: 지금 화면 엄격 재판정 — async)
         else:
             payload = await self._recipes.tool(args)
         data = payload.get("data")
@@ -284,12 +284,15 @@ class ToolsMixin:
                 # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
                 # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
                 fit_repeated(result, max_chars,
-                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                             limit=self.max_result_chars)
 
             attach_injection_signal(result, max_scan_chars=scan_chars)
             # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-            cap_result_size(result, max_chars)
+            # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
+            cap_result_size(result, max_chars, limit=self.max_result_chars)
             self._attach_window_notices(result)
+            settle_returned_chars(result)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result

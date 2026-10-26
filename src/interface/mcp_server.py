@@ -92,10 +92,12 @@ from interface.server_envelope import (  # noqa: E402,F401
     _TRUNC_HINT_TEXT,
     _compact_observation,
     _field_default,
+    _limit_text,
     _safe_cut,
     cap_result_size,
     envelope_dict,
     envelope_json,
+    settle_returned_chars,
 )
 from interface.server_signals import (  # noqa: E402,F401
     HANDOFF_HINT,
