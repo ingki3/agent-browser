@@ -19,8 +19,10 @@ import html
 import json
 import os
 import pickle
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -430,37 +432,85 @@ SIZES = [4 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20]
 #: 기억해 같은 일을 다시 하지 않았다) 실패시킨다.
 PERF_ROUNDS = 5
 PERF_SAME_WORK = 20
+#: WS-70(#180) — 판정 하나가 어긋나면(비율·1초 상한·같은 일) 새 격리 자식에서 원래와 같은 크기 집합·라운드 순서로
+#: PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용해 하나라도 어긋나면 실패시킨다(r4 test_ws51_r4_perf
+#: 와 같은 방식·같은 근거 — 러너 CPU 경합은 긴 측정을 다섯 번 모두 선점할 수 있지만 다음 자식까지 이어지지 않고, 이차시간·상수 지연·결과 캐시는 다시 재도 그대로다). 자식 격리는
+#: r1 `_run_perf`(WS-66 #173)와 같다. 기준(1.0초·2.5배·바닥 5ms·PERF_SAME_WORK)은 그대로.
+PERF_RECHECK_ROUNDS = 9
+PERF_ISOLATED_ENV = ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                     "PYTHONPYCACHEPREFIX")
+PERF_CODE_COPY_IGNORE = ("__pycache__", "*.pyc")
 
 
-def _perf_child(shape: str, nvals: int) -> None:
+def _perf_child(shape: str, nvals: int, rounds: int, sizes: list) -> None:
     from security.public_url import _public_text  # 캐시를 거치지 않는 본체
 
     for i in range(nvals):
         secret_registry.register_url(f"https://h.invalid/p?gateToken=SYNTH{i:04d}abcdefXYZ&sid=s{i:06d}x")
     rows = {"variants": len(secret_registry.REGISTRY), "times": {}, "runs": {}}
-    texts = {n: SHAPES[shape](n) for n in SIZES}
-    runs = {n: [] for n in SIZES}
-    for _ in range(PERF_ROUNDS):
-        for n in SIZES:
+    texts = {n: SHAPES[shape](n) for n in sizes}
+    runs = {n: [] for n in sizes}
+    for _ in range(rounds):
+        for n in sizes:
             t = time.perf_counter()
             _public_text(texts[n])
             runs[n].append(time.perf_counter() - t)
-    for n in SIZES:
+    for n in sizes:
         rows["times"][n] = min(runs[n])
         rows["runs"][n] = runs[n]
+    # 조건 성립(r1 과 같다): 격리된 환경에서, 부모가 만든 제품 소스 사본으로 돌았다
+    here = os.path.realpath(os.getcwd())
+    rows["isolated"] = all(os.path.realpath(os.environ.get(k, "")) == here for k in PERF_ISOLATED_ENV)
+    rows["module"] = os.path.realpath(sys.modules["security.public_url"].__file__)
+    origin = Path(__file__).resolve().parents[2] / "src"
+    loaded = [os.path.realpath(f) for m in list(sys.modules.values()) if isinstance(f := getattr(m, "__file__", None), str)]
+    rows["from_origin"] = [f for f in loaded if Path(f).is_relative_to(origin)]
     print(json.dumps(rows))
 
 
-def _run_perf(shape: str, nvals: int) -> dict:
+def _run_perf(shape: str, nvals: int, rounds: int = PERF_ROUNDS, sizes: tuple = tuple(SIZES)) -> dict:
+    """격리 자식 한 번의 측정. 자식마다 빈 홈·임시 디렉터리와 제품 소스 사본을 새로 만든다(r1 `_run_perf` 와 같다)."""
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    src = Path(__file__).resolve().parents[2] / "src"
+    rest = [os.path.abspath(p) for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ws70-perf-"))
+    box = os.path.join(root, "box")
+    code = os.path.join(root, "code", "src")
+    args = [shape, str(nvals), str(rounds), ",".join(map(str, sizes))]
     try:
-        proc = subprocess.run([sys.executable, __file__, shape, str(nvals)], capture_output=True, text=True,
-                              timeout=120, env=env)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"{shape}: 120초 안에 끝나지 않음(이차시간 회귀)")
+        os.mkdir(box)
+        shutil.copytree(src, code, ignore=shutil.ignore_patterns(*PERF_CODE_COPY_IGNORE))
+        env["PYTHONPATH"] = os.pathsep.join([code, *rest])
+        env.update(dict.fromkeys(PERF_ISOLATED_ENV, box))
+        try:
+            proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), *args], capture_output=True, text=True,
+                                  timeout=120, env=env, cwd=box)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"{shape}: 120초 안에 끝나지 않음(이차시간 회귀)")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
-    return json.loads(proc.stdout.strip().splitlines()[-1])
+    rows = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert rows["isolated"], (shape, "자식 환경 격리 실패", rows)
+    assert Path(rows["module"]).is_relative_to(code) and not rows["from_origin"], (shape, "제품 소스 사본 미사용", code, rows)
+    return rows
+
+
+def _perf_violations(rows: dict, sizes: tuple) -> list:
+    """한 측정의 판정 위반 목록 — 각 항목은 (판정, 다시 잴 크기들). `sizes` 는 판정에 쓰는 크기(256KiB 이상)."""
+    times = {int(k): v for k, v in rows["times"].items()}
+    found = []
+    for n in sizes:  # 반복도 첫 측정과 같은 일을 했다(캐시 적중이면 수십분의 일로 떨어진다)
+        first, *again = rows["runs"][str(n)]
+        if min(again) * PERF_SAME_WORK < first:
+            found.append((("same_work", n), (n,)))
+    if (1 << 20) in times and times[1 << 20] >= 1.0:
+        found.append((("budget", 1 << 20), (1 << 20,)))
+    # 2배 입력 → 시간 ≤ 2.5배 (잡음이 큰 아주 짧은 측정은 바닥 5ms 로 본다)
+    for small, big in zip(sizes, sizes[1:]):
+        if times[big] > 2.5 * max(times[small], 0.005):
+            found.append((("ratio", small, big), (small, big)))
+    return found
 
 
 @pytest.mark.parametrize("nvals", [0, 128])
@@ -469,15 +519,19 @@ def test_performance_linear_and_under_a_second(shape, nvals):
     rows = _run_perf(shape, nvals)
     if nvals:
         assert rows["variants"] == secret_registry.MAX_VALUES  # 레지스트리를 값 상한까지 채운 조건 성립(R4 §5)
-    times = {int(k): v for k, v in rows["times"].items()}
-    for n in SIZES[2:]:  # 판정에 쓰는 크기: 반복도 첫 측정과 같은 일을 했다(캐시 적중이면 수십분의 일로 떨어진다)
-        first, *again = rows["runs"][str(n)]
-        assert min(again) * PERF_SAME_WORK >= first, (shape, n, rows["runs"][str(n)])
-    assert times[1 << 20] < 1.0, (shape, times)
-    # 2배 입력 → 시간 ≤ 2.5배 (잡음이 큰 아주 짧은 측정은 바닥 5ms 로 본다)
-    for small, big in zip(SIZES[2:], SIZES[3:]):
-        assert times[big] <= 2.5 * max(times[small], 0.005), (shape, small, big, times)
+    first = [v for v, _ in _perf_violations(rows, tuple(SIZES[2:]))]
+    if first:
+        # WS-70: 위반이 하나라도 있으면 새 격리 자식에서 원래와 같은 크기 집합·라운드 순서(라운드마다 모든 크기)로
+        # PERF_RECHECK_ROUNDS 번 다시 재고, 그 결과에 모든 판정을 다시 적용한다 — 원래 위반이 사라져도 다른 위반이
+        # 하나라도 나면 실패(WS-70 R1 B1).
+        again = _run_perf(shape, nvals, PERF_RECHECK_ROUNDS)
+        if nvals:
+            assert again["variants"] == secret_registry.MAX_VALUES
+        still = [v for v, _ in _perf_violations(again, tuple(SIZES[2:]))]
+        record = {"shape": shape, "nvals": nvals, "first_violations": first, "first": rows, "recheck": again}
+        print("WS-70 재측정", json.dumps(record))
+        assert not still, ("재측정에서도 위반", still, record)
 
 
 if __name__ == "__main__":
-    _perf_child(sys.argv[1], int(sys.argv[2]))
+    _perf_child(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), [int(n) for n in sys.argv[4].split(",")])
