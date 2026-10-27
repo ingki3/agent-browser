@@ -106,12 +106,40 @@ def _quote_table(safe: str, plus: bool, lower: bool) -> Tuple[str, ...]:
     return tuple(table)
 
 
+@functools.lru_cache(maxsize=16)
+def _quote_keep(safe: str) -> bytes:
+    """그대로 남는 바이트(bytes.translate 의 delete 인자 — 남은 것이 바꿀 바이트다)."""
+    return bytes(sorted(_ALWAYS_SAFE | frozenset(safe.encode("ascii"))))
+
+
+#: _quote 의 바이트별 치환(bytes.replace) 횟수 상한 — 바꿀 바이트 종류가 더 많으면(한글 등 비 ASCII 가 많은 값) 표 조회로.
+_QUOTE_MAX_KINDS = 16
+
+
 def _quote(value: str, safe: str = "", plus: bool = False, lower: bool = False) -> str:
-    """urllib.parse.quote(value, safe)·quote_plus 와 같은 결과(lower=True 면 16진 소문자). 바이트마다 파이썬 함수를
-    부르는 urllib 구현과 달리 표 조회를 map 으로 돌려 긴 값(수 MiB)도 빠르다. 짝 없는 서로게이트는 UnicodeError."""
+    """urllib.parse.quote(value, safe)·quote_plus 와 같은 결과(lower=True 면 16진 소문자). 짝 없는 서로게이트는 UnicodeError.
+
+    WS-71(#183): 바꿀 바이트 종류가 적으면(따옴표·공백·`/?=&` 가 반복되는 긴 주소 값) 종류마다 `bytes.replace` 한 번 —
+    바이트마다 표를 조회해 이어 붙이는 것보다 몇 배 빠르다. 결과는 바이트별 치환과 같다: `%` 를 먼저 바꾸고(뒤 치환이 `%XX`
+    를 만든다), quote_plus 의 `+`(→ `%2B`)를 공백(→ `+`)보다 먼저 바꾼다. 치환 결과의 나머지 글자(16진 숫자)는 늘 남는
+    바이트라 다시 바뀌지 않는다. 종류가 _QUOTE_MAX_KINDS 를 넘으면 바이트마다 표 조회(이전 구현)."""
     if _INVARIANT.fullmatch(value) is not None:
         return value
-    return "".join(map(_quote_table(safe, plus, lower).__getitem__, value.encode("utf-8")))
+    data = value.encode("utf-8")
+    table = _quote_table(safe, plus, lower)
+    rest = data.translate(None, _quote_keep(safe))
+    if len(rest) * 2 > len(data):  # 대부분 바뀌는 값 — 종류를 세는 비용이 이득보다 크다
+        return "".join(map(table.__getitem__, data))
+    kinds: List[int] = []
+    while rest:
+        if len(kinds) == _QUOTE_MAX_KINDS:
+            return "".join(map(table.__getitem__, data))
+        kinds.append(rest[0])
+        rest = rest.replace(rest[:1], b"")
+    kinds.sort(key=lambda b: (b != 0x25, b != 0x2B))
+    for b in kinds:
+        data = data.replace(bytes((b,)), table[b].encode("ascii"))
+    return data.decode("ascii")
 
 
 #: R2 인코더(safe, plus): quote(safe="")·quote_plus(safe="")·encodeURIComponent·encodeURI 상당.
@@ -138,12 +166,18 @@ def _json(value: str) -> List[str]:
     return [json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]]
 
 
-_HTML_DEC = {ord(c): dec for c, (dec, _) in _HTML_NUM.items()}
-_HTML_HEX = {ord(c): hexa for c, (_, hexa) in _HTML_NUM.items()}
+def _html_numeric(value: str, which: int) -> str:
+    """value 의 html.escape 다섯 글자를 10진(which=0)·16진(which=1) 숫자 참조로 — 글자별 사전 조회(`str.translate`)와 같은
+    결과를 다섯 글자 `str.replace` 로(WS-71 — 긴 값에서 몇 배 빠르다). `&` 를 먼저 바꾼다 — 뒤 치환 결과(`&#…;`)에 든 `&`
+    를 다시 바꾸지 않게. 치환 결과의 다른 글자(`#`·숫자·`x`·16진·`;`)는 다섯 글자에 들지 않는다."""
+    for c, forms in _HTML_NUM.items():  # `&` 가 처음(_HTML_NUM 의 첫 키)
+        if c in value:
+            value = value.replace(c, forms[which])
+    return value
 
 
 def _html(value: str) -> List[str]:
-    return [html.escape(value, quote=True), value.translate(_HTML_DEC), value.translate(_HTML_HEX)]
+    return [html.escape(value, quote=True), _html_numeric(value, 0), _html_numeric(value, 1)]
 
 
 def _tagged(value: str) -> "OrderedDict[str, bool]":
@@ -290,7 +324,7 @@ def _build(entries: Iterable[Tuple[_Part, ...]]) -> _Snapshot:
         for part in parts:
             any_part = True
             for form in part.forms:
-                if _PUA_RE.search(form):
+                if not form.isascii() and _PUA_RE.search(form):  # ASCII 표현(퍼센트·JSON 등)에는 사설 영역 글자가 없다
                     used.update(_PUA_RE.findall(form))
             if part.long:
                 long_groups.append((part.anchor, part.forms))
