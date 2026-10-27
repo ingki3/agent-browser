@@ -597,6 +597,193 @@ async def test_unavailable_browser_ua_is_cached_unknown_without_navigation_delay
     assert site.requests["/robots.txt"] == 0
 
 
+class _FakeSession:
+    async def send(self, method):
+        assert method == "Browser.getVersion"
+        return {"userAgent": "Mozilla/5.0 HeadlessChrome/1.0"}
+
+    async def detach(self):
+        return None
+
+
+class _FakeContext:
+    """UA 판독만 보는 가짜 컨텍스트 — 지정한 횟수만큼 CDP 세션 열기가 실패한다(WS-72)."""
+
+    def __init__(self, failures: int) -> None:
+        self._impl_obj = type("Impl", (), {"_options": {}})()
+        self.failures = failures
+        self.calls = 0
+        outer = self
+
+        class Browser:
+            async def new_browser_cdp_session(self):
+                outer.calls += 1
+                if outer.calls <= outer.failures:
+                    raise RuntimeError("synthetic browser protocol failure")
+                return _FakeSession()
+
+        self.browser = Browser()
+
+
+async def test_failed_ua_discovery_is_shared_only_within_unknown_window():
+    """WS-72 (#184): 실패 공유는 짧은 창(UA_UNKNOWN_TTL_S)까지만 — 창 안 재판독 0회, 창 뒤 1회. 세션 끝까지 꺼지지 않는다."""
+    from security import robots_signal
+
+    now = [0.0]
+    service = RobotsSignals(clock=lambda: now[0])
+    ctx = _FakeContext(failures=1)
+    assert await service._context_user_agent(ctx) is None
+    now[0] = robots_signal.UA_UNKNOWN_TTL_S - 0.1
+    assert await service._context_user_agent(ctx) is None  # 창 안: 지연 없이 unknown, 재판독 없음
+    assert ctx.calls == 1
+    now[0] = robots_signal.UA_UNKNOWN_TTL_S + 0.1
+    assert await service._context_user_agent(ctx) == "Mozilla/5.0 HeadlessChrome/1.0"  # 창 뒤: 1회 재판독
+    assert ctx.calls == 2
+    now[0] = 10 * robots_signal.UA_UNKNOWN_TTL_S
+    assert await service._context_user_agent(ctx) == "Mozilla/5.0 HeadlessChrome/1.0"  # 성공은 계속 공유
+    assert ctx.calls == 2
+    await service.close()
+
+
+async def test_refresh_user_agent_rereads_after_failure_and_updates_shared_cache():
+    """WS-72 (#184): 예산이 있는 호출자(PDF 재요청)는 창 안이라도 1회 다시 읽고, 성공하면 공유 캐시를 갱신한다."""
+    service = RobotsSignals(clock=lambda: 0.0)
+    ctx = _FakeContext(failures=1)
+    assert await service._context_user_agent(ctx) is None
+    assert await service.refresh_user_agent(ctx, timeout_s=2.0) == "Mozilla/5.0 HeadlessChrome/1.0"
+    assert ctx.calls == 2
+    assert await service._context_user_agent(ctx) == "Mozilla/5.0 HeadlessChrome/1.0"  # navigate 경로도 회복
+    assert await service.refresh_user_agent(ctx, timeout_s=2.0) == "Mozilla/5.0 HeadlessChrome/1.0"
+    assert ctx.calls == 2  # 이미 아는 UA 는 다시 읽지 않는다
+    await service.close()
+
+
+class _SlowSession(_FakeSession):
+    async def send(self, method):
+        await asyncio.sleep(0.02)  # 동시 호출이 판독 도중에 겹치게 한다
+        return await super().send(method)
+
+
+class _StalledSession:
+    async def send(self, method):
+        await asyncio.sleep(30)
+
+    async def detach(self):
+        await asyncio.sleep(30)
+
+
+def _context(session_factory, failures: int) -> _FakeContext:
+    ctx = _FakeContext(failures=failures)
+
+    class Browser:
+        async def new_browser_cdp_session(self):
+            ctx.calls += 1
+            if ctx.calls <= ctx.failures:
+                raise RuntimeError("synthetic browser protocol failure")
+            return session_factory()
+
+    ctx.browser = Browser()
+    return ctx
+
+
+async def test_concurrent_refresh_shares_single_reread_and_navigate_stays_fast():
+    """WS-72 R1 (B1): 실패 창 안 PDF refresh 20 + navigate 판독 20 을 동시에 불러도 재판독은 1회(공유). navigate 는 기다리지 않는다."""
+    service = RobotsSignals(clock=lambda: 0.0)
+    ctx = _context(_SlowSession, failures=1)
+    assert await service._context_user_agent(ctx) is None
+    navigate_started = time.monotonic()
+    navigate = await asyncio.gather(*[service._context_user_agent(ctx) for _ in range(20)])
+    assert time.monotonic() - navigate_started < 0.01 and navigate == [None] * 20  # 창 안 지연 0
+    results = await asyncio.wait_for(asyncio.gather(
+        *[service.refresh_user_agent(ctx, timeout_s=2.0) for _ in range(20)],
+        *[service._context_user_agent(ctx) for _ in range(20)]), 3)
+    assert results[:20] == ["Mozilla/5.0 HeadlessChrome/1.0"] * 20
+    assert ctx.calls == 2  # 첫 실패 + 공유 재판독 1회
+    await service.close()
+
+
+async def test_sequential_refresh_rereads_at_most_once_per_failure_window():
+    """WS-72 R1 (B1): 창 안 연속 PDF refresh 5회도 새 판독은 최대 1회, 창이 지나면 다시 1회."""
+    from security import robots_signal
+
+    now = [0.0]
+    service = RobotsSignals(clock=lambda: now[0])
+    ctx = _context(_FakeSession, failures=2)
+    assert await service._context_user_agent(ctx) is None
+    for step in range(5):
+        now[0] = step
+        assert await service.refresh_user_agent(ctx, timeout_s=2.0) is None
+    assert ctx.calls == 2  # 첫 실패 + 창 안 재판독 1회(실패)
+    now[0] = robots_signal.UA_UNKNOWN_TTL_S + 0.1
+    assert await service.refresh_user_agent(ctx, timeout_s=2.0) == "Mozilla/5.0 HeadlessChrome/1.0"
+    assert ctx.calls == 3  # 창 뒤 1회
+    await service.close()
+
+
+@pytest.mark.parametrize("known_failure", [True, False])
+async def test_refresh_returns_within_budget_when_browser_and_detach_stall(known_failure):
+    """WS-72 R1 (NB): getVersion·detach 가 응답하지 않아도 refresh 는 자기 예산(2초) + 작은 여유 안에 돌아온다."""
+    service = RobotsSignals(clock=lambda: 0.0)
+    ctx = _context(_StalledSession, failures=1 if known_failure else 0)
+    if known_failure:
+        assert await service._context_user_agent(ctx) is None
+    started = time.monotonic()
+    assert await service.refresh_user_agent(ctx, timeout_s=2.0) is None
+    assert time.monotonic() - started <= 2.02
+    started = time.monotonic()
+    await service.close()  # 미뤄 둔 정리도 닫을 때 끝난다(누수 없음)
+    assert time.monotonic() - started < 0.5
+    assert not service._ua_cleanups
+
+
+async def test_cancelled_refresh_caller_does_not_disturb_shared_reread():
+    """WS-72 R1 (B1): 한 호출자가 취소돼도 공유 재판독은 계속되어 다른 대기자가 결과를 받는다."""
+    service = RobotsSignals(clock=lambda: 0.0)
+    ctx = _context(_SlowSession, failures=1)
+    assert await service._context_user_agent(ctx) is None
+    callers = [asyncio.create_task(service.refresh_user_agent(ctx, timeout_s=2.0)) for _ in range(3)]
+    await asyncio.sleep(0.005)
+    callers[0].cancel()
+    results = await asyncio.gather(*callers, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1:] == ["Mozilla/5.0 HeadlessChrome/1.0"] * 2
+    assert ctx.calls == 2
+    assert await service._context_user_agent(ctx) == "Mozilla/5.0 HeadlessChrome/1.0"
+    await service.close()
+
+
+@requires_chromium
+async def test_robots_signal_recovers_after_failed_ua_window(site, monkeypatch):
+    """WS-72 (#184): 첫 UA 판독이 실패해도 창(과 unknown 캐시)이 지나면 같은 세션의 robots 신호가 돌아온다."""
+    now = [0.0]
+    async with BrowserMCPServer(nav_settle=False, recipes=False) as server:
+        server._robots = RobotsSignals(clock=lambda: now[0])
+        browser = server._page.context.browser
+        original = browser.new_browser_cdp_session
+        calls = []
+
+        async def first_fails():
+            calls.append(True)
+            if len(calls) == 1:
+                raise RuntimeError("synthetic browser protocol failure")
+            return await original()
+
+        monkeypatch.setattr(browser, "new_browser_cdp_session", first_fails)
+        result = await navigate(server, site.url + "/read")
+        assert result.success and "robots" not in result.data
+        assert site.requests["/robots.txt"] == 0
+        now[0] = 601  # UA 실패 창·origin unknown 캐시(UNKNOWN_TTL_S) 모두 지남
+        await navigate(server, site.url + "/read")
+        for _ in range(100):
+            if not server._robots.pending:
+                break
+            await asyncio.sleep(0.05)
+        obs = await server.call_tool("browser_observe_page", {})
+    assert len(calls) == 2
+    assert site.requests["/robots.txt"] == 1
+    assert obs.data["robots"]["disallowed"] is True
+
+
 @requires_chromium
 async def test_each_same_origin_redirect_checks_guard_before_proxy_request(site, monkeypatch):
     from security.egress import EgressDecision
