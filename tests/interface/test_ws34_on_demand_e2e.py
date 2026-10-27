@@ -163,6 +163,24 @@ def _headed(s: BrowserMCPServer) -> int:
     return sum(1 for p in _procs_for(s._core.persistent_profile) if p["headed"])
 
 
+# WS-72 (#177): 창 종료 → headless 전환의 상한. Playwright 는 브라우저 닫기를 30초 기다린 뒤 강제 종료한다
+# (closeOrKill(DEFAULT_PLAYWRIGHT_TIMEOUT)) — 부하(코어×2 바쁜 프로세스)에서 headed 닫기 실측 최대 30.0초.
+# Chromium 이 스스로 끝나는 경로(리눅스에서 마지막 창 X — CDP Browser.close 로 모사)는 headless 표시 뒤에도 옛 headed
+# 프로세스가 내려가는 중이다(부하 15회 중 13회 남음, 2.4~30.1초 뒤 모두 사라짐). 그 상한 + 다시 열기 여유.
+WINDOW_SWITCH_TIMEOUT_S = 45.0
+
+
+async def _headed_after_close(s: BrowserMCPServer, timeout: float = WINDOW_SWITCH_TIMEOUT_S) -> int:
+    """창을 닫은 뒤 headed 프로세스 수 — 내려가는 중인 것은 상한까지 기다린다. 상한을 넘겨 남으면 그대로 돌려줘
+    누수(끝내 안 내려감)는 여전히 실패한다."""
+    deadline = time.monotonic() + timeout
+    n = _headed(s)
+    while n and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+        n = _headed(s)
+    return n
+
+
 async def _wait_no_procs(path: Path, timeout: float = 10.0) -> List[Dict[str, Any]]:
     deadline = time.monotonic() + timeout
     rows = _procs_for(path)
@@ -210,7 +228,7 @@ async def _wait_holder(s: BrowserMCPServer, holder: str, timeout: float = 10.0) 
     assert s.hub.holder == holder
 
 
-async def _wait_window(s: BrowserMCPServer, state: str, timeout: float = 15.0) -> None:
+async def _wait_window(s: BrowserMCPServer, state: str, timeout: float = WINDOW_SWITCH_TIMEOUT_S) -> None:
     deadline = time.monotonic() + timeout
     while s._window.state != state and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
@@ -616,7 +634,7 @@ async def test_e_human_closes_window(site):
         assert st["data"]["control"]["holder"] == "agent"
         assert st["data"]["window"]["state"] == "headless"
         assert st["data"]["window"]["notice"]["reason"] == "window_closed"
-        assert _headed(s) == 0
+        assert await _headed_after_close(s) == 0, _procs_for(s._core.persistent_profile)
         nav = await call("browser_navigate", {"url": site.url + "/pay"})
         assert nav["success"]
         await _egress_ok(s, call, site)

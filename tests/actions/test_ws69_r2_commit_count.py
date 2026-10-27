@@ -148,28 +148,50 @@ async def test_dcl_immediate_hop_never_partial_success_unhooked(server):
 # -- B1-b: 마지막 await 동안 오류 문서 커밋 — 그 뒤 동기 확인으로 실패 ------------------------------
 
 
-async def _error_commits_during_last_await(d, page):
+# WS-72: 주입(판독 + 오류 문서 커밋 대기)이 판독 예산 안에 끝나야 시험 전제가 선다. 판독 예산은 남은 timeout +
+# _NAV_READ_GRACE_S(50ms)인데, 부하에서 주입만 33~48ms 가 걸려 예산이 주입을 취소했다(계측 30회 중 3회: 값 None,
+# 그중 1회는 커밋 전 취소 → 전제 실패 #181). 이 시험의 대상은 '마지막 await 뒤 동기 확인'이지 판독 예산이 아니다
+# (예산은 B2 시험이 따로 잰다). 그래서 이 두 시험에서만 grace 를 주입 상한보다 넉넉히 둔다 — 제품 값은 그대로다.
+_INJECT_GRACE_S = 3.0
+_COMMIT_WAIT_S = 2.0  # 오류 문서 커밋 대기 상한(시각 기준 — 부하에서 sleep 횟수 기준 상한은 짧아진다)
+
+
+async def _error_commits_during_last_await(d, page, monkeypatch):
     """판독(마지막 await) 도중 실제 오류 문서를 커밋시키고 그 커밋까지 붙잡는다 — 검증 final_race.py 의 경계 주입.
 
     판독 값은 커밋 전 최초 문서의 것(interactive)이라, 판독 뒤 동기 확인이 없으면 부분 성공으로 새어 나간다."""
+    import actions.dispatcher as dispatcher_mod
+
+    monkeypatch.setattr(dispatcher_mod, "_NAV_READ_GRACE_S", _INJECT_GRACE_S)
     real = d._main_ready_state
-    seen = {"calls": 0}
+    seen = {"calls": 0, "value": None, "committed": False, "returned": False}
 
     async def slow(p):
         seen["calls"] += 1
         value = await real(p)
+        seen["value"] = value
         await page.evaluate("location.href='http://127.0.0.1:1/'")
-        for _ in range(200):
-            if page.url.startswith("chrome-error://"):
-                break
+        deadline = time.monotonic() + _COMMIT_WAIT_S
+        while not page.url.startswith("chrome-error://") and time.monotonic() < deadline:
             await asyncio.sleep(0.002)
+        seen["committed"] = page.url.startswith("chrome-error://")
+        seen["returned"] = True  # 예산에 취소되지 않고 판독 값을 돌려줬다
         return value
 
     d._main_ready_state = slow
     return seen
 
 
-async def test_error_document_committed_during_last_await_is_failure_direct(server):
+def _premise(seen, final, r) -> None:
+    """전제: 주입이 마지막 await 에 1회 걸렸고, 판독이 문서 값(interactive/complete)을 돌려줬으며, 그 await 안에서
+    오류 문서가 커밋됐다. 하나라도 아니면 제품 판정을 단정하지 않고 '전제 미성립'으로 실패한다(제품 결과 동봉)."""
+    ok = (seen["calls"] == 1 and seen["returned"] and seen["value"] in ("interactive", "complete")
+          and seen["committed"] and final.startswith("chrome-error://"))
+    assert ok, f"전제 미성립: seen={seen} final={final[:40]} 제품 결과 success={r.success} " \
+               f"error_code={r.error_code} data={r.data}"
+
+
+async def test_error_document_committed_during_last_await_is_failure_direct(server, monkeypatch):
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
@@ -177,36 +199,71 @@ async def test_error_document_committed_during_last_await_is_failure_direct(serv
         try:
             page = await b.new_page()
             d = _dispatcher(page)
-            seen = await _error_commits_during_last_await(d, page)
+            seen = await _error_commits_during_last_await(d, page, monkeypatch)
             r, _ = await _nav(d, server + "/img", "load", 300)
             final = page.url
         finally:
             await b.close()
-    assert seen["calls"] == 1  # 주입이 실제로 마지막 await 에 걸렸다
-    assert final.startswith("chrome-error://")
+    _premise(seen, final, r)  # 주입이 실제로 마지막 await 에 걸렸고 그 안에서 오류 문서가 커밋됐다
     assert r.success is False, r.data
     assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
     assert "load_state" not in r.data
     assert r.data["nav_failure"]["kind"] == "other"
 
 
-async def test_error_document_committed_during_last_await_is_failure_serve(server, tmp_path):
+async def test_error_document_committed_during_last_await_is_failure_serve(server, tmp_path, monkeypatch):
     from interface.mcp_server import BrowserMCPServer
 
     s = BrowserMCPServer(recipes=False, handoff_root=tmp_path / "hub")
     await s.start()
     try:
         page = s._page
-        seen = await _error_commits_during_last_await(s._dispatcher, page)
+        seen = await _error_commits_during_last_await(s._dispatcher, page, monkeypatch)
         r = await asyncio.wait_for(s.call_tool(
             "browser_navigate", {"url": server + "/img", "wait_until": "load", "timeout_ms": 300}), 5.0)
         final = page.url
     finally:
         await s.close()
-    assert seen["calls"] == 1
-    assert final.startswith("chrome-error://")
+    _premise(seen, final, r)
     assert r.success is False, r.data
     assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+
+
+async def test_injection_cancelled_by_real_read_budget_is_conservative_failure(server):
+    """WS-72 (#181): 제품 grace 그대로(50ms) — 판독이 예산을 넘겨 취소되는 동안 오류 문서가 커밋돼도 부분 성공이 아니라
+    보수 실패다(위 두 시험이 grace 를 늘린 것이 취소 경로의 거짓 성공을 가리지 않음을 따로 증명)."""
+    from playwright.async_api import async_playwright
+
+    import actions.dispatcher as dispatcher_mod
+
+    assert dispatcher_mod._NAV_READ_GRACE_S == 0.05  # 제품 값 그대로
+    async with async_playwright() as pw:
+        b = await pw.chromium.launch(headless=True)
+        try:
+            page = await b.new_page()
+            d = _dispatcher(page)
+            real = d._main_ready_state
+            seen = {"value": None, "cancelled": False}
+
+            async def slow_past_budget(p):
+                try:
+                    value = await real(p)
+                    seen["value"] = value
+                    await page.evaluate("location.href='http://127.0.0.1:1/'")
+                    await asyncio.sleep(1.0)  # 예산(남은 timeout + 50ms)을 확실히 넘긴다
+                except asyncio.CancelledError:
+                    seen["cancelled"] = True
+                    raise
+                return value
+
+            d._main_ready_state = slow_past_budget
+            r, _ = await _nav(d, server + "/img", "load", 300)
+        finally:
+            await b.close()
+    assert seen["cancelled"], seen  # 전제: 판독 예산이 주입을 취소했다(부하에서 판독 값 전 취소여도 같은 경로)
+    assert r.success is False, r.data
+    assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
+    assert "load_state" not in r.data
 
 
 # -- B2: 추가 판독은 남은 deadline 안에서만 — 넘기면 보수 실패, 반환 ≤ timeout_ms + 100ms ------------

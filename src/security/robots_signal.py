@@ -242,6 +242,9 @@ UNKNOWN_TTL_S = 10 * 60
 MAX_REDIRECTS = 5
 MAX_CACHE_ORIGINS = 1000
 UA_TIMEOUT_S = 0.1
+# WS-72 (#184): 실패한 UA 판독을 공유하는 시간. 이 창 안의 navigate 는 지연 없이 unknown, 지나면 다음 호출이 다시 읽는다
+# — 첫 판독이 루프 정지(GC·부하)로 UA_TIMEOUT_S 를 넘겨도 robots 신호·headless 재시도가 세션 끝까지 꺼지지 않게.
+UA_UNKNOWN_TTL_S = 30.0
 
 
 def _origin(url: str) -> Optional[str]:
@@ -280,7 +283,8 @@ class RobotsSignals:
         self._clock = clock
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._pending: dict[str, asyncio.Task[None]] = {}
-        self._user_agents: WeakKeyDictionary[BrowserContext, asyncio.Task[Optional[str]]] = WeakKeyDictionary()
+        self._user_agents: WeakKeyDictionary[BrowserContext, asyncio.Future[Optional[str]]] = WeakKeyDictionary()
+        self._ua_retry_at: WeakKeyDictionary[BrowserContext, float] = WeakKeyDictionary()
 
     @property
     def pending(self) -> bool:
@@ -412,15 +416,42 @@ class RobotsSignals:
         return None
 
     async def _context_user_agent(self, context: BrowserContext) -> Optional[str]:
-        # Share discovery across origins, including failures. A page must never
-        # supply this header: its navigator getter is controlled by the site.
+        # Share discovery across origins, including failures — but a failure only
+        # for UA_UNKNOWN_TTL_S (WS-72). A page must never supply this header: its
+        # navigator getter is controlled by the site.
         task = self._user_agents.get(context)
+        if task is not None and self._failed(task) and self._clock() >= self._ua_retry_at.get(context, 0.0):
+            task = None
         if task is None:
-            task = asyncio.create_task(self._read_user_agent(context))
+            task = asyncio.create_task(self._discover_user_agent(context, UA_TIMEOUT_S))
             self._user_agents[context] = task
         return await asyncio.shield(task)
 
-    async def _read_user_agent(self, context: BrowserContext) -> Optional[str]:
+    async def refresh_user_agent(self, context: BrowserContext, timeout_s: float) -> Optional[str]:
+        """UA 를 아직 모르면(판독 실패 공유 중이어도) timeout_s 안에서 한 번 더 읽는다 — 자기 예산이 있는 호출자용
+        (PDF 재요청, WS-72 #184). 성공하면 공유 캐시를 갱신해 navigate 경로도 회복한다. 페이지에서는 읽지 않는다."""
+        known = await self._context_user_agent(context)
+        if known is not None:
+            return known
+        user_agent = await self._read_user_agent(context, timeout_s)
+        if user_agent is not None:
+            done: asyncio.Future[Optional[str]] = asyncio.get_running_loop().create_future()
+            done.set_result(user_agent)
+            self._user_agents[context] = done
+            self._ua_retry_at.pop(context, None)
+        return user_agent
+
+    @staticmethod
+    def _failed(task: "asyncio.Future[Optional[str]]") -> bool:
+        return task.done() and not task.cancelled() and task.exception() is None and task.result() is None
+
+    async def _discover_user_agent(self, context: BrowserContext, timeout_s: float) -> Optional[str]:
+        user_agent = await self._read_user_agent(context, timeout_s)
+        if user_agent is None:
+            self._ua_retry_at[context] = self._clock() + UA_UNKNOWN_TTL_S
+        return user_agent
+
+    async def _read_user_agent(self, context: BrowserContext, timeout_s: float = UA_TIMEOUT_S) -> Optional[str]:
         session = None
         try:
             # Playwright exposes no public context-options getter. Read only
@@ -432,7 +463,7 @@ class RobotsSignals:
             browser = context.browser
             if browser is None:
                 return None
-            async with asyncio.timeout(UA_TIMEOUT_S):
+            async with asyncio.timeout(timeout_s):
                 session = await browser.new_browser_cdp_session()
                 version = await session.send("Browser.getVersion")
                 user_agent = version.get("userAgent")
@@ -460,6 +491,7 @@ class RobotsSignals:
         if ua_tasks:
             await asyncio.gather(*ua_tasks, return_exceptions=True)
         self._user_agents.clear()
+        self._ua_retry_at.clear()
 
 
 async def attach_robots_signal(service: RobotsSignals, result: ActionResult,
