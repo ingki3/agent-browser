@@ -107,39 +107,87 @@ def _quote_table(safe: str, plus: bool, lower: bool) -> Tuple[str, ...]:
 
 
 @functools.lru_cache(maxsize=16)
-def _quote_keep(safe: str) -> bytes:
-    """그대로 남는 바이트(bytes.translate 의 delete 인자 — 남은 것이 바꿀 바이트다)."""
-    return bytes(sorted(_ALWAYS_SAFE | frozenset(safe.encode("ascii"))))
+def _quote_keep(safe: str, plus: bool) -> Tuple[bytes, bytes]:
+    """(그대로 남는 바이트 — bytes.translate 의 delete 인자, 바이트 → 바뀌면 1·남으면 0 인 translate 표).
+    plus 면 공백은 safe 에 있어도 `+` 로 바뀐다(_quote_table 과 같다 — quote_plus 는 safe 와 무관하게 공백을 `+` 로)."""
+    keep = _ALWAYS_SAFE | frozenset(safe.encode("ascii"))
+    if plus:
+        keep = keep - {0x20}
+    return bytes(sorted(keep)), bytes(0 if b in keep else 1 for b in range(256))
 
 
-#: _quote 의 바이트별 치환(bytes.replace) 횟수 상한 — 바꿀 바이트 종류가 더 많으면(한글 등 비 ASCII 가 많은 값) 표 조회로.
-_QUOTE_MAX_KINDS = 16
+#: 이보다 짧은 값은 바로 표 조회 — 분기 판단의 고정 비용(함수 호출 몇 번)이 표 조회보다 클 수 있다.
+_QUOTE_REPLACE_MIN = 2048
+#: 바이트별 치환(bytes.replace) 경로의 비용 추정(표 조회 1바이트 = 1). 실측(64KiB·1MiB, 1~17종, 섞인/몰린 배치): 바뀌는
+#: 바이트 하나당 ≤ 2.2(무작위로 섞인 배치 — 분기 예측이 빗나간다; 몰린·주기적 배치는 ≈ 0.6~0.9), 종류 하나당 전체 훑기
+#: ≈ 0.0012 × 길이(결과가 길어지는 몫 포함 ≤ 3배). 추정은 실측보다 크게 잡는다 — 과대 추정은 표 조회로 갈 뿐(기준과 같은
+#: 속도)이고 과소 추정이 회귀를 만든다(R0 검증: 16종·50%·섞인 1MiB 에서 1.77배).
+_QUOTE_COST_CHANGED = 2.5
+_QUOTE_COST_SCAN = 0.004
+#: 추정 비용이 표 조회의 이 비율 이하일 때만 치환 경로(판단 비용·측정 흔들림 몫을 남긴다).
+_QUOTE_COST_BUDGET = 0.8
+#: 바꿀 종류를 찾는 표본 간격·창(뒤의 확인 단계가 빠뜨린 종류를 채운다 — 표본은 비용만 좌우하고 결과는 바꾸지 않는다).
+_QUOTE_SAMPLE_STEP = 61
+_QUOTE_SAMPLE_WINDOW = 4096
+
+
+def _quote_cost(n: int, changed: int, kinds: int) -> float:
+    return changed * _QUOTE_COST_CHANGED + kinds * n * _QUOTE_COST_SCAN
+
+
+def _quote_kinds(data: bytes, safe: str, plus: bool) -> Optional[Tuple[int, ...]]:
+    """바이트별 치환 경로의 바꿀 바이트 종류(치환 순서) — 표 조회가 더 싸거나 확실하지 않으면 None, 바꿀 것이 없으면 ().
+
+    WS-71 R1(B1): 바꿀 바이트 수(분기 없는 translate + 비트 수 — 배치와 무관하게 싸다)와 종류 수로 치환 비용을 추정해
+    표 조회보다 확실히 쌀 때만 치환한다. 종류는 표본·앞 창에서 찾고, 찾은 종류까지 지운 나머지가 비었는지 한 번 더
+    훑어 확인한다(대부분 지워지는 훑기라 분기 예측이 맞는다 — 섞인 배치의 `translate(None, keep)` 는 그렇지 않다).
+    표본이 기대보다 바꿀 바이트를 훨씬 적게 보면(표본 자리를 피한 배치) 확인 훑기가 비싸질 수 있으므로 표 조회로."""
+    n = len(data)
+    if n < _QUOTE_REPLACE_MIN:
+        return None
+    keep, flags = _quote_keep(safe, plus)
+    # 바뀌는 바이트 수 — translate 표가 0/1 이라 비트 수가 곧 개수(bytes.count 는 섞인 배치에서 분기 예측이 빗나가 느리다)
+    changed = int.from_bytes(data.translate(flags), "little").bit_count()
+    if not changed:
+        return ()
+    budget = n * _QUOTE_COST_BUDGET
+    if _quote_cost(n, changed, 1) > budget:
+        return None
+    sample = data[::_QUOTE_SAMPLE_STEP]
+    seen = len(sample) - sample.translate(flags).count(0)
+    if seen * 4 * n < changed * len(sample) and changed * len(sample) >= 32 * n:
+        return None  # 표본이 기대(changed/n)의 1/4 도 못 봄 — 표본을 피한 배치
+    found = set(sample.translate(None, keep))
+    found.update(data[:_QUOTE_SAMPLE_WINDOW].translate(None, keep))
+    while True:
+        if _quote_cost(n, changed, len(found)) > budget:
+            return None
+        rest = data.translate(None, keep + bytes(sorted(found)))
+        if not rest:
+            break
+        found.update(rest[:_QUOTE_SAMPLE_WINDOW])
+    # `%` 를 먼저(뒤 치환이 `%XX` 를 만든다), `+`(→ `%2B`)를 공백(→ `+`)보다 먼저
+    return tuple(sorted(found, key=lambda b: (b != 0x25, b != 0x2B, b)))
 
 
 def _quote(value: str, safe: str = "", plus: bool = False, lower: bool = False) -> str:
     """urllib.parse.quote(value, safe)·quote_plus 와 같은 결과(lower=True 면 16진 소문자). 짝 없는 서로게이트는 UnicodeError.
 
-    WS-71(#183): 바꿀 바이트 종류가 적으면(따옴표·공백·`/?=&` 가 반복되는 긴 주소 값) 종류마다 `bytes.replace` 한 번 —
+    WS-71(#183): 바꿀 바이트가 적은 긴 값(따옴표·공백·`/?=&` 가 반복되는 긴 주소 값)은 종류마다 `bytes.replace` 한 번 —
     바이트마다 표를 조회해 이어 붙이는 것보다 몇 배 빠르다. 결과는 바이트별 치환과 같다: `%` 를 먼저 바꾸고(뒤 치환이 `%XX`
     를 만든다), quote_plus 의 `+`(→ `%2B`)를 공백(→ `+`)보다 먼저 바꾼다. 치환 결과의 나머지 글자(16진 숫자)는 늘 남는
-    바이트라 다시 바뀌지 않는다. 종류가 _QUOTE_MAX_KINDS 를 넘으면 바이트마다 표 조회(이전 구현)."""
+    바이트라 다시 바뀌지 않는다. R1: 치환이 표 조회보다 확실히 쌀 때만(_quote_kinds) — 아니면 바이트마다 표 조회(이전 구현)."""
     if _INVARIANT.fullmatch(value) is not None:
         return value
     data = value.encode("utf-8")
     table = _quote_table(safe, plus, lower)
-    rest = data.translate(None, _quote_keep(safe))
-    if len(rest) * 2 > len(data):  # 대부분 바뀌는 값 — 종류를 세는 비용이 이득보다 크다
-        return "".join(map(table.__getitem__, data))
-    kinds: List[int] = []
-    while rest:
-        if len(kinds) == _QUOTE_MAX_KINDS:
-            return "".join(map(table.__getitem__, data))
-        kinds.append(rest[0])
-        rest = rest.replace(rest[:1], b"")
-    kinds.sort(key=lambda b: (b != 0x25, b != 0x2B))
-    for b in kinds:
-        data = data.replace(bytes((b,)), table[b].encode("ascii"))
-    return data.decode("ascii")
+    if len(data) >= _QUOTE_REPLACE_MIN:  # 짧은 값은 판단 함수도 부르지 않는다(호출 비용이 표 조회와 맞먹는다)
+        kinds = _quote_kinds(data, safe, plus)
+        if kinds is not None:
+            for b in kinds:
+                data = data.replace(bytes((b,)), table[b].encode("ascii"))
+            return data.decode("ascii")
+    return "".join(map(table.__getitem__, data))
 
 
 #: R2 인코더(safe, plus): quote(safe="")·quote_plus(safe="")·encodeURIComponent·encodeURI 상당.

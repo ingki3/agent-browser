@@ -192,12 +192,10 @@ def test_quote_matches_base_and_urllib(base):
             data = s.encode("utf-8")
         except UnicodeError:
             continue
-        rest = data.translate(None, cur_reg._quote_keep(""))
-        if rest:
-            branches.add("table_ratio" if len(rest) * 2 > len(data) else
-                         "table_kinds" if len(set(rest)) > cur_reg._QUOTE_MAX_KINDS else "replace")
-    # 조건 성립: 바이트별 치환·표 조회(비율)·표 조회(종류 초과) 세 분기가 모두 표본에 있다
-    assert branches == {"replace", "table_ratio", "table_kinds"}, branches
+        for safe, plus in cur_reg._ENCODERS:
+            branches.add(_branch(data, safe, plus))
+    # 조건 성립(R1): 짧은 값·바꿀 것 없음·바이트별 치환·비용 초과(표 조회) 네 분기가 모두 표본에 있다
+    assert branches == {"small", "none", "replace", "table"}, branches
     for s in samples:
         for safe, plus in cur_reg._ENCODERS:
             for lower in (False, True):
@@ -205,6 +203,98 @@ def test_quote_matches_base_and_urllib(base):
                 assert got == _call(base[1]._quote, s, safe, plus, lower), (repr(s)[:200], safe, plus, lower)
                 if not lower and got[0] == "ok":
                     assert got[1] == (quote_plus if plus else quote)(s, safe=safe), (repr(s)[:200], safe, plus)
+
+
+def _branch(data: bytes, safe: str, plus: bool) -> str:
+    if len(data) < cur_reg._QUOTE_REPLACE_MIN:
+        return "small"
+    kinds = cur_reg._quote_kinds(data, safe, plus)
+    return "table" if kinds is None else "replace" if kinds else "none"
+
+
+# ------------------------------------------------------------------ R1 — 임의 safe·plus·lower 조합(NB→수정)
+
+#: 검증 R0 의 형제 행렬(`sibling.py` VALUES × SAFES × plus × lower = 440, 기준 대비 66 차이 — safe 에 공백 + plus=True)
+SIBLING_VALUES = ["", " ", "a a", "a+a", "% +", "%25 + &#;", "   ", "A + % Z", "alpha", "x" * 100 + " " + "y" * 100]
+SIBLING_SAFES = ["", " ", "+", "%", " +", " %", "+%", " +%", "%+ ", "*", "!*'();/?:@&=+$,#"]
+
+
+def _sibling_values() -> list:
+    # 짧은 값은 표 조회(small)로 가므로 같은 값을 길게 늘려 바이트별 치환 분기도 지나게 한다(조건 성립은 아래 단정)
+    return SIBLING_VALUES + [v * (cur_reg._QUOTE_REPLACE_MIN // max(len(v), 1) + 1) for v in SIBLING_VALUES if v]
+
+
+def test_sibling_safe_matrix_matches_base(base):
+    """R1(NB→수정): `_quote('a a', safe=' ', plus=True)` 기준 'a+a' — quote_plus 는 safe 와 무관하게 공백을 `+` 로 바꾼다.
+    검증 R0 의 66 차이(safe 에 공백 + plus=True) 전부와 그 긴 꼴이 기준·urllib 와 같다."""
+    branches, rows = set(), 0
+    for value in _sibling_values():
+        for safe in SIBLING_SAFES:
+            for plus in (False, True):
+                for lower in (False, True):
+                    got = _call(cur_reg._quote, value, safe, plus, lower)
+                    assert got == _call(base[1]._quote, value, safe, plus, lower), (repr(value)[:80], safe, plus, lower)
+                    if not lower:
+                        assert got == ("ok", (quote_plus if plus else quote)(value, safe=safe)), (repr(value)[:80], safe)
+                    branches.add(_branch(value.encode(), safe, plus))
+                    rows += 1
+    assert rows == 2 * 440 - 4 * 11  # 짧은 행렬 440 + 빈 값을 뺀 긴 꼴 396
+    assert {"small", "replace"} <= branches, branches
+    assert cur_reg._quote("a a", " ", True) == "a+a" and cur_reg._quote("a a" * 400, " +", True) == "a+a" * 400
+
+
+def test_random_safe_args_match_base(base):
+    """임의 safe(ASCII 기호·영숫자 섞음, 비 ASCII 는 두 구현 모두 예외)·plus·lower 조합 — 기준과 같다."""
+    rnd = random.Random(71183)
+    pool = "".join(map(chr, range(0x20, 0x7F))) + "\t\n"
+    for _ in range(QUOTE_CASES):
+        safe = "".join(rnd.choice(pool) for _ in range(rnd.randint(0, 12)))
+        if rnd.random() < 0.02:
+            safe += "é"
+        plus, lower = rnd.random() < 0.5, rnd.random() < 0.5
+        value = _random_value(rnd) if rnd.random() < 0.5 else _random_text(rnd, [])
+        if rnd.random() < 0.3:
+            value = value * (cur_reg._QUOTE_REPLACE_MIN // max(len(value), 1) + 1)
+        got = _call(cur_reg._quote, value, safe, plus, lower)
+        assert got == _call(base[1]._quote, value, safe, plus, lower), (repr(value)[:120], safe, plus, lower)
+
+
+# ------------------------------------------------------------------ R1 — 불리한 입력의 분기(시간이 아니라 비용 추정 단정)
+
+def _adversarial(n: int, kinds: int, frac: float, mixed: bool, seed: int = 710183) -> str:
+    """검증 R0 의 불리한 입력 꼴: 바꿀 기호 `kinds` 종류가 전체의 frac, 나머지 `a`, mixed 면 섞는다."""
+    symbols = "!$'()*+,/:;=?@[]^"[:kinds]
+    m = int(n * frac)
+    chars = list((symbols * (m // kinds + 1))[:m] + "a" * (n - m))
+    if mixed:
+        random.Random(seed).shuffle(chars)
+    return "".join(chars)
+
+
+def test_adversarial_dense_mixed_goes_to_table():
+    """R1(B1): 1MiB·16종·≈50% 섞인 배치 — 종류마다 bytes.replace 하는 비용이 표 조회보다 커서(검증 실측 1.77배) 표 조회로."""
+    n = 1 << 20
+    changed = ("!$'()*+,/:;=?@[]" * ((n // 2 + 15) // 16))[: n // 2 - 1]
+    chars = list(changed + "a" * (n - len(changed)))
+    random.Random(710183).shuffle(chars)
+    data = "".join(chars).encode()
+    for safe, plus in cur_reg._ENCODERS:
+        if safe == "":
+            assert cur_reg._quote_kinds(data, safe, plus) is None, (safe, plus)
+    for kinds in (8, 12, 16, 17):
+        for frac in (0.5,):
+            assert cur_reg._quote_kinds(_adversarial(n, kinds, frac, True).encode(), "", False) is None, kinds
+
+
+def test_target_paths_stay_on_replace():
+    """목표 경로(WS-71 many_quote_ext·따옴표 주소)는 그대로 바이트별 치환 — 개선(0.48→0.19초)을 잃지 않는다."""
+    text = R2_PERF_CASES["many_quote_ext"](1 << 20).encode()
+    for safe, plus in cur_reg._ENCODERS:
+        assert cur_reg._quote_kinds(text, safe, plus), (safe, plus)
+    for kinds in (1, 2, 4, 8, 16, 17):
+        for frac in (0.01, 0.1):
+            data = _adversarial(1 << 16, kinds, frac, True).encode()
+            assert cur_reg._quote_kinds(data, "", False), (kinds, frac)
 
 
 def test_representations_match_base(base):
