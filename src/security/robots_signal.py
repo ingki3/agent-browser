@@ -20,7 +20,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from weakref import WeakKeyDictionary
 
 import httpx
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import BrowserContext, CDPSession, Page
 
 from contracts import ActionResult
 from security.egress import EgressGuard
@@ -285,6 +285,12 @@ class RobotsSignals:
         self._pending: dict[str, asyncio.Task[None]] = {}
         self._user_agents: WeakKeyDictionary[BrowserContext, asyncio.Future[Optional[str]]] = WeakKeyDictionary()
         self._ua_retry_at: WeakKeyDictionary[BrowserContext, float] = WeakKeyDictionary()
+        # WS-72 R1: 실패 창마다 예산 있는 재판독은 한 번만, 동시 호출자는 그 한 task 를 함께 기다린다(단일 비행).
+        # 키는 그 창을 연 실패 future — 창이 바뀌면(새 판독 실패) 새 재판독이 허용된다.
+        self._ua_rereads: WeakKeyDictionary[
+            BrowserContext, tuple[asyncio.Future[Optional[str]], asyncio.Task[Optional[str]]]] = WeakKeyDictionary()
+        # CDP 세션 detach 는 호출자 예산 밖에서 끝나도록 미뤄 두고, close() 가 모두 기다린다(누수 없음).
+        self._ua_cleanups: set[asyncio.Task[None]] = set()
 
     @property
     def pending(self) -> bool:
@@ -429,12 +435,31 @@ class RobotsSignals:
 
     async def refresh_user_agent(self, context: BrowserContext, timeout_s: float) -> Optional[str]:
         """UA 를 아직 모르면(판독 실패 공유 중이어도) timeout_s 안에서 한 번 더 읽는다 — 자기 예산이 있는 호출자용
-        (PDF 재요청, WS-72 #184). 성공하면 공유 캐시를 갱신해 navigate 경로도 회복한다. 페이지에서는 읽지 않는다."""
-        known = await self._context_user_agent(context)
-        if known is not None:
-            return known
+        (PDF 재요청, WS-72 #184). 성공하면 공유 캐시를 갱신해 navigate 경로도 회복한다. 페이지에서는 읽지 않는다.
+
+        WS-72 R1: 재판독은 컨텍스트·실패 창마다 최대 1회다. 진행 중이면 모든 호출자가 같은 task 를 기다리고
+        (호출자 취소는 공유 task 에 번지지 않는다), 이미 실패했으면 창이 끝날 때까지 다시 읽지 않는다.
+        반환은 detach 정리를 포함해 timeout_s 안이다."""
+        try:
+            async with asyncio.timeout(timeout_s):
+                known = await self._context_user_agent(context)
+                if known is not None:
+                    return known
+                window = self._user_agents.get(context)
+                if window is None:
+                    return None
+                entry = self._ua_rereads.get(context)
+                if entry is None or entry[0] is not window:
+                    entry = (window, asyncio.create_task(self._reread_user_agent(context, window, timeout_s)))
+                    self._ua_rereads[context] = entry
+                return await asyncio.shield(entry[1])
+        except TimeoutError:
+            return None
+
+    async def _reread_user_agent(self, context: BrowserContext, window: "asyncio.Future[Optional[str]]",
+                                 timeout_s: float) -> Optional[str]:
         user_agent = await self._read_user_agent(context, timeout_s)
-        if user_agent is not None:
+        if user_agent is not None and self._user_agents.get(context) is window:
             done: asyncio.Future[Optional[str]] = asyncio.get_running_loop().create_future()
             done.set_result(user_agent)
             self._user_agents[context] = done
@@ -472,10 +497,17 @@ class RobotsSignals:
             return None
         finally:
             if session is not None:
-                try:
-                    await asyncio.wait_for(session.detach(), timeout=UA_TIMEOUT_S)
-                except Exception:  # noqa: BLE001 - browser shutdown must not delay navigation
-                    pass
+                # WS-72 R1: 정리는 호출자 예산 밖으로 미루되 추적해 close() 에서 끝낸다.
+                cleanup = asyncio.create_task(self._detach(session))
+                self._ua_cleanups.add(cleanup)
+                cleanup.add_done_callback(self._ua_cleanups.discard)
+
+    @staticmethod
+    async def _detach(session: CDPSession) -> None:
+        try:
+            await asyncio.wait_for(session.detach(), timeout=UA_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - browser shutdown must not delay navigation
+            pass
 
     async def close(self) -> None:
         tasks = list(self._pending.values())
@@ -490,6 +522,15 @@ class RobotsSignals:
                 task.cancel()
         if ua_tasks:
             await asyncio.gather(*ua_tasks, return_exceptions=True)
+        rereads = [task for _, task in self._ua_rereads.values()]
+        for task in rereads:
+            if not task.done():
+                task.cancel()
+        if rereads:
+            await asyncio.gather(*rereads, return_exceptions=True)
+        self._ua_rereads.clear()
+        if self._ua_cleanups:
+            await asyncio.gather(*list(self._ua_cleanups), return_exceptions=True)
         self._user_agents.clear()
         self._ua_retry_at.clear()
 
