@@ -2731,6 +2731,67 @@
      "type": "object"
     },
     "name": "browser_youtube_search"
+   },
+   {
+    "description": "여러 단계를 한 번에(1~10, target={role,name,group?} — id·selector·좌표 없음). 단계마다 같은 관문, 위험·화면 변화·대상 불확실이면 멈추고 data.batch.reason + 현재 관찰",
+    "inputSchema": {
+     "properties": {
+      "observe": {
+       "description": "응답 관찰 인자(observe_page 와 같음)",
+       "type": "object"
+      },
+      "steps": {
+       "items": {
+        "properties": {
+         "action": {
+          "enum": [
+           "click",
+           "type_text",
+           "select_option",
+           "check_box",
+           "hover",
+           "press_key",
+           "scroll"
+          ]
+         },
+         "args": {
+          "type": "object"
+         },
+         "target": {
+          "properties": {
+           "group": {
+            "type": "string"
+           },
+           "name": {
+            "type": "string"
+           },
+           "role": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "role",
+           "name"
+          ],
+          "type": "object"
+         }
+        },
+        "required": [
+         "action"
+        ],
+        "type": "object"
+       },
+       "maxItems": 10,
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "steps"
+     ],
+     "type": "object"
+    },
+    "name": "browser_batch"
    }
   ],
   "build_server_tools": [
@@ -2879,6 +2940,67 @@
      "type": "object"
     },
     "name": "browser_youtube_search"
+   },
+   {
+    "description": "여러 단계를 한 번에(1~10, target={role,name,group?} — id·selector·좌표 없음). 단계마다 같은 관문, 위험·화면 변화·대상 불확실이면 멈추고 data.batch.reason + 현재 관찰",
+    "inputSchema": {
+     "properties": {
+      "observe": {
+       "description": "응답 관찰 인자(observe_page 와 같음)",
+       "type": "object"
+      },
+      "steps": {
+       "items": {
+        "properties": {
+         "action": {
+          "enum": [
+           "click",
+           "type_text",
+           "select_option",
+           "check_box",
+           "hover",
+           "press_key",
+           "scroll"
+          ]
+         },
+         "args": {
+          "type": "object"
+         },
+         "target": {
+          "properties": {
+           "group": {
+            "type": "string"
+           },
+           "name": {
+            "type": "string"
+           },
+           "role": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "role",
+           "name"
+          ],
+          "type": "object"
+         }
+        },
+        "required": [
+         "action"
+        ],
+        "type": "object"
+       },
+       "maxItems": 10,
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "steps"
+     ],
+     "type": "object"
+    },
+    "name": "browser_batch"
    }
   ],
   "build_server_tools_no_recipes": [
@@ -2978,6 +3100,67 @@
      "type": "object"
     },
     "name": "browser_youtube_search"
+   },
+   {
+    "description": "여러 단계를 한 번에(1~10, target={role,name,group?} — id·selector·좌표 없음). 단계마다 같은 관문, 위험·화면 변화·대상 불확실이면 멈추고 data.batch.reason + 현재 관찰",
+    "inputSchema": {
+     "properties": {
+      "observe": {
+       "description": "응답 관찰 인자(observe_page 와 같음)",
+       "type": "object"
+      },
+      "steps": {
+       "items": {
+        "properties": {
+         "action": {
+          "enum": [
+           "click",
+           "type_text",
+           "select_option",
+           "check_box",
+           "hover",
+           "press_key",
+           "scroll"
+          ]
+         },
+         "args": {
+          "type": "object"
+         },
+         "target": {
+          "properties": {
+           "group": {
+            "type": "string"
+           },
+           "name": {
+            "type": "string"
+           },
+           "role": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "role",
+           "name"
+          ],
+          "type": "object"
+         }
+        },
+        "required": [
+         "action"
+        ],
+        "type": "object"
+       },
+       "maxItems": 10,
+       "minItems": 1,
+       "type": "array"
+      }
+     },
+     "required": [
+      "steps"
+     ],
+     "type": "object"
+    },
+    "name": "browser_batch"
    }
   ],
   "list_tools": [

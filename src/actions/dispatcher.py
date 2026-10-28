@@ -1922,6 +1922,28 @@ class ActionDispatcher:
             return out
         return None
 
+    def late_dialogs(self) -> int:
+        """마지막 dispatch 뒤에 기록된 다이얼로그 수(다음 dispatch 입구에서 비워진다) — WS-73 묶음의 늦은 dialog 판정."""
+        return len(self._dialogs)
+
+    async def isolated_eval(self, expression: str) -> Any:
+        """최상위 문서의 **격리 world** 에서 식을 평가해 값을 돌려준다 (WS-73 묶음 실행의 표제·포커스 판정).
+
+        페이지 main world 의 prototype 바꿔치기(textContent getter 위조 등)가 닿지 않는다. 격리 world 를 못 만들거나
+        식이 예외를 내면 RuntimeError — 부르는 쪽(browser_batch)이 판정 불가로 멈춘다(fail-closed).
+        """
+        top = self._top_page()
+        cdp = await self._gate_cdp_for(top)
+
+        async def run(context_id: int) -> Any:
+            return await cdp.send("Runtime.evaluate", {
+                "expression": expression, "contextId": context_id, "returnByValue": True})
+
+        res = await self._in_gate_world(cdp, "", run)
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            raise RuntimeError("격리 world 평가 실패")
+        return (res.get("result") or {}).get("value")
+
     async def isolated_focus_target(self) -> Optional[Dict[str, Any]]:
         """키 입력을 받을 요소를 **격리 world** 에서 읽는다 (WS-67). 못 읽으면 None.
 
