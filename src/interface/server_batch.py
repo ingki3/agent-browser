@@ -253,6 +253,9 @@ class BatchMixin:
                 for i, step in enumerate(steps):
                     if time.monotonic() - started > TIME_LIMIT_S:
                         raise _Stop("time_limit", f"묶음 시간 상한 {int(TIME_LIMIT_S)}초를 넘어 {i}단계 전에 멈춤")
+                    if self._dispatcher is not disp:
+                        # 창 전환·작업 공간 복구로 디스패처가 바뀜 — 치유 끔 구간·관찰 근거가 그 디스패처 것이 아니다.
+                        raise _Stop("navigated", "브라우저 문맥(디스패처)이 바뀜 — 다시 관찰 필요")
                     if i > 0:
                         view = await self._batch_view(after_step=True)
                     t0 = time.perf_counter()
@@ -289,7 +292,7 @@ class BatchMixin:
             data.update(await self._batch_observation(observe_args))
             data["next"] = NEXT
             return {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}", "data": data}
-        data = {"batch": {"ran": total, "of": total, "steps": steps_out,
+        data = {"batch": {"ran": total, "of": total, "stopped_at": None, "reason": None, "detail": None, "steps": steps_out,
                           "ms": round((time.monotonic() - started) * 1000, 1)}}
         data.update(await self._batch_observation(observe_args))
         data["next"] = NEXT
