@@ -158,6 +158,16 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
   IPI 신호·다이얼로그(앞 단계 뒤 늦게 뜬 것 포함), 주 프레임 새 문서(`nav_committed`·epoch 증가 — 주소만 바뀌는
   fragment·pushState 는 계속), 새 탭, 대상 해석 실패(`target_not_found`·`target_ambiguous`·`target_unverifiable`·
   `target_new`·`group_mismatch`), 시간 상한 60초(단계 사이에서만 — 진행 중 단계는 취소하지 않음).
+- **묶음 수명 이벤트 구독(WS-73 R1)**: 기준 스냅샷 전에 주 프레임 새 문서 커밋(WS-69 와 같은 내부 'navigated' 중
+  newDocument 계수)·새 탭/팝업(BrowserContext 'page')·다이얼로그(주 페이지 'dialog')를 걸어 묶음 끝까지 둡니다. 매 단계
+  실행 직전(해석 관찰 뒤, call_tool 바로 앞 동기 지점)과 직후에 계수가 시작값과 다르면 `navigated`/`new_tab`/`dialog` 로
+  멈춥니다 — 해석 관찰과 겹친 변화(검증 B1·B2: setTimeout 이동·팝업)도, 단계가 정상적으로 일으킨 변화도 멈춤입니다. 직후
+  확인에서 걸린 변화는 그 단계 전인지 구분할 수 없어 보수적으로 멈추고 이미 실행된 단계 효과는 `step_result` 로 보고합니다.
+  남는 창(직전 확인~실제 클릭 디스패치)은 단건 호출과 같은 수준입니다(시험 `test_residual_window_same_as_single`). 구독을
+  걸 수 없으면(내부 API 모양이 다르면) 묶음 자체를 거부합니다(`E_FEATURE_NOT_IMPLEMENTED`, 아무것도 실행하지 않음).
+- **detail 은 고정 어휘**: `data.batch.detail` 은 멈춤 사유별 고정 문장(+ `action_failed` 면 오류 코드 이름)뿐입니다.
+  페이지·브라우저·native 오류 문자열은 싣지 않습니다(검증 B3: 원문을 먼저 잘라 등록 비밀 접두가 남던 결함). 원 문구는
+  이미 정제된 `data.step_result` 봉투에만 있고, 응답 관찰 실패도 `observation_error` 에 오류 코드 이름만 싣습니다.
 - **응답** `data.batch = {ran, of, stopped_at, reason, detail, steps:[{action, ok, ms, recipe_saved?}]}`, 멈춘 단계의 원
   봉투 `data.step_result`, 현재 관찰(`observe` 인자 — `prune_top_n`·`force_full_tree` 만, 기본은 observe_page 기본값 —
   일반 관찰 경로라 같은 신호·같은 크기 상한), `data.next`. **묶음 전에 받은 `@eN` id 는 쓰지 마십시오** — 응답 관찰의 id 를
@@ -172,7 +182,7 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
 - **실측(하나투어 실제 캡처 + 재렌더 스크립트, 로컬)**: 단건 최소 경로 5호출(observe→click→click→observe→click) 대비 묶음
   경로 3호출(observe→batch→click). 다만 실제 캡처(요소 777)는 기본 응답 상한(20,000자) 안의 어떤 관찰에도 날짜와 확정 단추가
   실리지 않아(확정 단추 점수순 531위) 이 비교는 `--max-result-chars 200000` + `prune_top_n 800` 에서 했습니다(기존 관찰 한계).
-  시험 `tests/interface/test_ws73_batch.py`·`test_ws73_batch_units.py`.
+  시험 `tests/interface/test_ws73_batch.py`·`test_ws73_batch_units.py`·`test_ws73_r1_watch.py`.
 
 ## 반복 묶음 대상 구분 (`data.repeated`, WS-62)
 

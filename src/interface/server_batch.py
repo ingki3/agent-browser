@@ -15,10 +15,17 @@
   한계: 같은 위치(css_path)에 같은 이름으로 다시 그려진 다른 요소는 같은 노드로 본다(단건 호출의 재렌더 처리와 같은 수준).
 * 위험·변화·불확실이 보이면 그 자리에서 멈춘다(끌 수 없음, 남은 단계 실행 0, 되돌리지 않음) — 멈춘 단계 봉투
   `data.step_result` + 현재 관찰 + `data.next`.
+* (WS-73 R1) 표본 확인이 아니라 **묶음 수명 전체 이벤트 구독**: 기준 스냅샷 전에 주 프레임 새 문서 커밋(WS-69 와 같은 내부
+  'navigated' 계수)·BrowserContext 'page'(새 탭/팝업)·주 페이지 'dialog' 를 걸고 묶음 끝까지 둔다. 매 단계 실행 직전(해석
+  관찰 뒤, call_tool 바로 앞 동기 지점)과 직후에 계수가 시작값과 다르면 멈춘다 — 단계가 정상적으로 일으킨 변화도 멈춤. 구독을
+  걸 수 없으면 묶음 자체를 거부한다(fail-closed). 해석 관찰 결과로 기준을 다시 잡지 않는다.
+* (WS-73 R1) `data.batch.detail` 은 고정 어휘(멈춤 사유별 고정 문장 + 오류 코드 이름)만 — 페이지·브라우저·native 오류 문자열은
+  싣지 않는다(원 문구는 이미 정제된 `data.step_result` 봉투에만).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import unicodedata
@@ -46,6 +53,47 @@ REASONS = ("action_failed", "approval_required", "manual_site", "human_control",
            "egress", "injection_suspected", "dialog", "navigated", "new_tab", "target_not_found", "target_ambiguous",
            "target_unverifiable", "target_new", "group_mismatch", "focus_failed", "time_limit")
 
+#: 멈춤 사유별 고정 문장(detail) — 페이지·브라우저 문자열을 넣지 않는다(WS-73 R1 B3). action_failed 만 오류 코드 이름을 붙인다.
+DETAILS = {
+    "action_failed": "단계 실패 — 원 오류는 data.step_result",
+    "approval_required": "사람 승인이 필요한(또는 승인이 붙은) 단계 — 묶음은 승인을 대신하거나 승인 뒤 계속 가지 않음",
+    "manual_site": "직접 조작할 사이트(사람이 직접 해야 함 — 묶음은 대신하지 않음)",
+    "human_control": "사람이 조작권을 가짐",
+    "handoff": "사람 인계 안내가 붙음",
+    "challenge": "캡차/차단 화면",
+    "robots": "robots.txt 금지 신호",
+    "egress": "외부 요청 차단(egress)",
+    "injection_suspected": "페이지 글자에 지시처럼 보이는 문구(IPI 신호)",
+    "dialog": "다이얼로그가 뜸(묶음 중)",
+    "navigated": "주 프레임 새 문서 또는 브라우저 문맥 변경(이전 관찰 무효) — 다시 관찰 필요",
+    "new_tab": "새 탭/팝업이 열림(묶음 중)",
+    "target_not_found": "대상(role·이름 정확 일치)이 화면에 없음",
+    "target_ambiguous": "대상 후보가 여럿(group 으로 좁히세요)",
+    "target_unverifiable": "대상을 확인할 수 없음(해석 관찰 실패·shadow DOM·묶음 표제·실행 직전 확인 불가)",
+    "target_new": "대상이 묶음 시작 때 없던 노드(앞 단계로 새로 생김)",
+    "group_mismatch": "대상이 지정한 group 에 없음",
+    "focus_failed": "키 입력 대상에 포커스를 확인하지 못함",
+    "time_limit": f"묶음 시간 상한 {int(TIME_LIMIT_S)}초를 넘어 다음 단계 전에 멈춤",
+}
+assert set(DETAILS) == set(REASONS)
+_CODES = frozenset(c.value for c in ErrorCode)
+
+
+def _detail(reason: str, code: Optional[str]) -> str:
+    """고정 어휘 detail. code 는 ErrorCode 값일 때만 붙인다(그 밖의 문자열은 버린다)."""
+    text = DETAILS[reason]
+    return f"{text} ({code})" if code in _CODES else text
+
+
+def fixed_details() -> frozenset:
+    """detail 이 가질 수 있는 값 전체(시험·검증용)."""
+    out = set(DETAILS.values())
+    out.update(f"{t} ({c})" for t in DETAILS.values() for c in _CODES)
+    return frozenset(out)
+
+
+REFUSED_NO_WATCH = "묶음 실행 불가: 문서 커밋·새 탭·다이얼로그 감시를 걸 수 없음(fail-closed) — 단건 호출로 진행하세요."
+
 NEXT = ("앞 단계 효과는 이미 일어났습니다(되돌리지 않음). 묶음 전에 받은 @eN id 는 무효 — 이 응답의 관찰 id 를 쓰고, "
         "멈췄다면 그 지점부터 평소대로 관찰·판단해 이어 가세요.")
 
@@ -72,12 +120,100 @@ def norm(text: Any) -> str:
 
 
 class _Stop(Exception):
-    def __init__(self, reason: str, detail: str, step_result: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, reason: str, code: Optional[str] = None, step_result: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(reason)
         assert reason in REASONS
         self.reason = reason
-        self.detail = detail
+        self.code = code
         self.step_result = step_result
+
+
+# ---------------------------------------------------------------------------- 묶음 수명 이벤트 구독 (WS-73 R1)
+
+
+def _context_of(page: Any) -> Any:
+    """page 의 BrowserContext (시험이 '없음' 으로 바꿔 끼운다)."""
+    return getattr(page, "context", None)
+
+
+class _Watch:
+    """묶음 수명 동안의 계수: 주 프레임 새 문서 커밋·새 탭/팝업·다이얼로그. changed() 는 동기(await 없음)."""
+
+    def __init__(self, disp: Any, page: Any, commits: Dict[str, Any], context: Any) -> None:
+        self.disp, self.page, self.commits, self.context = disp, page, commits, context
+        self.tabs = 0
+        self.dialogs = 0
+        self._closers: List[Any] = []
+
+    def _on_page(self, _page: Any) -> None:
+        self.tabs += 1
+
+    def _on_dialog(self, _dialog: Any) -> None:
+        self.dialogs += 1
+
+    def changed(self) -> Optional[str]:
+        """시작값과 다르면 멈춤 사유(우선순위 navigated > new_tab > dialog). 셀 수 없게 됐으면 navigated(보수)."""
+        count = self.commits.get("count")
+        if not isinstance(count, int) or count != 0:
+            return "navigated"
+        if self.tabs:
+            return "new_tab"
+        if self.dialogs:
+            return "dialog"
+        return None
+
+    def close(self) -> None:
+        for close in reversed(self._closers):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - 이미 닫힌 페이지·문맥
+                pass
+        self._closers = []
+
+
+def start_watch(disp: Any, page: Any) -> Optional[_Watch]:
+    """기준 스냅샷 전에 구독을 건다. 하나라도 걸 수 없으면 None(부르는 쪽이 묶음을 거부).
+
+    * 문서 커밋: 디스패처의 WS-69 계수기(_watch_document_commits — 주 프레임 내부 'navigated' 중 newDocument 있고 error
+      없는 것). pushState·hash 는 newDocument 가 없어 세지 않는다.
+    * 다이얼로그: 디스패처의 처리 리스너가 이 페이지에 먼저 걸려 있어야 한다(리스너가 하나라도 있으면 Playwright 가
+      자동으로 닫지 않으므로, 계수 리스너만 남으면 다이얼로그가 멈춘다).
+    """
+    watch_commits = getattr(disp, "_watch_document_commits", None)
+    unwatch_commits = getattr(disp, "_unwatch_document_commits", None)
+    install = getattr(disp, "_install_dialog_listener", None)
+    if not (callable(watch_commits) and callable(unwatch_commits) and callable(install)):
+        return None
+    try:
+        install()
+        dialog_ready = any(p is page for p in (getattr(disp, "_dialog_pages", None) or []))
+    except Exception:  # noqa: BLE001
+        dialog_ready = False
+    context = _context_of(page)
+    if not dialog_ready or context is None or not callable(getattr(context, "on", None)) \
+            or not callable(getattr(page, "on", None)):
+        return None
+    try:
+        commits = watch_commits(page)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(commits, dict) or commits.get("count") != 0:
+        try:
+            unwatch_commits(commits)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    w = _Watch(disp, page, commits, context)
+    w._closers.append(lambda: unwatch_commits(commits))
+    try:
+        context.on("page", w._on_page)
+        w._closers.append(lambda: context.remove_listener("page", w._on_page))
+        page.on("dialog", w._on_dialog)
+        w._closers.append(lambda: page.remove_listener("dialog", w._on_dialog))
+    except Exception:  # noqa: BLE001
+        w.close()
+        return None
+    return w
 
 
 class BatchInputError(ValueError):
@@ -244,59 +380,93 @@ class BatchMixin:
         scope = getattr(disp, "heal_disabled_scope", None)
         import contextlib
 
-        heal_off = scope() if callable(scope) else contextlib.nullcontext()
+        # 묶음 수명 이벤트 구독 — 기준 스냅샷 **전**에 건다(WS-73 R1). 걸 수 없으면 아무것도 실행하지 않고 거부.
+        watch = start_watch(disp, disp.ctx.page)
+        if watch is None:
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": REFUSED_NO_WATCH}
         try:
-            with heal_off:
-                # 기준 스냅샷: 1단계 전에(에이전트가 넘긴 id 가 없으므로 @eN 재배정 문제 없음). 1단계 해석에도 쓴다.
-                view = await self._batch_view()
-                baseline = await self._batch_baseline(view, steps)
-                for i, step in enumerate(steps):
-                    if time.monotonic() - started > TIME_LIMIT_S:
-                        raise _Stop("time_limit", f"묶음 시간 상한 {int(TIME_LIMIT_S)}초를 넘어 {i}단계 전에 멈춤")
-                    if self._dispatcher is not disp:
-                        # 창 전환·작업 공간 복구로 디스패처가 바뀜 — 치유 끔 구간·관찰 근거가 그 디스패처 것이 아니다.
-                        raise _Stop("navigated", "브라우저 문맥(디스패처)이 바뀜 — 다시 관찰 필요")
-                    if i > 0:
-                        view = await self._batch_view(after_step=True)
-                    t0 = time.perf_counter()
-                    call_args = dict(step["args"])
-                    if step["target"] is not None:
-                        eid = await self._batch_resolve(view, step["target"], baseline if i > 0 else None, i)
-                        if step["action"] == "scroll":
-                            call_args["target_element_id"] = eid
-                        else:
-                            call_args.update(element_id=eid, epoch=view["epoch"])
-                        if step["action"] == "press_key":
-                            await self._batch_focus(eid)
-                    epoch_before = self._batch_epoch()
-                    result = await self.call_tool(tool_name(ActionType(step["action"])), call_args)
-                    ran = i + 1
-                    entry: Dict[str, Any] = {"action": step["action"], "ok": bool(result.success),
-                                             "ms": round((time.perf_counter() - t0) * 1000, 1)}
-                    saved = result.data.pop("recipe_saved", None) if isinstance(result.data, dict) else None
-                    if saved is not None:
-                        entry["recipe_saved"] = saved
-                    steps_out.append(entry)
-                    stop = self._batch_judge(result, epoch_before)
-                    if stop is not None:
-                        raise _Stop(stop[0], stop[1], envelope_dict(result))
-        except _Stop as stop:
-            from recipes.store import clean_text
-
-            info = {"ran": ran, "of": total, "stopped_at": i, "reason": stop.reason,
-                    "detail": clean_text(stop.detail, 200), "steps": steps_out,
-                    "ms": round((time.monotonic() - started) * 1000, 1)}
-            data: Dict[str, Any] = {"batch": info}
-            if stop.step_result is not None:
-                data["step_result"] = stop.step_result
+            heal_off = scope() if callable(scope) else contextlib.nullcontext()
+            stop: Any = None  # 멈춤(_Stop) — 루프 안 같은 이름은 _batch_judge 판정(멈추면 바로 raise)
+            try:
+                with heal_off:
+                    # 기준 스냅샷: 1단계 전에(에이전트가 넘긴 id 가 없으므로 @eN 재배정 문제 없음). 1단계 해석에도 쓴다.
+                    view = await self._batch_view(watch)
+                    baseline = await self._batch_baseline(view, steps)
+                    for i, step in enumerate(steps):
+                        if time.monotonic() - started > TIME_LIMIT_S:
+                            raise _Stop("time_limit")
+                        if self._dispatcher is not disp:
+                            # 창 전환·작업 공간 복구로 디스패처가 바뀜 — 치유 끔 구간·관찰 근거가 그 디스패처 것이 아니다.
+                            raise _Stop("navigated")
+                        if i > 0:
+                            view = await self._batch_view(watch, after_step=True)
+                        t0 = time.perf_counter()
+                        call_args = dict(step["args"])
+                        if step["target"] is not None:
+                            eid = await self._batch_resolve(view, step["target"], baseline if i > 0 else None, i)
+                            if step["action"] == "scroll":
+                                call_args["target_element_id"] = eid
+                            else:
+                                call_args.update(element_id=eid, epoch=view["epoch"])
+                            if step["action"] == "press_key":
+                                await self._batch_focus(eid)
+                        epoch_before = self._batch_epoch()
+                        # 실행 직전 확인: 해석 관찰 이후 모든 await 뒤, call_tool 바로 앞 동기 지점(이 사이에 await 없음).
+                        changed = watch.changed()
+                        if changed is not None or self._dispatcher is not disp:
+                            raise _Stop(changed or "navigated")
+                        result = await self.call_tool(tool_name(ActionType(step["action"])), call_args)
+                        ran = i + 1
+                        entry: Dict[str, Any] = {"action": step["action"], "ok": bool(result.success),
+                                                 "ms": round((time.perf_counter() - t0) * 1000, 1)}
+                        saved = result.data.pop("recipe_saved", None) if isinstance(result.data, dict) else None
+                        if saved is not None:
+                            entry["recipe_saved"] = saved
+                        steps_out.append(entry)
+                        stop = self._batch_judge(result, epoch_before)
+                        if stop is not None:
+                            raise _Stop(stop[0], stop[1], envelope_dict(result))
+                        # 실행 직후 확인: 이 단계 중(또는 직전 확인 뒤) 계수가 바뀌었으면 그 단계 '전'인지 구분할 수 없으니
+                        # 보수적으로 멈춘다 — 이미 실행된 단계 효과는 step_result 로 보고.
+                        changed = watch.changed()
+                        if changed is not None:
+                            raise _Stop(changed, None, envelope_dict(result))
+            except _Stop as caught:
+                stop = caught
+                changed = watch.changed()
+                if stop.step_result is None and changed is not None and stop.reason not in ("navigated", "new_tab", "dialog"):
+                    # 해석 도중 실패(문서 교체로 관찰·표제 계산이 깨짐 등)의 실제 원인은 묶음 중 변화다.
+                    stop = _Stop(changed)
+            except Exception:
+                # 문서 교체 중이면 'context destroyed' 예외가 내부 'navigated' 이벤트보다 먼저 올 수 있다(실측) — 이벤트가
+                # 도착할 짧은 틈(최대 0.5초)만 기다려 원인을 가린다. 그래도 변화가 없으면 원래 예외 그대로.
+                changed = watch.changed()
+                for _ in range(10):
+                    if changed is not None:
+                        break
+                    await asyncio.sleep(0.05)
+                    changed = watch.changed()
+                if changed is None:
+                    raise
+                stop = _Stop(changed)  # 원인은 묶음 중 변화: 그 사유로 멈춘 것으로 보고
+            if stop is not None:
+                info = {"ran": ran, "of": total, "stopped_at": i, "reason": stop.reason,
+                        "detail": _detail(stop.reason, stop.code), "steps": steps_out,
+                        "ms": round((time.monotonic() - started) * 1000, 1)}
+                data: Dict[str, Any] = {"batch": info}
+                if stop.step_result is not None:
+                    data["step_result"] = stop.step_result
+                data.update(await self._batch_observation(observe_args))
+                data["next"] = NEXT
+                return {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}", "data": data}
+            data = {"batch": {"ran": total, "of": total, "stopped_at": None, "reason": None, "detail": None, "steps": steps_out,
+                              "ms": round((time.monotonic() - started) * 1000, 1)}}
             data.update(await self._batch_observation(observe_args))
             data["next"] = NEXT
-            return {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}", "data": data}
-        data = {"batch": {"ran": total, "of": total, "stopped_at": None, "reason": None, "detail": None, "steps": steps_out,
-                          "ms": round((time.monotonic() - started) * 1000, 1)}}
-        data.update(await self._batch_observation(observe_args))
-        data["next"] = NEXT
-        return {"success": True, "data": data}
+            return {"success": True, "data": data}
+        finally:
+            watch.close()  # 어떤 출구(취소 포함)에서도 구독을 뗀다
 
     def _batch_epoch(self) -> int:
         engine = getattr(getattr(self._dispatcher, "ctx", None), "engine", None)
@@ -304,7 +474,7 @@ class BatchMixin:
 
     # -- 관찰 -----------------------------------------------------------------
 
-    async def _batch_view(self, after_step: bool = False) -> Dict[str, Any]:
+    async def _batch_view(self, watch: _Watch, after_step: bool = False) -> Dict[str, Any]:
         """해석 관찰: 일반 observe_page 경로(같은 신호)로 전체 후보를 관찰하고, 자르기 전 요소 목록을 받는다.
 
         신호(injection_suspected·robots·challenge·handoff·dialogs)가 붙었으면 멈춘다. 반환: {epoch, elements}.
@@ -312,7 +482,7 @@ class BatchMixin:
         late = getattr(self._dispatcher, "late_dialogs", None)
         if after_step and callable(late) and late():
             # 앞 단계가 끝난 뒤(다음 dispatch 전) 뜬 다이얼로그 — 다음 dispatch 가 기록을 비우기 전에 본다.
-            raise _Stop("dialog", "앞 단계 뒤 다이얼로그가 뜸")
+            raise _Stop("dialog")
         sink: Dict[str, Any] = {}
         token = _INTERNAL.set(sink)
         try:
@@ -321,15 +491,18 @@ class BatchMixin:
             _INTERNAL.reset(token)
         # 해석용 관찰(전체 후보)의 봉투는 step_result 로 싣지 않는다 — 응답의 현재 관찰이 같은 경로로 같은 신호를 싣고,
         # 전체 후보 봉투까지 실으면 응답이 크기 상한의 두 배가 된다. 실패면 그 오류 코드만 detail 에.
+        changed = watch.changed()
+        if changed is not None:
+            raise _Stop(changed)  # 해석 관찰과 겹친 문서·탭·다이얼로그 변화 — 이 관찰로 기준을 다시 잡지 않는다
         if not res.success:
             stop = self._batch_judge(res, self._batch_epoch())
-            raise _Stop(stop[0] if stop else "target_unverifiable", "대상 해석용 관찰 실패 — " + (stop[1] if stop else ""))
+            raise _Stop(stop[0] if stop else "target_unverifiable", stop[1] if stop else None)
         signal = self._batch_signal(res.data or {})
         if signal is not None:
-            raise _Stop(signal[0], signal[1] + "(대상 해석용 관찰)")
+            raise _Stop(signal[0])
         elements = sink.get("elements")
         if not isinstance(elements, list):
-            raise _Stop("target_unverifiable", "전체 후보를 셀 수 없음")
+            raise _Stop("target_unverifiable")
         return {"epoch": int(res.snapshot_epoch), "elements": elements}
 
     async def _batch_observation(self, observe_args: Dict[str, Any]) -> Dict[str, Any]:
@@ -351,39 +524,41 @@ class BatchMixin:
             if data.get(k) is not None:
                 out[k] = data[k]
         if not res.success:
-            out["observation_error"] = clean_text(res.error_message or "", 200)
+            # 원 오류 문구는 싣지 않는다(WS-73 R1 B3 — 자른 뒤 가림이면 비밀 접두가 남는다). 오류 코드 이름만.
+            code = getattr(getattr(res, "error_code", None), "value", None)
+            out["observation_error"] = code if code in _CODES else "observe_failed"
         return out
 
     # -- 판정 -----------------------------------------------------------------
 
     @staticmethod
-    def _batch_signal(data: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-        """관찰·단계 결과의 멈춤 신호. 없으면 None."""
+    def _batch_signal(data: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+        """관찰·단계 결과의 멈춤 신호 (reason, None). 없으면 None. 문장은 DETAILS 고정 어휘."""
         from security.manual_sites import is_manual_handoff
 
         if "approval" in data or data.get("requires_confirmation"):
-            return "approval_required", "사람 승인이 붙은 단계(묶음은 승인 뒤 계속 가지 않음)"
+            return "approval_required", None
         if is_manual_handoff(data):
-            return "manual_site", "직접 조작할 사이트(사람이 직접 해야 함)"
+            return "manual_site", None
         if data.get("control"):
-            return "human_control", "사람이 조작권을 가짐"
+            return "human_control", None
         if data.get("challenge") is not None:
-            return "challenge", "캡차/차단 화면"
+            return "challenge", None
         if data.get("handoff") is not None:
-            return "handoff", "사람 인계 안내가 붙음"
+            return "handoff", None
         robots = data.get("robots")
         if isinstance(robots, dict) and (robots.get("disallowed") or robots.get("ai_agents_disallowed")):
-            return "robots", "robots.txt 금지 신호"
+            return "robots", None
         if data.get("egress"):
-            return "egress", "외부 요청 차단(egress)"
+            return "egress", None
         if data.get("injection_suspected") is not None:
-            return "injection_suspected", "페이지 글자에 지시처럼 보이는 문구(IPI 신호)"
+            return "injection_suspected", None
         if data.get("dialogs"):
-            return "dialog", "다이얼로그가 뜸"
+            return "dialog", None
         return None
 
-    def _batch_judge(self, result: Any, epoch_before: int) -> Optional[Tuple[str, str]]:
-        """단계 결과 판정. 멈춰야 하면 (reason, detail)."""
+    def _batch_judge(self, result: Any, epoch_before: int) -> Optional[Tuple[str, Optional[str]]]:
+        """단계 결과 판정. 멈춰야 하면 (reason, 오류 코드 이름 또는 None) — 원 오류 문구는 담지 않는다(WS-73 R1 B3)."""
         data = result.data if isinstance(getattr(result, "data", None), dict) else {}
         if not result.success:
             from security.manual_sites import is_manual_handoff
@@ -391,22 +566,22 @@ class BatchMixin:
             code = getattr(getattr(result, "error_code", None), "value", "") or ""
             # 레시피 재생(recipes.replay)과 같은 순서: 직접 조작할 사이트 → 사람 조작권 → 승인 → 그 밖의 신호 → 실패.
             if is_manual_handoff(data):
-                return "manual_site", "직접 조작할 사이트(사람이 직접 해야 함 — 묶음은 대신하지 않음)"
+                return "manual_site", None
             if data.get("control"):
-                return "human_control", "사람이 조작권을 가짐"
+                return "human_control", None
             if code == ErrorCode.HITL_UNATTENDED_BLOCKED.value or data.get("requires_confirmation") or "approval" in data:
-                return "approval_required", "사람 승인이 필요한 단계(묶음은 승인을 대신하지 않음)"
+                return "approval_required", None
             signal = self._batch_signal(data)
             if signal is not None:
                 return signal
-            return "action_failed", f"{code}: {result.error_message or ''}"
+            return "action_failed", code or None
         signal = self._batch_signal(data)
         if signal is not None:
             return signal
         if data.get("nav_committed") is True or self._batch_epoch() > epoch_before:
-            return "navigated", "주 프레임 새 문서(이전 관찰 무효)"
+            return "navigated", None
         if data.get("opened_tab_ids"):
-            return "new_tab", "새 탭/팝업이 열림"
+            return "new_tab", None
         return None
 
     # -- 대상 해석 ---------------------------------------------------------------
@@ -421,7 +596,7 @@ class BatchMixin:
                 continue
             h = engine.get_handle(str(el.get("element_id") or ""))
             if h is None or h.epoch != view["epoch"]:
-                raise _Stop("target_unverifiable", "후보 핸들이 관찰과 맞지 않음")
+                raise _Stop("target_unverifiable")
             out.append((str(el["element_id"]), h))
         return out
 
@@ -430,11 +605,11 @@ class BatchMixin:
         targets = [{"i": k, "css": h.css_path, "name": h.name, "role": h.role} for k, h in enumerate(handles)]
         evaluate = getattr(self._dispatcher, "isolated_eval", None)
         if not callable(evaluate):
-            raise _Stop("target_unverifiable", "격리 world 판정 불가")
+            raise _Stop("target_unverifiable")
         try:
             raw = await evaluate(_heading_expr(targets))
         except Exception:  # noqa: BLE001 - 판정 불가 = 멈춤
-            raise _Stop("target_unverifiable", "묶음 표제 계산 실패(격리 world)") from None
+            raise _Stop("target_unverifiable") from None
         return _headings_from_sets(raw, len(handles))
 
     async def _batch_fingerprints(self, view: Dict[str, Any], target: Dict[str, Any]) -> List[Tuple[str, Any, Tuple]]:
@@ -471,9 +646,9 @@ class BatchMixin:
         """대상 해석 → 실행할 element_id(이 관찰의 v1.16.0 핀이 붙은 핸들). 정확히 1개가 아니면 멈춘다."""
         cands = await self._batch_fingerprints(view, target)
         if not cands:
-            raise _Stop("target_not_found", f"{i}단계 대상(role·이름 정확 일치)이 화면에 없음")
+            raise _Stop("target_not_found")
         if any(h.is_shadow for _, h, _ in cands):
-            raise _Stop("target_unverifiable", f"{i}단계 대상 후보가 shadow DOM 안(묶음 확인 불가)")
+            raise _Stop("target_unverifiable")
         group = target.get("group")
         if group is not None:
             want = norm(group)
@@ -481,19 +656,19 @@ class BatchMixin:
             hit = [c for c in cands if want in c[2][3]]
             if not hit:
                 if unknown:
-                    raise _Stop("target_unverifiable", f"{i}단계 대상의 묶음 표제를 정할 수 없음")
-                raise _Stop("group_mismatch", f"{i}단계 대상이 지정한 group 에 없음")
+                    raise _Stop("target_unverifiable")
+                raise _Stop("group_mismatch")
             cands = hit
         if len(cands) != 1:
-            raise _Stop("target_ambiguous", f"{i}단계 대상 후보 {len(cands)}개(group 으로 좁히세요)")
+            raise _Stop("target_ambiguous")
         eid, handle, fp = cands[0]
         same_name = len(self._batch_matches(view, target))
         if same_name >= 2 and not getattr(handle, "group_path", None):
-            raise _Stop("target_unverifiable", f"{i}단계 같은 이름 후보 {same_name}개인데 실행 직전 묶음 확인 불가")
+            raise _Stop("target_unverifiable")
         if baseline is not None:
             key = json.dumps(target, sort_keys=True, ensure_ascii=False)
             if fp not in baseline.get(key, set()):
-                raise _Stop("target_new", f"{i}단계 대상이 묶음 시작 때 없던 노드(앞 단계로 새로 생김)")
+                raise _Stop("target_new")
         return eid
 
     async def _batch_focus(self, eid: str) -> None:
@@ -508,4 +683,4 @@ class BatchMixin:
         except Exception:  # noqa: BLE001 - 포커스 판정 불가 = 멈춤
             ok = False
         if ok is not True:
-            raise _Stop("focus_failed", "키 입력 대상에 포커스를 확인하지 못함")
+            raise _Stop("focus_failed")

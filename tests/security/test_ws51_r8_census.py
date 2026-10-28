@@ -93,6 +93,8 @@ ATTRS = {
     ("detail", "detail"): (FREE, "실패 세부 문장"),
     ("error_message", "name"): (FREE, "오류 문장(알 수 없는 도구 이름)"),
     ("error_message", "reason"): (FREE, "오류 문장(f-string)"),
+    ("observation_error", "value"): (FREE, "WS-73 R1 interface/server_batch.py 응답 관찰 실패 — ErrorCode 값(원 오류 문구 "
+                                          "아님)"),
     ("hint", "url"): (FREE, "안내 문장 안 주소(f-string — 문장 규칙)"),
     ("host", "host"): (FREE, "data.egress.host — 차단된 외부 주소의 호스트(주소 유래)"),
     ("host", "hostname"): (FREE, "data.egress.host — 차단된 외부 주소의 호스트(주소 유래)"),

@@ -68,6 +68,7 @@ TABLES = {
                                                          "어휘는 test_ws69 test_kinds_are_control_vocabulary)"),
     ("actions/nav_failure.py", "_EXACT_KINDS"): (NOT_OUT, "WS-69 net::ERR_* → kind 조회표(값은 data.nav_failure.kind)"),
     ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
+    ("interface/server_batch.py", "DETAILS"): (FREE, "WS-73 R1 data.batch.detail 고정 문장(키는 server_batch.REASONS 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
@@ -89,6 +90,8 @@ KEYS = {
     # WS-73 browser_batch: 단계 args 를 계약 모델로 미리 검증할 때 넣는 자리표시 id(응답에 싣지 않음)
     ("element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
     ("target_element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
+    ("observation_error", "interface/server_batch.py"): (FREE, "WS-73 R1 응답 관찰 실패 — ErrorCode 값 또는 observe_failed "
+                                                             "(원 오류 문구는 싣지 않음)"),
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
