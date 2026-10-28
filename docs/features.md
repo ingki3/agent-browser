@@ -1,4 +1,4 @@
-# 기능 — PDF 읽기, YouTube 영상 검색, 동작 캐시, 도착 페이지 기억, 반복 묶음 대상 구분
+# 기능 — PDF 읽기, YouTube 영상 검색, 동작 캐시, 묶음 실행, 도착 페이지 기억, 반복 묶음 대상 구분
 
 [← 문서 목차](README.md)
 
@@ -123,6 +123,56 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
 - **uses** — 저장 주소로 `navigate` 해 같은 주소(정규화 — 스킴·호스트 소문자, 해시 포함)에 닿은 뒤 **첫** `observe_page` 가 성공하면 +1(navigate 1회당 최대 1). 리다이렉트(끝 슬래시·https 승격·로그인 페이지 포함)·실패·challenge·egress 차단·HTTP 4xx/5xx·레시피 재생 중 이동은 0. 헤드리스 재시도는 최종 결과 기준입니다.
 - **작업 공간별**(WS-57) — 항목에 저장한 작업 공간을 기록하고 후보·목록·삭제는 같은 작업 공간 항목만 봅니다(다른 작업 공간 항목은 개수도 알리지 않음). `serve --attach` 로 붙은 연결은 첫 serve 프로세스 안의 같은 서버 객체에서 돌므로 파일 기록자는 하나입니다.
 - **저장 위치** — `--profile NAME` 이면 `~/.agent-browser/profiles/serve-NAME/saved_pages.json`(0600, 무작위 임시 파일 `O_EXCL|O_NOFOLLOW` + rename, 변경 즉시 쓰기). 없으면 메모리만. 깨진 파일은 `saved_pages.json.corrupt-…` 로 보존하고 빈 저장소로 시작하며, 읽을 때 항목마다 저장 규칙을 다시 검사해 어긋난 항목은 버립니다. 한도: 작업 공간·출처당 20, 전체 200 — 넘으면 오래된 것을 지우지 않고 거부합니다.
+
+## 묶음 실행 (`browser_batch`, WS-73)
+
+같은 화면에서 이어지는 여러 조작(예: 두 달 달력에서 가는 날·오는 날)을 한 번의 호출로 넘깁니다. 도구는 단계를 차례로
+실행하되 **단계마다 단건 호출과 같은 관문**(조작권·직접 조작할 사이트·HITL 승인·egress·robots·차단 화면·IPI 신호)을
+지나고, 위험·화면 변화·대상 불확실이 보이면 그 자리에서 멈춰 현재 관찰과 함께 돌려줍니다. 임의 JS 는 실행하지 않고,
+판단은 에이전트가 합니다(도구는 단계를 고치거나 비슷한 요소로 바꿔 누르지 않음 — 묶음 전체에서 자가 치유 끔).
+
+```json
+{"steps": [
+  {"action": "click", "target": {"role": "link", "name": "19", "group": "2026년 10월"}},
+  {"action": "click", "target": {"role": "link", "name": "6", "group": "2026년 11월"}}],
+ "observe": {"prune_top_n": 50}}
+```
+
+- **단계** 1~10개. 액션은 `click`·`type_text`·`select_option`·`check_box`·`hover`·`press_key`(대상에 포커스를 준 뒤
+  격리 world 에서 포커스를 확인 — 실패면 멈춤)·`scroll`(target 선택). 그 밖의 액션(이동·추출·대기·업로드 등)은 단건 호출로.
+  `args` 는 그 액션의 계약 입력이고 `element_id`·`target_element_id`·`selector`·`x`·`y`·`epoch`·`workspace`·`approval_id`·
+  `tab_id` 는 쓸 수 없습니다(하나라도 있으면 묶음 전체를 거부, 아무것도 실행하지 않음). 멈춤을 끄는 인자는 없습니다.
+- **대상** `target:{role, name, group?}` — 단계마다 현재 화면을 전체 후보(응답 크기로 자르기 전)로 다시 관찰해 role 과
+  이름이 NFKC·공백 정규화 뒤 **정확히** 같은 것이 1개일 때만 그 관찰의 id 로 실행합니다(부분 일치 없음 — 가격이 붙은
+  이름 등은 `target_not_found`). 기본 관찰 상위 20 밖 요소도 됩니다. `group` 은 관찰 `data.repeated` 의 group(페이지 글자)
+  이고, 도구는 같은 role+이름 후보만으로 묶음 표제를 **격리 world** 에서 다시 계산해 비교합니다(페이지 스크립트의 글자 위조가
+  닿지 않음). 같은 이름이 여러 묶음에 있는데 group 이 없으면 `target_ambiguous`.
+- **기준 노드** 2단계부터는 대상이 **묶음 시작 때(1단계 전) 화면에 있던 노드**여야 합니다 — 지문은 css 경로 + role + 이름
+  (+ group 지정 시 격리 world 표제). 1단계가 띄운 결제 확인 모달의 '확인', SPA 가 다른 자리에 새로 만든 같은 이름 단추는
+  `target_new` 로 멈춥니다. 지문의 한계: 같은 자리(css 경로)에 같은 이름으로 다시 그려진 다른 요소는 같은 노드로 봅니다
+  (단건 호출의 재렌더 처리와 같은 수준). 묶음 고정 지문(v1.16.0 핀)은 지문에서 뺐습니다 — 실제 하나투어 캡처에서 첫
+  관찰은 날짜를 바깥 레이아웃 쌍둥이 묶음에, 클릭 뒤 관찰은 달력 묶음에 고정해(WS-62 R4 한계) 같은 날짜의 지문이
+  흔들렸습니다. 핀은 실행 핸들에 그대로 붙어 실행 직전 묶음 확인은 그대로 돕니다.
+- **멈춤**(끌 수 없음, 남은 단계 실행 0, 앞 단계는 되돌리지 않음): 단계 실패, 성공이어도 `data.approval`(정책·elicitation
+  승인) 이 붙음, 직접 조작할 사이트·사람 조작권·차단 화면·인계 안내·robots 금지·egress 차단, 단계 결과나 해석용 관찰의
+  IPI 신호·다이얼로그(앞 단계 뒤 늦게 뜬 것 포함), 주 프레임 새 문서(`nav_committed`·epoch 증가 — 주소만 바뀌는
+  fragment·pushState 는 계속), 새 탭, 대상 해석 실패(`target_not_found`·`target_ambiguous`·`target_unverifiable`·
+  `target_new`·`group_mismatch`), 시간 상한 60초(단계 사이에서만 — 진행 중 단계는 취소하지 않음).
+- **응답** `data.batch = {ran, of, stopped_at, reason, detail, steps:[{action, ok, ms, recipe_saved?}]}`, 멈춘 단계의 원
+  봉투 `data.step_result`, 현재 관찰(`observe` 인자 — `prune_top_n`·`force_full_tree` 만, 기본은 observe_page 기본값 —
+  일반 관찰 경로라 같은 신호·같은 크기 상한), `data.next`. **묶음 전에 받은 `@eN` id 는 쓰지 마십시오** — 응답 관찰의 id 를
+  씁니다(해석 관찰이 id 를 다시 매김).
+- **묶음 밖에서 할 것**: 이름이 앞 단계 결과로 바뀌는 단추(예: 날짜를 고르면 '2026.10.19(월) ~ 2026.11.06(금) 선택완료' 로
+  바뀌는 확정 단추)와 달 넘기기(다음달). 묶음에 넣으면 `target_not_found`/`target_new` 로 멈추고 아무것도 누르지 않습니다 —
+  응답 관찰의 id 로 단건 click 하십시오.
+- **레시피와 차이**: 레시피(`browser_recipe run`)는 이미 통과해 저장된 흐름의 **재생**이고, 묶음은 **처음 하는 흐름**을 에이전트가
+  지금 화면을 보고 적어 넘기는 것입니다. 묶음 단계도 일반 호출처럼 레시피 궤적에 단계당 한 번 기록되고(자동 저장 표시는
+  `batch.steps[i].recipe_saved`), 묶음이 만든 내부 관찰은 레시피 후보·도착 페이지 후보 계산과 uses 소비를 하지 않습니다.
+  `serve --no-recipes` 와 무관하게 목록에 있습니다.
+- **실측(하나투어 실제 캡처 + 재렌더 스크립트, 로컬)**: 단건 최소 경로 5호출(observe→click→click→observe→click) 대비 묶음
+  경로 3호출(observe→batch→click). 다만 실제 캡처(요소 777)는 기본 응답 상한(20,000자) 안의 어떤 관찰에도 날짜와 확정 단추가
+  실리지 않아(확정 단추 점수순 531위) 이 비교는 `--max-result-chars 200000` + `prune_top_n 800` 에서 했습니다(기존 관찰 한계).
+  시험 `tests/interface/test_ws73_batch.py`·`test_ws73_batch_units.py`.
 
 ## 반복 묶음 대상 구분 (`data.repeated`, WS-62)
 

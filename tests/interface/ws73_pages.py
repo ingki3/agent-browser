@@ -107,13 +107,17 @@ _LOG = ("<script>window.__log = []; function log(x) { window.__log.push(x); let 
         " if (!o) { o = document.createElement('p'); o.id = '__out'; document.body.appendChild(o); }"
         " o.textContent = window.__log.join(','); }</script>")
 
-#: 1단계 '주문 계속' → 결제 확인 모달(그 안의 '확인')이 새로 뜬다. 묶음 시작 때 '확인' 은 없다.
+#: 1단계 '옵션 보기' → 결제 확인 모달(그 안의 '확인')이 새로 뜨고 본문(쿠폰 '확인' 포함)은 가려진다. 묶음 시작 때 있던
+#: '확인' 은 본문의 것 — 모달의 '확인' 은 이름·role 이 같지만 다른 노드(css_path 다름)라 target_new 여야 한다.
 MODAL_HTML = """<!doctype html><html><head><meta charset=utf-8></head><body>""" + _LOG + """
-<h1>주문</h1>
+<main id=body><h1>주문</h1>
 <button onclick="log('next'); openModal()">옵션 보기</button>
+<form onsubmit="return false"><input aria-label="쿠폰"><button onclick="log('coupon_ok')">확인</button></form>
+</main>
 <div id=slot></div>
 <script>
 function openModal() {
+  document.getElementById('body').style.display = 'none';
   const d = document.createElement('div');
   d.setAttribute('role', 'dialog');
   d.innerHTML = '<p>결제를 진행할까요?</p><button>확인</button>';

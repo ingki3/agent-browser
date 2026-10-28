@@ -217,6 +217,12 @@ def _headings_from_sets(raw: Any, n: int) -> Dict[int, Tuple[str, ...]]:
     return out
 
 
+def _observe_tool() -> str:
+    from interface.mcp_server import tool_name
+
+    return tool_name(ActionType.OBSERVE_PAGE)
+
+
 class BatchMixin:
     """browser_batch 서버 도구 (WS-73 믹스인 — 상태는 BrowserMCPServer.__init__)."""
 
@@ -248,6 +254,7 @@ class BatchMixin:
     # -- 실행 루프 -------------------------------------------------------------
 
     async def _run_batch(self, steps: List[Dict[str, Any]], observe_args: Dict[str, Any]) -> Dict[str, Any]:
+        from interface.mcp_server import tool_name
         from interface.server_envelope import envelope_dict
 
         disp = self._dispatcher
@@ -281,7 +288,7 @@ class BatchMixin:
                         if step["action"] == "press_key":
                             await self._batch_focus(eid)
                     epoch_before = self._batch_epoch()
-                    result = await self.call_tool(f"browser_{step['action']}", call_args)
+                    result = await self.call_tool(tool_name(ActionType(step["action"])), call_args)
                     ran = i + 1
                     entry: Dict[str, Any] = {"action": step["action"], "ok": bool(result.success),
                                              "ms": round((time.perf_counter() - t0) * 1000, 1)}
@@ -328,7 +335,7 @@ class BatchMixin:
         sink: Dict[str, Any] = {}
         token = _INTERNAL.set(sink)
         try:
-            res = await self.call_tool("browser_observe_page", {"force_full_tree": True})
+            res = await self.call_tool(_observe_tool(), {"force_full_tree": True})
         finally:
             _INTERNAL.reset(token)
         from interface.server_envelope import envelope_dict
@@ -351,7 +358,7 @@ class BatchMixin:
 
         token = _INTERNAL.set({})
         try:
-            res = await self.call_tool("browser_observe_page", dict(observe_args))
+            res = await self.call_tool(_observe_tool(), dict(observe_args))
         except Exception as exc:  # noqa: BLE001 - 관찰 실패로 묶음 응답을 망치지 않는다
             return {"observation_error": clean_text(type(exc).__name__)}
         finally:

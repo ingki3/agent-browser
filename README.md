@@ -14,13 +14,14 @@
 
 ## 주요 기능
 
-- **19종 액션 툴 + 서버 도구** — 관찰·클릭·입력·이동·탭·프레임·다운로드 등 액션과, 사람 인계·레시피·YouTube 검색 서버 도구를 stdio MCP 로 노출합니다. → [MCP 클라이언트 연동](docs/mcp-integration.md)
+- **19종 액션 툴 + 서버 도구** — 관찰·클릭·입력·이동·탭·프레임·다운로드 등 액션과, 사람 인계·레시피·묶음 실행·YouTube 검색 서버 도구를 stdio MCP 로 노출합니다. → [MCP 클라이언트 연동](docs/mcp-integration.md)
 - **관찰 → 액션 검증** — 접근성 트리를 정제한 상위 요소와 `epoch` 을 돌려주고, 오래된 `element_id` 는 `E_TOCTOU_MISMATCH` 로 거부하며, 성공은 실행 뒤 DOM 상태(사후조건)로 판정합니다. → [관찰 → 액션 흐름](docs/mcp-integration.md#관찰--액션-흐름)
 - **고위험 액션 게이트** — 결제·주문·삭제·제출·업로드를 무인 모드에서 막고, `--pre-approve`·`--mode interactive`·사람 승인 코드로 엽니다. → [고위험 액션 허용](docs/mcp-integration.md#고위험-액션-허용-serve---pre-approve---mode)
 - **차단 대신 신호** — 차단·캡차(`data.challenge`), 프롬프트 주입(`data.injection_suspected`), robots.txt(`data.robots`)를 결과에 붙이고 판단은 부르는 에이전트에 맡깁니다. → [응답 신호](docs/signals.md)
 - **헤드리스 이름 재시도** — 헤드리스 이름만 막는 사이트에서 이름·Client Hints 만 바꿔 한 번 다시 열고, 그 사실을 `data.identity` 로 공개합니다. → [헤드리스 이름 재시도](docs/headless-retry.md)
 - **사람 인계·로그인 유지** — 조작권(`control take/release`)·승인 코드, 필요할 때만 창(`--browser on-demand`), 영속 프로필(`--profile`), 미리 로그인(`agent-browser login`). → [사람 인계와 로그인](docs/human-handoff.md)
 - **동작 캐시(레시피)** — 통과한 흐름을 자동 저장해 도구 호출 한 번으로 재생하고, 화면이 어긋나면 누르지 않고 멈춥니다. → [기능](docs/features.md#동작-캐시--레시피-browser_recipe)
+- **묶음 실행** — 같은 화면에서 이어지는 여러 조작(두 달 달력의 날짜 둘 등)을 `browser_batch` 한 번으로 넘기면 단계마다 같은 관문을 지나며 차례로 하고, 위험·화면 변화·대상 불확실이면 멈춰 현재 관찰을 돌려줍니다. → [기능](docs/features.md#묶음-실행-browser_batch-ws-73)
 - **도착 페이지 기억** — 사용자가 "이 페이지 기억해"라고 한 주소를 저장해 같은 출처를 관찰할 때 후보(`data.saved_pages`)로 붙입니다(자동 저장 없음). → [기능](docs/features.md#도착-페이지-기억-browser_recipe-remember_pagepagesforget_page-ws-61)
 - **반복 묶음 대상 구분** — 두 달 달력의 같은 날짜·상품 행의 같은 '담기'처럼 같은 틀이 반복되면 관찰에 묶음 표제·위치(`data.repeated`)를 붙이고, 관찰 뒤 묶음(달)이 바뀐 대상은 누르지 않습니다. → [기능](docs/features.md#반복-묶음-대상-구분-datarepeated-ws-62)
 - **PDF 읽기·YouTube 영상 검색** — PDF 본문을 `data.document` 로, YouTube 검색을 공식 Data API v3 로. → [기능](docs/features.md)
@@ -146,7 +147,7 @@ LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](do
 | [docs/mcp-integration.md](docs/mcp-integration.md) | MCP 연동 상세 — `serve --browser`·`--nav-settle`·`--pre-approve`/`--mode`, 관찰 → 액션 흐름, 응답 형식 |
 | [docs/signals.md](docs/signals.md) | 차단·캡차, 이동 결과(부분 성공·실패 종류), 프롬프트 주입, robots.txt 신호 |
 | [docs/headless-retry.md](docs/headless-retry.md) | 헤드리스 이름 재시도, `data.identity`·`retry_skipped`·`cookie_change`, 쿠키 장부(WS-47·WS-52) |
-| [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피), 도착 페이지 기억 |
+| [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피), 묶음 실행, 도착 페이지 기억 |
 | [docs/human-handoff.md](docs/human-handoff.md) | 미리 로그인, 사람 인계(조작권·승인), 직접 조작할 사이트(`manual-sites`), 로그인 유지(`--profile`), 필요할 때만 창(`on-demand`) |
 | [docs/llm-agent.md](docs/llm-agent.md) | 내장 LLM 에이전트(`run`)·실환경 태스크 실행 |
 | [docs/security.md](docs/security.md) | 안전장치(예산·Egress·주입·출력 비밀 가림·세션 암호화), 로그인 세션과 자격증명 |

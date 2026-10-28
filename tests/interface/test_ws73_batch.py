@@ -523,3 +523,47 @@ async def test_recipe_recording_once_per_step(pages, tmp_path):
     saved = [x for x in _batch_of(out)["steps"] if "recipe_saved" in x]
     assert len(saved) == 1, _batch_of(out)["steps"]  # 구간(앞 navigate 포함)이 처음 저장된 단계 한 번만
     assert "recipe_saved" not in out["data"].get("step_result", {}).get("data", {})
+
+
+@requires_chromium
+async def test_elicitation_approved_step_still_stops(pages, tmp_path, monkeypatch):
+    """대역 밖 승인(elicitation accept)으로 1단계가 성공해도 data.approval 이 붙었으므로 멈춤 — 2단계 실행 0(B3)."""
+    import json
+
+    import anyio
+    from mcp import types as t
+    from mcp.client.session import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from interface import handoff
+    from interface.mcp_server import create_server
+
+    monkeypatch.setenv(handoff.STATE_ROOT_ENV, str(tmp_path / "state"))
+    server, backend = create_server(recipes=False)
+    asked: List[str] = []
+
+    async def elicit(ctx: Any, params: Any) -> Any:
+        asked.append(params.message)
+        return t.ElicitResult(action="accept", content={})
+
+    out: Dict[str, Any] = {}
+    try:
+        async with create_client_server_memory_streams() as (cs, ss):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(lambda: server.run(ss[0], ss[1], server.create_initialization_options()))
+                async with ClientSession(*cs, elicitation_callback=elicit) as session:
+                    await session.initialize()
+                    await session.call_tool("browser_navigate", {"url": pages + "/gates"})
+                    res = await session.call_tool(BATCH, {"steps": [_click("결제하기"), _click("다음")]})
+                    out = json.loads(res.content[0].text)
+                    out["log"] = await backend._dispatcher.ctx.page.evaluate(LOG_JS)
+                tg.cancel_scope.cancel()
+    finally:
+        await backend.close()
+        backend.hub.close()
+    b = out["data"]["batch"]
+    assert len(asked) == 1 and "결제하기" in asked[0]
+    assert out["success"] is False and (b["reason"], b["ran"]) == ("approval_required", 1), b
+    assert b["steps"][0]["ok"] is True  # 승인된 단계는 실제로 눌렸다(되돌리지 않음)
+    assert out["data"]["step_result"]["data"]["approval"]["via"] == "elicitation"
+    assert out["log"] == ["pay"]
