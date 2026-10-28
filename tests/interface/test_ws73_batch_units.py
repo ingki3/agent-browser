@@ -118,3 +118,11 @@ def test_docs_mention_batch():
     root = Path(__file__).resolve().parents[2]
     assert "browser_batch" in (root / "docs" / "features.md").read_text(encoding="utf-8")
     assert "browser_batch" in (root / "README.md").read_text(encoding="utf-8")
+
+
+def test_reasons_are_control_vocabulary():
+    """data.batch.reason 은 public_url 제어 어휘 안(가림 대상 아님) — 어휘 표와 REASONS 가 어긋나면 실패."""
+    from security.public_url import CONTROL_VOCABULARY, control_value
+
+    assert set(sb.REASONS) <= CONTROL_VOCABULARY["reason"]
+    assert all(control_value("reason", r) for r in sb.REASONS)

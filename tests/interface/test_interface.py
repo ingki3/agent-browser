@@ -273,7 +273,7 @@ def test_cli_tools_json_is_valid(capsys):
     # + WS-49 YouTube 검색 1개).
     actions = [s for s in payload if action_from_tool(s["name"]) is not None]
     assert len(actions) == 19
-    assert len(payload) == 19 + 6
+    assert len(payload) == 19 + 7  # WS-73 browser_batch
     assert all("inputSchema" in spec for spec in payload)
 
 

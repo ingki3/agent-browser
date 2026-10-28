@@ -86,6 +86,9 @@ TABLES = {
 
 #: 키 → (분류, 근거). (키, 파일) 은 같은 키의 파일별 예외.
 KEYS = {
+    # WS-73 browser_batch: 단계 args 를 계약 모델로 미리 검증할 때 넣는 자리표시 id(응답에 싣지 않음)
+    ("element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
+    ("target_element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),

@@ -56,28 +56,6 @@ INSTRUCTIONS = (f"{BATCH_TOOL}: 같은 화면에서 이어지는 여러 조작(�
                 "(+data.repeated 의 group). 멈추면 data.batch.reason 과 응답 관찰을 보고 이어 가세요. 이름이 앞 단계로 바뀌는 "
                 "단추·달 넘기기는 묶음 밖에서.")
 
-INPUT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "steps": {
-            "type": "array", "minItems": 1, "maxItems": MAX_STEPS,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "action": {"enum": list(BATCH_ACTIONS)},
-                    "target": {"type": "object", "properties": {
-                        "role": {"type": "string"}, "name": {"type": "string"}, "group": {"type": "string"}},
-                        "required": ["role", "name"]},
-                    "args": {"type": "object"},
-                },
-                "required": ["action"],
-            },
-        },
-        "observe": {"type": "object"},
-    },
-    "required": ["steps"],
-}
-
 #: 묶음이 만든 내부 관찰 표시(호출 문맥 단위). 값이 dict 면 그 관찰의 자르기 전 전체 요소를 담는다.
 #: 서버는 이 표시가 있는 observe 에서 saved_pages uses 소비·레시피 후보 계산을 건너뛴다(server_tools).
 _INTERNAL: ContextVar[Optional[Dict[str, Any]]] = ContextVar("browser_batch_internal_observe", default=None)
@@ -338,14 +316,14 @@ class BatchMixin:
             res = await self.call_tool(_observe_tool(), {"force_full_tree": True})
         finally:
             _INTERNAL.reset(token)
-        from interface.server_envelope import envelope_dict
-
+        # 해석용 관찰(전체 후보)의 봉투는 step_result 로 싣지 않는다 — 응답의 현재 관찰이 같은 경로로 같은 신호를 싣고,
+        # 전체 후보 봉투까지 실으면 응답이 크기 상한의 두 배가 된다. 실패면 그 오류 코드만 detail 에.
         if not res.success:
             stop = self._batch_judge(res, self._batch_epoch())
-            raise _Stop(stop[0] if stop else "target_unverifiable", "대상 해석용 관찰 실패", envelope_dict(res))
+            raise _Stop(stop[0] if stop else "target_unverifiable", "대상 해석용 관찰 실패 — " + (stop[1] if stop else ""))
         signal = self._batch_signal(res.data or {})
         if signal is not None:
-            raise _Stop(signal[0], signal[1] + "(대상 해석용 관찰)", envelope_dict(res))
+            raise _Stop(signal[0], signal[1] + "(대상 해석용 관찰)")
         elements = sink.get("elements")
         if not isinstance(elements, list):
             raise _Stop("target_unverifiable", "전체 후보를 셀 수 없음")
