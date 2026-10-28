@@ -38,6 +38,7 @@ MAX_STREAM_BYTES = 8 * 1024 * 1024
 MAX_RSS_BYTES = 256 * 1024 * 1024
 PARSE_TIMEOUT_S = 5.0
 FETCH_TIMEOUT_S = 15.0
+UA_REFRESH_TIMEOUT_S = 2.0  # WS-72: PDF 재요청의 UA 재판독 상한(FETCH_TIMEOUT_S 안)
 PDF_INSTRUCTIONS = (
     "PDF 는 browser_navigate 로 읽습니다(data.document). 나머지 쪽은 browser_extract의 "
     "selector='pdf:pages=3-5'로 읽고, 끼워 넣은 PDF 주소는 observe_page의 data.documents에서 찾습니다."
@@ -115,7 +116,8 @@ async def fetch_pdf(context: BrowserContext, url: str, guard: EgressGuard | None
     initial = origin(url)
     try:
         async with asyncio.timeout(FETCH_TIMEOUT_S):
-            ua = await robots._context_user_agent(context)
+            # WS-72 (#184): 공유 판독이 실패(0.1초 예산 초과 등)했어도 이 요청 예산 안에서 1회 다시 읽는다.
+            ua = await robots.refresh_user_agent(context, UA_REFRESH_TIMEOUT_S)
             if ua is None:
                 return FetchResult(url=url, reason="user_agent_unavailable")
             transport = httpx.Proxy(proxy.server_url)
