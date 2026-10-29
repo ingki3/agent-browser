@@ -720,6 +720,16 @@ def _set_groups(groups: List[Any], handles: List[Any], compact: bool) -> Optiona
     return {"groups": out_groups, "count": len(ranks), "best": min(ranks)}
 
 
+def _distinct_headings(groups: Sequence[Dict[str, Any]]) -> bool:
+    """세트의 공개 묶음들이 모두 표제를 보이고 서로 다른가(WS-74 F2).
+
+    _set_groups 가 내는 group 값(shown 규칙 — 비어 있지 않음·서로 다름, 압축이면 첫 조각 — 뒤 _short 40자)을 그대로 본다:
+    원 표제가 달라도 표시 뒤 같아지거나 하나라도 null 이면 고를 근거가 없다.
+    """
+    heads = [g.get("group") for g in groups]
+    return bool(heads) and all(isinstance(h, str) and h for h in heads) and len(set(heads)) == len(heads)
+
+
 def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]]:
     built: List[Dict[str, Any]] = []
     for s in sets:
@@ -734,10 +744,13 @@ def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]
         built.append(normal)
     if not built:
         return None
-    built.sort(key=lambda b: (-b["count"], b["best"]))
     # 크기(R4 R1-4): 다 담아 예산을 넘으면 먼저 전부 압축(첫 낱말·묶음 role·표제 첫 조각) — 그래도 넘는 세트는
     # 통째로 빼고(omitted) 다음 세트를 시도한다(탐욕). 압축 없이 들어가면 그대로 낸다.
     compact = _block_chars([g for b in built for g in b["groups"]]) > REPEATED_MAX_CHARS
+    # WS-74(#190) F2: 실제로 보일 묶음들이 서로 다른 표제를 가진 세트(두 달 달력·상품 행 — 묶음을 고를 근거) 먼저,
+    # 그 다음 큰 세트·앞 순위. 표시 전용 — 고정(repeated_v1160)·실행 직전 확인·batch 판정은 이 순서를 쓰지 않는다.
+    built.sort(key=lambda b: (not _distinct_headings(b["compact_groups"] if compact else b["groups"]),
+                              -b["count"], b["best"]))
     kept: List[Dict[str, Any]] = []
     omitted = 0
     for b in built:
