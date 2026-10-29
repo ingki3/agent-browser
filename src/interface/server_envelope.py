@@ -194,17 +194,22 @@ def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int
         obs = data.get("observation")
         if not isinstance(obs, dict) or not isinstance(obs.get("elements"), list):
             return
-        from perception.engine import estimate_tokens
+        from contracts import ObservedElement
+        from perception.engine import _summarize, estimate_tokens
 
         all_els = list(obs["elements"])
-        lines = str(obs.get("axtree_summary") or "").split("\n")
-        keep_summary = len(lines) == len(all_els)
+        # WS-74(#190): 요약은 남긴 요소들로부터 엔진 형식(_summarize)으로 다시 만든다 — 이름에 줄바꿈이 있어도
+        # 요약이 elements 와 같은 지점에서 끊긴다(요약에 elements 밖 id 가 남지 않음). 원 요약도 같은 함수로
+        # 만들어졌으므로 줄바꿈 없는 페이지에서는 예전 '앞 k 줄'과 같은 바이트다.
+        views = [ObservedElement.model_construct(
+            element_id=e.get("element_id"), role=e.get("role"), name=e.get("name"),
+            interactable=e.get("interactable", True),
+        ) if isinstance(e, dict) else e for e in all_els]
 
         def _set(k: int) -> None:
-            summary = "\n".join(lines[:k]) if keep_summary else obs.get("axtree_summary", "")
+            summary = _summarize(views[:k])
             data["observation"] = dict(
-                obs, elements=all_els[:k], axtree_summary=summary,
-                token_count=estimate_tokens(summary) if keep_summary else obs.get("token_count"),
+                obs, elements=all_els[:k], axtree_summary=summary, token_count=estimate_tokens(summary),
             )
 
         total, hint = len(all_els), _TRUNC_HINT_OBSERVE
