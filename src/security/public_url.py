@@ -628,6 +628,9 @@ _ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\
 _APPROVAL_STATUS = ("pending", "approved", "used", "denied", "revoked", "expired", "unknown")  # handoff.Approval·_FINISHED
 _REPLAY_STOP = ("page_changed", "not_ready", "target_not_found", "target_ambiguous", "approval_required",
                 "action_failed", "expect_mismatch", "manual_site")  # recipes.replay._Stop · recipes.keys found.reason
+#: interface.server_batch.REASONS 중 레시피 중단 사유(_REPLAY_STOP)에 없는 것(WS-73 data.batch.reason — 같음은 시험이 고정).
+_BATCH_STOP = ("human_control", "handoff", "challenge", "robots", "egress", "injection_suspected", "dialog", "navigated",
+               "new_tab", "target_unverifiable", "target_new", "group_mismatch", "focus_failed", "time_limit")
 _PDF_REASONS = ("egress_unavailable", "user_agent_unavailable", "egress_blocked", "redirect_origin", "redirect_limit",
                 "content_encoding", "file_size_limit", "invalid_length", "not_pdf", "fetch_timeout", "fetch_failed",
                 "encrypted", "page_range", "chars_limit", "pages_limit", "resource_limit", "parse_error",
@@ -642,7 +645,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                         "logged_in", "login_form", "captcha",  # browser.login_flow.LoginState
                         "succeeded"}),  # browser.headless_retry states
     "holder": frozenset({"agent", "human"}),  # handoff.HOLDER_AGENT·HOLDER_HUMAN
-    "reason": frozenset(_REPLAY_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
+    "reason": frozenset(_REPLAY_STOP + _BATCH_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
         "headless_ua_blocked",  # server_signals identity
         "login_recorded", "new_server_cookie", "login_ledger_unreadable", "cookies_unreadable",  # WS-58
         "already_failed", "robots_not_confirmed", "vendor_challenge", "disabled", "headed",  # headless_retry.SKIP_NOTES

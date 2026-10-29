@@ -34,6 +34,14 @@ NOT_OUT = "MCP 응답 출구 아님(에이전트 루프·LLM·하네스 내부·
 
 #: (키, 파일, 식) → 분류. 어휘 출처면 그 집합이 CONTROL_VOCABULARY[키] 에 든다(아래 enum 테스트).
 REVIEWED = {
+    # WS-73 browser_batch data.batch.reason — interface.server_batch.REASONS(_Stop 가 assert, 어휘 포함은 test_ws73_batch_units)
+    ("reason", "interface/server_batch.py", "reason"): "server_batch.REASONS(_Stop.__init__ assert)",
+    ("reason", "interface/server_batch.py", "stop.reason"): "server_batch.REASONS(_Stop.reason)",
+    ("reason", "interface/server_batch.py", "stop[0]"): "server_batch.REASONS(_batch_judge 반환 첫 칸)",
+    ("reason", "interface/server_batch.py", "signal[0]"): "server_batch.REASONS(_batch_signal 반환 첫 칸)",
+    ("reason", "interface/server_batch.py", "changed"): "server_batch._Watch.changed() — navigated·new_tab·dialog(REASONS 안, _Stop assert)",
+    # WS-73 R1: _Stop.code 는 응답 칸이 아니다 — _detail 이 ErrorCode 값일 때만 고정 문장 뒤에 붙인다(원 오류 문구 아님)
+    ("code", "interface/server_batch.py", "code"): NOT_OUT + " (WS-73 R1 _Stop.code 속성 — detail 에는 ErrorCode 값만)",
     # WS-64 직접 조작할 사이트
     ("changed", "interface/server_manual.py", "h.ended"): "security.manual_sites OUTCOMES(clicked·page_changed·done·expired)",
     ("sticky_reason", "interface/server_manual.py", "f'직접 조작할 사이트 {hit}'"): FREE + " (on-demand 미리 창 sticky 사유 — 늘 정제)",

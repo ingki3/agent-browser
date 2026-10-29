@@ -147,6 +147,7 @@ from interface.server_tools import (  # noqa: E402,F401
 )
 # WS-56: 새 모듈(분리 모듈 아님 — 전역 이전 대상이 아니다). 이름은 여기서도 재수출한다.
 from interface.server_manual import ManualSiteMixin  # noqa: E402,F401
+from interface.server_batch import BatchMixin  # noqa: E402,F401
 from interface.server_elicit import (  # noqa: E402,F401
     CURRENT_ELICITOR,
     ELICIT_TIMEOUT_S,
@@ -195,7 +196,7 @@ RELEASE_RECOVERY_WAIT_S = 10.0
 
 
 class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin,
-                       WindowMixin, LifecycleMixin, ManualSiteMixin):
+                       WindowMixin, LifecycleMixin, ManualSiteMixin, BatchMixin):
     """19종 툴을 노출하는 MCP 서버.
 
     실제 MCP SDK 바인딩은 `create_server()`에서 수행하고, 본 클래스는
@@ -591,10 +592,11 @@ def _server_instructions(recipes: bool) -> str:
     from security.robots_signal import ROBOTS_INSTRUCTIONS
     from actions.pdf_document import PDF_INSTRUCTIONS
     from browser.headless_retry import IDENTITY_INSTRUCTIONS
+    from interface.server_batch import INSTRUCTIONS as BATCH_INSTRUCTIONS
 
     return ((RECIPE_INSTRUCTIONS + "\n" if recipes else "") + OBSERVE_INSTRUCTIONS + "\n"
             + ROBOTS_INSTRUCTIONS + "\n" + PDF_INSTRUCTIONS + "\n" + IDENTITY_INSTRUCTIONS
-            + "\n" + YOUTUBE_INSTRUCTIONS + "\n" + WORKSPACE_INSTRUCTIONS)
+            + "\n" + YOUTUBE_INSTRUCTIONS + "\n" + BATCH_INSTRUCTIONS + "\n" + WORKSPACE_INSTRUCTIONS)
 
 
 async def run_stdio(

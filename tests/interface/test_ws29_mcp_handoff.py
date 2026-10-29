@@ -387,7 +387,9 @@ def test_server_tools_token_cost_small():
     enc = tiktoken.get_encoding("cl100k_base")
     # WS-29 사람 인계 도구 4종만 잰다(WS-38 레시피 도구는 tests/recipes 에서 설명 ≤80토큰으로, WS-49 YouTube 검색
     # 도구는 tests/interface/test_ws49_youtube_search.py 에서 따로 잰다).
-    handoff = [t for t in mcp_server.build_server_tools(recipes=False) if t["name"] != mcp_server.YOUTUBE_TOOL]
+    # WS-73 묶음 실행 도구는 tests/interface/test_ws73_batch_units.py 에서 따로 잰다.
+    handoff = [t for t in mcp_server.build_server_tools(recipes=False)
+               if t["name"] not in (mcp_server.YOUTUBE_TOOL, "browser_batch")]
     assert len(handoff) == 4
     extra = len(enc.encode(json.dumps(handoff, ensure_ascii=False)))
     assert extra <= 300, extra  # 실측 293 (WS-29 보고서)
@@ -631,7 +633,7 @@ async def test_real_serve_prints_server_id_and_serves_control_tools(tmp_path):
                 await session.initialize()
                 listed = await session.list_tools()
                 names = [t.name for t in listed.tools]
-                assert len(names) == 25 and set(SERVER_TOOLS) <= set(names)  # 19 + 서버 도구 6(WS-38·WS-49)
+                assert len(names) == 26 and set(SERVER_TOOLS) <= set(names)  # 19 + 서버 도구 7(WS-38·WS-49·WS-73)
                 res = await session.call_tool("browser_control_status", {})
                 st = json.loads(res.content[0].text)
                 assert st["data"]["control"]["holder"] == "agent"
