@@ -110,6 +110,34 @@ def build_all_tools() -> List[Dict[str, Any]]:
 #: tools/list = build_all_tools() + build_server_tools(). 설명은 짧게(WS-30b 토큰 예산).
 _WAIT_SCHEMA = {"type": "number", "maximum": 120}
 
+from interface.server_batch import BATCH_ACTIONS as _BATCH_ACTIONS  # noqa: E402
+from interface.server_batch import BATCH_TOOL as _BATCH_TOOL  # noqa: E402
+from interface.server_batch import DESCRIPTION as _BATCH_DESCRIPTION  # noqa: E402
+from interface.server_batch import MAX_STEPS as _BATCH_MAX_STEPS  # noqa: E402
+
+#: WS-73 browser_batch 입력 스키마(검증은 interface.server_batch.validate_batch — 스키마는 안내용).
+_BATCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "steps": {
+            "type": "array", "minItems": 1, "maxItems": _BATCH_MAX_STEPS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"enum": list(_BATCH_ACTIONS)},
+                    "target": {"type": "object", "properties": {
+                        "role": {"type": "string"}, "name": {"type": "string"}, "group": {"type": "string"}},
+                        "required": ["role", "name"]},
+                    "args": {"type": "object"},
+                },
+                "required": ["action"],
+            },
+        },
+        "observe": {"type": "object"},
+    },
+    "required": ["steps"],
+}
+
 
 SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
     f"{TOOL_PREFIX}control_request": {
@@ -180,6 +208,8 @@ SERVER_TOOLS: Dict[str, Dict[str, Any]] = {
             "required": ["query"],
         },
     },
+    # WS-73 묶음 실행 — 레시피 여부(--no-recipes)와 무관하게 노출. 설명·스키마는 interface.server_batch.
+    _BATCH_TOOL: {"description": _BATCH_DESCRIPTION, "inputSchema": _BATCH_SCHEMA},
 }
 
 

@@ -61,8 +61,9 @@ def test_create_server_does_not_crash():
         "browser_control_wait", "browser_approval_wait",
         "browser_recipe",  # WS-38 동작 캐시(기본 켬)
         "browser_youtube_search",  # WS-49 YouTube 영상 검색(키 없어도 목록에 보임)
+        "browser_batch",  # WS-73 묶음 실행(레시피 여부와 무관)
     }
-    assert len(names) == len(set(names)) == 25  # 19 + 서버 도구 6(WS-29 4·WS-38 레시피·WS-49 YouTube 검색)
+    assert len(names) == len(set(names)) == 26  # 19 + 서버 도구 7(WS-29 4·WS-38 레시피·WS-49 YouTube 검색·WS-73 묶음)
     assert set(names) == expected
 
 

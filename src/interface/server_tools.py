@@ -84,6 +84,12 @@ class ToolsMixin:
                 if self._started:
                     await self._ensure_workspace()
                 return await self._recipe_tool(args)
+        if name == f"{TOOL_PREFIX}batch":
+            # WS-73: 묶음 실행은 이 작업 공간의 액션 여러 개 — 레시피 재생과 같은 모양으로 묶음 전체를 직렬화 구간 안에서
+            # (단계 사이에 같은 작업 공간의 다른 호출이 끼지 않음; 안쪽 call_tool 은 같은 흐름이라 다시 잡지 않는다).
+            # approval_wait 폴백보다 앞(NB1), --no-recipes 와 무관.
+            async with self._dispatch_serial():
+                return await self._batch_tool(args)
         if name == YOUTUBE_TOOL:
             return await self._youtube_tool(args)
         if not self.hub.opened:
@@ -271,6 +277,15 @@ class ToolsMixin:
             # WS-61 R2: 창/복구 보고는 자르기 뒤에 붙는다 — 그 크기를 먼저 빼 둔 상한으로 후보 제거·자르기를 판단해
             # 보고까지 붙인 최종 직렬화 크기가 상한을 넘지 않게 한다(보고가 없으면 0 — 기존과 같은 바이트).
             max_chars = self.max_result_chars - self._window_notice_chars(result)
+            from interface.server_batch import batch_internal
+
+            sink = batch_internal()
+            if sink is not None and action is ActionType.OBSERVE_PAGE and result.success:
+                # WS-73: 묶음의 대상 해석은 자르기 전 전체 후보로 센다(같은 관찰의 id·role·이름 — 핸들은 엔진에).
+                obs = result.data.get("observation") if isinstance(result.data, dict) else None
+                if isinstance(obs, dict) and isinstance(obs.get("elements"), list):
+                    sink["elements"] = [{"element_id": e.get("element_id"), "role": e.get("role"),
+                                         "name": e.get("name")} for e in obs["elements"] if isinstance(e, dict)]
             if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
                 from recipes.saved_pages import fit_saved_pages
 
@@ -499,8 +514,11 @@ class ToolsMixin:
         uses 는 navigate 1회당 첫 observe 에서 최대 +1. 헤드리스 재시도의 내부 호출(_retry_recipe_boundary)은 건너뛴다
         — 바깥 navigate 의 최종 결과(재시도 결과 포함)로 한 번만 판정한다.
         """
+        from interface.server_batch import batch_internal
+
         saved = getattr(self, "_saved_pages", None)
-        if saved is None or self._retry_recipe_boundary.get():
+        if saved is None or self._retry_recipe_boundary.get() or batch_internal() is not None:
+            # WS-73: 묶음(browser_batch)이 만든 내부 관찰은 uses 를 소비하지 않는다.
             return
         if action is ActionType.NAVIGATE:
             saved.note_navigate(dict(arguments or {}), result)
@@ -553,8 +571,10 @@ class ToolsMixin:
                 self._recipes.reset("navigation_blocked")
             else:
                 self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
-            if action is ActionType.OBSERVE_PAGE:
-                await self._recipes.observe(result)
+            from interface.server_batch import batch_internal
+
+            if action is ActionType.OBSERVE_PAGE and batch_internal() is None:
+                await self._recipes.observe(result)  # WS-73: 묶음 내부 관찰은 레시피 후보를 계산하지 않는다
         # (WS-61 uses·관찰 후보는 _route_tool_call 의 _note_saved_pages — 조기 반환 경로까지 덮는다.)
         # (WS-36: 크기 상한은 call_tool 에서 — 주입 신호를 붙인 뒤 자른다.)
         return result
