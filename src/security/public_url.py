@@ -885,7 +885,8 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
 CONTENT_TEXT_KEYS: FrozenSet[str] = frozenset({"name", "value", "text", "href", "group", "heading", "summary", "label",
                                                "title"})
 #: perception 이 원문을 먼저 자르는 길이(사용자 결정 B 보강 2026-10-31 — 잘린 끝에 남는 등록 값 앞부분). 이 길이이거나
-#: 말줄임 `…` 로 끝나는 글자는 끝 조각을 `mask_tail` 로 더 본다. 출처(시험 test_ws75_cut_lengths 가 원천과 같음을 고정):
+#: 말줄임 `…` 로 끝나는 글자는 끝 조각을 `mask_tail` 로 더 본다(길이는 Python 글자 수와 JS 의 UTF-16 단위 둘 다 — R1 B1).
+#: 출처(시험 test_ws75_cut_lengths 가 원천과 같음을 고정):
 #: 12 = perception.repeated.COMPACT_WORD(압축 이름 첫 낱말), 40 = perception.repeated.NAME_LIMIT·JS rpClean(묶음 이름·표제),
 #: 120 = perception.sanitizer 이름 JS `text.slice(0, 120)`, 200 = sanitizer·shadow_dom 값 JS `String(el.value).slice(0, 200)`.
 CONTENT_CUT_LENGTHS: FrozenSet[int] = frozenset({12, 40, 120, 200})
@@ -901,6 +902,15 @@ _content_memo_chars = 0
 #: 응답 파이프라인이 내용 경로를 이미 가린 사본으로 바꿔 둔 레지스트리 version(server_tools — 크기 자르기 반복 중 다시 훑지
 #: 않는다, 계획 v2 B2). 이 문맥 밖의 직렬화는 늘 다시 가린다(메모로 싸다).
 _CONTENT_MASKED: ContextVar[Optional[int]] = ContextVar("public_url_content_masked", default=None)
+
+
+def _utf16_len(text: str) -> int:
+    """JS `String.length`(UTF-16 단위) — perception 의 JS `slice(0, n)` 은 이 단위로 자른다(WS-75 R1 B1: 서로게이트 쌍
+    글자는 Python 1자·JS 2단위라 Python `len` 만 보면 잘린 칸을 놓친다). 반쪽으로 잘린 서로게이트(짝 없는 \\ud800~
+    \\udfff)는 1단위."""
+    if text.isascii():
+        return len(text)
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
 
 
 def content_text(text: Any) -> Any:
@@ -920,7 +930,7 @@ def content_text(text: Any) -> Any:
     if hit is not None:
         return hit
     out = registry.mask_content(text)
-    if text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS:
+    if text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS or _utf16_len(text) in CONTENT_CUT_LENGTHS:
         out = registry.mask_tail(out)  # 원문을 먼저 자른 칸 — 끝에 남은 등록 값 앞부분
     memo[text] = out
     _content_memo_chars += len(text)

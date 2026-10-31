@@ -517,7 +517,8 @@ def _content_parts(parts: Tuple[_Part, ...], grade: int) -> Tuple[_Part, ...]:
 class SecretRegistry:
     """비밀 값의 LRU 집합. 값은 이 객체 밖으로 내보내지 않는다(repr·pickle·copy 금지)."""
 
-    __slots__ = ("_lock", "_order", "_snapshot", "_version", "_cap", "_max_chars", "_chars", "_grades", "_content")
+    __slots__ = ("_lock", "_order", "_snapshot", "_version", "_cap", "_max_chars", "_chars", "_grades", "_content",
+                 "_folded")
 
     def __init__(self, cap: int = MAX_VALUES, max_chars: int = MAX_CHARS) -> None:
         self._lock = threading.Lock()
@@ -527,6 +528,8 @@ class SecretRegistry:
         self._snapshot: _Snapshot = _EMPTY
         #: 내용 경로용 스냅샷(등급으로 고른 기저만, WS-75). version 은 공유.
         self._content: _Snapshot = _EMPTY
+        #: 내용 경로 스냅샷의 casefold 판(WS-75 R1 B2 — 레시피 저장 대조 전용, 처음 쓸 때 version 단위로 만든다).
+        self._folded: Tuple[int, _Snapshot] = (-1, _EMPTY)
         self._version = 0
         self._cap = cap
         self._max_chars = max_chars
@@ -633,7 +636,32 @@ class SecretRegistry:
         """잘린 글자(WS-75 — perception 이 원문을 먼저 자른 칸)의 끝이 내용 경로 가림 대상 등록 값의 **앞부분**(≥ 4자, 값
         전체보다 짧음)이면 그 끝 조각을 `[REDACTED]` 로. 끝의 말줄임 `…` 은 남긴다. 4~7자 값(자격증명)의 앞부분은 앞 글자가
         영숫자가 아닐 때만(경계 규칙과 같다). 일치가 없으면 입력 그대로(같은 객체)."""
-        heads = self._content.heads
+        return self._tail(text, self._content)
+
+    def content_hit(self, text: str) -> bool:
+        """레시피 저장 대조(WS-75 R1 B2): `text` 원문 또는 그 casefold 형태에 내용 경로 가림 대상 등록 값이 걸리는가 —
+        같은 등급·길이 규칙(≥ 8 부분 일치, 4~7 경계 일치)과 끝의 앞부분(≥ 4자) 걸침. 저장 문자열은 정규화(소문자화)로
+        원문이 소실될 수 있어 casefold 한 등록 값과도 대조한다. 가린 글자는 밖으로 내지 않는다(참·거짓만)."""
+        snap = self._content
+        if snap.empty or not isinstance(text, str) or len(text) < MIN_VALUE_CHARS:
+            return False
+        if self._mask(text, url=False, snap=snap) is not text or self._tail(text, snap) is not text:
+            return True
+        folded = self._folded_snapshot()
+        low = text.casefold()
+        return self._mask(low, url=False, snap=folded) is not low or self._tail(low, folded) is not low
+
+    def _folded_snapshot(self) -> _Snapshot:
+        with self._lock:
+            version, snap = self._folded
+            if version != self._version:
+                snap = _build(_content_parts(_parts(v.casefold()), self._grades.get(v, GRADE_CREDENTIAL))
+                              for v in self._order)
+                self._folded = (self._version, snap)
+            return snap
+
+    def _tail(self, text: str, snap: _Snapshot) -> str:
+        heads = snap.heads
         if not heads or len(text) < HEAD_CHARS:
             return text
         ellipsis = text.endswith("\u2026")
