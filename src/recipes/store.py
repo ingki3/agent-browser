@@ -310,6 +310,27 @@ def _check_paths(rec: Dict[str, Any]) -> None:
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
+def _secret_string(obj: Any, key: str = "") -> bool:
+    """저장 문자열 leaf 전수에 `_text_secret`(레지스트리 등록 값·비밀 키 값·JWT) — 골격 해시·사후 신호 종류는 제외."""
+    if key in _HASH_KEYS or key == "signals":
+        return False
+    if isinstance(obj, dict):
+        return any(_secret_string(value, str(field)) for field, value in obj.items())
+    if isinstance(obj, list):
+        return any(_secret_string(value, key) for value in obj)
+    return isinstance(obj, str) and _text_secret(obj)
+
+
+def _check_registered(rec: Dict[str, Any]) -> None:
+    """WS-75(#199 NB4): 대상 이름·인자 등 저장 문자열에 도구가 비밀로 아는 값이 있으면 그 단계를 저장하지 않는다.
+
+    응답의 내용 경로는 그 값을 `[REDACTED]` 로 보이지만 레시피 파일에는 원문이 남는다 — 가린 이름으로 저장하면 재생
+    locate(원문 이름 비교)가 깨지므로 가리지 않고 거부한다."""
+    if _secret_string({field: value for field, value in rec.items() if field != "name"}):
+        raise RecipeError("대상 이름·인자에 도구가 비밀로 아는 값(로그인 자격·주소 토큰 등)이 있어 저장하지 않습니다"
+                          "(응답에서는 [REDACTED] 로 가려지는 값).")
+
+
 #: 반복 디코딩 상한(WS-61 R1) — 이중·삼중 인코딩까지 풀고 그보다 깊게 감싼 값은 더 풀지 않는다(비용 상한).
 MAX_DECODE_ROUNDS = 3
 
@@ -543,6 +564,7 @@ def compile_recipe(
         "steps": steps,
     }
     _check_paths(rec)
+    _check_registered(rec)
     _check_leaks(rec, params.values())
     _check_pii(rec)
     return rec

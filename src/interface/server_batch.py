@@ -119,6 +119,14 @@ def norm(text: Any) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(text or "")).split())
 
 
+def shown(text: Any) -> str:
+    """에이전트가 응답에서 본 글자 기준의 비교 값(WS-75 B3): 내용 경로와 **같은** 가림(등급 규칙 — 전체 mask_registered 가
+    아님) 뒤 정규화. 지문(css_path·원 이름·원 표제)은 원문 그대로 쓴다."""
+    from security.public_url import content_text
+
+    return norm(content_text(str(text or "")))
+
+
 class _Stop(Exception):
     def __init__(self, reason: str, code: Optional[str] = None, step_result: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(reason)
@@ -592,7 +600,7 @@ class BatchMixin:
         role, name = norm(target["role"]), norm(target["name"])
         out: List[Tuple[str, Any]] = []
         for el in view["elements"]:
-            if norm(el.get("role")) != role or norm(el.get("name")) != name:
+            if norm(el.get("role")) != role or shown(el.get("name")) != name:
                 continue
             h = engine.get_handle(str(el.get("element_id") or ""))
             if h is None or h.epoch != view["epoch"]:
@@ -653,7 +661,7 @@ class BatchMixin:
         if group is not None:
             want = norm(group)
             unknown = [c for c in cands if not c[2][3]]
-            hit = [c for c in cands if want in c[2][3]]
+            hit = [c for c in cands if want in {shown(label) for label in c[2][3]}]
             if not hit:
                 if unknown:
                     raise _Stop("target_unverifiable")

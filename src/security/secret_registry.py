@@ -24,6 +24,11 @@
 * 프로세스 메모리 전용: 디스크·로그·응답에 쓰지 않는다. repr·str 은 개수만 보이고, pickle·copy 는 거부한다.
 * 스레드 안전: 등록은 Lock 안에서 새 스냅샷을 만들고, 조회는 스냅샷을 한 번 읽는다(잠금 없음).
 * 등록은 예외를 내지 않는다 — 등록 실패가 도구 동작을 막지 않는다.
+* 등급(WS-75 #199, 내부 구조 — 공개 계약 아님): 값마다 출처 등급을 기억한다(다시 등록되면 높은 쪽). 페이지 내용 경로
+  (`mask_content`)는 등급으로 가림 대상을 고른다 — 자격증명(`GRADE_CREDENTIAL`: SecretStore 해석 값·민감칸 입력·로그인
+  자격·주소 userinfo·password/otp 계열 키 값)은 4~7자 경계 규칙까지, 주소 비밀(`GRADE_URL`)은 ≥ 8 값만, 비밀 키가 아닌
+  키 아래 순수 16진(`GRADE_HEURISTIC` — ObjectId 류)은 가리지 않는다. 주소 칸·자유 문장(`mask`·`mask_url_part`)은 등급과
+  무관하게 예전 그대로다.
 """
 
 from __future__ import annotations
@@ -52,6 +57,11 @@ MIN_VALUE_CHARS = 4
 BLOCK_CHARS = 128
 #: 이 길이 이상의 원문은 블록 색인(잘린·일부 바뀐 꼴 대비, §1.4 '원문 연속 256자').
 LONG_VALUE_CHARS = 2 * BLOCK_CHARS
+#: 등록 값 등급(WS-75). 높을수록 내용 경로에서 넓게 가린다. 재등록 시 높은 쪽을 남긴다.
+GRADE_HEURISTIC = 1   # 비밀 키가 아닌 키 아래 순수 16진(ObjectId 류) — 내용 경로 원문
+GRADE_URL = 2         # 그 밖의 주소 비밀 — 내용 경로는 ≥ 8 값만
+GRADE_CREDENTIAL = 3  # 자격증명 — 내용 경로도 4~7자 경계 규칙 포함(6자리 OTP·짧은 PIN)
+
 #: 가림 표지 — 이 안에 들어 있는 문자열(`REDACTED` 등)을 등록하면 표지가 다시 가려져 멱등이 깨진다.
 _MARKERS = ("[REDACTED]", "[REDACTED-URL]", "[REDACTED-DEPTH]")
 
@@ -352,9 +362,15 @@ class _Snapshot(NamedTuple):
     hosts: FrozenSet[str]                                 # ≥ 8 원문의 casefold(호스트 라벨 비교)
     sentinels: Tuple[str, ...]                            # 표현에 쓰이지 않은 사설 영역 글자 후보
     empty: bool
+    #: 원문 앞 HEAD_CHARS 자 → (원문, ≥ 8 여부) — 잘린 글자 끝의 앞부분 일치(WS-75 `mask_tail`)
+    heads: Dict[str, Tuple[Tuple[str, bool], ...]] = {}
 
 
-_EMPTY = _Snapshot((), (), frozenset(), (), {}, frozenset(), ("\ue000",), True)
+_EMPTY = _Snapshot((), (), frozenset(), (), {}, frozenset(), ("\ue000",), True, {})
+#: 잘린 글자 끝에서 찾는 등록 값 앞부분의 최소 길이(WS-75 — 자격증명·주소 비밀 모두 4자+).
+HEAD_CHARS = 4
+#: 잘린 글자 끝에서 앞부분을 찾는 창(글자) — perception 의 자르기 길이(최대 200)보다 넉넉히.
+TAIL_WINDOW = 256
 _PUA = [chr(c) for c in range(0xE000, 0xE100)]
 _PUA_RE = re.compile("[\ue000-\ue0ff]")
 
@@ -367,10 +383,15 @@ def _build(entries: Iterable[Tuple[_Part, ...]]) -> _Snapshot:
     blocks: Dict[str, Tuple[str, int]] = {}
     hosts: set = set()
     used: set = set()
+    heads: Dict[str, List[Tuple[str, bool]]] = {}
     any_part = False
     for parts in entries:
         for part in parts:
             any_part = True
+            if len(part.r1) > HEAD_CHARS:
+                found = heads.setdefault(part.r1[:HEAD_CHARS], [])
+                if (part.r1, part.long) not in found:
+                    found.append((part.r1, part.long))
             for form in part.forms:
                 if not form.isascii() and _PUA_RE.search(form):  # ASCII 표현(퍼센트·JSON 등)에는 사설 영역 글자가 없다
                     used.update(_PUA_RE.findall(form))
@@ -390,7 +411,7 @@ def _build(entries: Iterable[Tuple[_Part, ...]]) -> _Snapshot:
         return _EMPTY
     sentinels = tuple(c for c in _PUA if c not in used) or ("\ue000",)
     return _Snapshot(tuple(long_groups), tuple(url_groups), frozenset(short_words), tuple(short_other),
-                     blocks, frozenset(hosts), sentinels, False)
+                     blocks, frozenset(hosts), sentinels, False, {k: tuple(v) for k, v in heads.items()})
 
 
 def _extend_right(text: str, end: int, value: str, vend: int) -> int:
@@ -484,15 +505,28 @@ def _pick_sentinel(text: str, snap: _Snapshot) -> Optional[str]:
     return None
 
 
+def _content_parts(parts: Tuple[_Part, ...], grade: int) -> Tuple[_Part, ...]:
+    """내용 경로 스냅샷에 넣을 기저(WS-75): 자격증명은 전부(4~7 경계 포함), 주소 비밀은 ≥ 8 만, 휴리스틱은 없음."""
+    if grade >= GRADE_CREDENTIAL:
+        return parts
+    if grade >= GRADE_URL:
+        return tuple(p for p in parts if p.long)
+    return ()
+
+
 class SecretRegistry:
     """비밀 값의 LRU 집합. 값은 이 객체 밖으로 내보내지 않는다(repr·pickle·copy 금지)."""
 
-    __slots__ = ("_lock", "_order", "_snapshot", "_version", "_cap", "_max_chars", "_chars")
+    __slots__ = ("_lock", "_order", "_snapshot", "_version", "_cap", "_max_chars", "_chars", "_grades", "_content")
 
     def __init__(self, cap: int = MAX_VALUES, max_chars: int = MAX_CHARS) -> None:
         self._lock = threading.Lock()
         self._order: "OrderedDict[str, Tuple[_Part, ...]]" = OrderedDict()
+        #: 값 → 등급(WS-75). _order 와 같은 키.
+        self._grades: Dict[str, int] = {}
         self._snapshot: _Snapshot = _EMPTY
+        #: 내용 경로용 스냅샷(등급으로 고른 기저만, WS-75). version 은 공유.
+        self._content: _Snapshot = _EMPTY
         self._version = 0
         self._cap = cap
         self._max_chars = max_chars
@@ -528,42 +562,61 @@ class SecretRegistry:
 
     # -- 등록 -------------------------------------------------------------------
 
-    def add_value(self, value: Any) -> None:
+    @property
+    def content_empty(self) -> bool:
+        """내용 경로에서 가릴 값이 없는가(WS-75 — 비었으면 내용 경로는 원문 공유, 비용 0)."""
+        return self._content.empty
+
+    def add_value(self, value: Any, grade: int = GRADE_CREDENTIAL) -> None:
         if not isinstance(value, str) or len(value) < MIN_VALUE_CHARS:
             return
-        self.add_values([value])
+        self.add_values([value], grade)
 
-    def add_values(self, values: Iterable[str]) -> None:
-        fresh = [v for v in values if isinstance(v, str) and len(v) >= MIN_VALUE_CHARS]
+    def add_values(self, values: Iterable[str], grade: int = GRADE_CREDENTIAL) -> None:
+        """값들을 같은 등급으로 등록한다. 출처를 모르는 호출은 가장 넓게 가리는 자격증명 등급(안전 쪽)."""
+        self.add_graded((v, grade) for v in values)
+
+    def add_graded(self, pairs: Iterable[Tuple[str, int]]) -> None:
+        """(값, 등급) 들을 등록한다(WS-75). 이미 있는 값은 뒤로 옮기고 등급은 높은 쪽을 남긴다."""
+        fresh = [(v, int(g)) for v, g in pairs if isinstance(v, str) and len(v) >= MIN_VALUE_CHARS]
         if not fresh:
             return
         with self._lock:
             changed = False
-            for value in fresh:
+            for value, grade in fresh:
                 if value in self._order:
                     self._order.move_to_end(value)  # 다시 본 값은 뒤로(스냅샷 내용은 같다)
+                    if grade > self._grades.get(value, 0):
+                        self._grades[value] = grade  # 높은 등급으로 — 내용 경로 스냅샷이 바뀐다
+                        changed = True
                     continue
                 parts = _parts(value)
                 if not parts:
                     continue
                 self._order[value] = parts
+                self._grades[value] = grade
                 self._chars += sum(p.chars for p in parts)
                 changed = True
             # 값 단위 LRU(R5 B2): 오래된 값부터 통째로 잊는다. 가장 최근 값은 남긴다 — 값 하나의 전 표현이 글자 예산을
             # 넘으면 그 값만 혼자 남는다(표현 일부를 버려 살아 있는 값이 새는 일이 없다).
             while len(self._order) > 1 and (len(self._order) > self._cap or self._chars > self._max_chars):
-                _, parts = self._order.popitem(last=False)
+                old, parts = self._order.popitem(last=False)
+                self._grades.pop(old, None)
                 self._chars -= sum(p.chars for p in parts)
                 changed = True
             if changed:
                 self._snapshot = _build(self._order.values())
+                self._content = _build(_content_parts(parts, self._grades.get(v, GRADE_CREDENTIAL))
+                                       for v, parts in self._order.items())
                 self._version += 1
 
     def clear(self) -> None:
         with self._lock:
             self._order.clear()
+            self._grades.clear()
             self._chars = 0
             self._snapshot = _EMPTY
+            self._content = _EMPTY
             self._version += 1
 
     # -- 조회 -------------------------------------------------------------------
@@ -571,6 +624,31 @@ class SecretRegistry:
     def mask(self, text: str) -> str:
         """자유 문장: 등록 값의 표현(≥ 8 부분 일치, 4~7 경계 일치)과 긴 원문의 조각을 `[REDACTED]` 로."""
         return self._mask(text, url=False)
+
+    def mask_content(self, text: str) -> str:
+        """페이지 내용 경로(WS-75): 등급으로 고른 값만 자유 문장 규칙(≥ 8 부분 일치, 4~7 경계 일치)으로 가린다."""
+        return self._mask(text, url=False, snap=self._content)
+
+    def mask_tail(self, text: str) -> str:
+        """잘린 글자(WS-75 — perception 이 원문을 먼저 자른 칸)의 끝이 내용 경로 가림 대상 등록 값의 **앞부분**(≥ 4자, 값
+        전체보다 짧음)이면 그 끝 조각을 `[REDACTED]` 로. 끝의 말줄임 `…` 은 남긴다. 4~7자 값(자격증명)의 앞부분은 앞 글자가
+        영숫자가 아닐 때만(경계 규칙과 같다). 일치가 없으면 입력 그대로(같은 객체)."""
+        heads = self._content.heads
+        if not heads or len(text) < HEAD_CHARS:
+            return text
+        ellipsis = text.endswith("\u2026")
+        body = text[:-1] if ellipsis else text
+        n = len(body)
+        for p in range(max(0, n - TAIL_WINDOW), n - HEAD_CHARS + 1):
+            found = heads.get(body[p:p + HEAD_CHARS])
+            if not found:
+                continue
+            tail = body[p:]
+            for value, long in found:
+                if len(tail) < len(value) and value.startswith(tail) and (
+                        long or p == 0 or not body[p - 1].isalnum()):
+                    return body[:p] + MASK + ("\u2026" if ellipsis else "")
+        return text
 
     def mask_url_part(self, text: str) -> str:
         """주소 칸(호스트 뒤): ≥ 8 값의 R1·R2 표현과 긴 원문 조각만(4~7 은 정상 경로 보존 — §2 P3)."""
@@ -581,8 +659,9 @@ class SecretRegistry:
         hosts = self._snapshot.hosts
         return bool(hosts) and label.casefold() in hosts
 
-    def _mask(self, text: str, url: bool) -> str:
-        snap = self._snapshot
+    def _mask(self, text: str, url: bool, snap: Optional[_Snapshot] = None) -> str:
+        if snap is None:
+            snap = self._snapshot
         if snap.empty or len(text) < MIN_VALUE_CHARS:
             return text
         sentinel = _pick_sentinel(text, snap)
@@ -624,11 +703,11 @@ def register_url(url: Any) -> None:
     if not isinstance(url, str) or not url:
         return
     try:
-        from security.public_url import secret_values
+        from security.public_url import graded_secret_values
 
-        found = secret_values(url)
+        found = graded_secret_values(url)
         if found:
-            REGISTRY.add_values(found)
+            REGISTRY.add_graded(found)
     except Exception:  # noqa: BLE001 - 등록 실패가 도구 동작을 막지 않는다(URL 문법 계층은 그대로 동작)
         return
 
@@ -646,13 +725,18 @@ def register_secret_values(values: Iterable[Any]) -> None:
     등록한다. 판정·상한은 주소 값과 같다(`_eligible` — 4자 미만·4~7자 순수 알파벳·도구 어휘 제외, 값 단위 LRU).
     값은 메모리에만 있고, 예외를 내지 않는다(등록 실패가 입력을 막지 않는다)."""
     try:
-        REGISTRY.add_values([v for v in values if isinstance(v, str) and v])
+        REGISTRY.add_values([v for v in values if isinstance(v, str) and v], GRADE_CREDENTIAL)
     except Exception:  # noqa: BLE001
         return
 
 
 def mask_registered(text: str) -> str:
     return REGISTRY.mask(text)
+
+
+def mask_content(text: str) -> str:
+    """페이지 내용 경로용 가림(WS-75 — 등급 규칙, `SecretRegistry.mask_content`)."""
+    return REGISTRY.mask_content(text)
 
 
 def version() -> int:

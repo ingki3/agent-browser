@@ -54,27 +54,35 @@
 영숫자가 아닐 때만 가리고 주소 칸에는 쓰지 않는다. 레지스트리 상한(값 256개·글자 16Mi)을 넘어 잊힌 옛 값은 URL 문법
 계층만 적용된다. 표현 범위는 `secret_registry.representations` (대소문자 섞인 16진·base64·NFC/NFD·말줄임은 범위 밖).
 호스트 라벨은 라벨 전체가 등록 값일 때만 가린다(`xx<V>yy.도메인` 은 남는다 — 정상 도메인 보호, 2026-10-17 결정).
-페이지 내용 subtree(아래 '경계')는 범위 밖(원문 보존 계약, 2026-10-17 결정).
+페이지 내용 subtree(아래 '경계')는 이 세 계층을 받지 않고 '아는 비밀만' 규칙(WS-75)만 받는다.
 
 **주소 칸**(url·*_url): public_url → 레지스트리(≥ 8 값의 R1·R2 표현·긴 원문 조각, 호스트는 라벨 단위 casefold) → JWT
 (R4 P3). 제어 필드(action·error_code·*tab_id·approval_id·레시피 id·status … — `control_value`)는 값이 그 키의 실제
 열거 어휘(`CONTROL_VOCABULARY`, 코드 상수에서 도출) 또는 도구 식별자 형식이면 그대로 둔다(R4 P2 · R5 B3·B4 — 낱말 모양
 일반 면제는 없다, 자유 문장 칸은 정제).
 
-**경계**: 페이지 *내용* 으로서의 주소는 가리지 않는다 — 에이전트가 링크를 따라가려면 원문이 필요하다
+**경계**(2026-10-17 계약 → WS-75 #199 사용자 결정 B 2026-10-31 로 좁힘): 페이지 *내용*
 (`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`, `data.repeated`(WS-62). **경로**로
-정한다 — 다른 자리의 같은 이름 키는 가린다, R1 NB-1). 서버 내부(탭 복원·창 전환·레시피·robots·쿠키
-장부)는 원문을 계속 쓴다 — 가린 주소로 복원하면 토큰이 필요한 페이지가 깨진다.
+정한다 — 다른 자리의 같은 이름 키는 가린다, R1 NB-1)에는 URL 문법·JWT 계층을 적용하지 않고 주소 칸 등록도 하지 않는다. 다만
+**도구가 비밀로 아는 값**(레지스트리 등록 값)은 등급 규칙(`secret_registry.mask_content` — 자격증명은 4~7자 경계 포함,
+주소 비밀은 ≥ 8, 비밀 키가 아닌 키 아래 순수 16진은 제외)으로 페이지 글자 칸(`CONTENT_TEXT_KEYS`·extract 항목의 모든 값)에서
+가린다(`content_text`). perception 이 원문을 먼저 자른 칸(`CONTENT_CUT_LENGTHS`·말줄임)은 끝에 남은 등록 값 앞부분도 가린다.
+모르는 값은 원문 — 에이전트가 링크를 따라가려면 원문이 필요하다(가린 href 는 `has_redaction_mark` 로 이동 거부 → 관찰의
+element_id 로 click). 응답 파이프라인(server_tools)은 크기 자르기 전에 내용 경로를 한 번 가린 사본(`content_view`)으로
+바꾸고 그 위에서 자른다(`content_masked` 문맥 안 직렬화는 같은 version 이면 다시 훑지 않는다). 서버 내부(탭 복원·창 전환·
+레시피 재생·robots·쿠키 장부·batch 지문)는 원문을 계속 쓴다 — 가린 주소로 복원하면 토큰이 필요한 페이지가 깨진다.
 
 가림 표지가 든 주소는 이동하지 않는다(`has_redaction_mark`) — 표지 문자열로 사이트에 요청이 나가지 않게.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import re
 import unicodedata
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from contextvars import ContextVar
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 from urllib.parse import quote, unquote, unquote_plus, urlsplit
 
 from contracts import ActionType, ErrorCode
@@ -181,11 +189,8 @@ _MAX_CONTENT_PATH = max(len(p) for p in CONTENT_PATHS)
 # ------------------------------------------------------------------ 키·값 판정
 
 
-def _secret_key(raw_key: str) -> bool:
-    """키 이름이 비밀 계열인가(대소문자 무시 — 모듈 설명 (a)).
-
-    판정 정규형(R2 B7): 퍼센트 디코딩 → NFKC(전각 `ｔｏｋｅｎ` → token) → casefold(long-s `ſeſſion` → session).
-    """
+def _norm_key(raw_key: str) -> Tuple[str, str]:
+    """(NFKC 키, casefold 키) — 퍼센트 디코딩(최대 3겹) → NFKC → casefold(R2 B7)."""
     key = raw_key
     for _ in range(_MAX_KEY_UNQUOTE):
         decoded = unquote_plus(key)
@@ -193,7 +198,15 @@ def _secret_key(raw_key: str) -> bool:
             break
         key = decoded
     key = unicodedata.normalize("NFKC", key)
-    low = key.casefold()
+    return key, key.casefold()
+
+
+def _secret_key(raw_key: str) -> bool:
+    """키 이름이 비밀 계열인가(대소문자 무시 — 모듈 설명 (a)).
+
+    판정 정규형(R2 B7): 퍼센트 디코딩 → NFKC(전각 `ｔｏｋｅｎ` → token) → casefold(long-s `ſeſſion` → session).
+    """
+    key, low = _norm_key(raw_key)
     compact = _KEY_JOINERS.sub("", low)  # WS-55: sortKey·sort_key·sort-key·SORTKEY 는 같은 키
     if compact in _NOT_SECRET_KEYS:
         return False
@@ -209,6 +222,33 @@ def _secret_key(raw_key: str) -> bool:
         if w in _SHORT_WORDS or w in _COMPOUNDS:
             return True
     return False
+
+
+#: 자격증명 키 낱말(WS-75 N3·NB-f): `_secret_key` 가 참인 키 중 이 낱말을 품은 키의 값은 자격증명 등급.
+#: 긴 낱말은 부분 일치(`new_password`), 짧은 낱말은 낱말 전체 일치(`otp_ttl` 처럼 부분이 아닌 낱말 단위 — NB-g).
+_CREDENTIAL_LONG = ("password", "passwd")
+_CREDENTIAL_WORDS = frozenset({"pwd", "otp", "passcode", "otpcode"})
+
+
+def _credential_key(raw_key: str) -> bool:
+    """비밀 키 중 자격증명 자체(password·passwd·pwd·otp·passcode·otpcode 계열)인가 — `_secret_key` 범위는 넓히지 않는다."""
+    if not _secret_key(raw_key):
+        return False
+    key, low = _norm_key(raw_key)
+    if any(word in low for word in _CREDENTIAL_LONG):
+        return True
+    if _KEY_JOINERS.sub("", low) in _CREDENTIAL_WORDS:
+        return True
+    if any(seg in _CREDENTIAL_WORDS for seg in _KEY_SEGMENT.findall(low)):
+        return True
+    return any(word.casefold() in _CREDENTIAL_WORDS for word in _KEY_WORD.findall(key))
+
+
+def _value_grade(raw_value: str) -> int:
+    """비밀 키가 아닌 자리에서 `_secret_value` 로 가린 값의 등급(WS-75): 순수 16진(ObjectId 류)은 휴리스틱, 그 밖은 주소 비밀."""
+    if _HEX.fullmatch(unquote(raw_value)):
+        return secret_registry.GRADE_HEURISTIC
+    return secret_registry.GRADE_URL
 
 
 def _word_char(ch: str) -> bool:
@@ -284,8 +324,8 @@ def _secret_value(raw_value: str) -> bool:
 # ------------------------------------------------------------------ 주소
 
 
-#: 가린 원 값을 모으는 자리(secret_values) — None 이면 모으지 않는다.
-_Sink = Optional[List[str]]
+#: 가린 원 값과 그 등급(WS-75)을 모으는 자리(secret_values) — None 이면 모으지 않는다.
+_Sink = Optional[List[Tuple[str, int]]]
 
 
 def _public_value(raw_value: str, depth: int, sink: _Sink = None) -> str:
@@ -295,7 +335,7 @@ def _public_value(raw_value: str, depth: int, sink: _Sink = None) -> str:
         return raw_value
     if depth >= MAX_URL_DEPTH:
         if sink is not None:
-            sink.append(raw_value)
+            sink.append((raw_value, secret_registry.GRADE_URL))
         return MASK  # 너무 깊은 중첩 주소 — 더 풀지 않고 값 전체를 가린다
     inner = _public_url(decoded, depth + 1, sink)
     if inner == decoded:
@@ -308,14 +348,18 @@ def _public_param(part: str, depth: int, sink: _Sink = None) -> str:
         key, value = part.split("=", 1)
         if value and (_secret_key(key) or _secret_value(value)):
             if sink is not None:
-                sink.append(value)
+                if _secret_key(key):
+                    grade = secret_registry.GRADE_CREDENTIAL if _credential_key(key) else secret_registry.GRADE_URL
+                else:
+                    grade = _value_grade(value)
+                sink.append((value, grade))
             value = MASK
         else:
             value = _public_value(value, depth, sink)
         return f"{key}={value}"
     if part and _secret_value(part):
         if sink is not None:
-            sink.append(part)
+            sink.append((part, _value_grade(part)))
         return MASK
     return part
 
@@ -336,7 +380,7 @@ def _public_fragment(fragment: str, depth: int, sink: _Sink = None) -> str:
         return _public_query(fragment, depth, sink)
     if fragment and _secret_value(fragment):
         if sink is not None:
-            sink.append(fragment)
+            sink.append((fragment, _value_grade(fragment)))
         return MASK
     return fragment
 
@@ -376,7 +420,7 @@ def _public_url(url: str, depth: int, sink: _Sink = None) -> str:
         if sink is not None:
             # 사용자정보는 통째로 뺀다 — 비밀번호(없으면 사용자 자리에 쓴 토큰)를 등록 대상으로.
             user, _, password = netloc.rsplit("@", 1)[0].partition(":")
-            sink.append(password or user)
+            sink.append((password or user, secret_registry.GRADE_CREDENTIAL))
         prefix = prefix.replace("//" + netloc, "//" + netloc.rsplit("@", 1)[1], 1)
     if ";" in prefix:
         prefix = _public_matrix(prefix, bool(netloc), depth, sink)
@@ -401,11 +445,16 @@ def public_url(url: str) -> str:
 def secret_values(url: str) -> List[str]:
     """public_url(url) 이 `[REDACTED]` 로 바꾸는(또는 사용자정보로 빼는) 원 값들 — 비밀 값 레지스트리의 등록
     판정이다(같은 함수라 주소 칸 판정과 갈라지지 않는다). 중첩 주소(`next=`)의 값은 디코드된 원 값."""
+    return [v for v, _ in graded_secret_values(url)]
+
+
+def graded_secret_values(url: str) -> List[Tuple[str, int]]:
+    """secret_values 의 (값, 등급) 쌍(WS-75 — 레지스트리 등록용). 등급은 수집 지점별 표(계획 v4)."""
     if not isinstance(url, str) or not url:
         return []
-    sink: List[str] = []
+    sink: List[Tuple[str, int]] = []
     _public_url(url, 0, sink)
-    return [v for v in sink if v]
+    return [(v, g) for v, g in sink if v]
 
 
 # ------------------------------------------------------------------ 자유 문장·응답 구조
@@ -818,7 +867,7 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
         for k, v in obj.items():
             sub = path + (k,) if path is not None and len(path) < _MAX_CONTENT_PATH else None
             if sub is not None and sub in paths:
-                out[k] = v  # 페이지 내용(공유 — 소비자는 바로 직렬화한다, 모듈 설명·보고서 참조)
+                out[k] = _content_subtree(sub, v)  # 페이지 내용 — 아는 비밀 값만 가린다(WS-75), 없으면 공유
             else:
                 out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k,
                                                 item_of if isinstance(v, str) else
@@ -829,14 +878,155 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
     return items if isinstance(obj, list) else tuple(items)
 
 
+# ------------------------------------------------------------------ 페이지 내용 경로(WS-75 #199, 사용자 결정 B)
+
+#: 내용 경로 안에서 가리는 페이지 글자 칸(NB3) — element_id·id·role·group_source·how·좌표 같은 구조·도구 칸은 그대로.
+#: extract 항목(data.items)은 칸 이름이 에이전트가 고른 속성 이름이라 모든 문자열 값을 가린다.
+CONTENT_TEXT_KEYS: FrozenSet[str] = frozenset({"name", "value", "text", "href", "group", "heading", "summary", "label",
+                                               "title"})
+#: perception 이 원문을 먼저 자르는 길이(사용자 결정 B 보강 2026-10-31 — 잘린 끝에 남는 등록 값 앞부분). 이 길이이거나
+#: 말줄임 `…` 로 끝나는 글자는 끝 조각을 `mask_tail` 로 더 본다. 출처(시험 test_ws75_cut_lengths 가 원천과 같음을 고정):
+#: 12 = perception.repeated.COMPACT_WORD(압축 이름 첫 낱말), 40 = perception.repeated.NAME_LIMIT·JS rpClean(묶음 이름·표제),
+#: 120 = perception.sanitizer 이름 JS `text.slice(0, 120)`, 200 = sanitizer·shadow_dom 값 JS `String(el.value).slice(0, 200)`.
+CONTENT_CUT_LENGTHS: FrozenSet[int] = frozenset({12, 40, 120, 200})
+_ELLIPSIS = "\u2026"
+#: axtree_summary 한 줄(perception.engine._summarize — `@eN role "이름"` + ` (disabled)`).
+_SUMMARY_LINE = re.compile(r'(\S+ \S+ ")(.*)("(?: \(disabled\))?)')
+#: 가린 결과 메모(레지스트리 version 단위 — version 이 바뀌면 버린다). (version, 원문 → 가린 글자).
+_CONTENT_MEMO: Tuple[int, Dict[str, str]] = (-1, {})
+#: 메모 상한 — 항목 수와 원문 글자 합(넘으면 비운다; 메모는 비용만 좌우하고 결과는 바꾸지 않는다).
+_CONTENT_MEMO_MAX = 100_000
+_CONTENT_MEMO_MAX_CHARS = 32 * 1024 * 1024
+_content_memo_chars = 0
+#: 응답 파이프라인이 내용 경로를 이미 가린 사본으로 바꿔 둔 레지스트리 version(server_tools — 크기 자르기 반복 중 다시 훑지
+#: 않는다, 계획 v2 B2). 이 문맥 밖의 직렬화는 늘 다시 가린다(메모로 싸다).
+_CONTENT_MASKED: ContextVar[Optional[int]] = ContextVar("public_url_content_masked", default=None)
+
+
+def content_text(text: Any) -> Any:
+    """페이지 내용 글자 하나를 가린다 — 등급 규칙(secret_registry.mask_content: 자격증명 4~7 경계 포함, 주소 비밀 ≥ 8,
+    휴리스틱 id 제외). URL 문법·JWT 계층은 적용하지 않는다(모르는 값은 원문). 멱등이고 version 단위 메모를 쓴다."""
+    global _CONTENT_MEMO, _content_memo_chars
+    if not isinstance(text, str) or len(text) < secret_registry.MIN_VALUE_CHARS:
+        return text
+    registry = secret_registry.REGISTRY
+    version = registry.version
+    memo_version, memo = _CONTENT_MEMO
+    if memo_version != version or len(memo) > _CONTENT_MEMO_MAX or _content_memo_chars > _CONTENT_MEMO_MAX_CHARS:
+        memo = {}
+        _CONTENT_MEMO = (version, memo)
+        _content_memo_chars = 0
+    hit = memo.get(text)
+    if hit is not None:
+        return hit
+    out = registry.mask_content(text)
+    if text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS:
+        out = registry.mask_tail(out)  # 원문을 먼저 자른 칸 — 끝에 남은 등록 값 앞부분
+    memo[text] = out
+    _content_memo_chars += len(text)
+    if out is not text:
+        memo[out] = out  # 가린 글자를 다시 지나면(직렬화마다) 바로 돌려준다
+    return out
+
+
+def content_summary(text: Any) -> Any:
+    """axtree_summary — 줄마다 이름 부분만 elements[].name 과 같은 함수(content_text)로 가린다(요약과 요소가 같은 결과).
+    형식이 다른 줄(이름 안 줄바꿈의 이어진 줄 등)은 줄 전체를 가린다."""
+    if not isinstance(text, str) or len(text) < secret_registry.MIN_VALUE_CHARS:
+        return text
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        m = _SUMMARY_LINE.fullmatch(line)
+        out.append(m.group(1) + content_text(m.group(2)) + m.group(3) if m else content_text(line))
+    joined = "\n".join(out)
+    return text if joined == text else joined
+
+
+def mask_content(obj: Any, all_strings: bool = False, key: Any = None, depth: int = 0) -> Any:
+    """내용 subtree 의 페이지 글자 칸을 가린 **새** 구조(입력 불변 — dict/list 는 늘 새로 만든다)."""
+    if isinstance(obj, str):
+        return content_text(obj) if (all_strings or key is None or key in CONTENT_TEXT_KEYS) else obj
+    if not isinstance(obj, (dict, list, tuple)):
+        return obj
+    if depth >= MAX_PAYLOAD_DEPTH:
+        return DEPTH_MASK
+    if isinstance(obj, dict):
+        return {k: (mask_content(v, all_strings, k, depth + 1) if not isinstance(v, str) or all_strings
+                    or k in CONTENT_TEXT_KEYS else v) for k, v in obj.items()}
+    items = [v if isinstance(v, str) and not all_strings else mask_content(v, all_strings, None, depth + 1)
+             for v in obj]
+    return items if isinstance(obj, list) else tuple(items)
+
+
+def _content_subtree(path: Tuple[Any, ...], value: Any) -> Any:
+    registry = secret_registry.REGISTRY
+    if registry.content_empty or _CONTENT_MASKED.get() == registry.version:
+        return value  # 가릴 값이 없거나 파이프라인이 같은 version 으로 이미 가린 사본(공유 — 바이트 동일)
+    if path[-1] == "axtree_summary":
+        return content_summary(value)
+    return mask_content(value, all_strings=path[-1] == "items")
+
+
+def content_view(data: Any) -> Any:
+    """result.data 의 내용 경로(items·observation.elements·axtree_summary·repeated)를 지금 레지스트리로 **한 번** 가린 새
+    dict(계획 v4 ③). 원본은 바꾸지 않는다 — 뒤 단계(fit_saved_pages·fit_repeated·cap_result_size)는 이 사본을 제자리
+    수정하고, version 이 바뀌면 호출자가 원본에서 다시 만든다. 가릴 값이 없으면 내용은 원본과 같은 객체를 공유한다
+    (반복 묶음만 얕게 복사 — fit_repeated 의 제자리 수정이 원본에 닿지 않게)."""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    masking = not secret_registry.REGISTRY.content_empty
+    if "items" in out and masking:
+        out["items"] = mask_content(out["items"], all_strings=True)
+    obs = out.get("observation")
+    if isinstance(obs, dict):
+        obs = dict(obs)
+        if masking:
+            if "elements" in obs:
+                obs["elements"] = mask_content(obs["elements"])
+            if "axtree_summary" in obs:
+                obs["axtree_summary"] = content_summary(obs["axtree_summary"])
+        out["observation"] = obs
+    rep = out.get("repeated")
+    if isinstance(rep, dict):
+        if masking:
+            out["repeated"] = mask_content(rep)
+        else:
+            rep = dict(rep)
+            if isinstance(rep.get("groups"), list):
+                rep["groups"] = list(rep["groups"])
+            out["repeated"] = rep
+    return out
+
+
+@contextlib.contextmanager
+def content_masked(version: int) -> Iterator[None]:
+    """이 문맥의 직렬화는 내용 경로가 `version` 으로 이미 가려졌다고 본다(레지스트리 version 이 같을 때만)."""
+    token = _CONTENT_MASKED.set(version)
+    try:
+        yield
+    finally:
+        _CONTENT_MASKED.reset(token)
+
+
+def register_url_fields(obj: Any) -> None:
+    """응답 구조(또는 result 필드 dict)의 주소 칸 원문을 등록한다(내용 경로 제외 — public_payload 의 등록과 같은 판정).
+    WS-75 ①: 크기 자르기 **전에** 결과 객체를 직접 순회해 부른다(model_dump 없이). 예외를 내지 않는다."""
+    try:
+        _register_url_fields(obj, (), 0, CONTENT_PATHS, False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def public_payload(obj: Any, *, content_paths: FrozenSet[Tuple[str, ...]] = CONTENT_PATHS) -> Any:
     """응답 구조(dict/list)의 문자열을 가린 **새** 구조를 돌려준다(입력은 바꾸지 않는다).
 
     * 주소 칸(`_is_url_key`: url·current_url·frame_url·robots_url·tabs[].url …)의 문자열은 스킴과 무관하게
       public_url(+JWT 가림), 그 밖의 문자열은 public_text.
-    * content_paths(최상위 응답 기준 경로 — extract 항목, 관찰 요소·요약)는 원문 그대로 둔다. 그 subtree 는
-      입력과 같은 객체다(복사하지 않음 — 두 소비자 envelope_dict·call_server_tool 은 새로 만든 dict 를 넘기고
-      결과를 바로 직렬화한다).
+    * content_paths(최상위 응답 기준 경로 — extract 항목, 관찰 요소·요약, 반복 묶음)는 **도구가 비밀로 아는 값만**
+      등급 규칙으로 가린다(WS-75 `mask_content` — 페이지 글자 칸만). 가릴 값이 없거나 파이프라인이 같은 version 으로
+      이미 가린 사본이면(`content_masked`) 입력과 같은 객체를 공유한다(복사하지 않음 — 바이트 동일·비용 0).
     * 깊이 MAX_PAYLOAD_DEPTH 를 넘는 자리는 DEPTH_MASK — 예외를 내지 않는다.
     * 가리기 전에 같은 응답의 주소 칸 원문(내용 경로 밖)을 비밀 값 레지스트리에 등록한다(R3 등록 지점 a) — 제목이
       주소 칸보다 먼저 나와도 그 주소의 비밀 값은 제목에서 가려진다.

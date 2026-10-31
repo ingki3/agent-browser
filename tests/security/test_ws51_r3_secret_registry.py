@@ -337,7 +337,8 @@ def test_registration_failure_never_raises(monkeypatch):
     def boom(url):
         raise RuntimeError("synthetic")
 
-    monkeypatch.setattr(pu, "secret_values", boom)
+    # WS-75: 등록은 등급을 함께 받는 graded_secret_values 를 부른다(secret_values 는 그 값만 돌려주는 얇은 함수).
+    monkeypatch.setattr(pu, "graded_secret_values", boom)
     secret_registry.register_url(f"{ORIGIN}/a?token={SECRET}")  # 예외 없음
     secret_registry.register_urls([None, 3, f"{ORIGIN}/a?token={SECRET}"])
     assert len(secret_registry.REGISTRY) == 0

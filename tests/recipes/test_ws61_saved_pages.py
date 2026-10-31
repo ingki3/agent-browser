@@ -559,7 +559,10 @@ def test_server_route_fits_saved_pages_before_cap():
 
     from interface import server_tools
 
-    src = inspect.getsource(server_tools.ToolsMixin._route_tool_call)
+    # WS-75: 크기 맞춤(fit_saved_pages → … → cap_result_size)은 가린 사본 위에서 다시 돌 수 있게 _fit_result 로 묶였다.
+    route = inspect.getsource(server_tools.ToolsMixin._route_tool_call)
+    assert "self._fit_result(" in route
+    src = inspect.getsource(server_tools.ToolsMixin._fit_result)
     assert src.index("fit_saved_pages(") < src.index("cap_result_size(")
 
 

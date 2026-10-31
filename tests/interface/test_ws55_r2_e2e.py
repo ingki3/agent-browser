@@ -81,13 +81,11 @@ def site():
     srv.server_close()
 
 
-def _outside_content(wire: str) -> str:
-    """페이지 내용 subtree(CONTENT_PATHS — 관찰 요소·요약, 원문 보존 계약)를 뺀 wire. 검증 B1-R1 도 이 범위만 셌다."""
-    obj = json.loads(wire)
-    obs = obj.get("data", {}).get("observation") or {}
-    obs.pop("elements", None)
-    obs.pop("axtree_summary", None)
-    return json.dumps(obj, ensure_ascii=False)
+def _full_wire(wire: str) -> str:
+    """MCP wire **전체**(WS-75 #199 — 내용 경로도 도구가 아는 비밀은 가리므로 예전 `_outside_content` 처럼 관찰 요소·요약을
+    빼지 않는다; 검증 B1-R1 는 그 범위만 셌다). JSON 으로 읽히는지만 확인하고 그대로 돌려준다."""
+    json.loads(wire)
+    return wire
 
 
 async def _open(s, site, path):
@@ -104,7 +102,7 @@ async def _type(s, text, **extra):
 async def _assert_hidden(s, typed, value):
     typed_wire = envelope_json(typed)
     assert value not in typed_wire, typed_wire
-    obs_wire = _outside_content(envelope_json(await s.call_tool("browser_observe_page", {})))
+    obs_wire = _full_wire(envelope_json(await s.call_tool("browser_observe_page", {})))
     assert value not in obs_wire, obs_wire
     assert "sortKey=[REDACTED]" in obs_wire
     assert len(secret_registry.REGISTRY) > 0, "민감 칸에 친 값이 등록되지 않았다"
