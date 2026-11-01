@@ -69,5 +69,27 @@ def test_r1b_item_operation_paths_stay_high(source, url):
     assert _risk("\U0001F4C1", [(source, url)]) is RiskLevel.HIGH, (source, url)
 
 
+# ---------------------------------------------------------------------------- R3 (재검증 R2 BLOCKING)
+#: 짧은 접두 m·u 는 메일 항목 증거가 아니다 — 사용자 분류(/u/42/spam)·모바일 상품(/m/42/block)·계정 폴더(/mail/u/0/spam).
+R3_CONTROLS = [
+    ("href", "/u/42/spam"), ("href", "/m/42/block"), ("href", "/mail/u/0/spam"), ("href", "/mail/u/0/trash"),
+    ("href", "https://mail.test/u/7/block"), ("form_action", "/m/6f1c2a9e-0b1d-4c3e-9f00-1234abcd5678/spam"),
+]
+R3_RISKY = [
+    ("href", "/mail/u/0/messages/42/trash"), ("href", "/api/messages/42/trash"), ("href", "/inbox/42/spam"),
+    ("href", "/u/42/spam?action=spam"),
+]
+
+
+@pytest.mark.parametrize("source,url", R3_CONTROLS)
+def test_r3_short_prefix_views_keep_baseline(source, url):
+    assert _risk("\U0001F4C1", [(source, url)]) is RiskLevel.LOW, (source, url)
+
+
+@pytest.mark.parametrize("source,url", R3_RISKY)
+def test_r3_explicit_item_operations_stay_high(source, url):
+    assert _risk("\U0001F4C1", [(source, url)]) is RiskLevel.HIGH, (source, url)
+
+
 def test_sample_sizes():
     assert len(R1A_CONTROLS) >= 6 and len(R1B_CONTROLS) >= 6

@@ -109,8 +109,8 @@ def test_b3_controls_keep_baseline(name, signals):
 B4_RISKY = [
     ("href", "/messages/42/trash"), ("href", "/messages/42/spam"), ("href", "/mail/abc123def/trash"),
     ("href", "/threads/42/block"), ("form_action", "/messages/42/trash"), ("formaction", "/api/msg/42/junk"),
-    ("href", "/mail?action=trash&id=42"), ("href", "/mail/42?op=spam"), ("href", "https://mail.test/u/7/block"),
-    ("form_action", "/m/6f1c2a9e-0b1d-4c3e-9f00-1234abcd5678/spam"),
+    ("href", "/mail?action=trash&id=42"), ("href", "/mail/42?op=spam"), ("href", "https://mail.test/msg/7/block"),
+    ("form_action", "/messages/6f1c2a9e-0b1d-4c3e-9f00-1234abcd5678/spam"),  # R3: m·u 접두 → test_ws76_r2 R3 대조
 ]
 B4_CONTROLS = [
     ("href", "/mail/trash"), ("href", "/spam"), ("href", "/folder/Trash"), ("href", "/mail?folder=trash"),

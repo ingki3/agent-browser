@@ -601,8 +601,10 @@ def lone_label(text: str) -> str:
 _ITEM_OPS = frozenset({"trash", "spam", "junk", "block", "report-spam", "reportspam", "move-to-trash", "movetotrash",
                        "mark-as-spam", "markasspam", "report-junk", "block-sender", "block-user"})
 _ITEM_OP_QUERY_KEYS = frozenset({"action", "op", "operation", "cmd", "command", "do", "act"})
-_ITEM_PREFIXES = frozenset({"messages", "message", "msg", "msgs", "m", "mail", "mails", "email", "emails", "thread",
-                            "threads", "conversation", "conversations", "inbox", "u"})
+#: R3: 짧은 m·u 는 뺀다 — 사용자(/u/42)·모바일(/m/42)·계정 범위(/mail/u/0) 탐색과 겹쳐 메일 항목 증거가 아니다.
+#: msg·msgs 는 남긴다 — 일상 경로에서 '메시지' 말고 다른 뜻으로 쓰이지 않는 약어다.
+_ITEM_PREFIXES = frozenset({"messages", "message", "msg", "msgs", "mail", "mails", "email", "emails", "thread",
+                            "threads", "conversation", "conversations", "inbox"})
 _ITEM_ID_RE = re.compile(r"^(?=[0-9a-z_\-]*\d)[0-9a-z_\-]{1,64}$")
 
 
