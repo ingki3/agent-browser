@@ -77,6 +77,9 @@ ATTRS = {
     ("closed", "tab_id"): (ID, "actions/dispatcher.py tab close data.closed — tab-N"),
     ("closed_tab_id", "tab_id"): (ID, "interface/server_lifecycle.py — tab-N"),
     ("tab_id", "tab_id"): (ID, "tab-N"),
+    # WS-77 data.human_handoff
+    ("request_id", "request_id"): (ID, "interface/server_control.py data.human_handoff.request_id — hub.request_id(rq_…)"),
+    ("release_source", "release_source"): (CONTROL, "interface/server_control.py — handoff.release_source(반납 출처)"),
     ("tab_id", "active_tab_id"): (ID, "tab-N"),
     ("approval_id", "approval_id"): (ID, "ap_…"),
     ("element_id", "element_id"): (ID, "@eN·@sN"),
@@ -255,7 +258,9 @@ def _producer_values():
         ("risk", "value"): {r.value for r in RiskLevel},
         ("action", "value"): {a.value for a in ActionType},
         ("code", "code"): {egress.UPSTREAM_RESOLVE_FAILED, egress.UPSTREAM_CONNECT_FAILED},
-        ("changed", "last_event"): {"taken", "released"},  # server_handoff: last_event in ("taken", "released") 일 때만
+        # server_handoff: last_event in ("taken", "released", "request_expired") 일 때만(WS-77: 요청 만료도)
+        ("changed", "last_event"): {"taken", "released", "request_expired"},
+        ("release_source", "release_source"): {"window_done", "cli", "login_finish", "window_closed", "server"},  # WS-77
         ("changed", "ended"): set(__import__("security.manual_sites", fromlist=["OUTCOMES"]).OUTCOMES),  # WS-64
         ("status", "status"): {"pending", "approved", "denied", "expired", "used", "revoked", "opening", "ready"},
         ("outcome", "outcome"): {"succeeded", "failed", "outcome_unknown"},

@@ -841,6 +841,11 @@
      "server_id": "SERVER_1",
      "since": "<iso>"
     },
+    "human_handoff": {
+     "control_window": "none",
+     "state": "no_window",
+     "tell_user": "지금 서버는 사람이 볼 브라우저 창이 없습니다 — 운영자에게 창을 띄울 수 있는 방식(`--browser on-demand`)으로 다시 실행해 달라고 하세요."
+    },
     "login_hint": "맥에서: --profile 로 서버를 띄워야 로그인이 유지됨 (이후 agent-browser login URL --profile 이름)."
    },
    "error_code": "E_FEATURE_NOT_IMPLEMENTED",

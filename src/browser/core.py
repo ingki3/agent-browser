@@ -195,6 +195,9 @@ class BrowserCore:
         #: WS-50: 관리 탭이 0개가 된 마지막 원인이 close_tab(=부르는 쪽, 에이전트)이었다. 다른 경로로
         #: 탭이 사라지거나(사람·사이트 JS) 새 탭이 등록되면 False — 시간 창이 아닌 결정적 표시.
         self._emptied_by_close_tab = False
+        #: WS-77 B1: 관리 탭에서 뺀 페이지(서버가 띄운 사람용 제어 창) — 어느 탭 목록·상한·창 감시에도 넣지 않는다.
+        #: 페이지 동일성으로 판정한다(targetId 로 찾은 그 페이지만 — 같은 순간 생긴 남의 팝업은 그대로 탭이 된다).
+        self._excluded_pages: List[Any] = []
 
     @property
     def is_user_chrome(self) -> bool:
@@ -299,6 +302,7 @@ class BrowserCore:
         self._tab_index.clear()
         self._active_by_ws.clear()
         self._adoptable_page = None
+        self._excluded_pages.clear()
         if ctx is not None:
             try:
                 await ctx.close()
@@ -367,6 +371,7 @@ class BrowserCore:
         self._tab_index.clear()
         self._active_by_ws.clear()
         self._adoptable_page = None
+        self._excluded_pages.clear()
 
         if self._browser:
             try:
@@ -564,6 +569,8 @@ class BrowserCore:
         existing = self._find_tab_by_page(page)
         if existing is not None:
             return existing
+        if self.is_excluded(page):
+            return None  # WS-77 B1: 서버 전용 제어 창 — 에이전트 탭이 아니다
         managed = self._contexts.get(profile_name)
         if managed is None:
             return None
@@ -628,6 +635,21 @@ class BrowserCore:
         if self._forget_tab(tab_id) is not None:
             # close_tab 이 아닌 경로(사람·사이트 JS)로 탭이 사라졌다 — 에이전트 닫기 표시를 지운다.
             self._emptied_by_close_tab = False
+
+    def exclude_page(self, page: Any) -> None:
+        """WS-77 B1: page 를 관리 탭에서 영구히 뺀다(서버가 띄운 사람용 제어 창). 이미 'page' 사건으로 탭이 됐으면
+        목록에서 지운다(관리 탭이 0개가 됐다는 '에이전트 닫기' 표시는 건드리지 않는다). 부르는 쪽이 도구 호출을
+        멈춘 구간(관문+drain) 안에서 부른다 — 그 사이 에이전트가 이 탭을 볼 틈이 없게."""
+        if page is None:
+            raise ValueError("page 가 필요합니다")
+        if not self.is_excluded(page):
+            self._excluded_pages.append(page)
+        tab = self._find_tab_by_page(page)
+        if tab is not None:
+            self._forget_tab(tab.tab_id)
+
+    def is_excluded(self, page: Any) -> bool:
+        return any(p is page for p in self._excluded_pages)
 
     async def new_tab(self, profile_name: str, url: Optional[str] = None) -> ManagedTab:
         if self.persistent_closed:
@@ -751,6 +773,8 @@ class BrowserCore:
         ws = current_workspace()
         n = 0
         for page in pages:
+            if self.is_excluded(page):
+                continue  # WS-77: 서버 제어 창은 누구의 탭도 아니다
             tab = self._find_tab_by_page(page)
             if tab is None or tab.workspace == ws:
                 n += 1

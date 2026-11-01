@@ -148,6 +148,7 @@ from interface.server_tools import (  # noqa: E402,F401
 # WS-56: 새 모듈(분리 모듈 아님 — 전역 이전 대상이 아니다). 이름은 여기서도 재수출한다.
 from interface.server_manual import ManualSiteMixin  # noqa: E402,F401
 from interface.server_batch import BatchMixin  # noqa: E402,F401
+from interface.server_control import ControlWindowMixin  # noqa: E402,F401
 from interface.server_elicit import (  # noqa: E402,F401
     CURRENT_ELICITOR,
     ELICIT_TIMEOUT_S,
@@ -196,7 +197,7 @@ RELEASE_RECOVERY_WAIT_S = 10.0
 
 
 class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, SignalsMixin, DisplayMixin, HandoffMixin,
-                       WindowMixin, LifecycleMixin, ManualSiteMixin, BatchMixin):
+                       WindowMixin, LifecycleMixin, ManualSiteMixin, BatchMixin, ControlWindowMixin):
     """19종 툴을 노출하는 MCP 서버.
 
     실제 MCP SDK 바인딩은 `create_server()`에서 수행하고, 본 클래스는
@@ -359,6 +360,18 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         #: WS-37: 진행 중인 닫힌 탭 복구(반납 처리). 감시 태스크가 반납을 먼저 집어 복구하는 동안
         #: 다른 호출(control_wait 등)이 복구가 끝나기 전에 '반납됨' 을 알리지 않도록 기다리는 데 쓴다.
         self._release_recovery: Optional["asyncio.Future[None]"] = None
+        #: WS-77: 사람용 제어 창(interface.control_window.ControlWindow) · 다시 띄우는 중 · 다시 띄운/포기한 요청 id.
+        self._control_window: Any = None
+        self._control_spawning = False
+        self._control_recreated: Optional[str] = None
+        self._control_gave_up: Optional[str] = None
+        #: WS-77 B5: 창을 연 요청 구간(그 request_id)도 로그인 감시 대상 · 요청 때 탭 origin · 감시 결과 활동 신호.
+        self._request_watch_id: Optional[str] = None
+        self._request_origins: List[str] = []
+        self._last_activity: Optional[str] = None
+        #: WS-77 B7: 막 끝난 인계(반납·만료)의 신호 — 다음 control_wait/status 에 싣는다.
+        self._handoff_end: Optional[Dict[str, Any]] = None
+        self._handoff_end_unreported = False
 
     def _init_session_fields(self) -> None:
         """__init__ 3부(WS-48 분해): 브라우저 세션 핸들·문서 상태·신호 캐시(start() 가 채운다)."""

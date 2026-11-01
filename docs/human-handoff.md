@@ -82,6 +82,15 @@ agent-browser control release
 
 4. 에이전트: `control_wait`가 `changed: "released"`로 돌아오면 `browser_observe_page`로 다시 관찰하고 이어서 답합니다. 반납 때 `snapshot_epoch`가 올라가므로(사람이 화면을 바꿨을 수 있음) 이전 `element_id`는 무효입니다. 사람이 에이전트가 쓰던 탭을 닫았으면 반납 때 남은 탭으로 바꾸고 `data.tab_closed_by_human={closed_tab_id, active_tab_id, hint}`로 알립니다(`browser_tab_control(command="list")`로 확인). 탭 복구가 10초 안에 끝나지 않으면 반납 응답에는 이 알림이 빠지고 다음 `browser_control_status` 응답에 실립니다(서버 로그에 경고 — 의도된 저하).
 
+**창 안 [다 했어요] — 터미널 없이 끝내기(WS-77).** 창이 있는 서버(`human`·`user-chrome`·`on-demand` 의 창이 열린 동안)에서 `browser_control_request` 를 부르면 서버가 같은 브라우저에 **작은 'agent-browser' 창**(별도 창, 스크립트 없는 빈 문서 — 웹 페이지가 아님)을 띄우고, 그 안에 요청 사유(에이전트가 쓴 글, 표시 살균)와 **[다 했어요]** 버튼을 보여 줍니다. user-chrome 이면 사용자의 그 Chrome 에 뜹니다. 텔레그램처럼 터미널을 쓸 수 없는 사용자의 흐름은 다음과 같습니다.
+
+1. 봇이 전하는 말(`data.human_handoff.tell_user` — 고정 문구): "브라우저 옆에 뜬 작은 'agent-browser' 창에서, 로그인·확인을 모두 마친 뒤 [다 했어요]를 누르세요."
+2. 사람: 브라우저 창에서 로그인·캡차를 직접 해결합니다(`control take` 없이 바로 해도 됩니다 — 그 구간의 로그인도 기록됩니다).
+3. 사람: 작은 창의 **[다 했어요]** 를 누릅니다 → `agent-browser control release` 와 같은 반납(조작권 에이전트·요청 해제·비밀 입력 보호 해제·`snapshot_epoch` 증가·로그인 기록·on-demand 면 headless 복귀)이 일어나고 작은 창은 닫힙니다.
+4. 에이전트: `browser_control_wait` 가 바로 `changed: "released"`, `data.human_handoff.release_source: "window_done"` 으로 돌아옵니다 → 다시 관찰해 결과(로그인됐는지)를 확인합니다.
+
+이 버튼은 **사람의 실제 클릭만** 받습니다. 서버는 그 창의 우리 전용 격리 실행 환경(isolated world)에만 붙인 통로로 신호를 받고, 신뢰 클릭(`isTrusted`)·이 요청의 id·우리 실행 환경·창을 띄울 때의 문서 그대로·아직 기다리는 요청 — 다섯 가지가 모두 맞을 때만 반납합니다. 작은 창은 에이전트 탭 목록에 들어가지 않아 에이전트 도구(click·좌표 클릭·press_key·batch·tab_control·레시피)로는 닿을 수 없고, 페이지 스크립트(같은 탭·다른 탭·iframe)는 그 창을 찾거나 누를 수 없습니다. 자동 반납은 없습니다 — 로그인 화면을 벗어났다고 반납하면 2단계 인증 도중에 풀리기 때문에, 사람이 끝났다고 누를 때만 반납합니다. 사람이 작은 창을 닫거나 그 창에서 다른 주소로 이동하면 **완료로 보지 않고** 한 번 다시 띄웁니다. 그래도 없어지면 띠와 응답이 `agent-browser control release` 안내로 바뀝니다(`control_window: "unavailable"`). 창 위쪽 안내 띠의 ▶·⤼ 버튼은 이 버튼이 아닙니다 — 눌러도 아무 일 없이 그 아래 페이지가 눌립니다. 승인 확인 코드는 작은 창에 띄우지 않습니다(코드는 지금처럼 창 오버레이 또는 별도 코드 창). headless 서버는 그대로 요청을 거부하고 `data.human_handoff.tell_user` 로 창 있는 방식을 안내합니다. 응답 필드는 [MCP 연동의 인계 응답](mcp-integration.md#사람-인계-응답-datahuman_handoff-ws-77)에 있습니다.
+
 `holder=human`인 동안 조작 액션(click·type_text·navigate·press_key·select_option·check_box·scroll·hover·upload_file·download_file·handle_dialog·switch_frame·reload·go_back, `tab_control`의 create/switch/close)은 `E_HITL_UNATTENDED_BLOCKED`와 `data.control={holder, reason, since, how_to_wait: "browser_control_wait"}`로 거부됩니다. 관찰(`observe_page`·`take_screenshot`·`extract`·`wait_for`·`tab_control list`)은 허용합니다 — 사람이 하는 일을 보고 이어받을 수 있게. 단 `secret_wanted=true`로 요청한 동안(비밀번호 입력 등)은 요청 순간부터 반납까지 관찰도 막습니다. 비밀값은 에이전트에게 가지 않습니다.
 
 **조작권 구간의 로그인 기록(WS-58).** 사람이 조작권을 가진 동안(take~release) 그 브라우저(모든 작업 공간의 탭·새 탭 — 사람 조작권은 브라우저 전체, WS-57)의 POST/PUT 요청(Network 계층, 메서드·origin 만 — 본문 미열람)·쿠키 추가·값 변경·비밀번호 칸 제출·`secret_wanted` 인계는 그 origin 을 로그인 기록(`human_control`)에 남겨, 이후 그 사이트에서는 헤드리스 이름 재시도를 하지 않습니다. 요청 감시는 조작권이 넘어간 그 동기 구간에서 먼저 붙고(설치 중 요청도 기록), 설치가 실패하면 그 구간에 방문한 origin 전부를 기록합니다(fail-closed). 규칙과 한계는 [헤드리스 이름 재시도](headless-retry.md)에 있습니다.
