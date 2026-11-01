@@ -22,6 +22,7 @@ from contracts import ActionResult, ActionType
 import security.public_url  # noqa: F401 - 모듈 적재(아래 sys.modules 조회)
 import sys
 
+from perception import cut_marks
 from security import secret_registry as sr
 from security.public_url import graded_secret_values, public_payload
 
@@ -33,8 +34,10 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 @pytest.fixture(autouse=True)
 def _clean():
     sr.clear()
+    cut_marks.clear()
     yield
     sr.clear()
+    cut_marks.clear()
 
 
 def _wire(payload):
@@ -213,12 +216,13 @@ def test_cut_lengths_match_perception_sources():
 
 @pytest.mark.parametrize("limit", sorted(pu.CONTENT_CUT_LENGTHS))
 def test_cut_tail_prefix_masked_every_position(limit):
-    """원문을 limit 자에서 자른 칸(말줄임 없음) — 등록 값이 경계를 걸치는 모든 위치에서 앞부분(≥4자)이 남지 않는다."""
+    """원문을 limit 자에서 자른 칸(말줄임 없음, producer 가 잘림 출처 표시 — R2) — 등록 값이 경계를 걸치는 모든 위치에서
+    앞부분(≥4자)이 남지 않는다."""
     v = "SYNTHcutvalue77"
     sr.register_secret_values([v])
     for start in range(max(0, limit - len(v) + 1), limit):
         raw = ("w " * limit)[:start] + v + " tail"
-        cut = raw[:limit]
+        cut = cut_marks.mark(raw[:limit])
         shown = pu.content_text(cut)
         kept = limit - start
         if kept >= 4:
@@ -228,13 +232,13 @@ def test_cut_tail_prefix_masked_every_position(limit):
 
 
 def test_ellipsis_tail_prefix_masked_every_position():
-    """display_safe(…, 40) 처럼 말줄임으로 끝나는 칸 — 표제·묶음 이름."""
-    from interface.handoff import display_safe
+    """묶음 표제·이름 표시(repeated._short — display_safe(…, 40) 말줄임, 잘림 출처 표시)."""
+    from perception.repeated import _short
 
     v = "SYNTHheadvalue88"
     sr.register_url("http://h/p?token=" + v)
     for start in range(0, 45):
-        cut = display_safe(" ".join(("가" * start + v + " 뒤쪽 글자 이어짐").split()), 40)
+        cut = _short("가" * start + v + " 뒤쪽 글자 이어짐")
         shown = pu.content_text(cut)
         for k in range(4, len(v)):
             assert v[:k] + "…" not in shown and not shown.rstrip("…").endswith(v[:k]), (start, shown)
@@ -243,17 +247,17 @@ def test_ellipsis_tail_prefix_masked_every_position():
 def test_cut_tail_unrelated_byte_identical_and_short_value_boundary():
     sr.register_secret_values(["SYNTHother9999", "7a3k9"])
     for limit in sorted(pu.CONTENT_CUT_LENGTHS):
-        cut = ("평범한 글자 SYNT" * 40)[:limit - 4] + "abcd"
+        cut = cut_marks.mark(("평범한 글자 SYNT" * 40)[:limit - 4] + "abcd")
         assert pu.content_text(cut) == cut
     # 4~7자 자격증명 앞부분은 앞 글자가 영숫자가 아닐 때만
-    assert pu.content_text(("x" * 115) + " 7a3k") == ("x" * 115) + " " + R
-    assert pu.content_text(("x" * 115) + "z7a3k") == ("x" * 115) + "z7a3k"
+    assert pu.content_text(cut_marks.mark(("x" * 115) + " 7a3k")) == ("x" * 115) + " " + R
+    assert pu.content_text(cut_marks.mark(("x" * 115) + "z7a3k")) == ("x" * 115) + "z7a3k"
 
 
 def test_tail_rule_respects_grades():
     hex24 = "507f1f77bcf86cd799439011"
     sr.register_url("http://h/o?id=" + hex24)  # 휴리스틱 — 내용 경로 대상 아님
-    cut = ("w" * 100) + " " + hex24[:19]
+    cut = cut_marks.mark(("w" * 100) + " " + hex24[:19])
     assert len(cut) == 120 and pu.content_text(cut) == cut
 
 

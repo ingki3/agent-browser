@@ -66,7 +66,7 @@
 정한다 — 다른 자리의 같은 이름 키는 가린다, R1 NB-1)에는 URL 문법·JWT 계층을 적용하지 않고 주소 칸 등록도 하지 않는다. 다만
 **도구가 비밀로 아는 값**(레지스트리 등록 값)은 등급 규칙(`secret_registry.mask_content` — 자격증명은 4~7자 경계 포함,
 주소 비밀은 ≥ 8, 비밀 키가 아닌 키 아래 순수 16진은 제외)으로 페이지 글자 칸(`CONTENT_TEXT_KEYS`·extract 항목의 모든 값)에서
-가린다(`content_text`). perception 이 원문을 먼저 자른 칸(`CONTENT_CUT_LENGTHS`·말줄임)은 끝에 남은 등록 값 앞부분도 가린다.
+가린다(`content_text`). perception producer 가 원문을 실제로 자른 칸(잘림 출처 표 `perception.cut_marks`, R2)은 끝에 남은 등록 값 앞부분도 가린다.
 모르는 값은 원문 — 에이전트가 링크를 따라가려면 원문이 필요하다(가린 href 는 `has_redaction_mark` 로 이동 거부 → 관찰의
 element_id 로 click). 응답 파이프라인(server_tools)은 크기 자르기 전에 내용 경로를 한 번 가린 사본(`content_view`)으로
 바꾸고 그 위에서 자른다(`content_masked` 문맥 안 직렬화는 같은 version 이면 다시 훑지 않는다). 서버 내부(탭 복원·창 전환·
@@ -86,6 +86,7 @@ from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 from urllib.parse import quote, unquote, unquote_plus, urlsplit
 
 from contracts import ActionType, ErrorCode
+from perception import cut_marks
 from security import secret_registry
 from security.masking import MASK
 
@@ -884,17 +885,16 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
 #: extract 항목(data.items)은 칸 이름이 에이전트가 고른 속성 이름이라 모든 문자열 값을 가린다.
 CONTENT_TEXT_KEYS: FrozenSet[str] = frozenset({"name", "value", "text", "href", "group", "heading", "summary", "label",
                                                "title"})
-#: perception 이 원문을 먼저 자르는 길이(사용자 결정 B 보강 2026-10-31 — 잘린 끝에 남는 등록 값 앞부분). 이 길이이거나
-#: 말줄임 `…` 로 끝나는 글자는 끝 조각을 `mask_tail` 로 더 본다(길이는 Python 글자 수와 JS 의 UTF-16 단위 둘 다 — R1 B1).
-#: 출처(시험 test_ws75_cut_lengths 가 원천과 같음을 고정):
-#: 12 = perception.repeated.COMPACT_WORD(압축 이름 첫 낱말), 40 = perception.repeated.NAME_LIMIT·JS rpClean(묶음 이름·표제),
-#: 120 = perception.sanitizer 이름 JS `text.slice(0, 120)`, 200 = sanitizer·shadow_dom 값 JS `String(el.value).slice(0, 200)`.
+#: perception 이 원문을 먼저 자르는 길이(사용자 결정 B 보강 2026-10-31 — 잘린 끝에 남는 등록 값 앞부분). **판정에는 쓰지
+#: 않는다**(WS-75 R2 #199 B3): 길이만 보면 안 잘린 일반 글자(`Order # 2026`)까지 가렸다. 끝 규칙은 producer 가 실제로 자른
+#: 칸(`perception.cut_marks` 잘림 출처 표)에만 — 이 값은 producer 자르기 길이 기록(시험이 원천과 같음을 고정)이다.
+#: 출처: 12 = perception.repeated.COMPACT_WORD(압축 이름 첫 낱말), 40 = perception.repeated.NAME_LIMIT·JS rpClean(묶음 이름·
+#: 표제), 120 = perception.sanitizer 이름 JS `text.slice(0, 120)`, 200 = sanitizer·shadow_dom 값 JS `String(el.value).slice(0, 200)`.
 CONTENT_CUT_LENGTHS: FrozenSet[int] = frozenset({12, 40, 120, 200})
-_ELLIPSIS = "\u2026"
 #: axtree_summary 한 줄(perception.engine._summarize — `@eN role "이름"` + ` (disabled)`).
 _SUMMARY_LINE = re.compile(r'(\S+ \S+ ")(.*)("(?: \(disabled\))?)')
 #: 가린 결과 메모(레지스트리 version 단위 — version 이 바뀌면 버린다). (version, 원문 → 가린 글자).
-_CONTENT_MEMO: Tuple[int, Dict[str, str]] = (-1, {})
+_CONTENT_MEMO: Tuple[int, Dict[Any, str]] = (-1, {})
 #: 메모 상한 — 항목 수와 원문 글자 합(넘으면 비운다; 메모는 비용만 좌우하고 결과는 바꾸지 않는다).
 _CONTENT_MEMO_MAX = 100_000
 _CONTENT_MEMO_MAX_CHARS = 32 * 1024 * 1024
@@ -904,19 +904,11 @@ _content_memo_chars = 0
 _CONTENT_MASKED: ContextVar[Optional[int]] = ContextVar("public_url_content_masked", default=None)
 
 
-def _utf16_len(text: str) -> int:
-    """JS `String.length`(UTF-16 단위) — perception 의 JS `slice(0, n)` 은 이 단위로 자른다(WS-75 R1 B1: 서로게이트 쌍
-    글자는 Python 1자·JS 2단위라 Python `len` 만 보면 잘린 칸을 놓친다). 반쪽으로 잘린 서로게이트(짝 없는 \\ud800~
-    \\udfff)는 1단위."""
-    if text.isascii():
-        return len(text)
-    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
-
-
 def content_cut(text: str) -> bool:
-    """perception 이 원문을 먼저 자른 칸인가 — 말줄임으로 끝나거나 길이가 자르기 길이(Python 글자 수 또는 JS UTF-16 단위,
-    R1 B1). 이런 칸만 끝 조각의 등록 값 앞부분을 더 본다(레시피 저장 대조도 같은 판정, recipes.store)."""
-    return text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS or _utf16_len(text) in CONTENT_CUT_LENGTHS
+    """perception producer 가 원문을 실제로 자른 칸인가(WS-75 R2 #199 B3 — 잘림 출처 표 `perception.cut_marks`). 이런
+    칸만 끝 조각의 등록 값 앞부분을 더 본다(레시피 저장 대조도 같은 판정, recipes.store). 출처 표시가 없는 글자(안 잘린
+    칸·구 경로·외부 입력)는 길이·말줄임과 무관하게 끝 규칙을 적용하지 않는다 — 전체 일치 대조는 그대로."""
+    return cut_marks.is_cut(text)
 
 
 def content_text(text: Any) -> Any:
@@ -932,13 +924,15 @@ def content_text(text: Any) -> Any:
         memo = {}
         _CONTENT_MEMO = (version, memo)
         _content_memo_chars = 0
-    hit = memo.get(text)
+    cut = content_cut(text)
+    key = (text, True) if cut else text  # 잘림 출처가 나중에 붙어도 이전(끝 규칙 없음) 결과를 쓰지 않는다
+    hit = memo.get(key)
     if hit is not None:
         return hit
     out = registry.mask_content(text)
-    if content_cut(text):
+    if cut:
         out = registry.mask_tail(out)  # 원문을 먼저 자른 칸 — 끝에 남은 등록 값 앞부분
-    memo[text] = out
+    memo[key] = out
     _content_memo_chars += len(text)
     if out is not text:
         memo[out] = out  # 가린 글자를 다시 지나면(직렬화마다) 바로 돌려준다

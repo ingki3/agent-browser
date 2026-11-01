@@ -47,6 +47,8 @@ import logging
 import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from perception import cut_marks
+
 logger = logging.getLogger(__name__)
 
 #: data.repeated 블록(groups 직렬화) 상한(글자).
@@ -107,7 +109,9 @@ COMMON_JS = r"""
     return !!el.isContentEditable;
   }
   function rpNorm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
-  function rpClean(s) { return rpNorm(s).slice(0, RP_LIMIT); }
+  // WS-75 R2: 실제로 자른 결과만 RP_CUT 에 모은다(관찰 계산은 Python 잘림 출처 표로 보낸다 — 출력·지문 불변).
+  const RP_CUT = new Set();
+  function rpClean(s) { const n = rpNorm(s), o = n.slice(0, RP_LIMIT); if (o.length < n.length) RP_CUT.add(o); return o; }
   function rpHidden(el) {
     if (el.hidden) return true;
     const cs = getComputedStyle(el);
@@ -603,7 +607,7 @@ REPEATED_JS = r"""
       for (const t of hit) { pins.push({i: t.i, path: path, fp: rpPinOf(id, t.el)}); t.done = true; }
     }
   }
-  return {sets: sets, pins: pins};
+  return {sets: sets, pins: pins, cut: Array.from(RP_CUT)};
 }
 """.replace("__COMMON__", COMMON_JS)
 
@@ -614,9 +618,25 @@ def first_token(name: Any) -> str:
 
 
 def _short(value: Any) -> str:
+    """표시용 이름·표제(공백 접기 → 살균·40자 말줄임). 실제로 잘렸거나(말줄임) 원천이 잘린 칸이면 잘림 출처 표에
+    표시한다(WS-75 R2 — 끝 규칙은 표시된 칸만)."""
     from actions.verification import safe_page_text
 
-    return safe_page_text(" ".join(str(value or "").split()), NAME_LIMIT)
+    src = " ".join(str(value or "").split())
+    out = safe_page_text(src, NAME_LIMIT)
+    if out and (cut_marks.is_cut(value)
+               or (out.endswith("…") and len(safe_page_text(src, len(src) * 6 + 8)) > NAME_LIMIT)):
+        cut_marks.mark(out)
+    return out
+
+
+def _mark_page_cuts(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """페이지 계산이 보낸 잘린 표제 목록(`cut`)을 잘림 출처 표로 옮기고 뺀 결과(내부 정보 — 블록에 싣지 않는다)."""
+    cuts = raw.get("cut")
+    if isinstance(cuts, list):
+        for text in cuts:
+            cut_marks.mark(text)
+    return {k: v for k, v in raw.items() if k != "cut"}
 
 
 def _block_chars(groups: Sequence[Dict[str, Any]]) -> int:
@@ -649,6 +669,8 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
     except Exception as exc:  # noqa: BLE001 - 부가 정보: 실패해도 관찰은 성공
         logger.debug("반복 묶음 계산 실패: %s", type(exc).__name__)
         return None
+    if isinstance(raw, dict):
+        raw = _mark_page_cuts(raw)
     sets = raw.get("sets") if isinstance(raw, dict) else None
     if not isinstance(sets, list) or not sets:
         return None
@@ -657,8 +679,15 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
 
 def _first_word(value: Any) -> str:
     """압축용 이름: 전체 이름을 먼저 살균·절단(_short)한 뒤 첫 낱말, 최대 COMPACT_WORD 자(NB2 — 가림 문구를 쪼개지 않는다)."""
-    words = _short(value).split()
-    return words[0][:COMPACT_WORD] if words else ""
+    short = _short(value)
+    words = short.split()
+    if not words:
+        return ""
+    word = words[0][:COMPACT_WORD]
+    # WS-75 R2: 첫 낱말을 12자에서 잘랐거나, 낱말이 하나뿐이라 잘린 이름의 끝이 그대로 남은 경우만 잘린 칸.
+    if len(words[0]) > COMPACT_WORD or (len(words) == 1 and cut_marks.is_cut(short)):
+        cut_marks.mark(word)
+    return word
 
 
 def _set_groups(groups: List[Any], handles: List[Any], compact: bool) -> Optional[Dict[str, Any]]:

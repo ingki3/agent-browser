@@ -14,6 +14,7 @@ import sys
 import pytest
 
 import security.public_url  # noqa: F401 - 모듈 적재
+from perception import cut_marks
 from security import secret_registry as sr
 from recipes.store import RecipeError, compile_recipe
 
@@ -26,14 +27,22 @@ E = "\U0001F600"  # 서로게이트 쌍(UTF-16 2단위)
 @pytest.fixture(autouse=True)
 def _clean():
     sr.clear()
+    cut_marks.clear()
     yield
     sr.clear()
+    cut_marks.clear()
 
 
 def _js_slice(text: str, limit: int) -> str:
     """JS `String.prototype.slice(0, limit)` — UTF-16 단위(반쪽 서로게이트는 짝 없는 서로게이트로 남는다)."""
     units = text.encode("utf-16-le", "surrogatepass")[:2 * limit]
     return units.decode("utf-16-le", "surrogatepass")
+
+
+def _js_cut(text: str, limit: int) -> str:
+    """JS 자르기 + producer 의 잘림 출처 표시(R2 — 실제로 잘렸을 때만, sanitizer·repeated 와 같은 판정)."""
+    cut = _js_slice(text, limit)
+    return cut_marks.mark(cut) if cut != text else cut
 
 
 # ------------------------------------------------------------------ B1: UTF-16 경계
@@ -48,7 +57,7 @@ def test_b1_utf16_cut_tail_masked(limit, astral):
         pad = limit - 2 * astral - kept
         if pad < 1:
             continue
-        cut = _js_slice(E * astral + "y" * (pad - 1) + " " + V + " tail", limit)
+        cut = _js_cut(E * astral + "y" * (pad - 1) + " " + V + " tail", limit)
         assert cut.endswith(V[:kept])
         shown = pu.content_text(cut)
         assert V[:kept] not in shown, (limit, astral, kept, shown)
@@ -57,11 +66,11 @@ def test_b1_utf16_cut_tail_masked(limit, astral):
 
 def test_b1_half_surrogate_cut_does_not_crash_and_masks_nothing_else():
     sr.register_secret_values([V])
-    cut = _js_slice("y" * 119 + E + V, 120)  # 이모지 한가운데서 잘림 — 짝 없는 서로게이트로 끝난다
+    cut = _js_cut("y" * 119 + E + V, 120)  # 이모지 한가운데서 잘림 — 짝 없는 서로게이트로 끝난다
     assert cut[-1] == "\ud83d"
     assert pu.content_text(cut) == cut
     # 반쪽 서로게이트 뒤가 아니라 앞에 등록 값 앞부분이 걸친 경우(JS 199단위 + 반쪽 = 200)
-    cut2 = _js_slice(E + "y" * 190 + " " + V[:5] + E, 200)
+    cut2 = _js_cut(E + "y" * 190 + " " + V[:5] + E, 200)
     assert pu.content_text(cut2) == cut2  # 끝 조각이 등록 값 앞부분이 아니다(반쪽 서로게이트) — 원문
 
 
@@ -70,15 +79,15 @@ def test_b1_emoji_unregistered_byte_identical():
     sr.register_secret_values([V, "SYNTHother9999"])
     for limit in sorted(pu.CONTENT_CUT_LENGTHS):
         for astral in (1, 2):
-            cut = _js_slice(E * astral + "평범한 글자 Z9vX 아님 " * 30, limit)
+            cut = _js_cut(E * astral + "평범한 글자 Z9vX 아님 " * 30, limit)
             assert pu.content_text(cut) is cut
-            cut2 = _js_slice(E * astral + "w" * 300, limit - 4) + "Z9vq"
+            cut2 = cut_marks.mark(_js_slice(E * astral + "w" * 300, limit - 4) + "Z9vq")
             assert pu.content_text(cut2) is cut2
 
 
 def test_b1_summary_line_uses_same_rule():
     sr.register_secret_values([V])
-    name = _js_slice(E + "y" * 113 + " " + V, 120)
+    name = _js_cut(E + "y" * 113 + " " + V, 120)
     shown = pu.content_summary(f'@e1 button "{name}"')
     assert V[:5] not in shown and shown.endswith(R + '"')
 
@@ -137,9 +146,11 @@ def test_b2_raw_name_before_whitespace_normalization_refused():
 def test_b2_truncated_prefix_crossing_refused():
     """원문 이름이 120 자에서 잘려 등록 값 앞부분(≥4)만 남은 경우도 저장하지 않는다."""
     sr.register_secret_values(["n7q4m9Key81"])
-    cut = "x" * 113 + " n7q4m9"  # JS slice(0, 120) 결과 길이
+    cut = cut_marks.mark("x" * 113 + " n7q4m9")  # JS slice(0, 120) 결과 길이 — recipes.keys 가 잘림 출처 표시(R2)
     assert len(cut) == 120
-    _refused(_entries(_desc(cut)))
+    desc = _desc(cut)
+    cut_marks.mark(desc["ui"]["name"])
+    _refused(_entries(desc))
     # 대조: 잘리지 않은 짧은 이름이 우연히 등록 값 앞부분으로 끝나도 저장된다(끝 규칙은 잘린 칸만)
     rec = compile_recipe("r", _entries(_desc("주문 n7q4")))
     assert rec["steps"][1]["variants"][0]["target"]["name"] == "주문 n7q4"

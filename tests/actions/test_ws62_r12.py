@@ -146,13 +146,55 @@ def test_display_and_pin_paths_share_no_code():
     assert "await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)" in disp
 
 
+#: WS-75 R2(#199 B3, 코디네이터 결정 A): sanitizer 의 6e449e2 대비 허용 차이 — 잘림 출처 표시 줄만(추가만, 내용까지 정확히,
+#: 이 순서). 이 줄을 빼면 6e449e2 와 바이트 동일해야 한다. 출력(요소 name·value·role·핀·지문·verification 입력) 불변은 같은
+#: 파일의 기준 동일성 행렬(test_baseline_identity_and_behavior)이 계속 단정한다.
+SANITIZER_R2_LINES = (
+    "\n",
+    "from perception import cut_marks  # WS-75 R2 잘림 출처 표\n",
+    "  accessibleName.cut = false;  // WS-75 R2: 실제로 자른 이름인가(반환값은 그대로 — 호출 직후 읽는다)\n",
+    "  accessibleName.cut = !!text && text.length > 120;  // WS-75 R2\n",
+    "      const nameCut = accessibleName.cut;  // WS-75 R2\n",
+    "      // WS-75 R2: 실제로 자른 칸 표시(내부 — Python 이 잘림 출처 표로 옮기고 출력에는 싣지 않는다).\n",
+    "      if (nameCut) results[results.length - 1].name_cut = true;\n",
+    "      if (el.value !== undefined && el.type !== 'password' && String(el.value).length > 200)"
+    " results[results.length - 1].value_cut = true;\n",
+    "    # WS-75 R2(#199 B3): JS 가 실제로 자른 칸만 잘림 출처 표에(끝 규칙 대상) — 요소 필드에는 더하지 않는다.\n",
+    "    for el, raw in zip(elements, payload.get(\"elements\", [])):\n",
+    "        if raw.get(\"name_cut\"):\n",
+    "            cut_marks.mark(el.name)\n",
+    "        if raw.get(\"value_cut\"):\n",
+    "            cut_marks.mark(el.value)\n",
+)
+
+
+def _only_inserted(arch: str, now: str) -> Optional[List[str]]:
+    """now 가 arch 에 줄을 **추가만** 했으면 추가된 줄 목록(순서대로), 바뀌거나 지운 줄이 있으면 None."""
+    import difflib
+
+    a, b = arch.splitlines(keepends=True), now.splitlines(keepends=True)
+    added: List[str] = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "insert":
+            added.extend(b[j1:j2])
+        elif tag != "equal":
+            return None
+    return added
+
+
 def test_inputs_and_verification_same_as_archive():
-    """기준 동일성의 전제: 관찰 요소를 만드는 엔진·점수기·살균기는 6e449e2 와 바이트 동일, verification 은 import 한 줄만 다르다."""
+    """기준 동일성의 전제: 관찰 요소를 만드는 엔진·점수기는 6e449e2 와 바이트 동일, 살균기는 WS-75 R2 잘림 출처 표시 줄
+    (SANITIZER_R2_LINES)을 빼면 바이트 동일, verification 은 import 한 줄만 다르다."""
     for rel in ("src/perception/engine.py", "src/perception/scorer.py", "src/perception/sanitizer.py"):
         arch = _git_show(rel)
         if arch is None:
             pytest.skip("git archive 없음")
-        assert (ROOT / rel).read_text(encoding="utf-8") == arch, rel
+        now = (ROOT / rel).read_text(encoding="utf-8")
+        if rel.endswith("sanitizer.py"):
+            # 추가만 했고 그 줄이 정확히 허용 목록 — 즉 그 줄을 빼면 6e449e2 와 바이트 동일
+            assert _only_inserted(arch, now) == list(SANITIZER_R2_LINES), rel
+        else:
+            assert now == arch, rel
     arch = _git_show("src/actions/verification.py")
     now = (ROOT / "src" / "actions" / "verification.py").read_text(encoding="utf-8")
     assert now == arch.replace("from perception.repeated import GROUP_CHECK_JS, pin_display",

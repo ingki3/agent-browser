@@ -19,6 +19,7 @@ import re
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlsplit
 
+from perception import cut_marks
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 #: ui 대상 위치 가드(px). 기록 위치에서 이보다 멀리 있는 같은 이름 요소는 다른 요소로 본다(M-1 최선 전략).
@@ -335,6 +336,7 @@ KEYS_JS = r"""
   function describe(t) {
     const role = inferRole(t);
     const nameRaw = String(accessibleName(t) || '');
+    const accCut = !!accessibleName.cut;
     const nameNorm = norm(nameRaw);
     const tagName = t.tagName.toLowerCase();
     const typ = (t.getAttribute('type') || '').toLowerCase();
@@ -356,6 +358,9 @@ KEYS_JS = r"""
     }
     const idn = identityOf(t, role, nameNorm);
     if (idn.id) out.identity = idn.id; else out.identity_refused = idn.refused;
+    // WS-75 R2: 실제로 자른 이름 표시(내부 — snapshot 이 잘림 출처 표로 옮기고 기술에서 뺀다).
+    out.name_cut = accCut || nameRaw.length > 120;
+    out.norm_cut = accCut;
     return out;
   }
   function found(el, extra) {
@@ -486,8 +491,24 @@ async def snapshot(page: Any, css: Optional[str] = None) -> Dict[str, Any]:
         "ready": int(raw.get("ready") or 0),
     }
     if css:
-        out["target"] = raw.get("target")
+        out["target"] = _mark_target_cuts(raw.get("target"))
     return out
+
+
+def _mark_target_cuts(target: Any) -> Any:
+    """대상 기술의 잘림 표시(name_cut·norm_cut)를 잘림 출처 표로 옮기고 기술에서 뺀다(WS-75 R2 — 레시피 저장 대조의
+    끝 규칙은 실제로 잘린 이름만, 기술 모양은 그대로)."""
+    if not isinstance(target, dict):
+        return target
+    name_cut = target.pop("name_cut", False)
+    norm_cut = target.pop("norm_cut", False)
+    if name_cut:
+        cut_marks.mark(target.get("name"))
+    if norm_cut:
+        for part in (target.get("ui"), target.get("identity")):
+            if isinstance(part, dict):
+                cut_marks.mark(part.get("name"))
+    return target
 
 
 async def locate(page: Any, target: Dict[str, Any]) -> Dict[str, Any]:
