@@ -137,7 +137,12 @@ def test_b2_raw_name_before_whitespace_normalization_refused():
 def test_b2_truncated_prefix_crossing_refused():
     """원문 이름이 120 자에서 잘려 등록 값 앞부분(≥4)만 남은 경우도 저장하지 않는다."""
     sr.register_secret_values(["n7q4m9Key81"])
-    _refused(_entries(_desc("x" * 110 + " n7q4m9")))
+    cut = "x" * 113 + " n7q4m9"  # JS slice(0, 120) 결과 길이
+    assert len(cut) == 120
+    _refused(_entries(_desc(cut)))
+    # 대조: 잘리지 않은 짧은 이름이 우연히 등록 값 앞부분으로 끝나도 저장된다(끝 규칙은 잘린 칸만)
+    rec = compile_recipe("r", _entries(_desc("주문 n7q4")))
+    assert rec["steps"][1]["variants"][0]["target"]["name"] == "주문 n7q4"
 
 
 def test_b2_sibling_paths_refused():

@@ -638,18 +638,18 @@ class SecretRegistry:
         영숫자가 아닐 때만(경계 규칙과 같다). 일치가 없으면 입력 그대로(같은 객체)."""
         return self._tail(text, self._content)
 
-    def content_hit(self, text: str) -> bool:
+    def content_hit(self, text: str, cut: bool = False) -> bool:
         """레시피 저장 대조(WS-75 R1 B2): `text` 원문 또는 그 casefold 형태에 내용 경로 가림 대상 등록 값이 걸리는가 —
-        같은 등급·길이 규칙(≥ 8 부분 일치, 4~7 경계 일치)과 끝의 앞부분(≥ 4자) 걸침. 저장 문자열은 정규화(소문자화)로
-        원문이 소실될 수 있어 casefold 한 등록 값과도 대조한다. 가린 글자는 밖으로 내지 않는다(참·거짓만)."""
+        같은 등급·길이 규칙(≥ 8 부분 일치, 4~7 경계 일치), `cut`(먼저 잘린 칸)이면 끝의 앞부분(≥ 4자) 걸침도. 저장
+        문자열은 정규화(소문자화)로 원문이 소실될 수 있어 casefold 한 등록 값과도 대조한다. 참·거짓만 돌려준다."""
         snap = self._content
         if snap.empty or not isinstance(text, str) or len(text) < MIN_VALUE_CHARS:
             return False
-        if self._mask(text, url=False, snap=snap) is not text or self._tail(text, snap) is not text:
+        if self._mask(text, url=False, snap=snap) is not text or (cut and self._tail(text, snap) is not text):
             return True
         folded = self._folded_snapshot()
         low = text.casefold()
-        return self._mask(low, url=False, snap=folded) is not low or self._tail(low, folded) is not low
+        return self._mask(low, url=False, snap=folded) is not low or (cut and self._tail(low, folded) is not low)
 
     def _folded_snapshot(self) -> _Snapshot:
         with self._lock:

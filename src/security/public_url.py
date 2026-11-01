@@ -913,6 +913,12 @@ def _utf16_len(text: str) -> int:
     return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
 
 
+def content_cut(text: str) -> bool:
+    """perception 이 원문을 먼저 자른 칸인가 — 말줄임으로 끝나거나 길이가 자르기 길이(Python 글자 수 또는 JS UTF-16 단위,
+    R1 B1). 이런 칸만 끝 조각의 등록 값 앞부분을 더 본다(레시피 저장 대조도 같은 판정, recipes.store)."""
+    return text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS or _utf16_len(text) in CONTENT_CUT_LENGTHS
+
+
 def content_text(text: Any) -> Any:
     """페이지 내용 글자 하나를 가린다 — 등급 규칙(secret_registry.mask_content: 자격증명 4~7 경계 포함, 주소 비밀 ≥ 8,
     휴리스틱 id 제외). URL 문법·JWT 계층은 적용하지 않는다(모르는 값은 원문). 멱등이고 version 단위 메모를 쓴다."""
@@ -930,7 +936,7 @@ def content_text(text: Any) -> Any:
     if hit is not None:
         return hit
     out = registry.mask_content(text)
-    if text.endswith(_ELLIPSIS) or len(text) in CONTENT_CUT_LENGTHS or _utf16_len(text) in CONTENT_CUT_LENGTHS:
+    if content_cut(text):
         out = registry.mask_tail(out)  # 원문을 먼저 자른 칸 — 끝에 남은 등록 값 앞부분
     memo[text] = out
     _content_memo_chars += len(text)
