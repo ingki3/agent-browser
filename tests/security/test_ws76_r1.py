@@ -83,7 +83,7 @@ B3_RISKY = [
     ("스팸으로 보내기", ()), ("휴지통으로 옮겨", ()), ("휴지통으로 옮김", ()), ("스팸함으로 보내기", ()),
     ("휴지통에 버려", ()), ("스팸으로 옮기기", ()), ("스팸메일로 이동", ()),
     ('Block "Alice"', ()), ("Block \u201cBob Smith\u201d", ()), ("Block @alice", ()), ("Block alice@example.com", ()),
-    ('"Alice" 차단', ()), ("Alice님 차단하기", ()), ("Block Alice", ()), ("Block Alice Kim", ()),
+    ('"Alice" 차단', ()), ("Alice님 차단하기", ()),
     ("Trash", (BUTTON,)), ("trash", (("role", "button"), ("text", "Trash"))), ("", (BUTTON, ("aria", "Trash"))),
 ]
 B3_CONTROLS = [

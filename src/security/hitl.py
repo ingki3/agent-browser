@@ -488,21 +488,6 @@ _IRR_BLOCK_TARGET_RE = re.compile(
     r"^block\s+(?:" + _IRR_QUOTED + r"|@[\w.\-]+|[\w.+\-]+@[\w\-]+\.[\w.\-]+)$"
     r"|^(?:" + _IRR_QUOTED + r"|\S+님)\s*(?:을|를)?\s*차단(?:하기|해|함)?$"
 )
-#: B3: 고유명 대상('Block Alice' · 'Block Alice Kim') — **원문 대소문자**로 Block + 대문자로 시작하는 낱말 1~2개.
-#: 기능 이름(Block Ads·Block Cookies·Block Editor·Block Layout …)은 대상이 사람이 아니므로 뺀다(첫 낱말 기준).
-_IRR_BLOCK_PROPER_RE = re.compile(r"^Block\s+([A-Z][\w'.\-]*)(?:\s+[A-Z][\w'.\-]*)?$")
-_IRR_BLOCK_FEATURES = frozenset({
-    "ad", "ads", "adverts", "advertising", "cookie", "cookies", "popup", "popups", "pop", "pop-ups", "pop-up", "image",
-    "images", "tracker", "trackers", "tracking", "notification", "notifications", "editor", "quote", "quotes", "layout",
-    "element", "elements", "list", "lists", "content", "settings", "setting", "all", "everything", "script", "scripts",
-    "javascript", "site", "sites", "website", "websites", "request", "requests", "third-party", "third", "sound",
-    "sounds", "video", "videos", "autoplay", "ip", "country", "countries", "keyword", "keywords", "word", "words",
-    "comment", "comments", "size", "style", "styles", "text", "type", "height", "width", "storage", "location",
-    "camera", "microphone", "mic", "download", "downloads", "redirect", "redirects", "font", "fonts", "banner",
-    "banners", "page", "pages", "mode", "view", "format", "code", "theme", "template", "plugin", "plugins", "level",
-    "inserter", "patterns", "pattern", "directory", "spam", "junk", "explorer", "chain", "game", "games", "puzzle",
-    "time", "schedule", "calendar", "mentions", "replies", "invites", "invitations", "requests", "messages", "calls",
-})
 #: 라벨 전체가 이 낱말이면 동작(한국어 동작 명사형). '광고 차단 안내'·'비우기 안내'는 전체가 아니다.
 _IRR_KO_WHOLE = (("차단", BLOCK_KEYWORD), ("차단하기", BLOCK_KEYWORD), ("비우기", EMPTY_KEYWORD))
 
@@ -585,10 +570,6 @@ def irreversible_action(source: str, text: str) -> Optional[str]:
     norm = normalize_gate_text(raw)
     if source not in PATH_SOURCES and _IRR_BLOCK_TARGET_RE.match(norm):
         return BLOCK_KEYWORD
-    if source not in PATH_SOURCES and norm.startswith("block "):
-        proper = _IRR_BLOCK_PROPER_RE.match(_SPACE_RE.sub(" ", strip_invisible(unicodedata.normalize("NFKC", raw))).strip())
-        if proper and proper.group(1).lower() not in _IRR_BLOCK_FEATURES:
-            return BLOCK_KEYWORD
     compact = "".join(ch for ch in norm if ch.isalnum())
     if source not in PATH_SOURCES:
         for word, keyword in _IRR_KO_WHOLE:
@@ -616,10 +597,12 @@ def lone_label(text: str) -> str:
     return "".join(ch for ch in normalize_gate_text(text) if ch.isalnum())
 
 
-#: B4 규칙: 마지막 조각이 조작(trash·spam·block…)이고 바로 앞 조각이 항목 id(숫자 포함)이거나 쿼리 action·op·cmd 값이 조작이면 항목 조작(HIGH), 그 밖(/mail/trash·/spam·?folder=trash)은 폴더 탐색.
+#: B4 규칙(R2): 마지막 조각이 조작(trash·spam·block…)이고 앞 조각이 메일·대화 항목 접두(_ITEM_PREFIXES) 뒤의 id(숫자 포함)이거나 쿼리 action·op·cmd 값이 조작이면 항목 조작(HIGH), 그 밖(/mail/trash·?folder=trash·/folders/42/spam·/wiki/42/block)은 탐색.
 _ITEM_OPS = frozenset({"trash", "spam", "junk", "block", "report-spam", "reportspam", "move-to-trash", "movetotrash",
                        "mark-as-spam", "markasspam", "report-junk", "block-sender", "block-user"})
 _ITEM_OP_QUERY_KEYS = frozenset({"action", "op", "operation", "cmd", "command", "do", "act"})
+_ITEM_PREFIXES = frozenset({"messages", "message", "msg", "msgs", "m", "mail", "mails", "email", "emails", "thread",
+                            "threads", "conversation", "conversations", "inbox", "u"})
 _ITEM_ID_RE = re.compile(r"^(?=[0-9a-z_\-]*\d)[0-9a-z_\-]{1,64}$")
 
 
@@ -633,7 +616,8 @@ def item_operation_destination(url: str, path_only: bool = False) -> Optional[st
     segments = [seg.lower() for seg in path.split("/") if seg]
     if _IRR_INFO_PATH & set(class_tokens(path)):
         return None
-    if len(segments) >= 2 and segments[-1] in _ITEM_OPS and _ITEM_ID_RE.match(segments[-2]):
+    if (len(segments) >= 3 and segments[-1] in _ITEM_OPS and _ITEM_ID_RE.match(segments[-2])
+            and segments[-3] in _ITEM_PREFIXES):
         return _item_op_keyword(segments[-1])
     if path_only:
         return None
