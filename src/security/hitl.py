@@ -97,7 +97,9 @@ PATH_SOURCES = frozenset({"href", "formaction", "form_action"})
 TOKEN_SOURCES = frozenset({"class", "id", "name_attr", "testid"})
 #: 판정 보조 사실(키워드 매칭 안 함): `nav_link` 같은 출처로 이동하는 a[href] 자신, `form_method`
 #: 제출 버튼의 실제 제출 메서드(get/post…). WS-31 R1 NB-6.
-META_SOURCES = frozenset({"nav_link", "form_method"})
+#: WS-76 R1: `role`(대상의 명시·암묵 역할), `tab_context`(탭·탭 목록 안 — 탐색), `edit_context`(텍스트 입력칸
+#: 옆 — 편집)도 판정 보조 사실이다(단독 `차단`·`비우기`·`Trash` 판정에만 쓴다).
+META_SOURCES = frozenset({"nav_link", "form_method", "role", "tab_context", "edit_context"})
 #: 같은 출처 이동 링크에서 적용하지 않는 원천 — 마크업 식별자(class·아이콘 사전·id·testid·name)와
 #: title(보조 설명). 링크는 이동이지 부작용이 아니다(WS-31 과차단: `fa-trash` '휴지통 보기',
 #: `data-testid=nav-order-history`). 이름·보이는 글자·aria·alt·svg title·pseudo·href 는 그대로 본다.
@@ -296,6 +298,8 @@ def match_signal(source: str, text: str, path_only: bool = False) -> Optional[st
         return ACCOUNT_TERMINATION_KEYWORD
     if hit is None:
         hit = irreversible_action(source, text)
+    if hit is None and source in PATH_SOURCES:
+        hit = item_operation_destination(text, path_only=path_only)
     return hit
 
 
@@ -420,7 +424,12 @@ def account_termination(source: str, text: str) -> bool:
 #   '휴지통 비우기' · '스팸 신고' · '사용자 차단'.
 # 반전·안내는 고위험이 아니다(기준 등급 유지): 앞에 un/undo/not, 뒤에 해제·취소·안내·help·list 등
 #   ('Undo move to trash' · '차단 해제' · '스팸 신고 안내' · 'Mark as not spam').
+# WS-76 R1 B2: 부정·안내 꼬리는 구 **바로 뒤가 아니라 뒤 어디든**(활용형 '신고하기 안내'·역추적 '비우+기취소' 우회 차단),
+#   안내 머리('How to …'·'Learn …'·'도움말')는 구 **앞 어디든** 본다.
 # 한국어 동작 명사형 단독 라벨('차단'·'차단하기'·'비우기')은 라벨 전체가 그 낱말일 때만 고위험이다.
+# WS-76 R1 B1: 단독 '차단' 은 탭 문맥(`tab_context`), 단독 '비우기' 는 입력칸 옆 편집 문맥(`edit_context`)이
+#   **확인될 때만** 기준 등급(assess_risk) — 문맥 신호가 없거나 못 읽었으면 고위험 그대로(fail-closed).
+# WS-76 R1 B3: 단독 'Trash' 는 동작 역할(button)일 때만 고위험 — 링크·탭·메뉴·트리 항목(폴더 목록)은 탐색.
 # 복원 계열('스팸 아님'·'Not spam'·'Restore'·'Unblock')은 되돌리는 동작이라 올리지 않는다(기준 LOW 그대로).
 
 #: 게이트가 근거로 보고하는 키워드(matched_keyword).
@@ -441,9 +450,12 @@ _IRR_BLOCK_OBJ = frozenset({"user", "users", "contact", "contacts", "number", "n
                             "email", "phone", "this", "them", "him", "her"})
 #: 구 바로 앞에 오면 반전(되돌리기·부정)이다.
 _IRR_NEG_BEFORE = frozenset({"un", "undo", "not", "dont", "don", "never", "cancel", "stop"})
-#: 구 바로 뒤에 오면 동작이 아니라 안내·목록·되돌리기다.
+#: 구 뒤(어디든)에 오면 동작이 아니라 안내·목록·되돌리기다(WS-76 R1 B2 — 바로 뒤만 보면 'Move to trash help' 는
+#: 막지만 'Report spam (help)'·'… help center' 류 안내 문구 끝 꼬리를 놓친다).
 _IRR_NEG_AFTER = frozenset({"undo", "help", "guide", "info", "settings", "setting", "list", "policy", "faq",
-                            "learn", "tips", "how", "instructions"})
+                            "learn", "tips", "how", "instructions", "cancel", "tutorial"})
+#: 구 앞(어디든)에 오면 안내 문구다('How to report spam' · 'Learn how to empty trash').
+_IRR_INFO_BEFORE = frozenset({"how", "learn", "help", "guide", "faq", "tips", "about", "tutorial", "instructions"})
 #: 목적지 경로에 있으면 안내 페이지다('/help/report-spam').
 _IRR_INFO_PATH = frozenset({"help", "guide", "faq", "support", "docs", "doc", "policy"})
 #: 한 글자씩 띄운 영문을 이은 한 토큰('r e p o r t s p a m' → reportspam).
@@ -452,16 +464,45 @@ _IRR_COMPOUND_RE = re.compile(
     r"|empty(?:the)?(?:trash|bin|spam|junk|cart)|report(?:as)?(?:spam|junk|phishing)|markas(?:spam|junk)"
     r"|block(?:this)?(?:user|sender|number|contact|caller))$"
 )
-_IRR_KO_NEG_TAIL = r"(?!해제|취소|안내|방법|설명|도움말|목록|설정|관리|내역|기준|정책|해지)"
+#: WS-76 R1 B2: 부정·안내 꼬리는 구 뒤 **어디든**(예전 lookahead 는 '비우기취소' 에서 '비우'+'기취소' 로 역추적해
+#: 우회됐고 '신고하기안내' 의 활용 어미 뒤 꼬리를 못 봤다), 안내 머리는 구 앞 어디든 본다(정규형 — 공백 없음).
+_IRR_KO_NEG_AFTER_RE = re.compile(r"해제|취소|안내|방법|설명|도움말|목록|설정|관리|내역|기준|정책|해지|가이드")
+_IRR_KO_INFO_BEFORE_RE = re.compile(r"도움말|안내|방법|가이드")
+#: B3: 이동·버림 동사의 활용형(옮기기·옮겨·옮김·보내기·보내·보냄·버리기·버려·버림·넣기·이동).
+_IRR_KO_MOVE = r"(?:이동|보내|보냄|버리|버려|버림|넣|옮기|옮겨|옮김)"
 _IRR_KO = (
-    (TRASH_KEYWORD, re.compile(r"휴지통(?:으로|에|로)?(?:이동|보내|버리|넣|옮기)" + _IRR_KO_NEG_TAIL)),
+    (TRASH_KEYWORD, re.compile(r"휴지통(?:으로|에|로)?" + _IRR_KO_MOVE)),
     (EMPTY_KEYWORD, re.compile(r"(?:휴지통|스팸함|스팸메일함|장바구니|메일함|편지함|받은편지함|폴더|전체|모두|목록)"
-                               r"(?:을|를)?(?:전체|모두|바로|지금)?(?:비우기|비우|비움)" + _IRR_KO_NEG_TAIL)),
-    (SPAM_KEYWORD, re.compile(r"스팸(?:메일)?(?:으로|로)?(?:신고|표시|처리|등록|지정|분류|이동)" + _IRR_KO_NEG_TAIL)),
+                               r"(?:을|를)?(?:전체|모두|바로|지금)?(?:비우기|비우|비움)")),
+    # 스팸함·스팸메일함 '으로/에' + 이동 동사도 스팸 처리('스팸함으로 보내기'). 조사 없는 '스팸함 이동'은 폴더 이동일 수 있어 뺀다.
+    (SPAM_KEYWORD, re.compile(r"스팸(?:메일)?(?:(?:함|메일함|편지함)(?:으로|로|에)|으로|로)?"
+                              r"(?:신고|표시|처리|등록|지정|분류|이동|보내|보냄|옮기|옮겨|옮김|버리|버려|넣)")),
     (BLOCK_KEYWORD, re.compile(r"(?:사용자|유저|계정|번호|전화번호|발신자|발신번호|보낸사람|연락처|친구|회원|아이디|"
                                r"상대방|상대|채널|작성자|메일주소|주소|도메인|수신)(?:을|를|은|는)?(?:영구)?차단"
-                               r"(?!된)" + _IRR_KO_NEG_TAIL)),
+                               r"(?!된)")),
 )
+#: B3: 따옴표·@·메일 주소로 대상을 지목한 차단('Block "Alice"' · 'Block @alice' · '"Alice" 차단' · 'Alice님 차단').
+#: 정규화(NFKC·소문자) 뒤 원문 전체에 맞춘다 — 'Unblock "Alice"'·'Block quote' 는 맞지 않는다.
+_IRR_QUOTED = r"[\"'\u201c\u2018\u00ab\u300c\u300e][^\"'\u201d\u2019\u00bb\u300d\u300f]+[\"'\u201d\u2019\u00bb\u300d\u300f]"
+_IRR_BLOCK_TARGET_RE = re.compile(
+    r"^block\s+(?:" + _IRR_QUOTED + r"|@[\w.\-]+|[\w.+\-]+@[\w\-]+\.[\w.\-]+)$"
+    r"|^(?:" + _IRR_QUOTED + r"|\S+님)\s*(?:을|를)?\s*차단(?:하기|해|함)?$"
+)
+#: B3: 고유명 대상('Block Alice' · 'Block Alice Kim') — **원문 대소문자**로 Block + 대문자로 시작하는 낱말 1~2개.
+#: 기능 이름(Block Ads·Block Cookies·Block Editor·Block Layout …)은 대상이 사람이 아니므로 뺀다(첫 낱말 기준).
+_IRR_BLOCK_PROPER_RE = re.compile(r"^Block\s+([A-Z][\w'.\-]*)(?:\s+[A-Z][\w'.\-]*)?$")
+_IRR_BLOCK_FEATURES = frozenset({
+    "ad", "ads", "adverts", "advertising", "cookie", "cookies", "popup", "popups", "pop", "pop-ups", "pop-up", "image",
+    "images", "tracker", "trackers", "tracking", "notification", "notifications", "editor", "quote", "quotes", "layout",
+    "element", "elements", "list", "lists", "content", "settings", "setting", "all", "everything", "script", "scripts",
+    "javascript", "site", "sites", "website", "websites", "request", "requests", "third-party", "third", "sound",
+    "sounds", "video", "videos", "autoplay", "ip", "country", "countries", "keyword", "keywords", "word", "words",
+    "comment", "comments", "size", "style", "styles", "text", "type", "height", "width", "storage", "location",
+    "camera", "microphone", "mic", "download", "downloads", "redirect", "redirects", "font", "fonts", "banner",
+    "banners", "page", "pages", "mode", "view", "format", "code", "theme", "template", "plugin", "plugins", "level",
+    "inserter", "patterns", "pattern", "directory", "spam", "junk", "explorer", "chain", "game", "games", "puzzle",
+    "time", "schedule", "calendar", "mentions", "replies", "invites", "invitations", "requests", "messages", "calls",
+})
 #: 라벨 전체가 이 낱말이면 동작(한국어 동작 명사형). '광고 차단 안내'·'비우기 안내'는 전체가 아니다.
 _IRR_KO_WHOLE = (("차단", BLOCK_KEYWORD), ("차단하기", BLOCK_KEYWORD), ("비우기", EMPTY_KEYWORD))
 
@@ -511,8 +552,12 @@ def _irreversible_tokens(tokens: List[str]) -> Optional[str]:
             j = _irr_skip(tokens, i + 1, _IRR_FILLERS - {"this"})
             if j < len(tokens) and tokens[j] in _IRR_BLOCK_OBJ:
                 end, keyword = j + 1, BLOCK_KEYWORD
-        if end is not None and not (end < len(tokens) and tokens[end] in _IRR_NEG_AFTER):
-            return keyword
+        if end is None:
+            continue
+        # WS-76 R1 B2: 안내 꼬리는 뒤 어디든, 안내 머리는 앞 어디든.
+        if any(t in _IRR_NEG_AFTER for t in tokens[end:]) or any(t in _IRR_INFO_BEFORE for t in tokens[:i]):
+            continue
+        return keyword
     return None
 
 
@@ -537,15 +582,76 @@ def irreversible_action(source: str, text: str) -> Optional[str]:
     hit = _irreversible_tokens(_acct_tokens(raw))
     if hit or source in TOKEN_SOURCES:
         return hit
-    compact = "".join(ch for ch in normalize_gate_text(raw) if ch.isalnum())
+    norm = normalize_gate_text(raw)
+    if source not in PATH_SOURCES and _IRR_BLOCK_TARGET_RE.match(norm):
+        return BLOCK_KEYWORD
+    if source not in PATH_SOURCES and norm.startswith("block "):
+        proper = _IRR_BLOCK_PROPER_RE.match(_SPACE_RE.sub(" ", strip_invisible(unicodedata.normalize("NFKC", raw))).strip())
+        if proper and proper.group(1).lower() not in _IRR_BLOCK_FEATURES:
+            return BLOCK_KEYWORD
+    compact = "".join(ch for ch in norm if ch.isalnum())
     if source not in PATH_SOURCES:
         for word, keyword in _IRR_KO_WHOLE:
             if compact == word:
                 return keyword
     for keyword, pattern in _IRR_KO:
-        if pattern.search(compact):
+        for m in pattern.finditer(compact):
+            if _IRR_KO_NEG_AFTER_RE.search(compact, m.end()) or _IRR_KO_INFO_BEFORE_RE.search(compact, 0, m.start()):
+                continue
             return keyword
     return None
+
+
+#: (단독 라벨의 정규형, 그 라벨을 기준 등급으로 돌리는 문맥 META 원천).
+#: '차단' 은 탭 문맥이면 탐색(상태 필터), '비우기' 는 입력칸 옆이면 편집(검색어 지우기) — WS-76 R1 B1.
+_LONE_EXEMPT = (("차단", "tab_context"), ("비우기", "edit_context"))
+#: 단독 'Trash' 를 동작으로 보는 역할 — WS-76 R1 B3. 링크·탭·메뉴·트리 항목(폴더 목록)은 탐색이라 뺀다.
+_TRASH_ACTION_ROLES = frozenset({"button"})
+#: 단독 'Trash' 를 볼 이름 원천(문자열 원천 중 대상 자신의 이름류).
+_LONE_NAME_SOURCES = frozenset({"name", "text", "aria", "value", "title"})
+
+
+def lone_label(text: str) -> str:
+    """라벨 전체의 비교용 정규형 — 글자·숫자만 남긴다(`차단`·`비우기`·`trash`)."""
+    return "".join(ch for ch in normalize_gate_text(text) if ch.isalnum())
+
+
+#: B4 규칙: 마지막 조각이 조작(trash·spam·block…)이고 바로 앞 조각이 항목 id(숫자 포함)이거나 쿼리 action·op·cmd 값이 조작이면 항목 조작(HIGH), 그 밖(/mail/trash·/spam·?folder=trash)은 폴더 탐색.
+_ITEM_OPS = frozenset({"trash", "spam", "junk", "block", "report-spam", "reportspam", "move-to-trash", "movetotrash",
+                       "mark-as-spam", "markasspam", "report-junk", "block-sender", "block-user"})
+_ITEM_OP_QUERY_KEYS = frozenset({"action", "op", "operation", "cmd", "command", "do", "act"})
+_ITEM_ID_RE = re.compile(r"^(?=[0-9a-z_\-]*\d)[0-9a-z_\-]{1,64}$")
+
+
+def item_operation_destination(url: str, path_only: bool = False) -> Optional[str]:
+    """목적지 URL 이 **개별 항목 조작**(휴지통·스팸·차단)이면 근거 키워드 (WS-76 R1 B4)."""
+    try:
+        parts = urlsplit(str(url or ""))
+        path, query = unquote_plus(parts.path), parts.query
+    except ValueError:
+        return None
+    segments = [seg.lower() for seg in path.split("/") if seg]
+    if _IRR_INFO_PATH & set(class_tokens(path)):
+        return None
+    if len(segments) >= 2 and segments[-1] in _ITEM_OPS and _ITEM_ID_RE.match(segments[-2]):
+        return _item_op_keyword(segments[-1])
+    if path_only:
+        return None
+    for pair in query.split("&"):
+        key, _, value = pair.partition("=")
+        if unquote_plus(key).strip().lower() in _ITEM_OP_QUERY_KEYS:
+            op = unquote_plus(value).strip().lower().replace("_", "-")
+            if op in _ITEM_OPS:
+                return _item_op_keyword(op)
+    return None
+
+
+def _item_op_keyword(op: str) -> str:
+    if "block" in op:
+        return BLOCK_KEYWORD
+    if "spam" in op or "junk" in op:
+        return SPAM_KEYWORD
+    return TRASH_KEYWORD
 
 
 @dataclass
@@ -617,12 +723,38 @@ def _basis(ctx: ActionContext, keyword: Optional[str], source: Optional[str]) ->
 
 
 def _first_hit(
-    sources: Sequence[Tuple[str, str]], path_only: bool = False
+    sources: Sequence[Tuple[str, str]], path_only: bool = False, exempt: Sequence[str] = ()
 ) -> Optional[Tuple[str, str]]:
     for source, text in sources:
         hit = match_signal(source, text, path_only=path_only)
         if hit:
+            # WS-76 R1 B1: 탐색·편집 문맥이 확인된 단독 '차단'·'비우기' 는 이 원천에서 고위험이 아니다(다른 원천은 계속 본다).
+            if exempt and lone_label(text) in exempt:
+                continue
             return hit, source
+    return None
+
+
+def _lone_context(ctx: ActionContext) -> Tuple[Tuple[str, ...], str]:
+    """(문맥 예외가 확인된 단독 라벨들, 대상 역할) — META 원천 `tab_context`·`edit_context`·`role` 에서 (WS-76 R1)."""
+    present = set()
+    role = ""
+    for src, text in ctx.signals:
+        src = str(src)
+        if src == "role":
+            role = str(text or "").strip().lower().split(" ")[0]
+        elif src in ("tab_context", "edit_context") and str(text or "").strip():
+            present.add(src)
+    return tuple(word for word, src in _LONE_EXEMPT if src in present), role
+
+
+def _lone_trash_action(ctx: ActionContext, role: str) -> Optional[str]:
+    """단독 'Trash' 가 동작 역할(button)이면 근거 원천 (WS-76 R1 B3). 역할을 모르면 기준 그대로(None)."""
+    if role not in _TRASH_ACTION_ROLES:
+        return None
+    for src, text in [("name", ctx.element_name)] + [(str(s), str(t or "")) for s, t in ctx.signals]:
+        if src in _LONE_NAME_SOURCES and lone_label(text) == "trash":
+            return src
     return None
 
 
@@ -667,7 +799,8 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
     own: List[Tuple[str, str]] = [
         ("name", ctx.element_name), ("selector", ctx.selector), ("detail", ctx.detail),
     ]
-    found = _first_hit(own)
+    exempt, role = _lone_context(ctx) if ctx.signals else ((), "")
+    found = _first_hit(own, exempt=exempt)
     if found is None and ctx.submits_form:
         return RiskAssessment(RiskLevel.HIGH, "폼 제출 액션", _basis(ctx, None, "form_submit"))
     if found is None:
@@ -675,7 +808,11 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
             str(src) == "form_method" and str(text or "").strip().lower() == "get"
             for src, text in ctx.signals
         )
-        found = _first_hit(_effective_signals(ctx), path_only=get_submit)
+        found = _first_hit(_effective_signals(ctx), path_only=get_submit, exempt=exempt)
+    if found is None and role:
+        trash_source = _lone_trash_action(ctx, role)
+        if trash_source:
+            found = TRASH_KEYWORD, trash_source
     if found is not None:
         hit, source = found
         return RiskAssessment(
