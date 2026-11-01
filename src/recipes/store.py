@@ -322,9 +322,8 @@ def _secret_string(obj: Any, key: str = "") -> bool:
 
 
 def _content_hit(obj: Any, key: str = "") -> bool:
-    """문자열 leaf 전수에 레지스트리 `content_hit`(내용 경로 규칙 — 원문과 casefold 형태, WS-75 R1 B2). 끝 앞부분(≥ 4)
-    걸침은 producer 가 실제로 자른 칸만(잘림 출처 표 — 기록 때 recipes.keys.snapshot 이 대상 이름에 표시, R2 #199 B3):
-    잘리지 않는 이름·URL·url_pat·href_pat·selector·params 이름은 길이와 무관하게 끝 규칙 없음. 골격 해시·사후 신호 종류는 제외."""
+    """문자열 leaf 전수에 레지스트리 `content_hit`(내용 경로 규칙 — 원문과 casefold 형태의 전체 포함 일치, WS-75 R1 B2).
+    골격 해시·사후 신호 종류는 제외."""
     if key in _HASH_KEYS or key == "signals":
         return False
     if isinstance(obj, dict):
@@ -333,10 +332,9 @@ def _content_hit(obj: Any, key: str = "") -> bool:
         return any(_content_hit(value, key) for value in obj)
     if not isinstance(obj, str):
         return False
-    from security.public_url import content_cut
     from security.secret_registry import REGISTRY
 
-    return REGISTRY.content_hit(obj, cut=content_cut(obj))
+    return REGISTRY.content_hit(obj)
 
 
 def _check_registered(rec: Dict[str, Any], entries: Sequence[Dict[str, Any]] = ()) -> None:

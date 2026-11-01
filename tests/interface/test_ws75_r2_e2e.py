@@ -1,9 +1,10 @@
-"""WS-75 R2 (#199 B3) E2E — 끝 규칙은 실제로 잘린 칸에만. 실 Chromium(headless) + 127.0.0.1 http, 합성 값만.
+"""WS-75 R2 (#199 B3)·R3(사용자 결정 A — 끝 앞부분 가림 제거) E2E. 실 Chromium(headless) + 127.0.0.1 http, 합성 값만.
 
 검증 재현(parent-proof): 실제 MCP `?password=2026PrivateKey` 등록 뒤 깨끗한 페이지의 안 잘린 일반 이름
 `Order # 2026`(12)·`Order details for ordinary shipment 2026`(40)·이모지 120 단위 이름은 원문 그대로 보이고 정상 레시피가
 저장된다(기준 ae4bd2d 와 같음). 묶음 표제(정확히 40자, 안 잘림)도 원문.
-대조(누출 방향): 같은 등록 값의 앞부분이 실제 120 자르기 경계에 남은 이름은 wire·레시피 파일에 앞부분 0건.
+전체 일치: 같은 등록 값 전체가 든 이름은 wire 에서 가려지고 레시피는 저장되지 않는다.
+문서화된 한계: 등록 값이 실제 120 자르기 경계에 걸치면 남은 앞부분은 원문으로 보인다(기준 ae4bd2d·v1.18.1 과 같음).
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ PAD = "Ordinary shipment details "
 EMOJI = "\U0001F600"
 NAMES = {"short12": "Order # 2026", "short40": "Order details for ordinary shipment 2026",
          "emoji120": EMOJI + (PAD * 6)[:114] + "2026", "near11": "Order: 2026", "plain": "Activate ordinary",
-         "cut120": "x" * 113 + " " + V + " tail"}  # 대조: 실제로 잘린다(앞 6자 `2026Pr` 이 경계에 남는다)
+         "cut120": "x" * 113 + " " + V + " tail",  # 실제로 잘린다(앞 6자 `2026Pr` 이 경계에 남는다 — 한계)
+         "whole": "Order " + V + " details"}
 HEADING40 = NAMES["short40"]
 
 
@@ -111,12 +113,21 @@ async def test_uncut_ordinary_name_shown_raw_and_recipe_saved(site, tmp_path, ke
 
 
 @requires_chromium
-async def test_real_cut_name_prefix_never_in_wire_or_recipe(site, tmp_path):
+async def test_whole_registered_value_masked_in_wire_and_recipe_refused(site, tmp_path):
+    src, shown, wire, save, disk = await _run(site, tmp_path, "whole")
+    assert src["raw"] == src["cut"]  # 시험 조건: 잘리지 않았다
+    assert shown == "Order [REDACTED] details", shown
+    assert V not in wire and V.casefold() not in disk.casefold()
+    assert save["success"] is False
+
+
+@requires_chromium
+async def test_documented_limit_cut_prefix_stays_like_baseline(site, tmp_path):
+    """문서화된 한계: producer 가 자른 경계에 걸친 등록 값은 앞부분이 원문으로 남는다(끝 앞부분 가림 없음 — 기준과 같음)."""
     src, shown, wire, save, disk = await _run(site, tmp_path, "cut120")
     assert src["cut"] != src["raw"] and src["cut"].endswith(V[:6])  # 시험 조건: 실제로 잘려 앞부분이 끝에 남는다
-    assert shown.endswith("[REDACTED]"), shown
-    assert _prefix_leaks(V, wire) == [] and _prefix_leaks(V.casefold(), disk.casefold()) == []
-    assert save["success"] is False
+    assert shown == src["cut"], shown
+    assert V not in wire and "[REDACTED]" not in json.dumps(json.loads(wire)["data"]["observation"]["elements"])
 
 
 @requires_chromium

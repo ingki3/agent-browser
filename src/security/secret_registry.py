@@ -362,15 +362,9 @@ class _Snapshot(NamedTuple):
     hosts: FrozenSet[str]                                 # ≥ 8 원문의 casefold(호스트 라벨 비교)
     sentinels: Tuple[str, ...]                            # 표현에 쓰이지 않은 사설 영역 글자 후보
     empty: bool
-    #: 원문 앞 HEAD_CHARS 자 → (원문, ≥ 8 여부) — 잘린 글자 끝의 앞부분 일치(WS-75 `mask_tail`)
-    heads: Dict[str, Tuple[Tuple[str, bool], ...]] = {}
 
 
-_EMPTY = _Snapshot((), (), frozenset(), (), {}, frozenset(), ("\ue000",), True, {})
-#: 잘린 글자 끝에서 찾는 등록 값 앞부분의 최소 길이(WS-75 — 자격증명·주소 비밀 모두 4자+).
-HEAD_CHARS = 4
-#: 잘린 글자 끝에서 앞부분을 찾는 창(글자) — perception 의 자르기 길이(최대 200)보다 넉넉히.
-TAIL_WINDOW = 256
+_EMPTY = _Snapshot((), (), frozenset(), (), {}, frozenset(), ("\ue000",), True)
 _PUA = [chr(c) for c in range(0xE000, 0xE100)]
 _PUA_RE = re.compile("[\ue000-\ue0ff]")
 
@@ -383,15 +377,10 @@ def _build(entries: Iterable[Tuple[_Part, ...]]) -> _Snapshot:
     blocks: Dict[str, Tuple[str, int]] = {}
     hosts: set = set()
     used: set = set()
-    heads: Dict[str, List[Tuple[str, bool]]] = {}
     any_part = False
     for parts in entries:
         for part in parts:
             any_part = True
-            if len(part.r1) > HEAD_CHARS:
-                found = heads.setdefault(part.r1[:HEAD_CHARS], [])
-                if (part.r1, part.long) not in found:
-                    found.append((part.r1, part.long))
             for form in part.forms:
                 if not form.isascii() and _PUA_RE.search(form):  # ASCII 표현(퍼센트·JSON 등)에는 사설 영역 글자가 없다
                     used.update(_PUA_RE.findall(form))
@@ -411,7 +400,7 @@ def _build(entries: Iterable[Tuple[_Part, ...]]) -> _Snapshot:
         return _EMPTY
     sentinels = tuple(c for c in _PUA if c not in used) or ("\ue000",)
     return _Snapshot(tuple(long_groups), tuple(url_groups), frozenset(short_words), tuple(short_other),
-                     blocks, frozenset(hosts), sentinels, False, {k: tuple(v) for k, v in heads.items()})
+                     blocks, frozenset(hosts), sentinels, False)
 
 
 def _extend_right(text: str, end: int, value: str, vend: int) -> int:
@@ -632,24 +621,17 @@ class SecretRegistry:
         """페이지 내용 경로(WS-75): 등급으로 고른 값만 자유 문장 규칙(≥ 8 부분 일치, 4~7 경계 일치)으로 가린다."""
         return self._mask(text, url=False, snap=self._content)
 
-    def mask_tail(self, text: str) -> str:
-        """잘린 글자(WS-75 — perception 이 원문을 먼저 자른 칸)의 끝이 내용 경로 가림 대상 등록 값의 **앞부분**(≥ 4자, 값
-        전체보다 짧음)이면 그 끝 조각을 `[REDACTED]` 로. 끝의 말줄임 `…` 은 남긴다. 4~7자 값(자격증명)의 앞부분은 앞 글자가
-        영숫자가 아닐 때만(경계 규칙과 같다). 일치가 없으면 입력 그대로(같은 객체)."""
-        return self._tail(text, self._content)
-
-    def content_hit(self, text: str, cut: bool = False) -> bool:
+    def content_hit(self, text: str) -> bool:
         """레시피 저장 대조(WS-75 R1 B2): `text` 원문 또는 그 casefold 형태에 내용 경로 가림 대상 등록 값이 걸리는가 —
-        같은 등급·길이 규칙(≥ 8 부분 일치, 4~7 경계 일치), `cut`(먼저 잘린 칸)이면 끝의 앞부분(≥ 4자) 걸침도. 저장
-        문자열은 정규화(소문자화)로 원문이 소실될 수 있어 casefold 한 등록 값과도 대조한다. 참·거짓만 돌려준다."""
+        같은 등급·길이 규칙(≥ 8 부분 일치, 4~7 경계 일치 — 전체 포함 일치만, R3 사용자 결정 A). 저장 문자열은
+        정규화(소문자화)로 원문이 소실될 수 있어 casefold 한 등록 값과도 대조한다. 참·거짓만 돌려준다."""
         snap = self._content
         if snap.empty or not isinstance(text, str) or len(text) < MIN_VALUE_CHARS:
             return False
-        if self._mask(text, url=False, snap=snap) is not text or (cut and self._tail(text, snap) is not text):
+        if self._mask(text, url=False, snap=snap) is not text:
             return True
-        folded = self._folded_snapshot()
         low = text.casefold()
-        return self._mask(low, url=False, snap=folded) is not low or (cut and self._tail(low, folded) is not low)
+        return self._mask(low, url=False, snap=self._folded_snapshot()) is not low
 
     def _folded_snapshot(self) -> _Snapshot:
         with self._lock:
@@ -659,24 +641,6 @@ class SecretRegistry:
                               for v in self._order)
                 self._folded = (self._version, snap)
             return snap
-
-    def _tail(self, text: str, snap: _Snapshot) -> str:
-        heads = snap.heads
-        if not heads or len(text) < HEAD_CHARS:
-            return text
-        ellipsis = text.endswith("\u2026")
-        body = text[:-1] if ellipsis else text
-        n = len(body)
-        for p in range(max(0, n - TAIL_WINDOW), n - HEAD_CHARS + 1):
-            found = heads.get(body[p:p + HEAD_CHARS])
-            if not found:
-                continue
-            tail = body[p:]
-            for value, long in found:
-                if len(tail) < len(value) and value.startswith(tail) and (
-                        long or p == 0 or not body[p - 1].isalnum()):
-                    return body[:p] + MASK + ("\u2026" if ellipsis else "")
-        return text
 
     def mask_url_part(self, text: str) -> str:
         """주소 칸(호스트 뒤): ≥ 8 값의 R1·R2 표현과 긴 원문 조각만(4~7 은 정상 경로 보존 — §2 P3)."""

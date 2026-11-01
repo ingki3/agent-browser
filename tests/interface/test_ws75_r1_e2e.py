@@ -1,8 +1,9 @@
 """WS-75 R1 (#199) E2E — 검증 BLOCKING 재현을 저장소 시험으로 옮겼다(.hermes/verify/ws75 unicode_probe·
 unicode_group_probe·recipe_probe). 실 Chromium(headless) + 127.0.0.1 http, 합성 값만.
 
-* B1: 등록 값 앞에 이모지(서로게이트 쌍) 0/1/2/20 개 — JS 의 UTF-16 사전 자르기(이름 120·값 200, 일반·shadow) 뒤 끝에
-  남은 앞부분이 MCP wire 전체에 0건. 묶음 표제(JS rpClean 40)도 같다. 대조: 이모지 섞인 모르는 이름은 원문 그대로.
+* B1(R3 사용자 결정 A — 끝 앞부분 가림 제거): 등록 값 앞에 이모지(서로게이트 쌍) 0/1/2/20 개 — 값 전체가 JS 사전 자르기
+  (이름 120·값 200, 일반·shadow) 안에 있으면 MCP wire 전체에 값·앞부분 0건. 묶음 표제(JS rpClean 40)도 같다. 경계에 걸친
+  앞부분은 문서화된 한계(test_ws75_r2_e2e). 대조: 이모지 섞인 모르는 이름은 원문 그대로.
 * B2: 등록 값(13종 + 대소문자 섞인 값)이 든 이름의 단추를 누른 단계는 레시피 파일에 원문·casefold·앞부분(≥4) 0건.
   대조: 일반 이름 단계는 저장된다.
 """
@@ -99,9 +100,9 @@ def _prefix_leaks(value: str, text: str):
 @pytest.mark.parametrize("astral", [0, 1, 2, 20])
 async def test_b1_astral_prefix_cut_zero_prefix_in_wire(tmp_path, astral):
     secret_registry.register_secret_values([V])
-    prefix = E * astral + "y" * (40 - 2 * astral)  # 둘 다 UTF-16 40 단위 — JS 자르기 뒤 V 앞 5자가 남는다
-    name = prefix + "x" * 75 + V
-    val = prefix + "x" * 155 + V
+    prefix = E * astral + "y" * (40 - 2 * astral)  # 둘 다 UTF-16 40 단위 — V 전체가 JS 자르기 길이 안에 든다
+    name = prefix + "x" * 50 + V + " tail" + "z" * 40
+    val = prefix + "x" * 130 + V + " tail" + "z" * 40
     page = f"""<!doctype html><meta charset=utf-8><title>Local Unicode seam</title>
 <button id=b>{name}</button>
 <input id=value aria-label="value" value="{val}">
@@ -125,7 +126,7 @@ r.innerHTML='<input aria-label="shadow" value="{val}">';</script>"""
 @pytest.mark.parametrize("astral", [0, 1, 5])
 async def test_b1_astral_group_heading_zero_prefix(tmp_path, astral):
     secret_registry.register_secret_values([V])
-    heading = E * astral + "y" * (35 - 2 * astral) + V
+    heading = E * astral + "y" * (15 - 2 * astral) + V  # UTF-16 36 단위 — 묶음 표제 자르기(40) 안
     members = "".join(f'<li><button onclick="this.dataset.clicked=1">{i}</button></li>' for i in range(1, 5))
     page = f"""<!doctype html><meta charset=utf-8><title>group source seam</title>
 <main style="display:flex;gap:50px"><section aria-label="{heading}"><h2>{heading}</h2><ul>{members}</ul></section>

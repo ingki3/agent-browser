@@ -19,7 +19,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from perception import cut_marks
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 
 logger = logging.getLogger(__name__)
@@ -74,12 +73,7 @@ function() {
   // (WS-30b — 사본이 갈라지면 관찰·검증 이름이 달라 TOCTOU 오탐, open/closed shadow 중복 제거 실패).
   __ACCESSIBLE_NAME__
   const name = String(accessibleName(el) || '');
-  const nameCut = accessibleName.cut;
-  const raw = el.value === undefined || el.type === 'password' ? '' : String(el.value);
   return {
-    // WS-75 R2: 실제로 자른 칸 표시(내부 — 잘림 출처 표로만 옮긴다).
-    name_cut: !!nameCut,
-    value_cut: raw.length > 200,
     tag: tag,
     role: String(role).toLowerCase(),
     name: name,
@@ -192,11 +186,6 @@ async def scan_shadow_roots(cdp: Any) -> ShadowScanResult:
                 props = await _extract_properties(cdp, backend_id)
                 if props is None:
                     continue
-                # WS-75 R2(#199 B3): JS 가 실제로 자른 이름·값만 잘림 출처 표에(요소 필드에는 더하지 않는다).
-                if props.get("name_cut"):
-                    cut_marks.mark(props.get("name", ""))
-                if props.get("value_cut"):
-                    cut_marks.mark(props.get("value"))
 
                 result.elements.append(
                     ShadowElement(

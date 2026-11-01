@@ -18,8 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from perception import cut_marks  # WS-75 R2 잘림 출처 표
-
 #: 상호작용 가능 후보로 간주하는 태그/역할
 INTERACTIVE_TAGS = (
     "a", "button", "input", "select", "textarea", "summary", "option", "label",
@@ -51,7 +49,6 @@ function accessibleName(el) {
   // 요소가 속한 문서 기준으로 참조를 찾는다 — 관찰(프레임 안에서 실행)에서는 document 와 같고,
   // 게이트가 최상위에서 iframe 안 포커스 요소를 읽을 때도 그 요소의 문서를 본다.
   const doc = el.ownerDocument || document;
-  accessibleName.cut = false;  // WS-75 R2: 실제로 자른 이름인가(반환값은 그대로 — 호출 직후 읽는다)
   const aria = el.getAttribute('aria-label');
   if (aria && aria.trim()) return aria.trim();
 
@@ -71,7 +68,6 @@ function accessibleName(el) {
     if (el.value && el.value.trim()) return el.value.trim();
   }
   const text = (el.innerText || el.textContent || '').trim();
-  accessibleName.cut = !!text && text.length > 120;  // WS-75 R2
   if (text) return text.slice(0, 120);
 
   // 텍스트가 없는 경우에만 보조 속성으로 폴백한다.
@@ -276,7 +272,6 @@ COLLECT_SCRIPT = """
       if (!vis.visible) continue;
 
       const name = accessibleName(el);
-      const nameCut = accessibleName.cut;  // WS-75 R2
       const r = vis.rect;
       results.push({
         seq: seq++,
@@ -296,9 +291,6 @@ COLLECT_SCRIPT = """
         bbox: { x: Math.round(r.x), y: Math.round(r.y),
                 width: Math.round(r.width), height: Math.round(r.height) },
       });
-      // WS-75 R2: 실제로 자른 칸 표시(내부 — Python 이 잘림 출처 표로 옮기고 출력에는 싣지 않는다).
-      if (nameCut) results[results.length - 1].name_cut = true;
-      if (el.value !== undefined && el.type !== 'password' && String(el.value).length > 200) results[results.length - 1].value_cut = true;
     }
   }
 
@@ -375,12 +367,6 @@ class SanitizedPage:
 def parse_collection(payload: Dict[str, Any]) -> SanitizedPage:
     """`COLLECT_SCRIPT` 반환값을 도메인 객체로 변환한다."""
     elements = [RawElement.from_dict(e) for e in payload.get("elements", [])]
-    # WS-75 R2(#199 B3): JS 가 실제로 자른 칸만 잘림 출처 표에(끝 규칙 대상) — 요소 필드에는 더하지 않는다.
-    for el, raw in zip(elements, payload.get("elements", [])):
-        if raw.get("name_cut"):
-            cut_marks.mark(el.name)
-        if raw.get("value_cut"):
-            cut_marks.mark(el.value)
     return SanitizedPage(
         title=str(payload.get("title") or ""),
         url=str(payload.get("url") or ""),

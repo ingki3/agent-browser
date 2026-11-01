@@ -4,7 +4,8 @@
   주소 비밀 = 내용 경로 ≥ 8 만, 비밀 키가 아닌 키 아래 순수 16진(ObjectId 류) = 내용 경로 원문.
 * 내용 경로(data.items·observation.elements·axtree_summary·repeated)의 페이지 글자 칸만 — element_id·role·구조 키 불변.
 * 레지스트리가 비었거나 응답에 등록 값이 없으면 바이트 동일.
-* perception 이 먼저 자른 칸(…·자르기 길이)의 끝에 남은 등록 값 앞부분도 가린다(코디네이터 승인 B, 2026-10-31).
+* 전체 일치만 가린다(R3 사용자 결정 A 2026-11-01). 문서화된 한계: perception 이 미리 자른 경계(이름 120·값 200·묶음 40
+  등)에 걸친 등록 값은 앞부분이 남을 수 있다(기준 ae4bd2d·v1.18.1 과 같음).
 * 레시피: 저장 문자열에 등록 값이 있으면 저장 거부.
 
 값은 모두 합성 값.
@@ -13,8 +14,6 @@
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 
 import pytest
 
@@ -22,22 +21,18 @@ from contracts import ActionResult, ActionType
 import security.public_url  # noqa: F401 - 모듈 적재(아래 sys.modules 조회)
 import sys
 
-from perception import cut_marks
 from security import secret_registry as sr
 from security.public_url import graded_secret_values, public_payload
 
 pu = sys.modules["security.public_url"]  # `security.public_url` 이름은 패키지가 함수로 재수출한다
 R = "[REDACTED]"
-SRC = Path(__file__).resolve().parents[2] / "src"
 
 
 @pytest.fixture(autouse=True)
 def _clean():
     sr.clear()
-    cut_marks.clear()
     yield
     sr.clear()
-    cut_marks.clear()
 
 
 def _wire(payload):
@@ -195,70 +190,36 @@ def test_byte_identical_when_registry_empty_or_value_absent():
     assert [_wire(p) for p in payloads] == base
 
 
-# ------------------------------------------------------------------ 잘린 칸의 끝(perception 사전 자르기)
+# ------------------------------------------------------------------ 잘린 칸의 끝(문서화된 한계 — R3 결정 A)
+
+#: perception producer 의 사전 자르기 길이(묶음 첫 낱말 12·묶음 이름/표제 40·이름 120·값 200).
+_CUT_LENGTHS = (12, 40, 120, 200)
 
 
-def _cut_sources():
-    return {
-        "compact": int(re.search(r"^COMPACT_WORD = (\d+)", (SRC / "perception/repeated.py").read_text(), re.M)[1]),
-        "name_limit": int(re.search(r"^NAME_LIMIT = (\d+)", (SRC / "perception/repeated.py").read_text(), re.M)[1]),
-        "text": int(re.search(r"text\.slice\(0, (\d+)\)", (SRC / "perception/sanitizer.py").read_text())[1]),
-        "value": {int(x) for f in ("sanitizer.py", "shadow_dom.py")
-                  for x in re.findall(r"String\(el\.value\)\.slice\(0, (\d+)\)", (SRC / "perception" / f).read_text())},
-    }
-
-
-def test_cut_lengths_match_perception_sources():
-    src = _cut_sources()
-    assert len(src["value"]) == 1
-    assert pu.CONTENT_CUT_LENGTHS == {src["compact"], src["name_limit"], src["text"], *src["value"]}
-
-
-@pytest.mark.parametrize("limit", sorted(pu.CONTENT_CUT_LENGTHS))
-def test_cut_tail_prefix_masked_every_position(limit):
-    """원문을 limit 자에서 자른 칸(말줄임 없음, producer 가 잘림 출처 표시 — R2) — 등록 값이 경계를 걸치는 모든 위치에서
-    앞부분(≥4자)이 남지 않는다."""
+@pytest.mark.parametrize("limit", _CUT_LENGTHS)
+def test_documented_limit_prefix_at_producer_cut_stays(limit):
+    """문서화된 한계: 도구·페이지가 자른 경계에 걸친 등록 값은 앞부분이 남는다(기준과 같음 — 끝 앞부분 가림 없음).
+    잘리지 않고 값 전체가 남은 위치는 그대로 가린다(전체 일치)."""
     v = "SYNTHcutvalue77"
     sr.register_secret_values([v])
-    for start in range(max(0, limit - len(v) + 1), limit):
+    for start in range(max(0, limit - len(v) - 2), limit):
         raw = ("w " * limit)[:start] + v + " tail"
-        cut = cut_marks.mark(raw[:limit])
+        cut = raw[:limit]
         shown = pu.content_text(cut)
-        kept = limit - start
-        if kept >= 4:
-            assert v[:kept] not in shown, (limit, start, shown)
-            assert shown.endswith(R)
-        assert shown.startswith(cut[:start].rstrip(" ")[:max(0, start - 1)]) or start <= 1
+        if v in cut:
+            assert v not in shown and R in shown, (limit, start, shown)
+        else:
+            assert shown == cut, (limit, start, shown)   # 앞부분 원문(한계 — 기준 동작)
 
 
-def test_ellipsis_tail_prefix_masked_every_position():
-    """묶음 표제·이름 표시(repeated._short — display_safe(…, 40) 말줄임, 잘림 출처 표시)."""
-    from perception.repeated import _short
-
-    v = "SYNTHheadvalue88"
-    sr.register_url("http://h/p?token=" + v)
-    for start in range(0, 45):
-        cut = _short("가" * start + v + " 뒤쪽 글자 이어짐")
-        shown = pu.content_text(cut)
-        for k in range(4, len(v)):
-            assert v[:k] + "…" not in shown and not shown.rstrip("…").endswith(v[:k]), (start, shown)
-
-
-def test_cut_tail_unrelated_byte_identical_and_short_value_boundary():
+def test_unrelated_cut_text_byte_identical():
+    """끝 규칙이 없으니 등록 값과 앞글자만 같은 일반 글자는 어느 길이에서도 원문(과잉 가림 0)."""
     sr.register_secret_values(["SYNTHother9999", "7a3k9"])
-    for limit in sorted(pu.CONTENT_CUT_LENGTHS):
-        cut = cut_marks.mark(("평범한 글자 SYNT" * 40)[:limit - 4] + "abcd")
-        assert pu.content_text(cut) == cut
-    # 4~7자 자격증명 앞부분은 앞 글자가 영숫자가 아닐 때만
-    assert pu.content_text(cut_marks.mark(("x" * 115) + " 7a3k")) == ("x" * 115) + " " + R
-    assert pu.content_text(cut_marks.mark(("x" * 115) + "z7a3k")) == ("x" * 115) + "z7a3k"
-
-
-def test_tail_rule_respects_grades():
-    hex24 = "507f1f77bcf86cd799439011"
-    sr.register_url("http://h/o?id=" + hex24)  # 휴리스틱 — 내용 경로 대상 아님
-    cut = cut_marks.mark(("w" * 100) + " " + hex24[:19])
-    assert len(cut) == 120 and pu.content_text(cut) == cut
+    for limit in _CUT_LENGTHS:
+        cut = ("평범한 글자 SYNT" * 40)[:limit - 4] + "abcd"
+        assert pu.content_text(cut) is cut
+    assert pu.content_text(("x" * 115) + " 7a3k") == ("x" * 115) + " 7a3k"
+    assert pu.content_text("Order # 2026…") == "Order # 2026…"
 
 
 # ------------------------------------------------------------------ 파이프라인 문맥(한 번 가린 사본)
