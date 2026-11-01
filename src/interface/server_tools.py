@@ -309,11 +309,19 @@ class ToolsMixin:
                 self._attach_window_notices(result)
                 settle_returned_chars(result)
             if secret_registry.version() != version:
-                # 그래도 바뀜(fail-closed — 누출보다 잘림): 지금 결과를 최신 레지스트리로 다시 가리고 자르기를 다시 한다.
-                result.data = content_view(result.data)
-                with content_masked(secret_registry.version()):
-                    cap_result_size(result, max_chars, limit=self.max_result_chars)
-                    settle_returned_chars(result)
+                # R4 S1: 그래도 바뀜 — 마지막 재시도도 **자르기 전 원본에서** 지금 레지스트리로 가린 뒤 자른다(자른 사본에
+                # 가림을 덧대면 서버가 자른 등록 값 앞부분이 남는다). 이미 실은 창 보고(data.window)는 옮겨 싣는다.
+                window = result.data.get("window") if isinstance(result.data, dict) else None
+                version = secret_registry.version()
+                result.data = content_view(original)
+                with content_masked(version):
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                if secret_registry.version() != version:
+                    # 끝까지 흔들림(fail-closed — 누출보다 생략): 내용 칸의 페이지 글자를 고정 문구로 바꾼 원본에서 자른다.
+                    from security.public_url import content_withheld
+
+                    result.data = content_withheld(original)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result
@@ -350,6 +358,14 @@ class ToolsMixin:
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
         cap_result_size(result, max_chars, limit=self.max_result_chars)
+
+    def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
+               attach_injection_signal: Any, window: Any) -> None:
+        """R4 S1 마지막 재시도: 원본에서 새로 만든 사본을 크기 맞춤하고, 이미 소비한 창 보고를 옮겨 싣고 길이를 맞춘다."""
+        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+        if window is not None and isinstance(result.data, dict):
+            result.data["window"] = window
+        settle_returned_chars(result)
 
     def _attach_window_notices(self, result: ActionResult) -> None:
         """아직 알리지 않은 창 전환·복구 보고를 결과에 싣는다(1회 소비)."""

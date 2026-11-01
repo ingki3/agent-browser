@@ -885,8 +885,6 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
 #: extract 항목(data.items)은 칸 이름이 에이전트가 고른 속성 이름이라 모든 문자열 값을 가린다.
 CONTENT_TEXT_KEYS: FrozenSet[str] = frozenset({"name", "value", "text", "href", "group", "heading", "summary", "label",
                                                "title"})
-#: axtree_summary 한 줄(perception.engine._summarize — `@eN role "이름"` + ` (disabled)`).
-_SUMMARY_LINE = re.compile(r'(\S+ \S+ ")(.*)("(?: \(disabled\))?)')
 #: 가린 결과 메모(레지스트리 version 단위 — version 이 바뀌면 버린다). (version, 원문 → 가린 글자).
 _CONTENT_MEMO: Tuple[int, Dict[str, str]] = (-1, {})
 #: 메모 상한 — 항목 수와 원문 글자 합(넘으면 비운다; 메모는 비용만 좌우하고 결과는 바꾸지 않는다).
@@ -923,17 +921,41 @@ def content_text(text: Any) -> Any:
 
 
 def content_summary(text: Any) -> Any:
-    """axtree_summary — 줄마다 이름 부분만 elements[].name 과 같은 함수(content_text)로 가린다(요약과 요소가 같은 결과).
-    형식이 다른 줄(이름 안 줄바꿈의 이어진 줄 등)은 줄 전체를 가린다."""
+    """axtree_summary — elements[].name 과 같은 함수(content_text)로 가린다(요약과 요소가 같은 결과).
+
+    R4 S2: 줄로 나누지 않고 **전체 문자열**을 한 번에 가린다 — 줄바꿈이 든 등록 값(이름 안 줄바꿈)은 줄 경계에 걸쳐
+    어느 한 줄에도 전체가 없다(예전 '줄마다 이름 부분' 가림이 놓쳤다). 줄 조각은 전체의 부분 문자열이고 그 양 끝
+    `"`·줄바꿈은 경계 글자라, 줄마다 가렸을 때 걸리는 값은 전체에서도 모두 걸린다(줄 처리를 다시 하지 않는다 — 1.2MB
+    요약에서 줄마다 가림보다 싸다)."""
     if not isinstance(text, str) or len(text) < secret_registry.MIN_VALUE_CHARS:
         return text
-    lines = text.split("\n")
-    out = []
-    for line in lines:
-        m = _SUMMARY_LINE.fullmatch(line)
-        out.append(m.group(1) + content_text(m.group(2)) + m.group(3) if m else content_text(line))
-    joined = "\n".join(out)
-    return text if joined == text else joined
+    return content_text(text)
+
+
+def _engine_summary(elements: Any) -> Optional[str]:
+    """perception.engine._summarize 와 같은 형식(`@eN role "이름"` + ` (disabled)`, 줄바꿈으로 잇기). dict 가 아니면 None."""
+    if not isinstance(elements, list):
+        return None
+    lines = []
+    for e in elements:
+        if not isinstance(e, dict):
+            return None
+        lines.append(f'{e.get("element_id")} {e.get("role")} "{e.get("name")}"'
+                     + ("" if e.get("interactable", True) else " (disabled)"))
+    return "\n".join(lines)
+
+
+def _summary_view(summary: Any, raw_elements: Any, masked_elements: Any) -> Any:
+    """content_view 의 요약 가림(R4 S2). 요약이 원 요소들로 만든 엔진 형식과 같으면 **가린 요소 이름으로 다시 만든다**
+    — 이름 단위 가림이라 줄바꿈이 든 이름(등록 값)도 통째로 가려지고 elements[].name 과 같은 결과다(줄로 나누지 않음,
+    1.2MB 요약도 이어 붙이기 비용뿐). 다르면 전체 문자열 가림(content_summary)."""
+    if not isinstance(summary, str) or len(summary) < secret_registry.MIN_VALUE_CHARS:
+        return summary
+    if _engine_summary(raw_elements) == summary:
+        rebuilt = _engine_summary(masked_elements)
+        if rebuilt is not None:
+            return summary if rebuilt == summary else rebuilt
+    return content_summary(summary)
 
 
 def mask_content(obj: Any, all_strings: bool = False, key: Any = None, depth: int = 0) -> Any:
@@ -976,10 +998,11 @@ def content_view(data: Any) -> Any:
     if isinstance(obs, dict):
         obs = dict(obs)
         if masking:
+            raw_elements = obs.get("elements")
             if "elements" in obs:
-                obs["elements"] = mask_content(obs["elements"])
+                obs["elements"] = mask_content(raw_elements)
             if "axtree_summary" in obs:
-                obs["axtree_summary"] = content_summary(obs["axtree_summary"])
+                obs["axtree_summary"] = _summary_view(obs["axtree_summary"], raw_elements, obs.get("elements"))
         out["observation"] = obs
     rep = out.get("repeated")
     if isinstance(rep, dict):
@@ -990,6 +1013,41 @@ def content_view(data: Any) -> Any:
             if isinstance(rep.get("groups"), list):
                 rep["groups"] = list(rep["groups"])
             out["repeated"] = rep
+    return out
+
+
+def _withhold(obj: Any, all_strings: bool, key: Any = None, depth: int = 0) -> Any:
+    if isinstance(obj, str):
+        return MASK if obj and (all_strings or key is None or key in CONTENT_TEXT_KEYS) else obj
+    if not isinstance(obj, (dict, list, tuple)):
+        return obj
+    if depth >= MAX_PAYLOAD_DEPTH:
+        return DEPTH_MASK
+    if isinstance(obj, dict):
+        return {k: _withhold(v, all_strings, k, depth + 1) for k, v in obj.items()}
+    items = [v if isinstance(v, str) and not all_strings else _withhold(v, all_strings, None, depth + 1)
+             for v in obj]
+    return items if isinstance(obj, list) else tuple(items)
+
+
+def content_withheld(data: Any) -> Any:
+    """R4 S1 fail-closed: 레지스트리 version 이 끝까지 흔들릴 때 — 내용 경로의 페이지 글자 칸(content_view 가 가리는
+    칸과 같은 범위)을 모두 고정 문구(MASK)로 바꾼 새 dict. 구조·도구 칸(element_id·role·좌표 …)은 그대로. 원본 불변."""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    if "items" in out:
+        out["items"] = _withhold(out["items"], True)
+    obs = out.get("observation")
+    if isinstance(obs, dict):
+        obs = dict(obs)
+        if "elements" in obs:
+            obs["elements"] = _withhold(obs["elements"], False)
+        if isinstance(obs.get("axtree_summary"), str) and obs["axtree_summary"]:
+            obs["axtree_summary"] = MASK
+        out["observation"] = obs
+    if isinstance(out.get("repeated"), dict):
+        out["repeated"] = _withhold(out["repeated"], False)
     return out
 
 
