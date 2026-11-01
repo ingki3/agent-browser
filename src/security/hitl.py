@@ -280,6 +280,7 @@ def match_signal(source: str, text: str, path_only: bool = False) -> Optional[st
 
     `path_only`: 폼 목적지(form_action·formaction)의 쿼리를 보지 않는다(GET 제출).
     WS-56 R3 B4: 키워드가 없어도 계정 '자체' 종료(Close account·계정 비활성화 …)면 고위험(`ACCOUNT_TERMINATION_KEYWORD`).
+    WS-76: 휴지통 이동·비우기·스팸 신고·차단 구(`irreversible_action`)도 고위험.
     """
     if not text or source in META_SOURCES:
         return None
@@ -293,6 +294,8 @@ def match_signal(source: str, text: str, path_only: bool = False) -> Optional[st
         hit = _match_text(text)
     if hit is None and account_termination(source, text):
         return ACCOUNT_TERMINATION_KEYWORD
+    if hit is None:
+        hit = irreversible_action(source, text)
     return hit
 
 
@@ -405,6 +408,144 @@ def account_termination(source: str, text: str) -> bool:
         return True
     compact = "".join(ch for ch in normalize_gate_text(raw) if ch.isalnum())
     return bool(_ACCT_KO_RE.search(compact))
+
+
+# ---------------------------------------------------------------------------
+# WS-76 (#204): 되돌리기 어려운 메일·계정 조작 — 휴지통 이동·비우기, 스팸 신고·표시, (사용자·번호) 차단.
+# ---------------------------------------------------------------------------
+#
+# 낱말 하나(휴지통·trash·spam·차단·block·비우기·empty)는 폴더 열기·안내·레이아웃 이름에도 쓰이므로
+# **동사+대상 구**일 때만 고위험이다(계정 종료 판정과 같은 방식):
+#   'Move to trash' · 'Empty trash' · 'Report spam' · 'Mark as spam' · 'Block user' · '휴지통으로 이동' ·
+#   '휴지통 비우기' · '스팸 신고' · '사용자 차단'.
+# 반전·안내는 고위험이 아니다(기준 등급 유지): 앞에 un/undo/not, 뒤에 해제·취소·안내·help·list 등
+#   ('Undo move to trash' · '차단 해제' · '스팸 신고 안내' · 'Mark as not spam').
+# 한국어 동작 명사형 단독 라벨('차단'·'차단하기'·'비우기')은 라벨 전체가 그 낱말일 때만 고위험이다.
+# 복원 계열('스팸 아님'·'Not spam'·'Restore'·'Unblock')은 되돌리는 동작이라 올리지 않는다(기준 LOW 그대로).
+
+#: 게이트가 근거로 보고하는 키워드(matched_keyword).
+TRASH_KEYWORD = "move to trash"
+EMPTY_KEYWORD = "empty"
+SPAM_KEYWORD = "report spam"
+BLOCK_KEYWORD = "block"
+_IRR_ITEMS = frozenset({"selected", "message", "messages", "mail", "mails", "email", "emails", "conversation",
+                        "conversations", "thread", "threads", "item", "items", "it", "this", "these", "all", "file",
+                        "files", "them"})
+_IRR_FILLERS = frozenset({"the", "my", "your", "this", "a", "an", "all", "selected"})
+_IRR_MOVE_VERBS = frozenset({"move", "send", "put", "throw"})
+_IRR_TRASH_DEST = frozenset({"trash", "bin", "junk", "spam", "wastebasket", "recycle"})
+_IRR_EMPTY_DEST = frozenset({"trash", "bin", "junk", "spam", "cart", "basket", "wastebasket", "recycle"})
+_IRR_SPAM = frozenset({"spam", "junk", "phishing"})
+_IRR_BLOCK_OBJ = frozenset({"user", "users", "contact", "contacts", "number", "numbers", "sender", "senders",
+                            "account", "person", "caller", "member", "profile", "channel", "domain", "address",
+                            "email", "phone", "this", "them", "him", "her"})
+#: 구 바로 앞에 오면 반전(되돌리기·부정)이다.
+_IRR_NEG_BEFORE = frozenset({"un", "undo", "not", "dont", "don", "never", "cancel", "stop"})
+#: 구 바로 뒤에 오면 동작이 아니라 안내·목록·되돌리기다.
+_IRR_NEG_AFTER = frozenset({"undo", "help", "guide", "info", "settings", "setting", "list", "policy", "faq",
+                            "learn", "tips", "how", "instructions"})
+#: 목적지 경로에 있으면 안내 페이지다('/help/report-spam').
+_IRR_INFO_PATH = frozenset({"help", "guide", "faq", "support", "docs", "doc", "policy"})
+#: 한 글자씩 띄운 영문을 이은 한 토큰('r e p o r t s p a m' → reportspam).
+_IRR_COMPOUND_RE = re.compile(
+    r"^(?:(?:move|send)(?:to)?(?:the)?(?:trash|bin|junk|spam)|trash(?:this|message|messages|it|selected)"
+    r"|empty(?:the)?(?:trash|bin|spam|junk|cart)|report(?:as)?(?:spam|junk|phishing)|markas(?:spam|junk)"
+    r"|block(?:this)?(?:user|sender|number|contact|caller))$"
+)
+_IRR_KO_NEG_TAIL = r"(?!해제|취소|안내|방법|설명|도움말|목록|설정|관리|내역|기준|정책|해지)"
+_IRR_KO = (
+    (TRASH_KEYWORD, re.compile(r"휴지통(?:으로|에|로)?(?:이동|보내|버리|넣|옮기)" + _IRR_KO_NEG_TAIL)),
+    (EMPTY_KEYWORD, re.compile(r"(?:휴지통|스팸함|스팸메일함|장바구니|메일함|편지함|받은편지함|폴더|전체|모두|목록)"
+                               r"(?:을|를)?(?:전체|모두|바로|지금)?(?:비우기|비우|비움)" + _IRR_KO_NEG_TAIL)),
+    (SPAM_KEYWORD, re.compile(r"스팸(?:메일)?(?:으로|로)?(?:신고|표시|처리|등록|지정|분류|이동)" + _IRR_KO_NEG_TAIL)),
+    (BLOCK_KEYWORD, re.compile(r"(?:사용자|유저|계정|번호|전화번호|발신자|발신번호|보낸사람|연락처|친구|회원|아이디|"
+                               r"상대방|상대|채널|작성자|메일주소|주소|도메인|수신)(?:을|를|은|는)?(?:영구)?차단"
+                               r"(?!된)" + _IRR_KO_NEG_TAIL)),
+)
+#: 라벨 전체가 이 낱말이면 동작(한국어 동작 명사형). '광고 차단 안내'·'비우기 안내'는 전체가 아니다.
+_IRR_KO_WHOLE = (("차단", BLOCK_KEYWORD), ("차단하기", BLOCK_KEYWORD), ("비우기", EMPTY_KEYWORD))
+
+
+def _irr_skip(tokens: List[str], start: int, allowed: frozenset, limit: int = 3) -> int:
+    j = start
+    while j < len(tokens) and j - start < limit and tokens[j] in allowed:
+        j += 1
+    return j
+
+
+def _irreversible_tokens(tokens: List[str]) -> Optional[str]:
+    for i, tok in enumerate(tokens):
+        if i > 0 and tokens[i - 1] in _IRR_NEG_BEFORE:
+            continue
+        end: Optional[int] = None
+        keyword = ""
+        m = _IRR_COMPOUND_RE.match(tok)
+        if m:
+            end, keyword = i + 1, (SPAM_KEYWORD if tok.startswith(("report", "mark")) else
+                                   BLOCK_KEYWORD if tok.startswith("block") else
+                                   EMPTY_KEYWORD if tok.startswith("empty") else TRASH_KEYWORD)
+        elif tok in _IRR_MOVE_VERBS:
+            j = _irr_skip(tokens, i + 1, _IRR_ITEMS)
+            if j < len(tokens) and tokens[j] in ("to", "into", "in"):
+                j = _irr_skip(tokens, j + 1, _IRR_FILLERS)
+                if j < len(tokens) and tokens[j] in _IRR_TRASH_DEST:
+                    if tokens[j] == "recycle" and j + 1 < len(tokens) and tokens[j + 1] == "bin":
+                        j += 1
+                    end, keyword = j + 1, (SPAM_KEYWORD if tokens[j] in _IRR_SPAM else TRASH_KEYWORD)
+        elif tok == "trash":
+            if i + 1 < len(tokens) and tokens[i + 1] in _IRR_ITEMS:
+                end, keyword = _irr_skip(tokens, i + 1, _IRR_ITEMS), TRASH_KEYWORD
+        elif tok == "empty":
+            j = _irr_skip(tokens, i + 1, _IRR_FILLERS)
+            if j < len(tokens) and tokens[j] in _IRR_EMPTY_DEST:
+                end, keyword = j + 1, EMPTY_KEYWORD
+        elif tok == "report":
+            j = _irr_skip(tokens, i + 1, _IRR_ITEMS | {"as"})
+            if j < len(tokens) and tokens[j] in _IRR_SPAM:
+                end, keyword = j + 1, SPAM_KEYWORD
+        elif tok == "mark":
+            j = _irr_skip(tokens, i + 1, _IRR_ITEMS)
+            if j + 1 < len(tokens) and tokens[j] == "as" and tokens[j + 1] in _IRR_SPAM:
+                end, keyword = j + 2, SPAM_KEYWORD
+        elif tok == "block":
+            j = _irr_skip(tokens, i + 1, _IRR_FILLERS - {"this"})
+            if j < len(tokens) and tokens[j] in _IRR_BLOCK_OBJ:
+                end, keyword = j + 1, BLOCK_KEYWORD
+        if end is not None and not (end < len(tokens) and tokens[end] in _IRR_NEG_AFTER):
+            return keyword
+    return None
+
+
+def irreversible_action(source: str, text: str) -> Optional[str]:
+    """이 원천의 문자열이 되돌리기 어려운 메일·계정 조작(휴지통·비우기·스팸 신고·차단)을 말하면 근거 키워드."""
+    if not text or source in META_SOURCES:
+        return None
+    raw = str(text)
+    if source in PATH_SOURCES:
+        try:
+            raw = unquote_plus(urlsplit(raw).path)
+        except Exception:  # noqa: BLE001 - 해석 실패 = 원문
+            pass
+        if _IRR_INFO_PATH & set(class_tokens(raw)):
+            return None
+    if source == "class":
+        for cls in raw.split():
+            hit = _irreversible_tokens(_acct_tokens(cls))
+            if hit:
+                return hit
+        return None
+    hit = _irreversible_tokens(_acct_tokens(raw))
+    if hit or source in TOKEN_SOURCES:
+        return hit
+    compact = "".join(ch for ch in normalize_gate_text(raw) if ch.isalnum())
+    if source not in PATH_SOURCES:
+        for word, keyword in _IRR_KO_WHOLE:
+            if compact == word:
+                return keyword
+    for keyword, pattern in _IRR_KO:
+        if pattern.search(compact):
+            return keyword
+    return None
 
 
 @dataclass
