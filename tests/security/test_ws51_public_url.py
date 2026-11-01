@@ -152,10 +152,12 @@ def test_public_payload_skips_content_keys_and_does_not_mutate():
     assert JWT not in out["current_url"] and JWT not in out["data"]["url"]
     assert B64 not in out["data"]["tabs"][0]["url"]
     assert "SYNTHX" not in out["data"]["observation"]["url"]
-    # 내용(관찰 요소·요약·extract 항목)은 원문
-    assert out["data"]["observation"]["elements"] == src["data"]["observation"]["elements"]
-    assert out["data"]["observation"]["axtree_summary"] == src["data"]["observation"]["axtree_summary"]
-    assert out["data"]["items"] == src["data"]["items"]
+    # 내용(관찰 요소·요약·extract 항목)에는 URL 문법 계층을 적용하지 않는다 — 다만 WS-75(#199): 같은 응답 주소 칸에서
+    # 도구가 본(등록된) JWT 는 내용에서도 가린다(예전 단언은 내용 원문 보존). 등록되지 않은 짧은 값(code=SYNTHX — 주소
+    # 등급 4~7자)은 내용에서 원문.
+    assert out["data"]["observation"]["elements"] == [{"name": "http://h.test/?token=[REDACTED]"}]
+    assert out["data"]["observation"]["axtree_summary"] == "link http://h.test/?token=[REDACTED]"
+    assert out["data"]["items"] == [{"href": "http://h.test/next?gateToken=[REDACTED]"}]
     assert out["data"]["n"] == 3 and out["data"]["ok"] is True and out["data"]["none"] is None
     # WS-62: 관찰 data.repeated(반복 묶음 대상 이름·표제)도 페이지 내용 경로 — elements[].name 과 같은 원문.
     assert CONTENT_KEYS == frozenset({"elements", "axtree_summary", "items", "repeated"})

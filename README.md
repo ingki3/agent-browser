@@ -25,7 +25,7 @@
 - **도착 페이지 기억** — 사용자가 "이 페이지 기억해"라고 한 주소를 저장해 같은 출처를 관찰할 때 후보(`data.saved_pages`)로 붙입니다(자동 저장 없음). → [기능](docs/features.md#도착-페이지-기억-browser_recipe-remember_pagepagesforget_page-ws-61)
 - **반복 묶음 대상 구분** — 두 달 달력의 같은 날짜·상품 행의 같은 '담기'처럼 같은 틀이 반복되면 관찰에 묶음 표제·위치(`data.repeated`)를 붙이고, 관찰 뒤 묶음(달)이 바뀐 대상은 누르지 않습니다. → [기능](docs/features.md#반복-묶음-대상-구분-datarepeated-ws-62)
 - **PDF 읽기·YouTube 영상 검색** — PDF 본문을 `data.document` 로, YouTube 검색을 공식 Data API v3 로. → [기능](docs/features.md)
-- **Egress 가드·출력 비밀 가림** — 검증 프록시로 사설망·메타데이터를 막고, 응답 주소·문장 속 비밀 값을 `[REDACTED]` 로 가립니다. → [보안](docs/security.md)
+- **Egress 가드·출력 비밀 가림** — 검증 프록시로 사설망·메타데이터를 막고, 응답 주소·문장 속 비밀 값을 `[REDACTED]` 로 가립니다. 도구가 비밀로 아는 값(주소 토큰·입력한 자격증명)은 관찰·추출 같은 페이지 내용에서도 전체 일치로 가립니다(가린 링크는 관찰의 `element_id` 로 클릭). 한계: 화면 글자를 미리 자르는 위치(이름 120·값 200·묶음 40 등)가 등록 값 중간에 걸리면 앞부분이 보일 수 있습니다(v1.18.1 과 같음). → [보안](docs/security.md)
 - **직접 조작할 사이트** — 자동 조작을 막는 사이트(예: SRT 매크로 방지)를 사람이 `agent-browser manual-sites add srail.kr` 로 넣으면 그 사이트에서는 누르기·입력을 실행하지 않고 대상을 창에 표시해 사람이 직접 하게 합니다(`data.handoff.reason="manual_site"` → `browser_control_wait`). 목록은 사람만 바꿉니다. → [직접 조작할 사이트](docs/human-handoff.md#직접-조작할-사이트-agent-browser-manual-sites-ws-64)
 - **우회하지 않습니다** — 캡차 자동 풀이·확인 화면 통과·IP 프록시 순환·자동화 지문 숨기기를 하지 않습니다. 막히면 사람에게 넘깁니다 — 보안 확인·차단 화면이면 결과의 `data.handoff` 가 사람 인계 절차(동의 → `browser_control_request` → `browser_control_wait` → 다시 읽기, 창 없는 serve 면 링크 직접 열기 안내)를 알려 주며 창을 자동으로 열거나 재시도하지 않습니다. → [차단 시 흐름](docs/signals.md#차단캡차-신호)
 
@@ -100,7 +100,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-7786개가 통과해야 합니다(10개 건너뜀, 10개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+7892개가 통과해야 합니다(10개 건너뜀, 10개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](docs/llm-agent.md)를 보십시오.
 

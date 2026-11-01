@@ -90,6 +90,30 @@ def test_content_path_keeps_member_names_like_elements():
     assert env["data"]["repeated"]["groups"][0]["group"] == SECRETISH
 
 
+def test_content_path_masks_registered_member_names_like_elements():
+    """WS-75(#199): 같은 이름이 도구가 아는 비밀이면 elements·repeated 이름·표제가 **같은** 가림 결과(에이전트가 맞춰 본다)."""
+    from interface.server_envelope import envelope_dict
+    from security import secret_registry
+
+    value = "SYNTHmember4321"
+    secret_registry.register_secret_values([value])
+    try:
+        block = _block(1, 2)
+        block["groups"][0]["members"][0]["name"] = "Key " + value
+        block["groups"][0]["group"] = "묶음 " + value
+        obs = _obs(1)
+        obs["elements"][0]["name"] = "Key " + value
+        r = ActionResult(success=True, action=ActionType.OBSERVE_PAGE, current_url=URL, snapshot_epoch=1,
+                         tab_id="tab-1", retry_safe=True, data={"observation": obs, "repeated": block})
+        env = envelope_dict(r)
+    finally:
+        secret_registry.clear()
+    assert value not in json.dumps(env, ensure_ascii=False)
+    assert env["data"]["observation"]["elements"][0]["name"] == "Key [REDACTED]"
+    assert env["data"]["repeated"]["groups"][0]["members"][0]["name"] == "Key [REDACTED]"
+    assert env["data"]["repeated"]["groups"][0]["group"] == "묶음 [REDACTED]"
+
+
 # ------------------------------------------------------------------ 주입 신호
 
 

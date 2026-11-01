@@ -103,7 +103,10 @@ def _outputs(pu, reg, text: str, extra: str) -> dict:
         "field_pre": _call(pu._public_url_field, text),
         "payload": _call(pu.public_payload, {"message": text, "url": text, "title": extra,
                                              "tabs": [{"url": extra, "title": text}],
-                                             "data": {"items": [text], "frame_url": extra}}),
+                                             # WS-75: data.items 는 내용 경로(아는 비밀을 등급 규칙으로 가림 — 기준과
+                                             # 의도적으로 다름, tests/security/test_ws75_content_mask.py). 인코더 동등성은
+                                             # 내용 밖 목록 칸에서 잰다.
+                                             "data": {"rows": [text], "frame_url": extra}}),
     }
     out.update({
         "public_text_post": _call(pu.public_text, text),

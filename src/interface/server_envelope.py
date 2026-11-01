@@ -74,7 +74,8 @@ def envelope_dict(result: ActionResult) -> Dict[str, Any]:
     if isinstance(data, dict) and "observation" in data:
         out["data"] = dict(data, observation=_compact_observation(data["observation"]))
     # WS-51: 에이전트에게 나가는 모든 주소(current_url·data.url·observation.url·window.tabs[].url·오류 문구 안의
-    # 주소 …)의 비밀 값을 가린다. 관찰 요소·extract 항목(페이지 내용)은 원문 — public_url.CONTENT_PATHS(경로 기준).
+    # 주소 …)의 비밀 값을 가린다. 관찰 요소·extract 항목(페이지 내용 — public_url.CONTENT_PATHS)은 도구가 비밀로 아는
+    # 값만 가린다(WS-75 — 등급 규칙, 모르는 글자는 원문).
     from security.public_url import public_payload
 
     return public_payload(out)
@@ -175,7 +176,8 @@ def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int
 
     * 자르는 단위는 항목 경계(관찰 요소 — 점수 순, 추출 행 — 문서 순). 앞쪽을 남긴다.
     * 첫 항목 하나만으로도 넘으면 그 항목의 텍스트만 글자 묶음 경계에서 자른다
-      (`text_truncated: true`, `text_chars` = 원래 글자 수).
+      (`text_truncated: true`, `text_chars` = 원래 글자 수 — WS-75: 서버 파이프라인에서는 내용 경로를 이미 가린
+      사본을 자르므로 가린 글자의 길이이고, 자르기도 가린 글자 위에서 한다).
     * 잘랐으면 `data.truncated = {total_items, returned_items, total_chars, returned_chars, hint}`
       (+ 텍스트를 잘랐으면 `item_text_truncated: true`). 상한 이하면 아무것도 바꾸지 않는다.
     * limit(WS-68) = 설정 상한(표시용). 자르는 기준은 max_chars(실효 예산 — 창 보고 등을 뺀 값) 그대로이고, 둘이

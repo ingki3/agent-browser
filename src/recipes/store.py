@@ -35,7 +35,7 @@ import stat
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 
 from recipes import keys
@@ -310,6 +310,48 @@ def _check_paths(rec: Dict[str, Any]) -> None:
                           "저장하지 않습니다(인증·재설정 링크는 만료되고 자격 증명이라 레시피로 남기지 않음).")
 
 
+def _secret_string(obj: Any, key: str = "") -> bool:
+    """저장 문자열 leaf 전수에 `_text_secret`(레지스트리 등록 값·비밀 키 값·JWT) — 골격 해시·사후 신호 종류는 제외."""
+    if key in _HASH_KEYS or key == "signals":
+        return False
+    if isinstance(obj, dict):
+        return any(_secret_string(value, str(field)) for field, value in obj.items())
+    if isinstance(obj, list):
+        return any(_secret_string(value, key) for value in obj)
+    return isinstance(obj, str) and _text_secret(obj)
+
+
+def _content_hit(obj: Any, key: str = "") -> bool:
+    """문자열 leaf 전수에 레지스트리 `content_hit`(내용 경로 규칙 — 원문과 casefold 형태의 전체 포함 일치, WS-75 R1 B2).
+    골격 해시·사후 신호 종류는 제외."""
+    if key in _HASH_KEYS or key == "signals":
+        return False
+    if isinstance(obj, dict):
+        return any(_content_hit(value, str(field)) for field, value in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return any(_content_hit(value, key) for value in obj)
+    if not isinstance(obj, str):
+        return False
+    from security.secret_registry import REGISTRY
+
+    return REGISTRY.content_hit(obj)
+
+
+def _check_registered(rec: Dict[str, Any], entries: Sequence[Dict[str, Any]] = ()) -> None:
+    """WS-75(#199 NB4): 대상 이름·인자 등 저장 문자열에 도구가 비밀로 아는 값이 있으면 그 단계를 저장하지 않는다.
+
+    응답의 내용 경로는 그 값을 `[REDACTED]` 로 보이지만 레시피 파일에는 원문이 남는다 — 가린 이름으로 저장하면 재생
+    locate(원문 이름 비교)가 깨지므로 가리지 않고 거부한다.
+
+    R1 B2: 저장 문자열은 기록 때 정규화(대상 이름 소문자화 등)돼 원문 대조를 빠져나간다 — 정규화 **전** 원문(기록된
+    대상 기술 desc 전체: 원래 이름·ui·slot·identity·href_pat)과 저장할 레시피의 모든 문자열(이름·params·인자·url_pat·
+    target 전 종류)을 casefold 형태까지 내용 경로 규칙으로 대조한다."""
+    if (_secret_string({field: value for field, value in rec.items() if field != "name"}) or _content_hit(rec)
+            or any(_content_hit(e.get("desc")) for e in entries)):
+        raise RecipeError("대상 이름·인자에 도구가 비밀로 아는 값(로그인 자격·주소 토큰 등)이 있어 저장하지 않습니다"
+                          "(응답에서는 [REDACTED] 로 가려지는 값).")
+
+
 #: 반복 디코딩 상한(WS-61 R1) — 이중·삼중 인코딩까지 풀고 그보다 깊게 감싼 값은 더 풀지 않는다(비용 상한).
 MAX_DECODE_ROUNDS = 3
 
@@ -543,6 +585,7 @@ def compile_recipe(
         "steps": steps,
     }
     _check_paths(rec)
+    _check_registered(rec, entries)
     _check_leaks(rec, params.values())
     _check_pii(rec)
     return rec
