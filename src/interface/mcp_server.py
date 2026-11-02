@@ -372,6 +372,8 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         #: WS-77 B7: 막 끝난 인계(반납·만료)의 신호 — 다음 control_wait/status 에 싣는다.
         self._handoff_end: Optional[Dict[str, Any]] = None
         self._handoff_end_unreported = False
+        #: WS-77 후속: hub 는 끝났는데 아직 기록(_note_handoff_end) 전인 인계 종료 — 기록되면 풀린다.
+        self._handoff_ending: Optional[asyncio.Future] = None
 
     def _init_session_fields(self) -> None:
         """__init__ 3부(WS-48 분해): 브라우저 세션 핸들·문서 상태·신호 캐시(start() 가 채운다)."""
