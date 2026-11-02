@@ -54,6 +54,10 @@ class HandoffMixin:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if "released" in events:
+            # WS-77 후속: hub 가 반납한 그 동기 구간에서 '기록 전 종료' 를 세운다 — 아래 어떤 await(로그인 기록·창 닫기)
+            # 사이에 들어온 control_wait/status 도 그 반납을 기다려 듣는다(none_pending 으로 놓치지 않게).
+            self._begin_handoff_end()
         if "taken" in events:
             # WS-58 R2 NB1: poll 이 holder 를 human 으로 바꾼 그 동기 구간에서 요청 감시를 붙인다 — 아래 어떤
             # await(쿠키 사이트 응답·안내 띠)보다 먼저.
@@ -109,6 +113,7 @@ class HandoffMixin:
                         await self._close_control_window()
                 finally:
                     self._release_gate()
+                    self._settle_handoff_end()  # 기록 경로가 예외로 끝나도 기다리는 wait/status 를 풀어 준다
                 await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
@@ -443,6 +448,8 @@ class HandoffMixin:
         return out
 
     async def _control_wait(self, timeout: float) -> Dict[str, Any]:
+        # WS-77 후속: 감시 태스크가 반납·만료를 처리하는 중(hub 는 끝남, 기록 전)이면 기록까지 기다린 뒤 판단한다.
+        await self._await_handoff_end()
         st = self._control_view()
         # WS-77: 감시 태스크가 먼저 처리한(에이전트가 아직 못 들은) 창 [다 했어요] 반납·요청 만료.
         ended = self._handoff_end if self._handoff_end_unreported else None
@@ -478,6 +485,9 @@ class HandoffMixin:
                 changed = self.hub.last_event
                 break
             await asyncio.sleep(0.05)
+        if changed in ("released", "request_expired"):
+            # 대기 중 감시 태스크가 집은 종료면 그 기록(로그인 기록 뒤 활동 신호)을 기다린다 — 여기서 먼저 기록하지 않게.
+            await self._await_handoff_end()
         window: Optional[Dict[str, Any]] = None
         if self._window is not None:
             # WS-34: 반납(또는 take)으로 창 전환이 시작됐으면 끝날 때까지 기다린다 — 다시 연 브라우저를
