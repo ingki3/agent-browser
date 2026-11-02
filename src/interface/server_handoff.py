@@ -227,7 +227,10 @@ class HandoffMixin:
             logger.debug("조작권 로그인 감시 정리 실패", exc_info=True)
             return
         # WS-77 B7: 관측 신호(반납 근거 아님) — not_seen 은 감시가 온전했을 때만.
-        self._last_activity = activity_of(found, degraded=watch.degraded, baseline_known=watch.baseline is not None)
+        # R1 F2: 누적 사건 종류로 판정(기록 dict 는 origin 별 대표 하나라 겹친 사건이 가려진다).
+        self._last_activity = activity_of(watch.events, degraded=watch.degraded,
+                                          baseline_known=watch.baseline is not None,
+                                          install_complete=not watch.install_incomplete)
         for origin in found:
             self._record_login(origin, SOURCE_HUMAN_CONTROL)
 
@@ -396,7 +399,7 @@ class HandoffMixin:
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 창을 앞으로 가져오기는 편의 기능 — 실패해도 조작권 요청은 유지된다.
             pass
-        from interface.handoff import display_safe
+        from interface.server_control import _reason_display
 
         # WS-77: 에이전트 창을 앞으로 가져온 **뒤에** 작은 제어 창을 띄운다(제어 창이 위에 보이게).
         windowed = await self._open_control_window(out["request_id"], reason)
@@ -405,7 +408,7 @@ class HandoffMixin:
                                      "터미널을 쓰면 — " + out["how_to_respond"])
         out["how_to_respond"] += " " + out["login_hint"]
         await self._show_control_banner(self._request_banner(reason, window=windowed))
-        _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
+        _stderr_line(f"agent-browser serve: [사람 조작 요청] {_reason_display(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         if window_out is not None:
             out = dict(out, window=self._window_view(window_out["window"]))

@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import secrets
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 from browser import login_ledger
 
@@ -49,11 +49,12 @@ ACTIVITY_UNKNOWN = "unknown"
 _ACTIVITY_EVENTS = frozenset({"network_request", "password_submit", "cookie_change"})
 
 
-def activity_of(found: Dict[str, str], *, degraded: bool, baseline_known: bool) -> str:
-    """finish() 결과 → seen/not_seen/unknown. not_seen 은 감시가 온전했을 때만(B7)."""
-    if any(event in _ACTIVITY_EVENTS for event in found.values()):
+def activity_of(events: Iterable[str], *, degraded: bool, baseline_known: bool, install_complete: bool = True) -> str:
+    """finish() 가 본 사건 종류(``ControlLoginWatch.events`` — origin 별 대표 하나가 아니라 누적, R1 F2) →
+    seen/not_seen/unknown. not_seen 은 감시가 온전했을 때만(B7): 설치 실패·부분 설치·기준점 없음은 unknown."""
+    if any(event in _ACTIVITY_EVENTS for event in events):
         return ACTIVITY_SEEN
-    if degraded or not baseline_known:
+    if degraded or not baseline_known or not install_complete:
         return ACTIVITY_UNKNOWN
     return ACTIVITY_NOT_SEEN
 
@@ -127,6 +128,10 @@ class ControlLoginWatch:
         self.visited: Set[str] = set()
         #: 감시 설치 일부가 실패했는가(요청 사건·CDP 세션·쿠키 기준점).
         self.degraded = False
+        #: R1 F2(b): 탭 감시(CDP 바인딩·스크립트) 설치가 열린 탭에서 실패했다 — 활동 신호는 unknown(not_seen 금지).
+        self.install_incomplete = False
+        #: R1 F2(a): finish() 가 본 사건 종류 전부(origin 이 겹쳐 기록 dict 에서 가려진 사건도).
+        self.events: Set[str] = set()
         #: secret_wanted 구간에 사람이 보던(에이전트 활성 frame) origin.
         self.secret_origins: Set[str] = set()
         self.baseline: Optional[Dict[CookieKey, Tuple[str, bool]]] = None
@@ -270,6 +275,12 @@ class ControlLoginWatch:
                     pass
         except Exception:  # noqa: BLE001 - 닫힌 탭 등: 쿠키 비교만 남는다
             logger.debug("조작권 로그인 감시 설치 실패", exc_info=True)
+            try:
+                closed = bool(page.is_closed())
+            except Exception:  # noqa: BLE001
+                closed = True
+            if not closed and not self.closed:
+                self.install_incomplete = True  # 열린 탭에 감시가 반만 걸렸다 — 제출을 못 볼 수 있다
         if self.closed:
             await self._detach(page)
 
@@ -306,12 +317,19 @@ class ControlLoginWatch:
             except Exception:  # noqa: BLE001 - 닫힌 컨텍스트
                 pass
         out: Dict[str, str] = {}
+
+        def note(origin: str, event: str) -> None:
+            # 기록 dict 는 origin 별 첫 사건(예전 그대로) — 사건 종류는 겹쳐도 모두 누적한다(R1 F2: secret_handoff 가
+            # 같은 origin 의 cookie_change 를 가려 활동 신호가 not_seen 으로 뒤집히던 결함).
+            out.setdefault(origin, event)
+            self.events.add(event)
+
         for origin in self.posted:
-            out.setdefault(origin, "network_request")
+            note(origin, "network_request")
         for origin in self.submitted:
-            out.setdefault(origin, "password_submit")
+            note(origin, "password_submit")
         for origin in self.secret_origins:
-            out.setdefault(origin, "secret_handoff")
+            note(origin, "secret_handoff")
         if context is not None and self.baseline is not None:
             try:
                 cookies = list(await context.cookies())
@@ -319,10 +337,10 @@ class ControlLoginWatch:
                 cookies = []
                 self.degraded = True
             for origin in self._cookie_changes(cookies):
-                out.setdefault(origin, "cookie_change")
+                note(origin, "cookie_change")
         if self.degraded:
             for origin in self.visited:
-                out.setdefault(origin, "watch_unavailable")
+                note(origin, "watch_unavailable")
         for page in list(self._pages):
             await self._detach(page)
         return out
@@ -356,7 +374,7 @@ class ControlLoginWatch:
         계층 요청·쿠키 저장소)가 온전할 때만: 감시 설치 실패·기준점 없음·쿠키 읽기 실패는 unknown."""
         if self.posted or self.submitted:
             return ACTIVITY_SEEN
-        if self.degraded or self.baseline is None or context is None:
+        if self.degraded or self.install_incomplete or self.baseline is None or context is None:
             return ACTIVITY_UNKNOWN
         try:
             cookies = list(await context.cookies())

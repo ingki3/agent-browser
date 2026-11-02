@@ -7,7 +7,10 @@
 
 서버가 받아들이는 조건(B2) — 하나라도 어긋나면 버린다:
 
-1. ``isTrusted`` 클릭(페이지·제어 창 main world 스크립트의 ``click()``·``dispatchEvent`` 거름),
+1. ``isTrusted`` 클릭(페이지·제어 창 main world 스크립트의 ``click()``·``dispatchEvent`` 거름), 그리고 클릭된 버튼이
+   **원래 제어 창 문서에 붙어 있음**(ownerDocument·isConnected·event.view — R1 F1: main world 가 버튼을 팝업 등 다른
+   문서로 옮기면 그 문서는 관리 탭이 될 수 있다). 버튼이 원 문서를 떠나면(MutationObserver) world 가 버튼을 죽이고
+   '옮겨짐' 을 보고 → 서버는 그 창을 닫고 1회 다시 띄운다(B3 과 같은 흐름),
 2. payload 의 nonce == 이 창을 띄운 요청의 request_id (hub 가 poll 때 **지금** 요청과 다시 대조),
 3. 호출한 실행 문맥 == 우리가 만든 isolated world, 그리고 그 문서(loaderId)가 띄울 때 그대로(사람이 창을 다른
    사이트로 옮기면 새 문서에는 바인딩이 없고, 이동은 감지해 창을 닫는다 — B3),
@@ -69,10 +72,22 @@ _UI_JS = r"""(() => {
   const b = add('button', T.button, 'font-size:20px;padding:12px 28px;cursor:pointer');
   add('p', T.note, 'color:#666;font-size:12px;margin:14px 0 0');
   let sent = 0;
+  let dead = false;
+  const doc = document, view = window;
+  // R1 F1: 버튼이 원래 이 문서에 붙어 있는가(adoptNode·appendChild 로 다른 문서·창에 옮기면 거짓).
+  const attached = () => b.isConnected === true && b.ownerDocument === doc && doc.contains(b);
+  const send = (msg) => { if (sent >= __MAX__) return; sent += 1; try { B(JSON.stringify(msg)); } catch (err) {} };
+  const kill = () => {
+    if (dead) return;
+    dead = true;
+    b.disabled = true;
+    send({nonce: nonce, moved: true});  // 서버가 이 창을 닫고 1회 다시 띄운다(완료 아님)
+  };
+  new MutationObserver(() => { if (!attached()) kill(); }).observe(doc, {childList: true, subtree: true});
   b.addEventListener('click', (e) => {
-    if (sent >= __MAX__) return;
-    sent += 1;
-    try { B(JSON.stringify({nonce: nonce, trusted: e.isTrusted === true})); } catch (err) {}
+    const here = !dead && attached() && e.view === view && (e.target === b || b.contains(e.target));
+    send({nonce: nonce, trusted: e.isTrusted === true, attached: here});
+    if (!here) { kill(); return; }
     if (e.isTrusted === true) { b.disabled = true; b.textContent = T.sent; }
   });
   const r = b.getBoundingClientRect();
@@ -114,6 +129,8 @@ class ControlWindow:
         #: 사람이 창을 닫음(우리 close 아님) · 창 문서가 다른 문서로 바뀜(B3).
         self.gone = False
         self.navigated = False
+        #: R1 F1: 버튼이 원 문서를 떠났다는 우리 world 의 보고 — 이 창은 무효(서버가 닫고 1회 다시 띄움).
+        self.moved = False
         self._closing = False
 
     # -- 만들기 -------------------------------------------------------------
@@ -241,7 +258,7 @@ class ControlWindow:
         """B2 ①~③ 검사 뒤 hub 대기 사건 큐에 넣는다(④는 hub.poll). 상태를 직접 바꾸지 않는다."""
         if event.get("name") != self.binding:
             return
-        ok = (not self._closing and not self.gone and not self.navigated
+        ok = (not self._closing and not self.gone and not self.navigated and not self.moved
               and self.context_id is not None and event.get("executionContextId") == self.context_id)
         payload: Any = None
         if ok:
@@ -250,9 +267,13 @@ class ControlWindow:
                 payload = json.loads(raw) if isinstance(raw, str) and len(raw) <= 512 else None
             except ValueError:
                 payload = None
-            ok = (isinstance(payload, dict) and payload.get("trusted") is True
-                  and isinstance(payload.get("nonce"), str)
-                  and secrets.compare_digest(payload["nonce"], self.request_id))
+            mine = (isinstance(payload, dict) and isinstance(payload.get("nonce"), str)
+                    and secrets.compare_digest(payload["nonce"], self.request_id))
+            if mine and payload.get("moved") is True:
+                self.moved = True  # 버튼이 원 문서를 떠났다 — 이후 이 창의 호출은 모두 버린다
+                return
+            # R1 F1: 클릭 대상 버튼이 원래 제어 창 문서에 붙어 있었고 사건의 view 가 그 창일 때만(attached).
+            ok = mine and payload.get("trusted") is True and payload.get("attached") is True
         if not ok:
             self.rejected += 1
             return

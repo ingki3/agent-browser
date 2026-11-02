@@ -367,7 +367,7 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         self._control_gave_up: Optional[str] = None
         #: WS-77 B5: 창을 연 요청 구간(그 request_id)도 로그인 감시 대상 · 요청 때 탭 origin · 감시 결과 활동 신호.
         self._request_watch_id: Optional[str] = None
-        self._request_origins: List[str] = []
+        self._request_origins: List[Any] = []  # (작업 공간, origin) — 보여 줄 때 호출 작업 공간으로 거름(R1 F4)
         self._last_activity: Optional[str] = None
         #: WS-77 B7: 막 끝난 인계(반납·만료)의 신호 — 다음 control_wait/status 에 싣는다.
         self._handoff_end: Optional[Dict[str, Any]] = None

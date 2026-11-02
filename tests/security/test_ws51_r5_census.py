@@ -66,7 +66,8 @@ REVIEWED = {
         "handoff.release_by_server 인자 — window_done·cli·login_finish·window_closed·server",
     ("release_source", "interface/server_control.py", "self.hub.release_source"): "handoff.release_source(같은 어휘)",
     ("reason", "interface/control_window.py", "reason"): NOT_OUT + " (WS-77 제어 창 화면에 그리는 사유 — 창 DOM)",
-    ("reason", "interface/server_control.py", "display_safe(reason, 80)"): NOT_OUT + " (WS-77 제어 창 open 인자 — 창 DOM)",
+    ("reason", "interface/server_control.py", "_reason_display(reason, 80)"):
+        NOT_OUT + " (WS-77 제어 창 open 인자 — 창 DOM, R1: public_text 가림 + display_safe)",
     ("state", "llm/decisions.py", "state"): NOT_OUT,
     ("holder", "interface/handoff.py", "self.holder"): "HOLDER_AGENT·HOLDER_HUMAN",
     ("reason", "actions/pdf_document.py", "f'http_{response.status_code}'"): "CONTROL_PATTERNS['reason']",
