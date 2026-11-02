@@ -1094,6 +1094,16 @@ _FOCUS_NODE_JS = """
 }
 """
 
+#: WS-78 T1(#142): 포커스 노드(_FOCUS_NODE_JS 의 결과)가 민감 칸인가와 그 칸의 현재 값. 노드가 아니면 null.
+#: 판정은 type_text 의 is_sensitive_field 와 같은 기준(input[type=password]).
+_KEY_FIELD_JS = (
+    "n => (n && typeof n === 'object' && n.tagName) ? "
+    "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
+    "v: typeof n.value === 'string' ? n.value : ''} : null"
+)
+#: WS-78 T1 B4: 민감 칸으로 간 키 뒤 그 칸 값을 읽지 못했다(문서 이동 등) — 키 전 값만 등록했다는 고정 신호(값 없음).
+SENSITIVE_VALUE_UNREAD = "민감 칸 키 입력 뒤 칸 값을 읽지 못해 키 전 값까지만 가림 대상으로 등록했습니다."
+
 _MEANING_KEYS = ("href", "action", "method", "target")
 
 #: WS-56 R2 B1: 보호 폴더(프로필·서버 상태) 저장 거부 문구.
@@ -1230,6 +1240,11 @@ class ActionDispatcher:
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
         self._nav_info: Dict[str, Any] = {}
+        #: WS-78 T1(#142): 마지막 press_key 가 민감 칸(키 전·키 뒤 password)으로 갔는가 — 레시피 기록이 그 단계를
+        #: 비밀로 끊는 데 쓴다(press_key 마다 다시 정한다).
+        self.last_key_sensitive: bool = False
+        #: WS-78 T1 sticky: 앞 press_key 에서 민감으로 판정한 포커스 노드(JSHandle) — 같은 노드면 type 이 바뀌어도 민감.
+        self._sticky_key_node: Any = None
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
@@ -3264,6 +3279,18 @@ class ActionDispatcher:
         register_secret_values([text])
         params[_CONCEAL_KEY] = True
 
+    @staticmethod
+    async def _register_field_value(target: Any) -> None:
+        """민감 칸의 현재 값 전체를 자격증명 등급으로 등록한다(WS-78 NB1). 못 읽으면 조용히(친 text 는 이미 등록)."""
+        try:
+            value = await target.evaluate("el => typeof el.value === 'string' ? el.value : ''")
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(value, str) and value:
+            from security.secret_registry import register_secret_values
+
+            register_secret_values([value])
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 
@@ -3513,6 +3540,10 @@ class ActionDispatcher:
                 await guard(action, params)
                 await target.type(text, timeout=5000)
             await self._mark_sensitive_input(handle, params, text)
+            if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
+                # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
+                # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
+                await self._register_field_value(target)
             if params.get("press_enter"):
                 await guard(action, params)
                 await target.press("Enter", timeout=5000)
@@ -3927,6 +3958,69 @@ class ActionDispatcher:
             reobserve_required=changed,
         )
 
+    async def _key_field_before(self, top: Any) -> Tuple[Any, bool, str]:
+        """WS-78 T1 B2: 키 **전** 포커스 노드를 잡아 민감 여부·현재 값을 본다. 반환 (노드 핸들|None, 민감, 값).
+
+        판정 불가(포커스 없음·다른 출처 iframe 'opaque'·닫힌 shadow·평가 실패)는 (None, False, "") — 한계로 문서화
+        (docs/security.md). 노드 핸들은 키 뒤 **그 노드**의 값을 읽는 데 쓴다(Tab 으로 포커스가 옮겨도 같은 노드).
+        """
+        try:
+            node = await top.evaluate_handle(_FOCUS_NODE_JS)
+        except Exception:  # noqa: BLE001 — 판정 불가
+            return None, False, ""
+        try:
+            info = await node.evaluate(_KEY_FIELD_JS)
+        except Exception:  # noqa: BLE001
+            info = None
+        if not isinstance(info, dict):
+            await self._dispose_quiet(node)
+            return None, False, ""
+        sensitive = bool(info.get("s"))
+        sticky = getattr(self, "_sticky_key_node", None)
+        if not sensitive and sticky is not None:
+            # sticky: 앞 키에서 민감으로 판정한 **그 노드**면 지금 type 이 바뀌었어도(입력 이벤트로 password→text) 민감.
+            try:
+                sensitive = (await node.evaluate("(n, m) => n === m", sticky)) is True
+            except Exception:  # noqa: BLE001 — 다른 문서의 핸들 등 = 같은 노드 아님
+                sensitive = False
+        return node, sensitive, str(info.get("v") or "")
+
+    @staticmethod
+    async def _dispose_quiet(node: Any) -> None:
+        try:
+            await node.dispose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _key_field_after(self, node: Any, sensitive: bool, before: str, data: Dict[str, Any]) -> None:
+        """WS-78 T1 B2~B4: 키 **뒤** 그 노드의 값을 읽어, 키 전·키 뒤 어느 쪽이든 민감이면(sticky·OR) 칸 전체 값을
+        자격증명 등급으로 등록한다. 누적 값을 매번 통째로 등록하고 앞서 등록한 접두는 그대로 둔다(B3, 지우는 API 없음).
+        민감인데 키 뒤 값을 못 읽으면 키 전 값만 등록하고 data 에 고정 신호(B4, 값 없음). 일반 칸은 아무것도 붙이지 않는다.
+        """
+        after: Optional[str] = None
+        try:
+            info = await node.evaluate(_KEY_FIELD_JS)
+            if isinstance(info, dict):
+                sensitive = sensitive or bool(info.get("s"))
+                after = str(info.get("v") or "")
+        except Exception:  # noqa: BLE001 — 문서 이동·노드 소멸
+            after = None
+        self.last_key_sensitive = sensitive
+        if sensitive and after is not None:
+            # 이 노드를 다음 키의 sticky 기준으로 둔다(앞 기준 노드는 놓아 준다).
+            old, self._sticky_key_node = getattr(self, "_sticky_key_node", None), node
+            if old is not None and old is not node:
+                await self._dispose_quiet(old)
+        else:
+            await self._dispose_quiet(node)
+        if not sensitive:
+            return
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([v for v in (before, after) if v])
+        if after is None:
+            data["sensitive_input"] = {"value_read": False, "hint": SENSITIVE_VALUE_UNREAD}
+
     async def _elementless_press_key(self, action: ActionType, params: Dict[str, Any]) -> ActionResult:
         """press_key(WS-48 분해)."""
         raw_key = str(params.get("key", ""))
@@ -3934,6 +4028,7 @@ class ActionDispatcher:
         # 키보드·문서 이동은 최상위 Page 의 것이다 — 프레임 안이어도 포커스된 요소가
         # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
         top = self._top_page()
+        self.last_key_sensitive = False
         frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
         # WS-56 R2 B2: 사람 승인으로 연 키 입력 — 키를 받을 포커스 노드가 승인 때 잡은 그 노드(그 목적지)여야 한다.
         pin = self._current_pin()
@@ -3941,6 +4036,8 @@ class ActionDispatcher:
             action, pin, await self._pin_mismatch_for(pin, params) if pin is not None else None)
         if refused is not None:
             return refused
+        # WS-78 T1 B2: 민감 판정은 키 **전**(키의 input 이벤트로 type 이 바뀌기 전) — 목록 재판정(키 직전)보다 앞에 둔다.
+        node, sensitive, before = await self._key_field_before(top)
         watch = None
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
@@ -3949,12 +4046,16 @@ class ActionDispatcher:
         if refused is not None:
             if watch is not None:
                 watch.close()
+            if node is not None:
+                await self._dispose_quiet(node)
             return refused
         try:
             await top.keyboard.press(key)
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
+            if node is not None:
+                await self._key_field_after(node, sensitive, before, {})
             return self._result(
                 success=False,
                 action=action,
@@ -3962,12 +4063,16 @@ class ActionDispatcher:
                 error_code=ErrorCode.KEY_PRESS_FAILED,
                 error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
             )
+        data: Dict[str, Any] = {"key": key}
+        if node is not None:
+            # 키 뒤 곧바로(이동 대기 전에) 그 노드 값을 읽는다 — Enter 제출로 문서가 바뀌기 전에 읽을 가능성이 크다.
+            await self._key_field_after(node, sensitive, before, data)
         # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
         # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
         if watch is not None:
             self._nav_info = await watch.settle()
         return self._result(
-            success=True, action=action, retry_safe=False, data={"key": key}
+            success=True, action=action, retry_safe=False, data=data
         )
 
     async def _elementless_screenshot(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
