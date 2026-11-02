@@ -236,8 +236,14 @@ WORKSPACE_INSTRUCTIONS = (
 OBSERVE_INSTRUCTIONS = (
     "페이지를 열면 먼저 browser_observe_page — 상품·가격은 data.page_data 에 요약돼 있을 수 있다\n"
     "같은 이름 대상(두 달 달력의 날짜·상품 행의 '담기')은 data.repeated 의 group(페이지 글자, null 이면 x·y)으로 "
-    "고르고, 누른 뒤 입력칸 값으로 확인하세요(최근 관찰의 id 만)"
+    "고르고, 누른 뒤 입력칸 값으로 확인하세요(최근 관찰의 id 만)\n"
+    "data.page_not_found 는 서버가 404/410 으로 답한 없는 주소 — 차단이 아니니 막혔다고 하지 말고 다른 경로를 찾으세요"
 )
+
+#: WS-78 T2(#139): 지금 화면의 문서가 404/410(판정용 상태 — 현재 URL == 응답 URL)이고 차단·캡차가 아닐 때 data 에
+#: 싣는 고정 신호 {status, hint}. SPA 의 200 '없는 페이지' 화면은 대상이 아니다.
+PAGE_NOT_FOUND_STATUSES = frozenset({404, 410})
+PAGE_NOT_FOUND_HINT = "없는 주소 — 차단 아님, 다른 경로를 찾으세요"
 
 
 #: MCP initialize 의 서버 instructions(WS-38·38b — 레시피 쓰는 법). serve --no-recipes 면 보내지 않는다.

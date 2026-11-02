@@ -528,7 +528,7 @@ class BatchMixin:
         data = envelope_dict(res).get("data") or {}
         out: Dict[str, Any] = {}
         for k in ("observation", "repeated", "injection_suspected", "truncated", "challenge", "handoff", "hint",
-                  "robots", "dialogs"):
+                  "robots", "dialogs", "page_not_found"):
             if data.get(k) is not None:
                 out[k] = data[k]
         if not res.success:
