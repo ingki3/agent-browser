@@ -57,6 +57,8 @@ REVIEWED = {
     ("state", "interface/server_window.py", "target"): "headed·headless",
     # WS-77 data.human_handoff(server_control) · 반납 출처(handoff)
     ("state", "interface/server_control.py", "event"): "_note_handoff_end 인자 — released·request_expired",
+    # WS-78 T4: 끝난 인계 응답 — _note_handoff_end 가 기록한 state(같은 어휘)
+    ("state", "interface/server_control.py", "end.get('state')"): "_handoff_end['state'] — released·request_expired",
     ("changed", "interface/server_control.py", "set(now) != set(before)"): "bool(문자열 아님) — tab_origins.changed",
     ("control_window", "interface/server_control.py", "self._control_window_state()"):
         "server_control._control_window_state — open·opening·unavailable·none",
@@ -88,6 +90,11 @@ REVIEWED = {
     ("reason", "harness/tier2_som.py", "reason"): NOT_OUT,
     ("reason", "interface/handoff.py", "self.reason"): FREE + " (browser_control_request 사유 — R4-B3)",
     ("reason", "interface/handoff.py", "str(reason or '')[:500]"): FREE + " (R4-B3)",
+    # WS-78 T4: 사람용 파일·CLI 의 사유 투영본(public_text → display_safe)
+    ("reason", "interface/handoff.py", "_projected(st.get('reason'), 500)"): FREE + " (WS-78 control.json·ack 투영 사유)",
+    ("reason", "interface/handoff.py", "_projected(out.get('reason'), 500)"): FREE + " (WS-78 CLI 표시 투영 사유)",
+    ("sticky_reason", "interface/handoff.py", "_projected(window['sticky_reason'], 300)"):
+        FREE + " (WS-78 control.json 투영 sticky 사유)",
     ("reason", "interface/run_cli.py", "challenge.reason"): FREE + " (challenge 사유 문장)",
     ("reason", "interface/server_hitl.py", "decision.reason"): FREE + " (hitl 사유 문장)",
     ("reason", "interface/server_hitl.py", "why"): FREE + " (check_approval 사유 문장)",
@@ -115,6 +122,7 @@ REVIEWED = {
     ("kind", "interface/on_demand.py", "str(challenge.get('kind') or '')"): "ChallengeKind",
     ("kind", "interface/run_cli.py", "challenge.kind.value"): "ChallengeKind",
     ("kind", "interface/server_signals.py", "found.kind.value"): "ChallengeKind",
+    ("status", "interface/server_signals.py", "judge_status"): "int(문자열 아님) — WS-78 data.page_not_found.status 404·410",
     ("reason", "interface/server_signals.py", "kind"): "ChallengeKind (WS-63 C data.handoff.reason = challenge kind)",
     ("kind", "llm/budget.py", "kind"): NOT_OUT,
     ("kind", "actions/nav_failure.py", "_EGRESS_KINDS[egress_code]"): "WS-69 nav_failure.kind — dns·connect·blocked",

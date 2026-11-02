@@ -74,6 +74,7 @@ TABLES = {
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
     ("interface/handoff.py", "_KEY_LABEL"): (FREE, "승인 불일치 사유 문장에 쓰는 사람용 이름"),
+    ("interface/server_control.py", "TELL_ENDED"): (FREE, "WS-78 끝난 인계 tell_user 고정 문장(키는 released·request_expired)"),
     ("interface/server_elicit.py", "_STATUS"): (FREE, "WS-56 data.elicitation.answer 낱말(declined·cancelled·timeout·"
                                                   "error) — 어휘 밖(등록 값이면 가림)"),
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
