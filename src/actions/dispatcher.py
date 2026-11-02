@@ -1101,10 +1101,78 @@ _KEY_FIELD_JS = (
     "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
     "v: typeof n.value === 'string' ? n.value : ''} : null"
 )
+#: WS-78 R1 R3: 노드 식별 열쇠(같은 문서 안 자식 위치 경로 — open shadow·같은 출처 iframe 경계는 표지) — 핸들 없이
+#: 키 전·키 뒤 포커스가 같은 노드인가를 본다(일반 칸은 핸들·해제 왕복을 쓰지 않는다).
+_NODE_KEY_JS = """
+(n) => {
+  const p = [];
+  let c = n;
+  for (let d = 0; c && d < 256; d++) {
+    const par = c.parentNode;
+    if (par) { p.push(Array.prototype.indexOf.call(par.childNodes, c)); c = par; continue; }
+    if (c.host) { p.push('s'); c = c.host; continue; }
+    const fe = c.defaultView && c.defaultView.frameElement;
+    if (fe) { p.push('f'); c = fe; continue; }
+    break;
+  }
+  return p.join('.');
+}
+"""
+#: WS-78 R1 R3: 키 **전** 판정을 평가 한 번으로 — 포커스 노드(_FOCUS_NODE_JS)가 민감 칸인가(s)·앞 키의 sticky 노드인가
+#: (same)·식별 열쇠(k)·값(v, 민감일 때만). 노드가 아니면(opaque·none) null.
+_KEY_FOCUS_JS = (
+    "(sticky) => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+    "if (!(n && typeof n === 'object' && n.tagName)) return null; "
+    "const s = n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password'; "
+    "const same = !!sticky && n === sticky; "
+    "return {s: s, same: same, k: (" + _NODE_KEY_JS.strip() + ")(n), "
+    "v: (s || same) && typeof n.value === 'string' ? n.value : ''}; }"
+)
+#: WS-78 R1 R3: 일반 칸 키 **뒤** 확인 — 지금 포커스 노드가 키 전 그 노드(식별 열쇠 k)일 때만 {s, v}, 아니면 null.
+_KEY_FOCUS_AFTER_JS = (
+    "(k) => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+    "if (!(n && typeof n === 'object' && n.tagName) || (" + _NODE_KEY_JS.strip() + ")(n) !== k) return null; "
+    "return {s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
+    "v: typeof n.value === 'string' ? n.value : ''}; }"
+)
 #: WS-78 T1: 포커스 노드 판정·키 뒤 값 읽기의 상한(초) — 문서 이동 중이면 평가가 이동 끝까지 멈출 수 있다(실측).
 _KEY_FIELD_TIMEOUT_S = 0.3
+#: WS-78 R1 R3: 서버가 미리 시작한 키 전 판정을 쓰는 최대 경과(초) — 그보다 오래면(승인 대기 등) 버리고 다시 판정한다.
+_KEY_PREFETCH_MAX_AGE_S = 0.25
+#: WS-78 R1 R3: 서버가 일반 칸의 키 뒤 확인을 기존 차단 판정(detect_challenge)과 겹쳐 돌릴 때 주는 자리(목록) —
+#: 디스패처는 확인 작업(Task)을 여기에 넣고 기다리지 않는다. 자리가 없으면(디스패처 직접 사용) 그 자리에서 기다린다.
+KEY_AFTER_DEFER: ContextVar[Optional[List[Any]]] = ContextVar("press_key_after_defer", default=None)
+#: WS-78 R1(#200): 미지원 키 오류 문구 상한 — 키 원문(에이전트 유래)을 가린 뒤 고정 길이로 자른다(WS-75 순서).
+KEY_ERROR_MAX_CHARS = 600
+_KEY_ERROR_TEXT_CHARS = 300
+_KEY_ERROR_ECHO_CHARS = 120
 #: WS-78 T1 B4: 민감 칸으로 간 키 뒤 그 칸 값을 읽지 못했다(문서 이동 등) — 키 전 값만 등록했다는 고정 신호(값 없음).
 SENSITIVE_VALUE_UNREAD = "민감 칸 키 입력 뒤 칸 값을 읽지 못해 키 전 값까지만 가림 대상으로 등록했습니다."
+
+
+@dataclass(frozen=True)
+class _PlainKey:
+    """WS-78 R1 R3: 키 전 일반 칸 — 핸들 대신 식별 열쇠만(키 뒤 같은 노드인가를 열쇠로 본다)."""
+
+    k: str
+
+
+class _NoNode:
+    """WS-78 R1 R3: 민감인데 노드 핸들을 못 잡은 경우 — 키 뒤 읽기가 실패해 fail-closed 신호로 간다."""
+
+    async def evaluate(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("포커스 노드 핸들 없음")
+
+    async def dispose(self) -> None:
+        return None
+
+
+def _bounded_echo(text: str, limit: int) -> str:
+    """WS-78 R1: 오류 문구에 싣는 글자 — 가린 뒤(WS-75 순서) limit 글자로 자른다."""
+    from security.public_url import public_text
+
+    masked = public_text(text)
+    return masked if len(masked) <= limit else masked[:limit] + "…"
 
 _MEANING_KEYS = ("href", "action", "method", "target")
 
@@ -3965,30 +4033,71 @@ class ActionDispatcher:
 
         판정 불가(포커스 없음·다른 출처 iframe 'opaque'·닫힌 shadow·평가 실패·상한 초과)는 (None, False, "") — 한계로
         문서화(docs/security.md). 노드 핸들은 키 뒤 **그 노드**의 값을 읽는 데 쓴다(Tab 으로 포커스가 옮겨도 같은 노드).
+        WS-78 R1 R3: 서버가 미리 시작해 둔 판정(prefetch_key_judge — 기존 레시피 스냅숏 평가와 겹쳐 돈다)이 같은 Page·짧은
+        시간 안의 것이면 그것을 쓴다(새 왕복 없음). 아니면 버리고 지금 판정한다.
         """
+        pre, self._key_prefetch = getattr(self, "_key_prefetch", None), None
+        if pre is not None:
+            if pre[0] is top and time.monotonic() - pre[2] <= _KEY_PREFETCH_MAX_AGE_S:
+                try:
+                    return await asyncio.wait_for(pre[1], _KEY_FIELD_TIMEOUT_S)
+                except Exception:  # noqa: BLE001
+                    return None, False, ""
+            self._drop_prefetch(pre)
         try:
             return await asyncio.wait_for(self._key_field_judge(top), _KEY_FIELD_TIMEOUT_S)
         except Exception:  # noqa: BLE001 — 판정 불가(앞 이동이 진행 중이면 평가가 이동 끝까지 멈출 수 있다)
             return None, False, ""
 
-    async def _key_field_judge(self, top: Any) -> Tuple[Any, bool, str]:
-        node = await top.evaluate_handle(_FOCUS_NODE_JS)
+    def prefetch_key_judge(self) -> None:
+        """WS-78 R1 R3: press_key 의 키 전 판정을 미리 시작한다 — 서버가 기존 평가(레시피 기록 스냅숏)와 겹쳐 돌린다.
+        판정은 읽기뿐이고 키보다 앞서 끝난다(press_key 가 키 전에 기다린다). 쓰이지 않으면 drop_key_prefetch."""
+        self.drop_key_prefetch()
         try:
-            info = await node.evaluate(_KEY_FIELD_JS)
-        except Exception:  # noqa: BLE001
-            info = None
-        if not isinstance(info, dict):
-            self._dispose_later(node)
-            return None, False, ""
-        sensitive = bool(info.get("s"))
-        sticky = getattr(self, "_sticky_key_node", None)
-        if not sensitive and sticky is not None:
-            # sticky: 앞 키에서 민감으로 판정한 **그 노드**면 지금 type 이 바뀌었어도(입력 이벤트로 password→text) 민감.
+            top = self._top_page()
+            task = asyncio.ensure_future(self._key_field_judge(top))
+        except Exception:  # noqa: BLE001 — 미리 못 하면 press_key 가 직접 판정
+            return
+        self._key_prefetch = (top, task, time.monotonic())
+
+    def drop_key_prefetch(self) -> None:
+        """쓰이지 않은 미리 판정을 버린다(잡은 핸들은 놓아 준다)."""
+        pre, self._key_prefetch = getattr(self, "_key_prefetch", None), None
+        if pre is not None:
+            self._drop_prefetch(pre)
+
+    def _drop_prefetch(self, pre: Any) -> None:
+        def _release(task: Any) -> None:
             try:
-                sensitive = (await node.evaluate("(n, m) => n === m", sticky)) is True
-            except Exception:  # noqa: BLE001 — 다른 문서의 핸들 등 = 같은 노드 아님
-                sensitive = False
-        return node, sensitive, str(info.get("v") or "")
+                node = task.result()[0]
+            except BaseException:  # noqa: BLE001 — 취소·실패 = 놓을 핸들 없음
+                return
+            if node is not None and not isinstance(node, _PlainKey):
+                self._dispose_later(node)
+
+        pre[1].add_done_callback(_release)
+
+    async def _key_field_judge(self, top: Any) -> Tuple[Any, bool, str]:
+        # WS-78 R1 R3: 평가 한 번으로 민감·sticky·식별 열쇠를 함께 본다 — 일반 칸은 핸들을 잡지 않는다(핸들·노드 평가·
+        # 해제 왕복 없음). 민감(또는 sticky 그 노드)일 때만 키 뒤 **그 노드**를 읽을 핸들을 잡는다.
+        sticky = getattr(self, "_sticky_key_node", None)
+        try:
+            info = await top.evaluate(_KEY_FOCUS_JS, sticky)
+        except Exception:  # noqa: BLE001 — 다른 문서의 sticky 핸들 등: 그 기준을 놓고 한 번 더(sticky 없이)
+            if sticky is None:
+                raise
+            self._sticky_key_node = None
+            self._dispose_later(sticky)
+            info = await top.evaluate(_KEY_FOCUS_JS, None)
+        if not isinstance(info, dict):
+            return None, False, ""
+        if not (info.get("s") or info.get("same")):
+            return _PlainKey(str(info.get("k") or "")), False, ""
+        node = await top.evaluate_handle(_FOCUS_NODE_JS)
+        if node.as_element() is None:
+            self._dispose_later(node)
+            return _NoNode(), True, str(info.get("v") or "")  # 키 뒤 못 읽음 = fail-closed 신호(키 전 값 등록)
+        return node, True, str(info.get("v") or "")
 
     @staticmethod
     def _dispose_later(node: Any) -> None:
@@ -4071,7 +4180,7 @@ class ActionDispatcher:
         if refused is not None:
             if watch is not None:
                 watch.close()
-            if node is not None:
+            if node is not None and not isinstance(node, _PlainKey):
                 self._dispose_later(node)
             return refused
         try:
@@ -4079,28 +4188,77 @@ class ActionDispatcher:
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
-            if node is not None:
+            if node is not None and not isinstance(node, _PlainKey):
                 await self._key_field_after(node, sensitive, before, {})
+            # WS-78 R1(#200): 키 원문(에이전트 유래 — Playwright 문구에도 반복된다)은 가린 뒤 고정 길이로 자른다.
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=False,  # 키 입력은 발송 후 재시도 위험
                 error_code=ErrorCode.KEY_PRESS_FAILED,
-                error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
+                error_message=(f"{_bounded_echo(str(exc), _KEY_ERROR_TEXT_CHARS)} (입력값: "
+                               f"{_bounded_echo(repr(raw_key), _KEY_ERROR_ECHO_CHARS)} -> "
+                               f"{_bounded_echo(repr(key), _KEY_ERROR_ECHO_CHARS)})"),
             )
         data: Dict[str, Any] = {"key": key}
         # 키 뒤 곧바로 그 노드 값 읽기를 시작하고 이동 대기와 겹쳐 돌린다 — Enter 제출 직후의 평가는 새 문서가 올
         # 때까지 멈출 수 있어(실측) 기다리지 않고, 대기가 끝난 뒤 짧은 상한 안에서만 결과를 받는다.
-        pending = asyncio.ensure_future(self._key_field_read(node)) if node is not None else None
+        pending = None
+        if isinstance(node, _PlainKey):
+            pending = asyncio.ensure_future(self._key_plain_read(top, node.k))
+        elif node is not None:
+            pending = asyncio.ensure_future(self._key_field_read(node))
         # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
         # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
         if watch is not None:
             self._nav_info = await watch.settle()
-        if node is not None:
+        if isinstance(node, _PlainKey):
+            # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
+            task = asyncio.ensure_future(self._key_plain_after(top, pending))
+            defer = KEY_AFTER_DEFER.get()
+            if defer is not None:
+                defer.append(task)
+            else:
+                await task
+        elif node is not None:
             await self._key_field_after(node, sensitive, before, data, pending)
         return self._result(
             success=True, action=action, retry_safe=False, data=data
         )
+
+    @staticmethod
+    async def _key_plain_read(top: Any, k: str) -> Optional[Dict[str, Any]]:
+        """WS-78 R1 R3: 키 뒤 지금 포커스가 키 전 그 노드(열쇠 k)면 {s, v}, 아니면·못 읽으면 None."""
+        try:
+            info = await top.evaluate(_KEY_FOCUS_AFTER_JS, k)
+        except Exception:  # noqa: BLE001
+            return None
+        return info if isinstance(info, dict) else None
+
+    async def _key_plain_after(self, top: Any, pending: Any) -> None:
+        """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다."""
+        try:
+            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            info = None
+        if not (isinstance(info, dict) and info.get("s")):
+            return
+        self.last_key_sensitive = True
+        value = str(info.get("v") or "")
+        if value:
+            from security.secret_registry import register_secret_values
+
+            register_secret_values([value])
+        try:
+            node = await asyncio.wait_for(top.evaluate_handle(_FOCUS_NODE_JS), _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — sticky 를 못 잡아도 다음 키 전 판정이 password 를 본다
+            return
+        if node.as_element() is None:
+            self._dispose_later(node)
+            return
+        old, self._sticky_key_node = getattr(self, "_sticky_key_node", None), node
+        if old is not None and old is not node:
+            self._dispose_later(old)
 
     async def _elementless_screenshot(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """take_screenshot(WS-48 분해)."""
