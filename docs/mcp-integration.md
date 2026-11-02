@@ -138,9 +138,9 @@ click         ->  element_id="@e3", epoch=0
 | :--- | :--- |
 | `request_id` | 이 인계의 요청 id |
 | `state` | `waiting_human`(요청 중) · `human_holding`(사람이 take) · `released` · `request_expired`, 창 없는 서버의 거부는 `no_window` |
-| `expires_at` | 요청 만료 시각(ISO, on-demand 가 요청으로 연 창만 — 다른 방식은 만료가 없어 `null`) |
-| `control_window` | 작은 'agent-browser' 창 상태: `open` · `opening`(다시 띄우는 중) · `unavailable`(닫힘·이동 뒤 한 번 다시 띄운 뒤에도 없어짐 → CLI 안내) · `none` |
-| `tell_user` | 사람에게 그대로 전할 **고정 문구**(페이지·사유 글자 없음). 창이 있으면 "브라우저 옆에 뜬 작은 'agent-browser' 창에서 … [다 했어요]를 누르세요", 창이 없어지면 `agent-browser control release` 안내, headless 서버면 창 있는 방식 안내 |
+| `expires_at` | 요청 만료 시각(ISO, on-demand 가 요청으로 연 창만 — 다른 방식은 만료가 없어 `null`). 끝난 인계(`released`·`request_expired`)도 `null`(WS-78) |
+| `control_window` | (끝난 인계에도 지금 상태로 실림, WS-78) 작은 'agent-browser' 창 상태: `open` · `opening`(다시 띄우는 중) · `unavailable`(닫힘·이동 뒤 한 번 다시 띄운 뒤에도 없어짐 → CLI 안내) · `none` |
+| `tell_user` | 사람에게 그대로 전할 **고정 문구**(페이지·사유 글자 없음). 창이 있으면 "브라우저 옆에 뜬 작은 'agent-browser' 창에서 … [다 했어요]를 누르세요", 창이 없어지면 `agent-browser control release` 안내, headless 서버면 창 있는 방식 안내. 끝난 인계는 종료용 고정 문구(`released`: 조작이 끝났다·더 할 일 없음, `request_expired`: 요청 만료 — 진행 중 안내를 다시 쓰지 않음, WS-78) |
 | `human_activity_seen` | 요청 뒤 브라우저에서 활동이 보였는지. **활동 = 네트워크 요청(본문을 싣는 POST/PUT)·비밀번호 칸 제출·쿠키 변화** 뿐입니다 — 칸에 입력만 하고 제출하지 않았거나 클릭만 한 것은 활동이 아닙니다. `seen`(위 사건 중 하나라도) · `not_seen`(브라우저 수준 감시가 모든 탭에 온전히 걸렸는데 위 사건이 없음) · `unknown`(감시 설치 실패·일부 탭만 설치·쿠키 기준점 없음·아직 판정 불가). **반납 근거가 아닌 관측 신호**이며 페이지 스크립트가 만든 요청·쿠키도 `seen` 이 됩니다. `not_seen` 이어도 다시 관찰해 확인하십시오 |
 | `tab_origins` | `{changed, before, now}` — 요청 때와 지금의 탭 origin(각 최대 5개). **호출한 작업 공간의 탭만** 셉니다(다른 작업 공간 탭은 `tab_control list` 의 `other_workspace_tabs` 개수로만) |
 | `release_source` | 반납 출처(끝난 인계만): `window_done`(창의 [다 했어요]) · `cli` · `login_finish` · `window_closed` · `server` |
