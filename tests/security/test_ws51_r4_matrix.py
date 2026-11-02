@@ -370,7 +370,9 @@ def test_control_key_inventory_is_fixed():
                                     # WS-63 C: data.handoff.tool(인계 도구 이름)
                                     "tool",
                                     # WS-69: navigate 부분 성공 data.load_state.reached
-                                    "reached"}
+                                    "reached",
+                                    # WS-77: data.human_handoff 제어 창 상태·관측 신호·반납 출처
+                                    "control_window", "human_activity_seen", "release_source"}
     assert pu.CONTROL_ITEM_VOCABULARY == {("dialogs", "type"): {"alert", "beforeunload", "confirm", "prompt",
                                                                 "unknown"}}
     # R9: 목록 바로 아래 문자열 원소 경로 어휘(healing_attempts 복합 코드·signals 순수 코드 — test_ws51_r9_census 가 도출)

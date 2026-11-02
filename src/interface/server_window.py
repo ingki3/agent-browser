@@ -197,6 +197,11 @@ class WindowMixin:
         core._launch_kwargs()
         # 창을 닫으면 그 창의 오버레이(확인 코드·안내 띠)도 함께 사라진다 — 창에 없는 코드는 무효.
         self._banner = None
+        # WS-77: 창 전환은 브라우저를 닫는다 — 제어 창도 닫고 다시 띄우지 않는다(전환 뒤에는 띠+CLI 안내).
+        if self._control_window is not None:
+            rid = self._control_window.request_id
+            await self._close_control_window()
+            self._control_gave_up = rid
         if self._code_where == "overlay":
             self.hub.withdraw_codes()
             self._code_on_overlay = False
@@ -250,9 +255,20 @@ class WindowMixin:
                 # 사람이 take 하지 않았다 — 요청을 거두고 창도 닫는다.
                 w.opened_for_request = None
                 self.hub.cancel_request()
+                self._begin_handoff_end()  # WS-77 후속: 만료를 기록하기 전 await 동안 들어온 wait 도 만료를 듣게
                 w.notice = {"reason": "request_expired",
                             "hint": "사람이 조작권을 가져가지 않아 요청을 거두고 창을 닫았습니다."}
                 _stderr_line("agent-browser serve: 조작권 요청 만료 — 창을 닫습니다")
+                # WS-77 B5: take 없이 창에서 로그인했을 수 있다 — 창(컨텍스트)을 닫기 전에 이 구간을 기록한다(기록하는
+                # 동안 새 도구 호출은 관문에서 기다린다). 만료 응답에 실을 관측 신호도 지금(전환 전 탭) 남긴다.
+                self._hold_gate()
+                try:
+                    await self._login_watch_finish()
+                finally:
+                    self._release_gate()
+                    self._settle_handoff_end()  # 바로 아래 기록과 사이에 await 없음 — 예외 때만 의미가 있다
+                self._note_handoff_end("request_expired")
+                await self._close_control_window()
                 if not w.keep_window_after_release():
                     self._spawn_switch(False, "request_expired")
                 else:
@@ -264,7 +280,8 @@ class WindowMixin:
         w.notice = {"reason": "window_closed",
                     "hint": ("사람이 창을 닫았습니다 — 조작권을 에이전트에게 돌리고 headless 로 다시 열어 "
                              "마지막 탭을 복원했습니다. 다시 관찰하세요.")}
-        self.hub.release_by_server()
+        self.hub.release_by_server(release_source="window_closed")
+        self._note_handoff_end("released")  # WS-77 B7
         self._bump_all_epochs("window_closed_by_human")  # WS-57 R1: 창 = 브라우저 전체
         self._control_banner = None
         _stderr_line("agent-browser serve: 사람이 창을 닫음 — headless 로 돌아갑니다")

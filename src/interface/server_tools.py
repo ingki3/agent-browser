@@ -102,6 +102,7 @@ class ToolsMixin:
         await self._poll_handoff()
         short = name[len(TOOL_PREFIX):]
         if short == "control_status":
+            await self._await_handoff_end()  # WS-77 후속: 감시 태스크가 처리 중인 반납·만료는 기록된 뒤에 보여 준다
             data: Dict[str, Any] = {"control": self.hub.status()}
             data["control"].pop("window", None)
             if self.profile is not None:
@@ -117,6 +118,9 @@ class ToolsMixin:
             pending = self._manual_pending_view()
             if pending is not None:
                 data["manual_handoff"] = pending
+            handoff_view = await self._handoff_view_async()  # WS-77 B7: 요청·조작권·막 끝난 인계가 있을 때만
+            if handoff_view is not None:
+                data["human_handoff"] = handoff_view
             return {"success": True, "data": data}
         if short == "control_request":
             result = await self._control_request(args)
@@ -512,12 +516,16 @@ class ToolsMixin:
         if self._recipes is not None:
             self._recipes.reset("human_control")
         what = "관찰을 포함한 모든 액션" if control["secret_wanted"] else "조작 액션"
+        data: Dict[str, Any] = {"control": control}
+        view = self._handoff_view(self._live_activity_sync())  # WS-77 B7: 만료 시각·사용자 안내 고정 문구
+        if view is not None:
+            data["human_handoff"] = view
         return self._error_result(
             action,
             ErrorCode.HITL_UNATTENDED_BLOCKED,
             f"사람이 브라우저를 다루는 중이라 {what}을 거부했습니다({control['reason']}). "
             "browser_control_wait 로 반납을 기다린 뒤 다시 관찰하세요.",
-            data={"control": control},
+            data=data,
         )
 
     def _validated_params(self, action: ActionType, params: Dict[str, Any]) -> Any:

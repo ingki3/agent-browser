@@ -54,6 +54,10 @@ class HandoffMixin:
 
     async def _poll_handoff(self) -> List[str]:
         events = self.hub.poll()
+        if "released" in events:
+            # WS-77 후속: hub 가 반납한 그 동기 구간에서 '기록 전 종료' 를 세운다 — 아래 어떤 await(로그인 기록·창 닫기)
+            # 사이에 들어온 control_wait/status 도 그 반납을 기다려 듣는다(none_pending 으로 놓치지 않게).
+            self._begin_handoff_end()
         if "taken" in events:
             # WS-58 R2 NB1: poll 이 holder 를 human 으로 바꾼 그 동기 구간에서 요청 감시를 붙인다 — 아래 어떤
             # await(쿠키 사이트 응답·안내 띠)보다 먼저.
@@ -96,6 +100,8 @@ class HandoffMixin:
                     if self._window is not None:
                         # 창 전환이 창 컨텍스트를 닫기 전에(쿠키를 읽을 수 있을 때) 기록한다.
                         await self._login_watch_finish()
+                        self._note_handoff_end("released")  # WS-77 B7: 전환 전 탭 origin
+                        await self._close_control_window()  # WS-77: 모든 반납에서 제어 창을 닫는다
                         # WS-34 D2: 창을 닫고 headless 로 다시 연다(sticky 면 창 유지). 탭은 다시 열려
                         # 복원되므로 닫힌 탭 복구(NB-3)는 필요 없다.
                         self._on_demand_released()
@@ -103,8 +109,11 @@ class HandoffMixin:
                         # 복구 Future 는 poll 과 같은 동기 구간에서 만들어야 한다(WS-37) — 기록은 그 뒤.
                         await self._recover_closed_tab_serialized()
                         await self._login_watch_finish()
+                        self._note_handoff_end("released")
+                        await self._close_control_window()
                 finally:
                     self._release_gate()
+                    self._settle_handoff_end()  # 기록 경로가 예외로 끝나도 기다리는 wait/status 를 풀어 준다
                 await self._show_control_banner(None)
                 _stderr_line("agent-browser serve: 조작권 반납됨 — 에이전트가 이어서 진행합니다")
             elif event == "taken":
@@ -114,12 +123,12 @@ class HandoffMixin:
                     if self._window.state == "headless" and self._started:
                         # 요청 없이 사람이 바로 take — 조작할 창이 필요하다.
                         self._spawn_switch(True, "taken")
-                await self._show_control_banner(
-                    "사람이 조작 중 — 끝나면 `agent-browser control release`")
+                await self._show_control_banner(self._taken_banner())
                 _stderr_line("agent-browser serve: 조작권을 사람이 가져감")
         await self._login_watch_tick()
         if self._window is not None:
             await self._watch_window()
+        await self._sync_control_window()  # WS-77: 끝난 인계의 제어 창 닫기·닫힌/옮겨진 창 1회 다시 띄우기
         await self._sync_code_overlay()
         # WS-37: 다른 태스크(감시 태스크)가 반납을 먼저 집어 복구 중이면 끝날 때까지 기다린다 —
         # 이 함수가 돌아온 뒤 호출자가 보는 상태(반납·탭 알림)가 어긋나지 않게.
@@ -175,14 +184,18 @@ class HandoffMixin:
         from interface.handoff import HOLDER_HUMAN
 
         watch = self._login_watch
-        if watch is not None and self.hub.holder != HOLDER_HUMAN:
-            # 'released' 사건 없이 끝난 구간(사람이 창을 닫아 서버가 반납 등)도 마무리한다.
+        # WS-77 B5: 창을 연 요청 구간(take 없이 사람이 창에서 로그인할 수 있다)도 감시 구간이다.
+        active = self.hub.holder == HOLDER_HUMAN or (
+            self._request_watch_id is not None and self.hub.requested
+            and self.hub.request_id == self._request_watch_id)
+        if watch is not None and not active:
+            # 'released' 사건 없이 끝난 구간(사람이 창을 닫아 서버가 반납·요청 만료 등)도 마무리한다.
             await self._login_watch_finish()
             return
         if watch is None and self.hub.holder == HOLDER_HUMAN:
             self._login_watch_begin()  # take 를 다른 경로(로그인 작업·직접 _apply)로 받은 경우
             watch = self._login_watch
-        if watch is None or self.hub.holder != HOLDER_HUMAN or not self._started or self._core is None:
+        if watch is None or not active or not self._started or self._core is None:
             return
         if self.hub.secret_wanted:
             watch.note_secret(self._agent_input_url())
@@ -198,7 +211,10 @@ class HandoffMixin:
         """조작권 반납 — 감시 결과·로그인 작업(agent-browser login)을 로그인 기록에 남긴다."""
         from browser.login_ledger import SOURCE_HUMAN_CONTROL, SOURCE_LOGIN_FLOW
 
+        from browser.login_watch import activity_of
+
         watch, self._login_watch = self._login_watch, None
+        self._request_watch_id = None
         job_url, self._login_job_url = self._login_job_url, None
         if job_url:
             self._record_login(job_url, SOURCE_LOGIN_FLOW)
@@ -215,6 +231,11 @@ class HandoffMixin:
         except Exception:  # noqa: BLE001
             logger.debug("조작권 로그인 감시 정리 실패", exc_info=True)
             return
+        # WS-77 B7: 관측 신호(반납 근거 아님) — not_seen 은 감시가 온전했을 때만.
+        # R1 F2: 누적 사건 종류로 판정(기록 dict 는 origin 별 대표 하나라 겹친 사건이 가려진다).
+        self._last_activity = activity_of(watch.events, degraded=watch.degraded,
+                                          baseline_known=watch.baseline is not None,
+                                          install_complete=not watch.install_incomplete)
         for origin in found:
             self._record_login(origin, SOURCE_HUMAN_CONTROL)
 
@@ -343,6 +364,10 @@ class HandoffMixin:
                     "로그인하면 이후 headless 에서도 로그인이 유지됩니다."
                 )
                 data["profile"] = self._profile_info()
+            from interface.server_control import TELL_HEADLESS
+
+            # WS-77: 사람에게 그대로 전할 고정 안내(창 없는 서버 — 동작은 그대로).
+            data["human_handoff"] = {"state": "no_window", "control_window": "none", "tell_user": TELL_HEADLESS}
             return {
                 "success": False,
                 "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
@@ -367,22 +392,32 @@ class HandoffMixin:
                     "data": {"window": self._window_view(window_out.get("window") or self._window.info())},
                 }
         out = self.hub.request(reason, secret_wanted=bool(args.get("secret_wanted")))
+        self._note_handoff_start(out["request_id"])
+        # WS-77 B5: take 없이 사람이 창에서 바로 로그인해도 기록되게 — 이 요청 구간을 로그인 감시 구간으로.
+        self._request_watch_id = out["request_id"]
+        self._login_watch_begin()
+        await self._login_watch_tick()
         out["login_hint"] = self._login_hint()
-        out["how_to_respond"] += " " + out["login_hint"]
         page = getattr(getattr(self._dispatcher, "ctx", None), "page", None) or self._page
         try:
             await page.bring_to_front()
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 창을 앞으로 가져오기는 편의 기능 — 실패해도 조작권 요청은 유지된다.
             pass
-        from interface.handoff import display_safe
+        from interface.server_control import _reason_display
 
-        await self._show_control_banner(f"에이전트가 사람 조작을 요청: {display_safe(reason, 80)} — "
-                                        f"`agent-browser control take`")
-        _stderr_line(f"agent-browser serve: [사람 조작 요청] {display_safe(reason, 500)} "
+        # WS-77: 에이전트 창을 앞으로 가져온 **뒤에** 작은 제어 창을 띄운다(제어 창이 위에 보이게).
+        windowed = await self._open_control_window(out["request_id"], reason)
+        if windowed:
+            out["how_to_respond"] = ("사람: 브라우저 창에서 직접 해결 → 옆의 작은 'agent-browser' 창에서 [다 했어요]. "
+                                     "터미널을 쓰면 — " + out["how_to_respond"])
+        out["how_to_respond"] += " " + out["login_hint"]
+        await self._show_control_banner(self._request_banner(reason, window=windowed))
+        _stderr_line(f"agent-browser serve: [사람 조작 요청] {_reason_display(reason, 500)} "
                      f"(secret_wanted={out['secret_wanted']}) — {out['how_to_respond']}")
         if window_out is not None:
             out = dict(out, window=self._window_view(window_out["window"]))
+        out["human_handoff"] = self._handoff_view(self._live_activity_sync())
         return {"success": True, "data": out}
 
     async def _open_window_for_request(self) -> Dict[str, Any]:
@@ -413,9 +448,15 @@ class HandoffMixin:
         return out
 
     async def _control_wait(self, timeout: float) -> Dict[str, Any]:
+        # WS-77 후속: 감시 태스크가 반납·만료를 처리하는 중(hub 는 끝남, 기록 전)이면 기록까지 기다린 뒤 판단한다.
+        await self._await_handoff_end()
         st = self._control_view()
-        if st["holder"] == "agent" and not st["requested"] and not (self._window is not None
-                                                                    and self._release_unreported):
+        # WS-77: 감시 태스크가 먼저 처리한(에이전트가 아직 못 들은) 창 [다 했어요] 반납·요청 만료.
+        ended = self._handoff_end if self._handoff_end_unreported else None
+        pre_ended = ended is not None and (ended["state"] == "request_expired"
+                                           or ended.get("release_source") == "window_done")
+        if st["holder"] == "agent" and not st["requested"] and not pre_ended and not (
+                self._window is not None and self._release_unreported):
             # WS-64: 직접 조작할 사이트 인계 대기(clicked|page_changed|done|expired) — 조작권 인계가 없을 때.
             manual = await self._manual_wait(timeout)
             if manual is not None:
@@ -423,24 +464,30 @@ class HandoffMixin:
         # WS-34: on-demand 에서는 감시 태스크가 반납을 먼저 처리하고 창 전환을 시작했을 수 있다 —
         # 에이전트가 아직 듣지 못한 반납이면 그 반납(과 전환 결과)을 알린다.
         pre_released = self._window is not None and self._release_unreported
-        if st["holder"] == "agent" and not st["requested"] and not pre_released:
+        if pre_ended and ended["state"] == "released":
+            pre_released = True
+        if st["holder"] == "agent" and not st["requested"] and not pre_released and not pre_ended:
             data0: Dict[str, Any] = {"control": st, "changed": "none_pending", "hint": _RELEASE_HINT}
             if self._window is not None:
                 data0["window"] = self._take_window_report()
             return {"success": True, "data": data0}
         start_version = self.hub.version
         deadline = time.monotonic() + timeout
-        changed = "released" if pre_released else "timeout"
+        changed = "released" if pre_released else ("request_expired" if pre_ended else "timeout")
         while changed == "timeout" and time.monotonic() < deadline:
             events = await self._poll_handoff()
             hit = [e for e in events if e in ("taken", "released")]
             if hit:
                 changed = hit[-1]
                 break
-            if self.hub.version != start_version and self.hub.last_event in ("taken", "released"):
+            # WS-77: 요청 만료(서버가 거둠)도 바로 알린다 — 만료까지 기다리던 에이전트가 timeout 만 듣지 않게.
+            if self.hub.version != start_version and self.hub.last_event in ("taken", "released", "request_expired"):
                 changed = self.hub.last_event
                 break
             await asyncio.sleep(0.05)
+        if changed in ("released", "request_expired"):
+            # 대기 중 감시 태스크가 집은 종료면 그 기록(로그인 기록 뒤 활동 신호)을 기다린다 — 여기서 먼저 기록하지 않게.
+            await self._await_handoff_end()
         window: Optional[Dict[str, Any]] = None
         if self._window is not None:
             # WS-34: 반납(또는 take)으로 창 전환이 시작됐으면 끝날 때까지 기다린다 — 다시 연 브라우저를
@@ -461,6 +508,18 @@ class HandoffMixin:
                 data["tab_closed_by_human"], self._tab_notice = self._tab_notice, None
         if window is not None:
             data["window"] = window
+        if changed in ("released", "request_expired"):
+            # WS-77 B7: 끝난 인계의 관측 신호(반납 출처·사람 활동·탭 origin 변화) + 다음 할 일 — 한 번 알린다.
+            if self._handoff_end is None:
+                self._note_handoff_end("released" if changed == "released" else "request_expired")
+            self._handoff_end_unreported = False
+            view = self._handoff_view()
+            if view is not None:
+                data["human_handoff"] = view
+        else:
+            view = await self._handoff_view_async()
+            if view is not None:
+                data["human_handoff"] = view
         return {"success": True, "data": data}
 
     def _attach_window_report(self, result: ActionResult) -> None:

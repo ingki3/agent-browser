@@ -55,6 +55,19 @@ REVIEWED = {
     ("state", "browser/site_session.py", "state.value"): "LoginState",
     ("state", "interface/on_demand.py", "self.state"): "WindowState.state — headless·headed·switching·failed",
     ("state", "interface/server_window.py", "target"): "headed·headless",
+    # WS-77 data.human_handoff(server_control) · 반납 출처(handoff)
+    ("state", "interface/server_control.py", "event"): "_note_handoff_end 인자 — released·request_expired",
+    ("changed", "interface/server_control.py", "set(now) != set(before)"): "bool(문자열 아님) — tab_origins.changed",
+    ("control_window", "interface/server_control.py", "self._control_window_state()"):
+        "server_control._control_window_state — open·opening·unavailable·none",
+    ("human_activity_seen", "interface/server_control.py", "activity"): "browser.login_watch ACTIVITY_*(peek·live_activity)",
+    ("human_activity_seen", "interface/server_control.py", "self._last_activity"): "browser.login_watch.activity_of — ACTIVITY_*",
+    ("release_source", "interface/handoff.py", "release_source"):
+        "handoff.release_by_server 인자 — window_done·cli·login_finish·window_closed·server",
+    ("release_source", "interface/server_control.py", "self.hub.release_source"): "handoff.release_source(같은 어휘)",
+    ("reason", "interface/control_window.py", "reason"): NOT_OUT + " (WS-77 제어 창 화면에 그리는 사유 — 창 DOM)",
+    ("reason", "interface/server_control.py", "_reason_display(reason, 80)"):
+        NOT_OUT + " (WS-77 제어 창 open 인자 — 창 DOM, R1: public_text 가림 + display_safe)",
     ("state", "llm/decisions.py", "state"): NOT_OUT,
     ("holder", "interface/handoff.py", "self.holder"): "HOLDER_AGENT·HOLDER_HUMAN",
     ("reason", "actions/pdf_document.py", "f'http_{response.status_code}'"): "CONTROL_PATTERNS['reason']",
@@ -239,6 +252,9 @@ ID_PRODUCERS = {
     ("interface/server_manual.py", "secrets.token_hex(4)"): ("WS-64 인계 handoff_id(mh-+hex8) — 면제하지 않음(public_text 를 "
                                                             "지나며 모양이 바뀌지 않음)", None, None),
     ("security/manual_sites.py", "_secrets.token_hex(6)"): ("WS-64 목록 임시 파일 이름(.tmp-manual-) — 출구 아님", None, None),
+    ("interface/control_window.py", "secrets.token_hex(6)"): ("WS-77 제어 창 isolated world 이름(CDP 내부) — 출구 아님",
+                                                            None, None),
+    ("interface/control_window.py", "secrets.token_hex(8)"): ("WS-77 제어 창 바인딩 이름(CDP 내부) — 출구 아님", None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{secrets.randbelow(9999)}"),

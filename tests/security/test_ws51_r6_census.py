@@ -75,6 +75,9 @@ CANDIDATES = {
     ("browser/serve_profile.py", "f'{EPHEMERAL_PREFIX}{server_id}'"): (NOT_OUT + " (디스크 임시 프로필 디렉터리 이름)",
                                                                        None, None),
     ("browser/login_watch.py", "'abw' + secrets.token_hex(8)"): (NOT_OUT + " (WS-58 조작권 감시 CDP 바인딩 이름)", None, None),
+    ("interface/control_window.py", "'ab_control_' + secrets.token_hex(6)"): (NOT_OUT + " (WS-77 제어 창 isolated world 이름)",
+                                                                              None, None),
+    ("interface/control_window.py", "'abd' + secrets.token_hex(8)"): (NOT_OUT + " (WS-77 제어 창 CDP 바인딩 이름)", None, None),
     ("recipes/saved_pages.py", "'p_' + _secrets.token_hex(4)"): ("WS-61 기억한 페이지 id — 면제하지 않음(public_text 를 지나며 "
                                                                "모양이 바뀌지 않음, 등록 대상 아님)", None, None),
     ("interface/profile_cli.py", "f'{n}B'"): (NOT_OUT + " (CLI 크기 표기)", None, None),

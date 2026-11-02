@@ -58,6 +58,7 @@ NOT_OUT_FILES = {
     "interface/manual_sites_cli.py": "WS-64 manual-sites·handoff CLI stdout(사람 CLI)",
     "interface/server_schema.py": "도구 스키마(정적 — 응답 data 아님, WS-48 골든 고정)",
     "security/public_url.py": "소비자 자신(제어 표 — 생산자 아님)",
+    "interface/control_window.py": "WS-77 사람용 제어 창 화면 문구·CDP 인자(창 DOM — isolated world 가 그림, MCP 응답 아님)",
 }
 
 #: 모듈·클래스 수준 조회표(Record.table) → 분류.
@@ -112,6 +113,11 @@ KEYS = {
     "how_to_wait": (CONTROL, "interface/handoff.py 조작권 요청 안내 — 도구 이름"),
     "tool": (CONTROL, "interface/server_signals.py data.handoff.tool — 인계 도구 이름(WS-63 C)"),
     "changed": (CONTROL, "interface/server_handoff.py control_wait"),
+    # WS-77 data.human_handoff
+    "control_window": (CONTROL, "interface/server_control.py·server_handoff.py 제어 창 상태(open·opening·unavailable·none)"),
+    "human_activity_seen": (CONTROL, "interface/server_control.py 관측 신호(browser.login_watch ACTIVITY_*)"),
+    "tell_user": (FREE, "WS-77 사람에게 전할 고정 안내 문장(server_control TELL_*)"),
+    "next_step": (FREE, "WS-77 다음 할 일 고정 문장(server_control NEXT_*)"),
     "holder": (CONTROL, "interface/handoff.py control_status"),
     "outcome": (CONTROL, "interface/server_hitl.py 승인 결과"),
     "status": (CONTROL, "interface/handoff.py·server_hitl.py 승인 상태"),

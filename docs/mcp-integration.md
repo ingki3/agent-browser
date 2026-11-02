@@ -128,3 +128,21 @@ click         ->  element_id="@e3", epoch=0
 `scroll` 결과 `data`에는 요청량 `scrolled` 외에 실제 세로 이동량 `scrolled_px`(위로는 음수)가 붙고, 움직이지 않았으면(이미 끝이거나 창 스크롤이 없는 페이지) `no_effect: true`와 `hint`가 붙습니다. 성공 판정과 `reobserve_required`(문서 높이 변화) 규칙은 그대로입니다.
 
 `switch_frame`의 `frame_selector`는 지금 들어가 있는 프레임 기준으로 먼저 찾고, 없으면 최상위 문서 기준으로 찾습니다. 그래서 깊은 프레임에서 현재 프레임에 없는 셀렉터를 주면 "없음"이 아니라 최상위 기준으로 찾은 더 얕은 프레임으로 되돌아갈 수 있습니다 — 결과의 `resolved_from`(`current_frame`/`root`)과 `frame_depth`로 확인하십시오. 결과 `data`에 `frame_url`·`frame_depth`·`frame_path`·`child_frames`(`selector_hint`, `url`)가 붙고, 못 찾으면 현재 프레임 URL과 그 안의 iframe 목록을 돌려줍니다. 최상위로 돌아가려면 `{"to_main": true}`만 보냅니다. 프레임 안의 `take_screenshot`은 최상위 페이지를 찍고 `data.frame_bbox`에 프레임 영역을 싣습니다.
+
+## 사람 인계 응답 (`data.human_handoff`, WS-77)
+
+`browser_control_request`·`browser_control_status`·`browser_control_wait`, 그리고 사람이 조작 중이라 거부된 액션 응답에 `data.human_handoff` 가 붙습니다(요청·사람 조작권·막 끝난 인계가 없으면 없음 — 인계를 쓰지 않는 응답은 그대로). 흐름은 [사람 인계의 창 안 [다 했어요]](human-handoff.md#사람-인계--조작권과-승인-mcp)에 있습니다.
+
+| 필드 | 뜻 |
+| :--- | :--- |
+| `request_id` | 이 인계의 요청 id |
+| `state` | `waiting_human`(요청 중) · `human_holding`(사람이 take) · `released` · `request_expired`, 창 없는 서버의 거부는 `no_window` |
+| `expires_at` | 요청 만료 시각(ISO, on-demand 가 요청으로 연 창만 — 다른 방식은 만료가 없어 `null`) |
+| `control_window` | 작은 'agent-browser' 창 상태: `open` · `opening`(다시 띄우는 중) · `unavailable`(닫힘·이동 뒤 한 번 다시 띄운 뒤에도 없어짐 → CLI 안내) · `none` |
+| `tell_user` | 사람에게 그대로 전할 **고정 문구**(페이지·사유 글자 없음). 창이 있으면 "브라우저 옆에 뜬 작은 'agent-browser' 창에서 … [다 했어요]를 누르세요", 창이 없어지면 `agent-browser control release` 안내, headless 서버면 창 있는 방식 안내 |
+| `human_activity_seen` | 요청 뒤 브라우저에서 활동이 보였는지. **활동 = 네트워크 요청(본문을 싣는 POST/PUT)·비밀번호 칸 제출·쿠키 변화** 뿐입니다 — 칸에 입력만 하고 제출하지 않았거나 클릭만 한 것은 활동이 아닙니다. `seen`(위 사건 중 하나라도) · `not_seen`(브라우저 수준 감시가 모든 탭에 온전히 걸렸는데 위 사건이 없음) · `unknown`(감시 설치 실패·일부 탭만 설치·쿠키 기준점 없음·아직 판정 불가). **반납 근거가 아닌 관측 신호**이며 페이지 스크립트가 만든 요청·쿠키도 `seen` 이 됩니다. `not_seen` 이어도 다시 관찰해 확인하십시오 |
+| `tab_origins` | `{changed, before, now}` — 요청 때와 지금의 탭 origin(각 최대 5개). **호출한 작업 공간의 탭만** 셉니다(다른 작업 공간 탭은 `tab_control list` 의 `other_workspace_tabs` 개수로만) |
+| `release_source` | 반납 출처(끝난 인계만): `window_done`(창의 [다 했어요]) · `cli` · `login_finish` · `window_closed` · `server` |
+| `next_step` | 기다리는 중이면 `browser_control_wait`, 끝났으면 "다시 관찰해 결과 확인" |
+
+`browser_control_wait` 은 요청 만료(on-demand)도 바로 `changed: "request_expired"` 로 돌려줍니다(전에는 `timeout`). 만료·반납 응답의 `human_activity_seen` 이 `seen` 이어도 로그인됐다고 단정하지 말고 다시 관찰해 확인하십시오.

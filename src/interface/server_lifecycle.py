@@ -442,6 +442,10 @@ class LifecycleMixin:
             except Exception:  # noqa: BLE001
                 logger.warning("승인 코드 창 정리 실패", exc_info=True)
         try:
+            await self._close_control_window()  # WS-77: 서버 종료에서도 제어 창을 닫는다
+        except Exception:  # noqa: BLE001
+            logger.warning("제어 창 정리 실패", exc_info=True)
+        try:
             if self._core is not None:
                 await self._core.close()
             await self._close_egress()
