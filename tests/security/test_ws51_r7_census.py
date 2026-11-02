@@ -94,6 +94,9 @@ KEYS = {
     ("target_element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
     ("observation_error", "interface/server_batch.py"): (FREE, "WS-73 R1 응답 관찰 실패 — ErrorCode 값 또는 observe_failed "
                                                              "(원 오류 문구는 싣지 않음)"),
+    ("observation_omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 묶음 응답 관찰 생략 고정 문장"
+                                                               "(BATCH_OBSERVATION_OMITTED)"),
+    ("omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 step_result 본문 생략 고정 문장(STEP_RESULT_OMITTED)"),
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
