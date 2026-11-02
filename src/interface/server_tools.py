@@ -290,6 +290,9 @@ class ToolsMixin:
             # 같은 응답의 주소 비밀까지 알고 만들어지게(직렬화 때만 등록하면 자른 뒤에야 알게 된다).
             register_url_fields({name: getattr(result, name) for name in type(result).model_fields})
             sink = batch_internal()
+            if sink is not None:
+                # WS-78 T3(#200): 묶음 응답 관찰 — 바깥 묶음 봉투(batch·step_result·next)가 쓸 만큼 실효 예산을 미리 줄인다.
+                max_chars -= int(sink.get("reserve") or 0)
             if sink is not None and action is ActionType.OBSERVE_PAGE and result.success:
                 # WS-73: 묶음의 대상 해석은 자르기 전 전체 후보로 센다(같은 관찰의 id·role·이름 — 핸들은 엔진에).
                 obs = result.data.get("observation") if isinstance(result.data, dict) else None

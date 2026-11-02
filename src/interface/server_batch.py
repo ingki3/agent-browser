@@ -114,6 +114,27 @@ def batch_internal() -> Optional[Dict[str, Any]]:
     return _INTERNAL.get()
 
 
+def _wire_len(payload: Dict[str, Any]) -> int:
+    """서버 도구 응답의 최종 wire 길이(가린 뒤 — call_server_tool 의 public_payload 와 MCP 직렬화와 같은 모양)."""
+    from security.public_url import public_payload
+
+    return len(json.dumps(public_payload(payload), ensure_ascii=False, separators=(",", ":")))
+
+
+def _settle_batch_returned(payload: Dict[str, Any]) -> int:
+    """data.truncated.returned_chars 를 묶음 응답 최종 wire 길이로 맞추고(고정점) 그 길이를 돌려준다(WS-78 NB4)."""
+    trunc = (payload.get("data") or {}).get("truncated")
+    size = _wire_len(payload)
+    if not isinstance(trunc, dict) or "returned_chars" not in trunc:
+        return size
+    for _ in range(5):
+        if trunc["returned_chars"] == size:
+            break
+        trunc["returned_chars"] = size
+        size = _wire_len(payload)
+    return size
+
+
 def norm(text: Any) -> str:
     """이름·표제 비교 정규화: NFKC + 공백 묶기 + 앞뒤 정리(대소문자 유지, 부분 일치 없음)."""
     return " ".join(unicodedata.normalize("NFKC", str(text or "")).split())
@@ -364,14 +385,17 @@ class BatchMixin:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": "묶음 실행은 최상위 문서에서만 됩니다(프레임 안이면 switch_frame to_main 뒤 다시)."}
         payload = await self._run_batch(steps, observe_args)
-        data = payload.get("data")
+        self._batch_injection(payload.get("data"))
+        return payload
+
+    def _batch_injection(self, data: Any) -> None:
+        """묶음 응답 data 에 주입 신호(관찰이 이미 실었으면 그대로)."""
         if isinstance(data, dict) and "injection_suspected" not in data:
             from security.injection_signal import injection_signal
 
             signal = injection_signal(data, None, 10 * self.max_result_chars)
             if signal is not None:
                 data["injection_suspected"] = signal
-        return payload
 
     # -- 실행 루프 -------------------------------------------------------------
 
@@ -465,14 +489,11 @@ class BatchMixin:
                 data: Dict[str, Any] = {"batch": info}
                 if stop.step_result is not None:
                     data["step_result"] = stop.step_result
-                data.update(await self._batch_observation(observe_args))
-                data["next"] = NEXT
-                return {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}", "data": data}
+                return await self._batch_respond(
+                    {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}"}, data, observe_args)
             data = {"batch": {"ran": total, "of": total, "stopped_at": None, "reason": None, "detail": None, "steps": steps_out,
                               "ms": round((time.monotonic() - started) * 1000, 1)}}
-            data.update(await self._batch_observation(observe_args))
-            data["next"] = NEXT
-            return {"success": True, "data": data}
+            return await self._batch_respond({"success": True}, data, observe_args)
         finally:
             watch.close()  # 어떤 출구(취소 포함)에서도 구독을 뗀다
 
@@ -513,12 +534,40 @@ class BatchMixin:
             raise _Stop("target_unverifiable")
         return {"epoch": int(res.snapshot_epoch), "elements": elements}
 
-    async def _batch_observation(self, observe_args: Dict[str, Any]) -> Dict[str, Any]:
-        """응답에 싣는 현재 관찰 — 일반 observe_page 경로(같은 신호·같은 크기 상한), 인자는 에이전트가 고른 것."""
+    async def _batch_respond(self, head: Dict[str, Any], meta: Dict[str, Any],
+                             observe_args: Dict[str, Any]) -> Dict[str, Any]:
+        """묶음 응답을 만든다(WS-78 T3, #200) — 최종 wire(가린 뒤, 주입 신호 포함)가 설정 상한 이하가 되게.
+
+        방식 (a): 바깥 메타(batch·step_result·next·성공/오류 문구)를 먼저 가린 직렬화로 재서 안쪽 관찰의 실효 예산을
+        그만큼 미리 줄인다(WS-68 max_chars/limit 이중 인자 그대로 — 가린 뒤 자름(WS-75)·요약 재구성(WS-74) 순서 불변).
+        그래도 넘으면(바깥 주입 신호·가림 길이 차이 등) 넘은 만큼 더 줄여 관찰을 다시 만든다(최대 3번). 사후에 자르지
+        않는다. data.truncated.returned_chars 는 이 묶음 응답의 최종 wire 길이(NB4).
+        """
+        limit = int(self.max_result_chars)
+        bare = dict(head, data=dict(meta, next=NEXT))
+        reserve = _wire_len(bare)
+        payload: Dict[str, Any] = bare
+        for _ in range(3):
+            data = dict(meta)
+            data.update(await self._batch_observation(observe_args, reserve))
+            data["next"] = NEXT
+            self._batch_injection(data)
+            payload = dict(head, data=data)
+            size = _settle_batch_returned(payload)
+            if size <= limit:
+                break
+            reserve += size - limit
+        return payload
+
+    async def _batch_observation(self, observe_args: Dict[str, Any], reserve: int = 0) -> Dict[str, Any]:
+        """응답에 싣는 현재 관찰 — 일반 observe_page 경로(같은 신호·같은 크기 상한), 인자는 에이전트가 고른 것.
+
+        reserve(WS-78 T3): 바깥 묶음 봉투가 쓸 글자 수 — 안쪽 관찰의 실효 예산에서 미리 뺀다(call_tool 이 읽음).
+        """
         from interface.server_envelope import envelope_dict
         from recipes.store import clean_text
 
-        token = _INTERNAL.set({})
+        token = _INTERNAL.set({"reserve": max(0, int(reserve))})
         try:
             res = await self.call_tool(_observe_tool(), dict(observe_args))
         except Exception as exc:  # noqa: BLE001 - 관찰 실패로 묶음 응답을 망치지 않는다
