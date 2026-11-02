@@ -37,6 +37,8 @@ NEXT_OBSERVE = ("browser_observe_page 로 다시 관찰해 결과(로그인·해
 BANNER_NOT_BUTTON = "(이 띠의 ▶·⤼ 버튼 아님 — 누르면 띠 아래 페이지가 눌립니다)"
 #: 탭 origin 변화 보고 상한(개).
 MAX_ORIGINS = 5
+#: 감시 태스크가 처리 중인 인계 종료(로그인 기록·창 닫기)의 기록을 wait/status 가 기다리는 상한(초).
+HANDOFF_END_WAIT_S = 10.0
 
 
 def _origins(urls: List[str]) -> List[str]:
@@ -178,6 +180,33 @@ class ControlWindowMixin:
         self._control_recreated = None
         self._control_gave_up = None
         self._request_origins = self._tab_origins_now()
+        self._settle_handoff_end()
+
+    def _begin_handoff_end(self) -> None:
+        """WS-77 후속: hub 가 인계를 끝낸(반납·만료) **그 동기 구간에서** 부른다 — 기록(_note_handoff_end)까지
+        await 가 끼는 동안 들어온 wait/status 가 '끝난 인계 없음' 으로 빠지지 않고 기록을 기다리게."""
+        fut = self._handoff_ending
+        if fut is None or fut.done():
+            try:
+                self._handoff_ending = asyncio.get_running_loop().create_future()
+            except RuntimeError:
+                self._handoff_ending = None
+
+    def _settle_handoff_end(self) -> None:
+        """진행 중 종료 표시를 푼다(기록했거나 기록 경로가 실패로 끝남 — 기다리는 쪽이 멈추지 않게)."""
+        fut, self._handoff_ending = self._handoff_ending, None
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+
+    async def _await_handoff_end(self, timeout: float = HANDOFF_END_WAIT_S) -> None:
+        """감시 태스크가 처리 중인 인계 종료가 있으면 기록될 때까지(상한 timeout) 기다린다."""
+        fut = self._handoff_ending
+        if fut is None or fut.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("인계 종료 기록 대기 시간 초과 — 지금 상태로 응답합니다")
 
     def _note_handoff_end(self, event: str) -> None:
         """인계가 끝났다(released|request_expired) — 다음 wait/status 응답에 그 신호를 싣는다."""
@@ -193,6 +222,7 @@ class ControlWindowMixin:
             "ended_at": _iso(time.time()),
         }
         self._handoff_end_unreported = True
+        self._settle_handoff_end()
 
     # -- 창 ----------------------------------------------------------------
 

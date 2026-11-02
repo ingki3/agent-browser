@@ -255,6 +255,7 @@ class WindowMixin:
                 # 사람이 take 하지 않았다 — 요청을 거두고 창도 닫는다.
                 w.opened_for_request = None
                 self.hub.cancel_request()
+                self._begin_handoff_end()  # WS-77 후속: 만료를 기록하기 전 await 동안 들어온 wait 도 만료를 듣게
                 w.notice = {"reason": "request_expired",
                             "hint": "사람이 조작권을 가져가지 않아 요청을 거두고 창을 닫았습니다."}
                 _stderr_line("agent-browser serve: 조작권 요청 만료 — 창을 닫습니다")
@@ -265,6 +266,7 @@ class WindowMixin:
                     await self._login_watch_finish()
                 finally:
                     self._release_gate()
+                    self._settle_handoff_end()  # 바로 아래 기록과 사이에 await 없음 — 예외 때만 의미가 있다
                 self._note_handoff_end("request_expired")
                 await self._close_control_window()
                 if not w.keep_window_after_release():

@@ -102,6 +102,7 @@ class ToolsMixin:
         await self._poll_handoff()
         short = name[len(TOOL_PREFIX):]
         if short == "control_status":
+            await self._await_handoff_end()  # WS-77 후속: 감시 태스크가 처리 중인 반납·만료는 기록된 뒤에 보여 준다
             data: Dict[str, Any] = {"control": self.hub.status()}
             data["control"].pop("window", None)
             if self.profile is not None:
