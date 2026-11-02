@@ -1101,6 +1101,8 @@ _KEY_FIELD_JS = (
     "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
     "v: typeof n.value === 'string' ? n.value : ''} : null"
 )
+#: WS-78 T1: 포커스 노드 판정·키 뒤 값 읽기의 상한(초) — 문서 이동 중이면 평가가 이동 끝까지 멈출 수 있다(실측).
+_KEY_FIELD_TIMEOUT_S = 0.3
 #: WS-78 T1 B4: 민감 칸으로 간 키 뒤 그 칸 값을 읽지 못했다(문서 이동 등) — 키 전 값만 등록했다는 고정 신호(값 없음).
 SENSITIVE_VALUE_UNREAD = "민감 칸 키 입력 뒤 칸 값을 읽지 못해 키 전 값까지만 가림 대상으로 등록했습니다."
 
@@ -3961,19 +3963,22 @@ class ActionDispatcher:
     async def _key_field_before(self, top: Any) -> Tuple[Any, bool, str]:
         """WS-78 T1 B2: 키 **전** 포커스 노드를 잡아 민감 여부·현재 값을 본다. 반환 (노드 핸들|None, 민감, 값).
 
-        판정 불가(포커스 없음·다른 출처 iframe 'opaque'·닫힌 shadow·평가 실패)는 (None, False, "") — 한계로 문서화
-        (docs/security.md). 노드 핸들은 키 뒤 **그 노드**의 값을 읽는 데 쓴다(Tab 으로 포커스가 옮겨도 같은 노드).
+        판정 불가(포커스 없음·다른 출처 iframe 'opaque'·닫힌 shadow·평가 실패·상한 초과)는 (None, False, "") — 한계로
+        문서화(docs/security.md). 노드 핸들은 키 뒤 **그 노드**의 값을 읽는 데 쓴다(Tab 으로 포커스가 옮겨도 같은 노드).
         """
         try:
-            node = await top.evaluate_handle(_FOCUS_NODE_JS)
-        except Exception:  # noqa: BLE001 — 판정 불가
+            return await asyncio.wait_for(self._key_field_judge(top), _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 판정 불가(앞 이동이 진행 중이면 평가가 이동 끝까지 멈출 수 있다)
             return None, False, ""
+
+    async def _key_field_judge(self, top: Any) -> Tuple[Any, bool, str]:
+        node = await top.evaluate_handle(_FOCUS_NODE_JS)
         try:
             info = await node.evaluate(_KEY_FIELD_JS)
         except Exception:  # noqa: BLE001
             info = None
         if not isinstance(info, dict):
-            await self._dispose_quiet(node)
+            self._dispose_later(node)
             return None, False, ""
         sensitive = bool(info.get("s"))
         sticky = getattr(self, "_sticky_key_node", None)
@@ -3986,33 +3991,53 @@ class ActionDispatcher:
         return node, sensitive, str(info.get("v") or "")
 
     @staticmethod
-    async def _dispose_quiet(node: Any) -> None:
+    def _dispose_later(node: Any) -> None:
+        """핸들을 놓아 준다 — 기다리지 않는다(문서 이동 중이면 해제 왕복도 이동 끝까지 멈출 수 있다)."""
+        async def _go() -> None:
+            try:
+                await asyncio.wait_for(node.dispose(), _KEY_FIELD_TIMEOUT_S)
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
-            await node.dispose()
+            asyncio.get_running_loop().create_task(_go())
         except Exception:  # noqa: BLE001
             pass
 
-    async def _key_field_after(self, node: Any, sensitive: bool, before: str, data: Dict[str, Any]) -> None:
-        """WS-78 T1 B2~B4: 키 **뒤** 그 노드의 값을 읽어, 키 전·키 뒤 어느 쪽이든 민감이면(sticky·OR) 칸 전체 값을
-        자격증명 등급으로 등록한다. 누적 값을 매번 통째로 등록하고 앞서 등록한 접두는 그대로 둔다(B3, 지우는 API 없음).
-        민감인데 키 뒤 값을 못 읽으면 키 전 값만 등록하고 data 에 고정 신호(B4, 값 없음). 일반 칸은 아무것도 붙이지 않는다.
-        """
-        after: Optional[str] = None
+    @staticmethod
+    async def _key_field_read(node: Any) -> Optional[Dict[str, Any]]:
+        """키 뒤 그 노드의 {s, v}. 못 읽으면 None(문서 이동·노드 소멸)."""
         try:
             info = await node.evaluate(_KEY_FIELD_JS)
-            if isinstance(info, dict):
-                sensitive = sensitive or bool(info.get("s"))
-                after = str(info.get("v") or "")
-        except Exception:  # noqa: BLE001 — 문서 이동·노드 소멸
-            after = None
+        except Exception:  # noqa: BLE001
+            return None
+        return info if isinstance(info, dict) else None
+
+    async def _key_field_after(self, node: Any, sensitive: bool, before: str, data: Dict[str, Any],
+                               pending: Any = None) -> None:
+        """WS-78 T1 B2~B4: 키 **뒤** 그 노드의 값을 읽어, 키 전·키 뒤 어느 쪽이든 민감이면(sticky·OR) 칸 전체 값을
+        자격증명 등급으로 등록한다. 누적 값을 매번 통째로 등록하고 앞서 등록한 접두는 그대로 둔다(B3, 지우는 API 없음).
+        민감인데 키 뒤 값을 못 읽으면(상한 안에 못 읽음 포함) 키 전 값만 등록하고 data 에 고정 신호(B4, 값 없음).
+        일반 칸은 아무것도 붙이지 않는다. pending: 키 직후 시작해 둔 읽기(이동 대기와 겹쳐 돈다).
+        """
+        if pending is None:
+            pending = asyncio.ensure_future(self._key_field_read(node))
+        try:
+            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — Enter 제출 직후 평가가 새 문서 도착까지 멈추는 경우(실측) 등
+            info = None
+        after: Optional[str] = None
+        if info is not None:
+            sensitive = sensitive or bool(info.get("s"))
+            after = str(info.get("v") or "")
         self.last_key_sensitive = sensitive
         if sensitive and after is not None:
             # 이 노드를 다음 키의 sticky 기준으로 둔다(앞 기준 노드는 놓아 준다).
             old, self._sticky_key_node = getattr(self, "_sticky_key_node", None), node
             if old is not None and old is not node:
-                await self._dispose_quiet(old)
+                self._dispose_later(old)
         else:
-            await self._dispose_quiet(node)
+            self._dispose_later(node)
         if not sensitive:
             return
         from security.secret_registry import register_secret_values
@@ -4047,7 +4072,7 @@ class ActionDispatcher:
             if watch is not None:
                 watch.close()
             if node is not None:
-                await self._dispose_quiet(node)
+                self._dispose_later(node)
             return refused
         try:
             await top.keyboard.press(key)
@@ -4064,13 +4089,15 @@ class ActionDispatcher:
                 error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
             )
         data: Dict[str, Any] = {"key": key}
-        if node is not None:
-            # 키 뒤 곧바로(이동 대기 전에) 그 노드 값을 읽는다 — Enter 제출로 문서가 바뀌기 전에 읽을 가능성이 크다.
-            await self._key_field_after(node, sensitive, before, data)
+        # 키 뒤 곧바로 그 노드 값 읽기를 시작하고 이동 대기와 겹쳐 돌린다 — Enter 제출 직후의 평가는 새 문서가 올
+        # 때까지 멈출 수 있어(실측) 기다리지 않고, 대기가 끝난 뒤 짧은 상한 안에서만 결과를 받는다.
+        pending = asyncio.ensure_future(self._key_field_read(node)) if node is not None else None
         # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
         # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
         if watch is not None:
             self._nav_info = await watch.settle()
+        if node is not None:
+            await self._key_field_after(node, sensitive, before, data, pending)
         return self._result(
             success=True, action=action, retry_safe=False, data=data
         )

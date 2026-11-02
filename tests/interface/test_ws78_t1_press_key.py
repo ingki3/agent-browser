@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -240,3 +241,31 @@ async def test_unread_after_key_fail_closed():
     assert "SYNTHbeforeEnter78" not in json.dumps(data, ensure_ascii=False)
     assert disp.last_key_sensitive is True
     assert secret_registry.REGISTRY.mask("x SYNTHbeforeEnter78 y") != "x SYNTHbeforeEnter78 y"
+
+
+class _HangNode:
+    """Enter 제출 직후처럼 평가가 새 문서 도착까지 멈추는 노드(실측: 응답 3초 지연 폼에서 5회 중 1회)."""
+
+    async def evaluate(self, *a, **k):
+        await asyncio.sleep(30)
+
+    async def dispose(self):
+        await asyncio.sleep(30)
+
+
+@pytest.mark.parametrize("sensitive", [True, False])
+async def test_hanging_read_is_bounded(sensitive):
+    """키 뒤 읽기·핸들 해제가 멈춰도 상한(_KEY_FIELD_TIMEOUT_S) 안에 끝난다 — 민감이면 fail-closed 신호, 일반 칸은 그대로."""
+    import time
+
+    from actions.dispatcher import _KEY_FIELD_TIMEOUT_S, ActionDispatcher
+
+    disp = ActionDispatcher.__new__(ActionDispatcher)
+    data: dict = {"key": "Enter"}
+    t0 = time.perf_counter()
+    await disp._key_field_after(_HangNode(), sensitive, "SYNTHhangBefore78", data)
+    assert time.perf_counter() - t0 < _KEY_FIELD_TIMEOUT_S + 0.5
+    if sensitive:
+        assert data["sensitive_input"]["value_read"] is False
+    else:
+        assert data == {"key": "Enter"} and len(secret_registry.REGISTRY) == 0
