@@ -50,6 +50,8 @@ DEFAULT_STATE_ROOT = Path.home() / ".agent-browser" / "servers"
 
 #: 승인 증표 기본 수명(초) — OpenBot 행동 제안과 같은 30분.
 DEFAULT_APPROVAL_TTL_S = 30 * 60
+#: WS-77: 제어 창 [다 했어요] 대기 사건 큐 길이(최근 것만).
+WINDOW_DONE_QUEUE = 8
 #: browser_control_wait / browser_approval_wait 의 timeout_s 상한·기본(초).
 WAIT_MAX_S = 120.0
 WAIT_DEFAULT_S = 60.0
@@ -420,6 +422,11 @@ class HandoffHub:
         self.login: Optional[LoginJob] = None
         self._finished_logins: Dict[str, None] = {}
         self.site_jobs: List[str] = []
+        #: WS-77 B4: 제어 창 [다 했어요] 대기 사건(그 창의 request_id) — poll() 이 기존 반납 흐름으로 처리한다.
+        #: 바인딩 콜백은 여기 넣기만 하고 상태를 직접 바꾸지 않는다. 최근 WINDOW_DONE_QUEUE 개만 둔다.
+        self._window_done: List[str] = []
+        #: 마지막 반납의 출처(window_done|cli|login_finish|window_closed|server) — 응답에 싣는다.
+        self.release_source: Optional[str] = None
 
     # -- 수명주기 ------------------------------------------------------------
 
@@ -513,10 +520,11 @@ class HandoffHub:
         self._changed(event)
         return True
 
-    def release_by_server(self) -> None:
+    def release_by_server(self, release_source: str = "server") -> None:
         """서버가 조작권을 에이전트에게 돌린다(WS-34: 사람이 창을 직접 닫음 = 창이 없음).
 
         사람의 release 와 같은 상태로 만든다(비밀 입력 보호도 해제 — 비밀을 넣을 창이 없다)."""
+        self.release_source = release_source
         self._clear_login()
         self.holder = HOLDER_AGENT
         self.requested = False
@@ -533,6 +541,23 @@ class HandoffHub:
             self._finished_logins.pop(next(iter(self._finished_logins)))
         if job.status != "ready":
             self._ack(job.nonce, False, "로그인 창 요청 취소/시간 만료")
+
+    def queue_window_done(self, request_id: Any) -> None:
+        """WS-77: 제어 창이 검증한 [다 했어요] 를 대기 사건으로 둔다(처리는 poll). 형식이 아니면 버린다."""
+        if not isinstance(request_id, str) or not _ID_RE.fullmatch(request_id):
+            return
+        self._window_done.append(request_id)
+        del self._window_done[:-WINDOW_DONE_QUEUE]
+
+    def _take_window_done(self) -> Optional[str]:
+        """대기 사건 중 지금 요청(또는 사람이 쥔 조작권)의 것이 있으면 반납한다 — 사건 이름 또는 None."""
+        queued, self._window_done = self._window_done, []
+        rid = self.request_id
+        live = self.requested or self.holder == HOLDER_HUMAN
+        if not live or not rid or not any(secrets.compare_digest(q, rid) for q in queued):
+            return None
+        self.release_by_server(release_source="window_done")
+        return "released"
 
     def how_to_respond(self) -> str:
         sid = self.server_id
@@ -862,6 +887,10 @@ class HandoffHub:
             _, _, event = self._apply({"op": "login_finish", "login_id": self.login.login_id})
             if event:
                 events.append(event)
+        if self._window_done:
+            event = self._take_window_done()
+            if event:
+                events.append(event)
         for name in sorted(names):
             m = _CMD_RE.match(name)
             if not m:
@@ -949,7 +978,7 @@ class HandoffHub:
                 return True, "이미 반납했습니다.", None
             self._clear_login()
             if self.holder == HOLDER_HUMAN:
-                self.release_by_server()
+                self.release_by_server(release_source="login_finish")
                 return True, "로그인 조작권 반납", "released"
             self._write_control()
             return True, "로그인 요청 취소", None
@@ -960,7 +989,7 @@ class HandoffHub:
             self._changed("taken")
             return True, "조작권을 사람이 가져갔습니다. 해결 뒤 release 하세요.", "taken"
         if op == "release":
-            self.release_by_server()
+            self.release_by_server(release_source="cli")
             return True, "조작권을 에이전트에게 돌려줬습니다.", "released"
         if op == "done":
             # WS-64: 상태(holder·requested·secret_wanted·version)를 바꾸지 않는다 — 에이전트에게 '다시 관찰' 신호만.

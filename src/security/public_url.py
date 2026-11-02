@@ -693,7 +693,9 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "status": frozenset(_APPROVAL_STATUS + ("opening", "ready")),  # + server_handoff LoginJob.status
     "state": frozenset({"headless", "headed", "switching", "failed",  # on_demand.WindowState·server_window
                         "logged_in", "login_form", "captcha",  # browser.login_flow.LoginState
-                        "succeeded"}),  # browser.headless_retry states
+                        "succeeded",  # browser.headless_retry states
+                        # WS-77 data.human_handoff.state(server_control·server_handoff)
+                        "waiting_human", "human_holding", "released", "request_expired", "no_window"}),
     "holder": frozenset({"agent", "human"}),  # handoff.HOLDER_AGENT·HOLDER_HUMAN
     "reason": frozenset(_REPLAY_STOP + _BATCH_STOP + _PDF_REASONS + _YOUTUBE_REASONS + (
         "headless_ua_blocked",  # server_signals identity
@@ -732,7 +734,12 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     # server_handoff._control_wait + WS-64 직접 조작 인계 결과(security.manual_sites OUTCOMES). cancelled 는 쓰지 않는다 —
     # 사용자가 그만두면 done(사람 CLI) 또는 expired(15분)로 끝난다.
     "changed": frozenset({"none_pending", "released", "taken", "timeout",
-                          "clicked", "page_changed", "done", "expired"}),
+                          "clicked", "page_changed", "done", "expired",
+                          "request_expired"}),  # WS-77: on-demand 요청 만료도 control_wait 가 바로 알린다
+    # WS-77 data.human_handoff — 제어 창 상태·사람 활동 관측 신호(login_watch ACTIVITY_*)·반납 출처(handoff.release_source)
+    "control_window": frozenset({"open", "opening", "unavailable", "none"}),
+    "human_activity_seen": frozenset({"seen", "not_seen", "unknown"}),
+    "release_source": frozenset({"window_done", "cli", "login_finish", "window_closed", "server"}),
     # actions.dispatcher _NavWatch.aborted → data.nav_aborted (R6 — f"status_{status}" 는 _NO_DOCUMENT_STATUS 204·205)
     "nav_aborted": frozenset({"download", "request_failed", "status_204", "status_205"}),
     # WS-69 actions.dispatcher navigate 부분 성공 data.load_state.reached(2단계 대기 전 확정된 상태)
