@@ -261,11 +261,15 @@ async def test_masked_url_navigate_is_refused_without_request(site, mode):
 
 
 @requires_chromium
-async def test_extract_href_keeps_raw_url(site):
+async def test_extract_href_masks_only_the_known_token(site):
+    """WS-75(#199, 결정 B): 예전에는 extract href 를 원문 그대로 냈다(내용 경로 원문 보존). 이제 도구가 이동으로 **본** 토큰은
+    내용 경로에서도 가리고, 주소의 나머지(경로·모르는 값 `date=`)는 원문이다 — 가린 href 는 navigate 가 거부하므로 관찰의
+    element_id 로 click 해 따라간다."""
     async with BrowserMCPServer() as s:
         call = Wire(s)
         assert (await call("browser_navigate", {"url": site.camp}))["success"]
         ex = await call("browser_extract", {"selector": "#next", "attributes": ["href"]})
         assert ex["success"], ex
-        assert JWT in json.dumps(ex["data"]["items"], ensure_ascii=False)
+        assert JWT not in json.dumps(ex, ensure_ascii=False)
+        assert ex["data"]["items"]["href"] == "/camp?gateToken=[REDACTED]&date=2026-10-17"
         assert JWT not in ex["current_url"]

@@ -511,6 +511,38 @@ function gateSignals(el) {
   } catch (e) { /* 판정 못 하면 링크 완화 없음 */ }
   const link = el.closest ? el.closest('a[href]') : null;
   if (link) push('href', link.getAttribute('href'));
+  // WS-76 R1: 판정 보조 사실(META — 키워드 매칭 안 함). role = 명시 role 첫 토큰 또는 암묵 역할(button·link),
+  // tab_context = 탭·탭 목록 안 또는 aria-selected/aria-controls(상태 필터 탭 — 탐색), edit_context = 텍스트
+  // 입력칸 옆(같은 label·이웃 형제 2칸·aria-controls 대상 — 검색어 지우기). 못 읽으면 내보내지 않는다(= 예외 없음).
+  try {
+    const explicitRole = ((el.getAttribute('role') || '').trim().toLowerCase().split(/\\s+/)[0]) || '';
+    let implicitRole = '';
+    if (tag === 'BUTTON' || (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].indexOf(type) !== -1)) implicitRole = 'button';
+    else if (tag === 'A' && el.hasAttribute('href')) implicitRole = 'link';
+    push('role', explicitRole || implicitRole);
+    if ((explicitRole === 'tab') || el.hasAttribute('aria-selected') || el.hasAttribute('aria-controls')
+        || (el.closest && el.closest('[role="tab"], [role="tablist"]'))) {
+      push('tab_context', '1');
+    }
+    const TEXT_TYPES = ['', 'text', 'search', 'email', 'url', 'tel'];
+    const isText = (n) => !!n && n.nodeType === 1 && ((n.tagName === 'INPUT'
+        && TEXT_TYPES.indexOf((n.getAttribute('type') || '').trim().toLowerCase()) !== -1)
+      || n.tagName === 'TEXTAREA' || n.isContentEditable);
+    const holdsText = (n) => !!n && n.nodeType === 1 && n !== el && !n.contains(el)
+      && (isText(n) || !!Array.prototype.find.call(n.querySelectorAll('input, textarea, [contenteditable]'), isText));
+    let edit = false;
+    const lab = el.closest ? el.closest('label') : null;
+    if (lab && Array.prototype.find.call(lab.querySelectorAll('input, textarea, [contenteditable]'), isText)) edit = true;
+    let sib = el.previousElementSibling;
+    for (let k = 0; !edit && sib && k < 2; k++, sib = sib.previousElementSibling) if (holdsText(sib)) edit = true;
+    sib = el.nextElementSibling;
+    for (let k = 0; !edit && sib && k < 2; k++, sib = sib.nextElementSibling) if (holdsText(sib)) edit = true;
+    const ctl = el.getAttribute('aria-controls');
+    if (!edit && ctl) {
+      for (const id of ctl.trim().split(/\\s+/)) { if (isText(el.ownerDocument.getElementById(id))) edit = true; }
+    }
+    if (edit) push('edit_context', '1');
+  } catch (e) { /* 판정 보조 사실 없음 = 예외 없음(fail-closed) */ }
   const submitter = (tag === 'BUTTON' && (type === '' || type === 'submit'))
     || (tag === 'INPUT' && (type === 'submit' || type === 'image'));
   if (submitter && el.form) {

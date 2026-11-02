@@ -30,6 +30,8 @@ class ToolsMixin:
     #: WS-52 R2: the passive reads a running settle tail survives (only as the sole call in flight).
     _TAIL_PASSIVE_ACTIONS = frozenset({ActionType.OBSERVE_PAGE, ActionType.EXTRACT, ActionType.TAKE_SCREENSHOT,
                                        ActionType.WAIT_FOR})
+    #: WS-75: 가린 사본(③)을 만든 뒤 레지스트리 version 이 바뀌었을 때 원본에서 다시 만드는 최대 횟수(첫 시도 포함).
+    _MASK_ATTEMPTS = 3
 
     def tool_entry(self, name: str) -> Any:
         """WS-52 도구 시작 장벽 — 모든 도구 진입점이 await 전에 동기적으로 든다(with).
@@ -278,7 +280,12 @@ class ToolsMixin:
             # 보고까지 붙인 최종 직렬화 크기가 상한을 넘지 않게 한다(보고가 없으면 0 — 기존과 같은 바이트).
             max_chars = self.max_result_chars - self._window_notice_chars(result)
             from interface.server_batch import batch_internal
+            from security import secret_registry
+            from security.public_url import content_masked, content_view, register_url_fields
 
+            # WS-75 ①: 결과 객체의 주소 칸(내용 경로 밖)을 크기 자르기 **전에** 직접 순회해 등록한다 — 가린 사본(③)이
+            # 같은 응답의 주소 비밀까지 알고 만들어지게(직렬화 때만 등록하면 자른 뒤에야 알게 된다).
+            register_url_fields({name: getattr(result, name) for name in type(result).model_fields})
             sink = batch_internal()
             if sink is not None and action is ActionType.OBSERVE_PAGE and result.success:
                 # WS-73: 묶음의 대상 해석은 자르기 전 전체 후보로 센다(같은 관찰의 id·role·이름 — 핸들은 엔진에).
@@ -286,28 +293,35 @@ class ToolsMixin:
                 if isinstance(obs, dict) and isinstance(obs.get("elements"), list):
                     sink["elements"] = [{"element_id": e.get("element_id"), "role": e.get("role"),
                                          "name": e.get("name")} for e in obs["elements"] if isinstance(e, dict)]
-            if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
-                from recipes.saved_pages import fit_saved_pages
+            # WS-75 ③~⑤: 내용 경로(관찰 요소·요약·반복 묶음·extract 항목)를 지금 레지스트리로 **한 번** 가린 사본으로 바꾼 뒤
+            # 크기 맞춤(④)을 그 사본 위에서 한다 — 글자 자르기는 늘 가린 글자를 자른다(B1), 반복 직렬화는 다시 훑지 않는다(B2).
+            # 사본을 만든 뒤 version 이 바뀌면(새 값 등록) **자르기 전 원본에서** ③부터 다시(NB-h).
+            original = result.data
+            version = secret_registry.version()
+            for _ in range(self._MASK_ATTEMPTS):
+                version = secret_registry.version()
+                result.data = content_view(original)
+                with content_masked(version):
+                    self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+                if secret_registry.version() == version:
+                    break
+            with content_masked(version):
+                self._attach_window_notices(result)
+                settle_returned_chars(result)
+            if secret_registry.version() != version:
+                # R4 S1: 그래도 바뀜 — 마지막 재시도도 **자르기 전 원본에서** 지금 레지스트리로 가린 뒤 자른다(자른 사본에
+                # 가림을 덧대면 서버가 자른 등록 값 앞부분이 남는다). 이미 실은 창 보고(data.window)는 옮겨 싣는다.
+                window = result.data.get("window") if isinstance(result.data, dict) else None
+                version = secret_registry.version()
+                result.data = content_view(original)
+                with content_masked(version):
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                if secret_registry.version() != version:
+                    # 끝까지 흔들림(fail-closed — 누출보다 생략): 내용 칸의 페이지 글자를 고정 문구로 바꾼 원본에서 자른다.
+                    from security.public_url import content_withheld
 
-                # WS-61: 기억한 페이지 후보가 크기 상한에서 페이지 요소를 밀어내지 않게 — 넘으면 후보를 뺀다.
-                # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
-                fit_saved_pages(result, max_chars,
-                                finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
-            if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
-                from perception.repeated import fit_repeated
-
-                # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
-                # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
-                fit_repeated(result, max_chars,
-                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
-                             limit=self.max_result_chars)
-
-            attach_injection_signal(result, max_scan_chars=scan_chars)
-            # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
-            # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
-            cap_result_size(result, max_chars, limit=self.max_result_chars)
-            self._attach_window_notices(result)
-            settle_returned_chars(result)
+                    result.data = content_withheld(original)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             return result
@@ -320,6 +334,38 @@ class ToolsMixin:
                 self._inflight -= 1
                 if capture:
                     self._captures_inflight -= 1
+
+    def _fit_result(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
+                    attach_injection_signal: Any) -> None:
+        """크기 맞춤(WS-75 ④ — 가린 사본 위에서): saved_pages → 반복 묶음 → 주입 신호 → 항목 경계 자르기."""
+        if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
+            from recipes.saved_pages import fit_saved_pages
+
+            # WS-61: 기억한 페이지 후보가 크기 상한에서 페이지 요소를 밀어내지 않게 — 넘으면 후보를 뺀다.
+            # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
+            fit_saved_pages(result, max_chars,
+                            finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+        if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
+            from perception.repeated import fit_repeated
+
+            # WS-62: 반복 묶음은 saved_pages 다음(먼저 saved_pages 를 뺀다). 요소를 다 잘라도 최종(주입 신호 포함)이
+            # 상한을 넘을 때만 우선순위 낮은 묶음부터 통째로 뺀다 — 묶음은 조작 정확성용이라 요소보다 먼저 유지.
+            fit_repeated(result, max_chars,
+                         finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                         limit=self.max_result_chars)
+
+        attach_injection_signal(result, max_scan_chars=scan_chars)
+        # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
+        # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
+        cap_result_size(result, max_chars, limit=self.max_result_chars)
+
+    def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
+               attach_injection_signal: Any, window: Any) -> None:
+        """R4 S1 마지막 재시도: 원본에서 새로 만든 사본을 크기 맞춤하고, 이미 소비한 창 보고를 옮겨 싣고 길이를 맞춘다."""
+        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+        if window is not None and isinstance(result.data, dict):
+            result.data["window"] = window
+        settle_returned_chars(result)
 
     def _attach_window_notices(self, result: ActionResult) -> None:
         """아직 알리지 않은 창 전환·복구 보고를 결과에 싣는다(1회 소비)."""

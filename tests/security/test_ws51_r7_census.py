@@ -283,7 +283,10 @@ def test_r7_control_value_survives_registration(fresh_registry, key, value):
     """생산 값(어휘 전부)을 강제 등록해도 응답 wire 의 제어 칸 값은 원래와 같고, 자유 문장 칸(note)에서는 가린다."""
     maskable = _force_register(value)
     out = _wire({key: value, "nested": {key: value}, "items": [{key: value}], "note": f"about {value} here"})
-    assert out[key] == value and out["nested"][key] == value and out["items"][0][key] == value
+    assert out[key] == value and out["nested"][key] == value
+    # WS-75(#199): data.items 는 페이지 내용(extract 속성 이름 = 칸 이름)이라 제어 칸이 아니다 — 등록 값이면 가린다
+    # (예전에는 내용 경로 원문 보존이라 그대로였다).
+    assert out["items"][0][key] == (R if maskable else value)
     if maskable:
         assert value not in out["note"] and R in out["note"]
 

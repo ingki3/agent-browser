@@ -377,19 +377,22 @@ def test_b4_recipe_id_format_matches_producer():
 # ------------------------------------------------------------------ 허용 한계 — '현재 동작 고정'(계획 §1.2·§1.6, 2026-10-17)
 
 
-def test_limit_page_content_subtree_kept_verbatim():
-    """페이지 내용 subtree(extract data.items·관찰 elements·axtree_summary)는 원문 보존 계약 — 범위 밖(§1.2). 같은 응답의
-    제목·오류 문구는 가린다. 이 동작이 바뀌면(내용까지 가리거나 제목을 안 가리면) 이 테스트가 바뀐다."""
+def test_limit_page_content_subtree_masks_only_known_secrets():
+    """페이지 내용 subtree(extract data.items·관찰 elements·axtree_summary)는 2026-10-17 원문 보존 계약이었다 — WS-75(#199,
+    사용자 결정 B 2026-10-31)로 좁혀 **도구가 아는 값**(레지스트리)만 등급 규칙으로 가리고 URL 문법·JWT 계층은 적용하지
+    않는다(모르는 값·주소 모양은 원문). 같은 응답의 제목·오류 문구는 예전대로 세 계층으로 가린다."""
     v = "SYNTHcontent88"
     sr.register_url("http://127.0.0.1/seen?token=" + v)
     assert len(sr.REGISTRY) == 1
-    items = [{"text": v, "href": "/a?token=" + v}]
+    unknown = "/b?token=SYNTHunknownValue99"  # 도구가 본 적 없는 값 — 내용 경로에서는 URL 문법으로 가리지 않는다
+    items = [{"text": v + " " + unknown, "href": "/a?token=" + v}]
     elements = [{"element_id": "@e1", "name": v}]
     payload = {"error_message": f"실패 {v}",
                "data": {"items": items, "observation": {"title": v, "elements": elements, "axtree_summary": v}}}
     out = public_payload(payload)
-    assert out["data"]["items"] == items and out["data"]["observation"]["elements"] == elements
-    assert out["data"]["observation"]["axtree_summary"] == v
+    assert out["data"]["items"] == [{"text": R + " " + unknown, "href": "/a?token=" + R}]
+    assert out["data"]["observation"]["elements"] == [{"element_id": "@e1", "name": R}]
+    assert out["data"]["observation"]["axtree_summary"] == R
     assert out["data"]["observation"]["title"] == R and out["error_message"] == f"실패 {R}"
 
 
