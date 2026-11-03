@@ -33,11 +33,26 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
+from playwright.async_api import ElementHandle as PlaywrightElementHandle
+from playwright.async_api import Locator as PlaywrightLocator
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from perception.engine import ElementHandle, PerceptionEngine
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 from security.secrets import KEY_PATTERN as SECRET_KEY_PATTERN
 
+from actions.covered_click import (
+    COVER_CORE_JS,
+    COVER_JUDGE_ALL_JS,
+    COVER_JUDGE_JS,
+    COVERED_CLICK_BUDGET_MS,
+    COVERED_MESSAGE,
+    COVERED_POINT_TIMEOUT_MS,
+    click_point_view,
+    covered_by_view,
+    is_pointer_intercept,
+    parse_judge,
+    public_error_text,
+)
 from actions.healing import (
     FailurePhase,
     HealingCandidate,
@@ -1215,6 +1230,41 @@ class _TargetRefused(Exception):
         self.result = result
 
 
+class _CoveredRefused(Exception):
+    """WS-79: 대상의 누를 자리가 모두 덮임(기존 대기 예산 뒤 재판정에서도) — 입력을 보내지 않았다. covered_by 는 고정 모양."""
+
+    def __init__(self, covered_by: Dict[str, Any]) -> None:
+        super().__init__("covered")
+        self.covered_by = covered_by
+
+
+#: WS-79 NB2: 이 호출에서 가운데 대신 덮이지 않은 대상 점을 썼다면 data.click_point(성공 때만 싣는다).
+_CLICK_POINT: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_click_point", default=None)
+
+
+def _with_click_point(data: Dict[str, Any]) -> Dict[str, Any]:
+    """성공 data 에 이 호출의 click_point(WS-79 — 다른 점을 썼을 때만)를 붙인다. 가운데 경로면 키를 더하지 않는다."""
+    point = _CLICK_POINT.get()
+    if point is not None:
+        data["click_point"] = point
+    return data
+
+
+def _actionable_point(why: Any) -> Optional[Dict[str, float]]:
+    """_ACTIONABLE_JS 의 'point:x:y'(WS-79) → Playwright position. 다른 값이면 None."""
+    if not isinstance(why, str) or not why.startswith("point:"):
+        return None
+    parts = why.split(":")
+    try:
+        px, py = float(parts[1]), float(parts[2])
+        checked = int(parts[3]) if len(parts) == 4 else 0
+    except (ValueError, IndexError):
+        return None
+    if len(parts) > 4 or not (abs(px) < 1e6 and abs(py) < 1e6):
+        return None
+    return {"x": px, "y": py, "checked": float(max(0, min(checked, 1000)))}
+
+
 @dataclass
 class _FrameCtx:
     """R4 B2: 관문을 입력 노드의 실제 소유 프레임으로 돌리는 판정 문맥(manual_site_hit 가 읽는 page·root_page 만)."""
@@ -1243,6 +1293,7 @@ _ACTIONABLE_KIND: Dict[ActionType, str] = {
 #: select(보임·활성). 보이는 영역 밖이면 그 문서(결속 확인 직후, 같은 평가 안)에서 즉시 스크롤한다.
 _ACTIONABLE_JS = r"""
 async (n, [d, kind, ms]) => {
+  __COVER__
   const end = performance.now() + ms;
   const frame = () => new Promise(r => { let done = false; const f = () => { if (!done) { done = true; r(); } };
     requestAnimationFrame(f); setTimeout(f, 50); });
@@ -1277,7 +1328,13 @@ async (n, [d, kind, ms]) => {
         for (let e = hit; e; e = e.parentNode || e.host) {
           if (e === target || e === el || (e.tagName === 'LABEL' && e.control === el)) { ok = true; break; }
         }
-        if (!ok) why = 'not hit target';
+        if (!ok) {
+          // WS-79: 가운데가 덮였으면 같은 평가 안에서 덮이지 않은 대상 점을 고른다(B3·B4 — 모달·중첩 조작부 제외).
+          // 그 점은 비 force 로 보낸다(Playwright hit 검사 — 덮개 클릭 0). 없으면 기다림 그대로.
+          const j = __ws79Judge(el);
+          if (j && j.s === 'point') return 'point:' + j.x + ':' + j.y + ':' + j.checked;
+          why = 'not hit target';
+        }
       }
     }
     if (why === 'ok') return 'ok';
@@ -1285,7 +1342,7 @@ async (n, [d, kind, ms]) => {
     await frame();
   }
 }
-"""
+""".replace("__COVER__", COVER_CORE_JS)
 
 #: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
 _POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
@@ -2300,7 +2357,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=is_retry_safe(action, FailurePhase.PRE_DISPATCH),
                 error_code=ErrorCode.PAGE_CRASHED,
-                error_message=f"{type(exc).__name__}: {exc}",
+                error_message=f"{type(exc).__name__}: {public_error_text(exc)}",  # WS-79 B8: 호출 기록 제외
             )
         if self.ctx.root_page is not None and action not in _TOP_RECORDER_KEEP_ACTIONS:
             # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
@@ -2896,10 +2953,10 @@ class ActionDispatcher:
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
                 downloaded_path=downloaded,
-                data={
+                data=_with_click_point({
                     "signals": [f"file_saved: {downloaded}"],
                     "element_id": handle.element_id,
-                },
+                }),
             )
 
         post = await self._element_post_condition(
@@ -2912,7 +2969,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
-                data={"signals": post.signals, "element_id": handle.element_id},
+                data=_with_click_point({"signals": post.signals, "element_id": handle.element_id}),
             )
 
         return await self._retry_unsatisfied(action, handle, params, healed_flag, before, post)
@@ -2922,6 +2979,7 @@ class ActionDispatcher:
     ) -> Any:
         """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
+        _CLICK_POINT.set(None)
         before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
@@ -2965,6 +3023,12 @@ class ActionDispatcher:
             if watch is not None:
                 watch.close()
             return self._fixed_node_gone(action, healed_flag)
+        except _CoveredRefused as exc:
+            # WS-79: 누를 자리가 모두 덮임 — 입력을 보내지 않았다(고정 문구, Playwright 원문 없음).
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return self._covered_result(action, exc, healed_flag)
         except _ProtectedSaveRefused as exc:
             # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
             self._off_popup(_on_popup)
@@ -2988,12 +3052,24 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
-                error_message=f"이벤트 발송 실패: {exc}",
+                error_message=f"이벤트 발송 실패: {public_error_text(exc)}",
                 healed=healed_flag,
             )
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
+
+    def _covered_result(self, action: ActionType, exc: "_CoveredRefused", healed_flag: bool) -> ActionResult:
+        """WS-79: 누를 자리가 모두 덮임 — 기존 코드(E_ELEMENT_NOT_INTERACTABLE), 입력 없음(retry_safe), 고정 문구 + covered_by."""
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+            error_message=COVERED_MESSAGE,
+            healed=healed_flag,
+            data={"covered_by": exc.covered_by},
+        )
 
     def _fixed_node_gone(self, action: ActionType, healed_flag: bool) -> ActionResult:
         """R3 B1: 고정 노드가 떨어짐 — 기존 '대상 바뀜' 계열(E_TOCTOU_MISMATCH·재관찰), 새 오류 코드 없음."""
@@ -3032,7 +3108,7 @@ class ActionDispatcher:
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
                 reobserve_required=True,
-                data={"signals": ["navigation_started"], "element_id": handle.element_id},
+                data=_with_click_point({"signals": ["navigation_started"], "element_id": handle.element_id}),
             )
         root_after = await self._capture_root() if root_before is not None else None
         if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed"):
@@ -3137,19 +3213,22 @@ class ActionDispatcher:
             )
 
         # 멱등 액션만 1회 재시도
+        _CLICK_POINT.set(None)
         try:
             await self._execute_element_action(action, handle, params)
         except (_ManualSiteRefused, _TargetRefused) as exc:
             return exc.result
         except _FixedNodeGone:
             return self._fixed_node_gone(action, healed_flag)
+        except _CoveredRefused as exc:
+            return self._covered_result(action, exc, healed_flag)
         except Exception as exc:  # noqa: BLE001
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
-                error_message=f"재시도 실패: {exc}",
+                error_message=f"재시도 실패: {public_error_text(exc)}",
                 reobserve_required=True,
                 healed=healed_flag,
             )
@@ -3172,7 +3251,7 @@ class ActionDispatcher:
             error_message=(
                 None if retry_post.satisfied else f"재시도 후에도 미충족({retry_post.detail})"
             ),
-            data={"signals": retry_post.signals, "retried": True},
+            data=_with_click_point({"signals": retry_post.signals, "retried": True}),
             healed=healed_flag,
             reobserve_required=not retry_post.satisfied,
         )
@@ -3442,15 +3521,15 @@ class ActionDispatcher:
                     await self._reresolved_check(action, handle, params, node, first_doc)
                 # 대기(스크롤 포함) 전에도 관문 — 치유·재해석 사이 목록 문서로 바뀌었으면 그 문서에서 기다리지도 않는다.
                 await self._manual_guard(action, params)
-                await self._wait_actionable(action, params, node, first_doc, deadline)
+                point = await self._wait_actionable(action, params, node, first_doc, deadline)
                 token = _BOUND_NODE.set(node)  # 민감 칸 판정도 입력할 그 노드로(is_sensitive_field)
                 try:
                     await self._send_to_target(action, handle, params, node, fixed=True, bind=first_doc,
-                                               progress=progress)
+                                               progress=progress, point=point)
                 finally:
                     _BOUND_NODE.reset(token)
                 return
-            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused):
+            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused, _CoveredRefused):
                 raise
             except _NodeDetached as exc:
                 last = exc
@@ -3492,30 +3571,41 @@ class ActionDispatcher:
 
     async def _wait_actionable(
         self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any, deadline: float
-    ) -> None:
+    ) -> Optional[Dict[str, float]]:
         """R4 2: 효과 없는 대기 — 조각마다 페이지 안에서 결속(소유 문서)과 actionability 를 함께 본다(_ACTIONABLE_JS).
 
-        다른 문서 소유(adoptNode)면 그 실제 소유 프레임으로 관문(_bind_or_gate), 떨어졌으면 _NodeDetached(다시 해석)."""
+        다른 문서 소유(adoptNode)면 그 실제 소유 프레임으로 관문(_bind_or_gate), 떨어졌으면 _NodeDetached(다시 해석).
+        WS-79: 반환 None = 가운데로(기존 force 입력), {x, y} = 가운데가 덮여 고른 덮이지 않은 대상 점(비 force 로 보냄).
+        기한까지 덮여 있었으면 _CoveredRefused."""
         kind = _ACTIONABLE_KIND.get(action)
         if kind is None:  # 업로드: set_input_files 는 actionability 대기가 없다 — 결속만
             await self._bind_or_gate(action, params, node, first_doc)
-            return
+            return None
         loop = asyncio.get_running_loop()
+        why: Any = None
         while True:
             remaining_ms = (deadline - loop.time()) * 1000
             if remaining_ms <= 0:
+                if why == "not hit target":
+                    raise _CoveredRefused(covered_by_view(await self._cover_judge(node)))
                 raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다")
             try:
                 why = await node.evaluate(_ACTIONABLE_JS, [first_doc, kind, int(min(_WAIT_SLICE_MS, remaining_ms))])
             except Exception as exc:  # noqa: BLE001 — 문서 소멸·문맥 교체
                 raise _NodeDetached(str(exc)) from exc
             if why == "ok":
-                return
+                return None
+            point = _actionable_point(why)
+            if point is not None:
+                return point  # WS-79: 가운데가 덮여 같은 평가에서 고른 덮이지 않은 대상 점(비 force 로 보냄)
             if why in ("detached", "moved"):
                 # moved → 실제 소유 프레임 관문(목록이면 manual_site)·'대상 바뀜', detached → 다시 해석(_NodeDetached)
                 await self._bind_or_gate(action, params, node, first_doc)
                 continue
             if (deadline - loop.time()) <= 0:
+                if why == "not hit target":
+                    # WS-79: 기한까지 덮여 있었다 — 고정 문구 + covered_by(입력 없음).
+                    raise _CoveredRefused(covered_by_view(await self._cover_judge(node)))
                 raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다({why})")
 
     async def _bind_or_gate(self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any) -> None:
@@ -3549,9 +3639,12 @@ class ActionDispatcher:
 
     async def _send_to_target(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
-        bind: Any = None, progress: Optional[Dict[str, bool]] = None,
+        bind: Any = None, progress: Optional[Dict[str, bool]] = None, point: Optional[Dict[str, float]] = None,
     ) -> None:
         """target(Locator, 또는 fixed=True 면 고정 노드 Playwright ElementHandle — 승인 결속·R3 고정)으로 입력을 보낸다.
+
+        WS-79: 포인터 입력(click·check·hover·download trigger)은 _pointer_call 로 — 가운데가 덮였으면 덮이지 않은 대상
+        점으로 비 force(point 는 결속 경로에서 _wait_actionable 이 고른 점).
 
         bind(R4, 목록이 있을 때 — 관문 통과 문서의 JS 핸들)가 있으면 관문 직후 결속 확인(_bind_or_gate)을 하고 대기 없는
         즉시 입력(force)을 보낸다 — actionability 대기는 _bound_input 이 효과 없이 먼저 끝냈다. progress 는 입력 호출이
@@ -3572,8 +3665,9 @@ class ActionDispatcher:
                 progress["sent"] = True
 
         if action is ActionType.CLICK:
-            await guard(action, params)
-            await target.click(button=params.get("button", "left"), timeout=5000, **fk)
+            button = params.get("button", "left")
+            await self._pointer_call(action, params, target, guard, fk, point,
+                                     lambda **kw: target.click(button=button, **kw))
             sent()
 
         elif action is ActionType.TYPE_TEXT:
@@ -3629,16 +3723,12 @@ class ActionDispatcher:
             sent()
 
         elif action is ActionType.CHECK_BOX:
-            await guard(action, params)
-            if params.get("checked", True):
-                await target.check(timeout=5000, **fk)
-            else:
-                await target.uncheck(timeout=5000, **fk)
+            toggle = target.check if params.get("checked", True) else target.uncheck
+            await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: toggle(**kw))
             sent()
 
         elif action is ActionType.HOVER:
-            await guard(action, params)
-            await target.hover(timeout=5000, **fk)
+            await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: target.hover(**kw))
             sent()
 
         elif action is ActionType.UPLOAD_FILE:
@@ -3652,8 +3742,7 @@ class ActionDispatcher:
             async with self.ctx.page.expect_download(
                 timeout=params.get("timeout_ms", 30000)
             ) as dl:
-                await guard(action, params)
-                await target.click(timeout=5000, **fk)
+                await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: target.click(**kw))
                 sent()
             download = await dl.value
             # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
@@ -3677,6 +3766,82 @@ class ActionDispatcher:
 
         else:
             raise ValueError(f"요소 대상 액션이 아닙니다: {action.value}")
+
+    async def _cover_judge(self, target: Any) -> Optional[Dict[str, Any]]:
+        """WS-79 (1): 읽기 전용 덮임 판정 — 클릭할 그 locator/handle 에서 따로 평가한다(capture_state 와 합치지 않음, B7).
+
+        Locator 는 evaluate_all(기다리지 않음 — 없으면 판정 불가), 고정 노드는 ElementHandle.evaluate. 그 밖(가짜 대상)·
+        평가 실패·모르는 모양은 None(판정 불가 → 기존 경로)."""
+        try:
+            if isinstance(target, PlaywrightLocator):
+                raw = await target.evaluate_all(COVER_JUDGE_ALL_JS)
+            elif isinstance(target, PlaywrightElementHandle):
+                raw = await target.evaluate(COVER_JUDGE_JS)
+            else:
+                return None
+        except Exception:  # noqa: BLE001 — 판정 불가: 기존 경로(Playwright 의 대기·hit 검사)
+            return None
+        return parse_judge(raw)
+
+    async def _pointer_call(
+        self, action: ActionType, params: Dict[str, Any], target: Any, guard: Any, fk: Dict[str, Any],
+        point: Optional[Dict[str, float]], call: Any,
+    ) -> None:
+        """WS-79: 포인터 입력 — 가운데가 대상이면 기존 호출 그대로(바이트·지연 동일), 덮였으면 덮이지 않은 대상 점으로
+        **비 force** position 입력, 그런 점이 없으면 기존 호출을 COVERED_CLICK_BUDGET_MS 로(스크롤 재시도·덮개 사라짐
+        대기 유지). 덮임 시간 초과면 스크롤된 상태에서 한 번 더 판정 → 점이 있으면 그 점으로, 없으면 _CoveredRefused.
+        모든 입력 바로 앞에 관문(guard) — 관문과 입력 사이에 await 를 두지 않는다(WS-64)."""
+        if fk:
+            # 목록 사이트 결속 경로(R4): actionability 는 _wait_actionable 이 끝냈다. 가운데면 기존 force 입력,
+            # 고른 점이면 비 force(force 대체 점 금지 — 덮개가 그 사이 생겼으면 Playwright 가 거부).
+            await guard(action, params)
+            if point is None:
+                await call(timeout=5000, **fk)
+                return
+            try:
+                await call(position={"x": point["x"], "y": point["y"]}, timeout=COVERED_POINT_TIMEOUT_MS)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+                raise _CoveredRefused(covered_by_view(await self._cover_judge(target))) from None
+            _CLICK_POINT.set(click_point_view(point))
+            return
+        judge = await self._cover_judge(target)
+        state = judge.get("s") if judge else None
+        if judge is not None and state == "point":
+            pos = {"x": judge["x"], "y": judge["y"]}
+            await guard(action, params)
+            try:
+                await call(position=pos, timeout=5000)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+                again = await self._cover_judge(target)
+                raise _CoveredRefused(covered_by_view(again if again and again.get("cover") else judge)) from None
+            _CLICK_POINT.set(click_point_view(judge))
+            return
+        await guard(action, params)
+        try:
+            await call(timeout=5000 if state in (None, "center", "unknown") else COVERED_CLICK_BUDGET_MS)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if not is_pointer_intercept(exc):
+                raise
+        # (2) 시간 초과(가로채기): Playwright 가 스크롤한 상태에서 한 번 더 판정한다.
+        again = await self._cover_judge(target)
+        if again is not None and again.get("s") == "point":
+            pos = {"x": again["x"], "y": again["y"]}
+            await guard(action, params)
+            try:
+                await call(position=pos, timeout=COVERED_POINT_TIMEOUT_MS)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+            else:
+                _CLICK_POINT.set(click_point_view(again))
+                return
+        best = again if again is not None and again.get("cover") else judge
+        raise _CoveredRefused(covered_by_view(best)) from None
 
     async def _execute_elementless(
         self, action: ActionType, params: Dict[str, Any]
@@ -4674,7 +4839,7 @@ class ActionDispatcher:
                 action=ActionType.WAIT_FOR,
                 retry_safe=True,
                 error_code=ErrorCode.TIMEOUT,
-                error_message=f"{condition} 대기 실패: {exc}",
+                error_message=f"{condition} 대기 실패: {public_error_text(exc)}",  # WS-79 B8: 호출 기록(요소 HTML) 제외
             )
         return self._result(
             success=True,

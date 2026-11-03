@@ -34,6 +34,8 @@ NOT_OUT = "MCP 응답 출구 아님(에이전트 루프·LLM·하네스 내부·
 
 #: (키, 파일, 식) → 분류. 어휘 출처면 그 집합이 CONTROL_VOCABULARY[키] 에 든다(아래 enum 테스트).
 REVIEWED = {
+    # WS-79 data.covered_by.layer — covered_click.covered_by_view 가 COVER_LAYERS 안 값만 통과(밖이면 "other")
+    ("layer", "actions/covered_click.py", "layer"): "actions.covered_click.COVER_LAYERS(covered_by_view 거름)",
     # WS-73 browser_batch data.batch.reason — interface.server_batch.REASONS(_Stop 가 assert, 어휘 포함은 test_ws73_batch_units)
     ("reason", "interface/server_batch.py", "reason"): "server_batch.REASONS(_Stop.__init__ assert)",
     ("reason", "interface/server_batch.py", "stop.reason"): "server_batch.REASONS(_Stop.reason)",

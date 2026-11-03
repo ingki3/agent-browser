@@ -101,6 +101,9 @@ KEYS = {
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
     # --- CONTROL: 도구 열거 어휘
+    "layer": (CONTROL, "actions/covered_click.py data.covered_by.layer — COVER_LAYERS(WS-79)"),
+    ("tag", "actions/covered_click.py"): (FREE, "WS-79 data.covered_by.tag — 페이지 태그 이름([a-z0-9-]≤32 로 거름, "
+                                               "밖이면 unknown — 면제 없음)"),
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),
     "resolved_from": (CONTROL, "actions/dispatcher.py switch_frame — current_frame|root(server_schema 안내, R6-B1)"),
     "nav_aborted": (CONTROL, "actions/dispatcher.py _NavWatch.aborted(R6)"),

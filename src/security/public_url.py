@@ -711,6 +711,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "captcha", "blocked",  # WS-63 C data.handoff.reason = browser.challenge.ChallengeKind
         "manual_site",  # WS-64 data.handoff.reason · window.notice.reason · 창 전환 사유 · 레시피 중단 사유
         "load_timed_out",  # WS-69 headless_retry.SKIP_NOTES(부분 성공 navigate)
+        "center_covered",  # WS-79 actions.covered_click data.click_point.reason
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
                               "mismatch"}),  # handoff.check_approval 사유 코드
@@ -769,6 +770,8 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "how_to_wait": frozenset({"browser_control_wait"}),  # interface.handoff 조작권 요청 안내(도구 이름)
     # WS-63 C server_signals data.handoff.tool(도구 이름) + WS-64 security.manual_sites WAIT_TOOL
     "tool": frozenset({"browser_control_request", "browser_control_wait"}),
+    # WS-79 actions.covered_click data.covered_by.layer(COVER_LAYERS)
+    "layer": frozenset({"fixed", "sticky", "modal", "frame", "other"}),
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
     "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
     # healing_attempts 는 R9 부터 목록 경로 어휘(CONTROL_LIST_VOCABULARY — 복합 코드는 낱말 모양이 아니다)
