@@ -62,7 +62,7 @@
 일반 면제는 없다, 자유 문장 칸은 정제).
 
 **경계**(2026-10-17 계약 → WS-75 #199 사용자 결정 B 2026-10-31 로 좁힘): 페이지 *내용*
-(`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`, `data.repeated`(WS-62). **경로**로
+(`CONTENT_PATHS`: 응답의 `data.items`(extract 항목), `data.observation.elements`·`axtree_summary`, `data.repeated`(WS-62), `data.select_options`(WS-80). **경로**로
 정한다 — 다른 자리의 같은 이름 키는 가린다, R1 NB-1)에는 URL 문법·JWT 계층을 적용하지 않고 주소 칸 등록도 하지 않는다. 다만
 **도구가 비밀로 아는 값**(레지스트리 등록 값)은 등급 규칙(`secret_registry.mask_content` — 자격증명은 4~7자 경계 포함,
 주소 비밀은 ≥ 8, 비밀 키가 아닌 키 아래 순수 16진은 제외)으로 페이지 글자 칸(`CONTENT_TEXT_KEYS`·extract 항목의 모든 값)에서
@@ -181,6 +181,8 @@ CONTENT_PATHS: FrozenSet[Tuple[str, ...]] = frozenset({
     ("data", "observation", "axtree_summary"),
     # WS-62: 반복 묶음(대상 이름·묶음 표제) — 같은 대상의 elements[].name 과 같은 원문이어야 에이전트가 맞춰 본다.
     ("data", "repeated"),
+    # WS-80: select 선택지 라벨·optgroup 표제 — 같은 select 의 elements[].name 과 같은 규칙(아는 비밀만, URL 문법 계층 없음).
+    ("data", "select_options"),
 })
 #: (호환) 위 경로의 마지막 키 이름. 판정은 CONTENT_PATHS(경로)로 한다.
 CONTENT_KEYS: FrozenSet[str] = frozenset(p[-1] for p in CONTENT_PATHS)
@@ -712,6 +714,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
         "manual_site",  # WS-64 data.handoff.reason · window.notice.reason · 창 전환 사유 · 레시피 중단 사유
         "load_timed_out",  # WS-69 headless_retry.SKIP_NOTES(부분 성공 navigate)
         "center_covered",  # WS-79 actions.covered_click data.click_point.reason
+        "no_match", "ambiguous", "out_of_range",  # WS-80 data.select_candidates.reason(select_options.FAIL_MESSAGES 키)
     )),
     "reason_code": frozenset({"unknown", "expired", "used", "denied", "revoked", "not_approved", "target_changed",
                               "mismatch"}),  # handoff.check_approval 사유 코드
@@ -1023,6 +1026,10 @@ def content_view(data: Any) -> Any:
             if isinstance(rep.get("groups"), list):
                 rep["groups"] = list(rep["groups"])
             out["repeated"] = rep
+    sel = out.get("select_options")
+    if isinstance(sel, list):
+        # WS-80: select 선택지 — 가릴 값이 없으면 목록만 얕게 복사(fit_select_options 의 항목 빼기가 원본에 닿지 않게).
+        out["select_options"] = mask_content(sel) if masking else list(sel)
     return out
 
 
@@ -1058,6 +1065,8 @@ def content_withheld(data: Any) -> Any:
         out["observation"] = obs
     if isinstance(out.get("repeated"), dict):
         out["repeated"] = _withhold(out["repeated"], False)
+    if isinstance(out.get("select_options"), list):
+        out["select_options"] = _withhold(out["select_options"], False)
     return out
 
 

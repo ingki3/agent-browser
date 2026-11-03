@@ -357,6 +357,14 @@ class ToolsMixin:
             # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
             fit_saved_pages(result, max_chars,
                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+        if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
+            from perception.select_options import fit_select_options
+
+            # WS-80: select 선택지는 saved_pages 다음·반복 묶음 앞 — 요소보다 먼저 줄인다(잘릴 요소의 항목은 지우고, 그래도
+            # 넘으면 뒤 항목부터 통째로 뺀다).
+            fit_select_options(result, max_chars,
+                               finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                               limit=self.max_result_chars)
         if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
             from perception.repeated import fit_repeated
 
@@ -370,6 +378,12 @@ class ToolsMixin:
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
         cap_result_size(result, max_chars, limit=self.max_result_chars)
+        if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
+            from perception.select_options import drop_orphans, element_ids
+
+            # WS-80: 요소를 자른 뒤 elements 밖 element_id 를 가리키는 항목이 남지 않게(WS-74 불변식) — 지웠으면 길이 다시.
+            if drop_orphans(result.data, element_ids(result)):
+                settle_returned_chars(result)
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
                attach_injection_signal: Any, window: Any) -> None:

@@ -108,8 +108,8 @@ BATCH_TRUNC_HINT = ("묶음 응답이 크기 상한을 넘어 단계 결과의 �
 META_TEXT_CHARS = 200
 META_LIST_ITEMS = 20
 #: 응답 관찰에서 묶음 응답으로 옮기는 키.
-_OBS_KEYS = ("observation", "repeated", "injection_suspected", "truncated", "challenge", "handoff", "hint",
-             "robots", "dialogs", "page_not_found")
+_OBS_KEYS = ("observation", "repeated", "select_options", "select_options_omitted", "injection_suspected", "truncated",
+             "challenge", "handoff", "hint", "robots", "dialogs", "page_not_found")
 #: WS-78 R1 R2: 크기 맞춤·관찰 생략 뒤에도 남기는 검출 신호(처음 관찰에서 본 것 OR).
 _SIGNAL_KEYS = ("injection_suspected", "challenge", "handoff", "robots", "page_not_found", "dialogs",
                 "observation_error")

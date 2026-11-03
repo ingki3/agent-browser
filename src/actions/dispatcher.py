@@ -1242,6 +1242,16 @@ class _CoveredRefused(Exception):
 _CLICK_POINT: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_click_point", default=None)
 
 
+class _SelectRefused(_TargetRefused):
+    """WS-80: select_option 해석·사후 확인 거부(선택지 없음·모호·비활성·범위 밖·대리 위젯·선택지 바뀜) — result 는 거부 응답.
+
+    _TargetRefused 와 같은 경로(목록 결속 재시도에서도 그대로 올림·발송 단계·재시도 단계가 result 를 돌려줌)를 탄다."""
+
+
+#: WS-80: 사후 확인이 '고른 option == 해석한 option' 을 확인했다(params 내부 키 — 기대 상태 충족, 이미 고른 값 재선택 포함).
+_SELECT_CONFIRMED_KEY = "_select_confirmed"
+
+
 def _with_click_point(data: Dict[str, Any]) -> Dict[str, Any]:
     """성공 data 에 이 호출의 click_point(WS-79 — 다른 점을 썼을 때만)를 붙인다. 가운데 경로면 키를 더하지 않는다."""
     point = _CLICK_POINT.get()
@@ -2962,8 +2972,11 @@ class ActionDispatcher:
         post = await self._element_post_condition(
             action, handle, params, before, after, root_before, root_after
         )
+        # WS-80: select_option 의 사후 확인(고른 option == 해석한 option)은 기대 상태 충족이다 — 이미 고른 값을 다시 골라
+        # 페이지가 바뀌지 않아도 성공(재시도하지 않는다).
+        confirmed = bool(params.pop(_SELECT_CONFIRMED_KEY, False))
 
-        if post.satisfied:
+        if post.satisfied or confirmed:
             return self._result(
                 success=True,
                 action=action,
@@ -3637,6 +3650,94 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001
             return False
 
+    # -- WS-80 (#206): select 선택지 해석·확인·표시 -------------------------------------------
+
+    async def _select_eval(self, fn: str, arg: Any, handle: Any, target: Any, fixed: bool) -> Any:
+        """select 페이지 함수 fn(el, arg) 평가. 최상위 문서·shadow 아님이면 **격리 world** 에서 css 경로의 노드로(페이지 world
+        prototype 위조가 닿지 않음), 못 하면(프레임·shadow·격리 world 실패·그 경로에 노드 없음) 입력할 그 노드에서. 실패면 None."""
+        css = getattr(handle, "css_path", "") or ""
+        if self.ctx.root_page is None and css and not getattr(handle, "is_shadow", False):
+            from perception.select_options import node_expr
+
+            try:
+                out = await self.isolated_eval(node_expr(fn, css, arg))
+            except Exception:  # noqa: BLE001 — 격리 world 를 못 만듦: 노드 평가로
+                out = None
+            if isinstance(out, dict) and out.get("verdict") != "gone":
+                return out
+        try:
+            if fixed:
+                return await target.evaluate(fn, arg)
+            return await target.evaluate(fn, arg, timeout=5000)
+        except Exception:  # noqa: BLE001 — 해석 불가: 기존 경로
+            return None
+
+    async def _resolve_select(self, handle: Any, params: Dict[str, Any], target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
+        """select_option 인자 해석(관문 앞 1회). 반환 verdict: ok(index·value·label) / fail(reason·indices) / index(total) /
+        not_select / gone, 또는 None(해석 불가 — 기존 Playwright 호출 그대로)."""
+        from perception.select_options import RESOLVE_FN
+
+        if params.get("value") is not None:
+            arg: Dict[str, Any] = {"value": str(params["value"])}
+        else:
+            arg = {"index": int(params.get("index") or 0)}
+        out = await self._select_eval(RESOLVE_FN, arg, handle, target, fixed)
+        return out if isinstance(out, dict) and isinstance(out.get("verdict"), str) else None
+
+    def _select_refusal(self, action: ActionType, handle: Any, params: Dict[str, Any],
+                        resolved: Optional[Dict[str, Any]]) -> Optional[ActionResult]:
+        """해석 결과 → 거부 응답(입력 없음 — retry_safe) 또는 None(진행). 후보는 index 만(라벨 글자 없음)."""
+        from perception import select_options as so
+
+        if resolved is None:
+            return None
+        verdict = resolved.get("verdict")
+        if verdict == "fail":
+            reason = str(resolved.get("reason"))
+            if reason not in so.FAIL_MESSAGES:
+                return None
+            indices = [int(i) for i in resolved.get("indices") or [] if isinstance(i, int)][:so.MAX_CANDIDATES]
+            cand: Dict[str, Any] = {"reason": reason, "indices": indices}
+            total = resolved.get("total")
+            if isinstance(total, int) and total > len(indices):
+                cand["total"] = total
+            return self._result(success=False, action=action, retry_safe=True, error_code=ErrorCode.OPTION_NOT_FOUND,
+                                error_message=so.FAIL_MESSAGES[reason], data={"select_candidates": cand})
+        if verdict == "index":
+            total = resolved.get("total")
+            index = int(params.get("index") or 0)
+            if isinstance(total, int) and not 0 <= index < total:
+                return self._result(success=False, action=action, retry_safe=True,
+                                    error_code=ErrorCode.OPTION_NOT_FOUND,
+                                    error_message=so.FAIL_MESSAGES["out_of_range"],
+                                    data={"select_candidates": {"reason": "out_of_range", "total": total}})
+            return None
+        if verdict == "not_select" and getattr(handle, "role", None) == "combobox":
+            # T3: 대리 위젯 — 숨긴 select 에 값을 넣거나 짝을 짓지 않는다(고정 안내만).
+            return self._result(success=False, action=action, retry_safe=True,
+                                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE, error_message=so.PROXY_HINT,
+                                data={"hint": so.PROXY_HINT})
+        return None
+
+    async def _annotate_select_options(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
+        """관찰 data 에 select 선택지 블록(data.select_options)을 싣는다 — 관찰된 combobox 가 없으면 평가하지 않는다(바이트·
+        비용 그대로). 표시 전용(핸들·실행 무관): 실패해도 관찰은 그대로 성공한다."""
+        from perception import select_options as so
+
+        try:
+            targets, handles = so.select_targets(self.ctx.engine, elements)
+            if not targets:
+                return
+            if self.ctx.root_page is None:
+                raw = await self.isolated_eval(so.display_expr(targets))
+            else:
+                fn, arg = so.display_args(targets)
+                raw = await page.evaluate(fn, arg)
+        except Exception as exc:  # noqa: BLE001 — 부가 정보
+            logger.debug("select 선택지 수집 실패: %s", type(exc).__name__)
+            return
+        so.apply_block(data, raw, handles)
+
     async def _send_to_target(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
         bind: Any = None, progress: Optional[Dict[str, bool]] = None, point: Optional[Dict[str, float]] = None,
@@ -3713,8 +3814,30 @@ class ActionDispatcher:
                 await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
+            # WS-80: Playwright 의 value-or-label 첫 일치 대신 한 번 해석한다(정확한 value → 정규화 라벨 1개). 해석은 관문
+            # 앞이다 — 관문과 입력 사이에 새 await 를 두지 않는다(WS-64). 해석 불가(평가 실패)면 기존 호출 그대로.
+            from perception import select_options as so
+
+            resolved = await self._resolve_select(handle, params, target, fixed)
+            refused = self._select_refusal(action, handle, params, resolved)
+            if refused is not None:
+                raise _SelectRefused(refused)
             await guard(action, params)
-            if params.get("value") is not None:
+            if resolved is not None and resolved.get("verdict") == "ok":
+                await target.select_option(index=int(resolved["index"]), timeout=5000, **fk)
+                sent()
+                # 사후 확인: 고른 option 이 해석한 그 option 인가(해석과 입력 사이 선택지 순서 변경 — TOCTOU). 확실히
+                # 다를 때만 거부한다(문서 이동 등으로 읽지 못하면 기존 사후조건 판정).
+                check = await self._select_eval(so.CONFIRM_FN, {
+                    "index": int(resolved["index"]), "value": resolved.get("value"), "label": resolved.get("label")},
+                    handle, target, fixed)
+                if isinstance(check, dict) and check.get("verdict") == "differ":
+                    raise _SelectRefused(self._result(
+                        success=False, action=action, retry_safe=True, error_code=ErrorCode.TOCTOU_MISMATCH,
+                        error_message=so.MISMATCH_MESSAGE, reobserve_required=True))
+                if isinstance(check, dict) and check.get("verdict") == "match":
+                    params[_SELECT_CONFIRMED_KEY] = True
+            elif params.get("value") is not None:
                 await target.select_option(value=params["value"], timeout=5000, **fk)
             else:
                 await target.select_option(
@@ -3918,6 +4041,8 @@ class ActionDispatcher:
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
         if repeated is not None:
             data["repeated"] = repeated
+        # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).
+        await self._annotate_select_options(page, observed.elements, data)
         return self._result(
             success=True,
             action=action,
