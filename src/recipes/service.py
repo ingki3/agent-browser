@@ -197,6 +197,11 @@ class RecipeService:
             self.reset("no_postcondition")
             return
         secret = data.get("secret_resolved") is not None
+        if a == "press_key" and getattr(self.server._dispatcher, "last_key_sensitive", False):
+            # WS-78 T1 B1: 민감 칸(키 전·키 뒤 password)으로 간 키는 비밀 단계 — 구간을 끊고(segment stuck) 저장·이름에
+            # 그 키 글자를 남기지 않는다. 메모리 궤적에도 키 글자를 싣지 않는다.
+            secret = True
+            params = {k: v for k, v in params.items() if k != "key"}
         entry = make_entry(a, params, pre, str(result.current_url or ""), data, secret)
         if entry["expect"]["nav"] == "error":
             self.reset("nav_error")  # R1 NB-3: 오류 페이지(차단·실패)로 간 단계는 기록하지 않는다

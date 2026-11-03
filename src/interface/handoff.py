@@ -135,6 +135,27 @@ _BIDI = frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A
 _HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 
 
+def _projected(value: Any, limit: int) -> str:
+    """사람에게 보일 자유 문장(사유)의 가린 투영 — public_text 다음 display_safe(가린 뒤 자름, WS-78 T4).
+
+    CLI 처럼 레지스트리가 없는 프로세스에서도 public_text 의 URL 문법 층(토큰 주소·JWT)은 돈다.
+    """
+    from security.public_url import public_text
+
+    return display_safe(public_text(str(value or "")), limit)
+
+
+def _cli_status_view(st: Dict[str, Any]) -> Dict[str, Any]:
+    """CLI 표시·--json 직전 한 번 더 투영(심층 방어 — 옛 서버가 쓴 원문 파일도)."""
+    out = dict(st)
+    if "reason" in out:
+        out["reason"] = _projected(out.get("reason"), 500)
+    window = out.get("window")
+    if isinstance(window, dict) and window.get("sticky_reason"):
+        out["window"] = dict(window, sticky_reason=_projected(window["sticky_reason"], 300))
+    return out
+
+
 def display_safe(value: Any, limit: int = DISPLAY_LIMIT) -> str:
     """외부 유래 문자열(요소 이름·판정 근거·reason·URL·호스트)을 사람에게 보여 주기 직전에 살균한다.
 
@@ -607,9 +628,22 @@ class HandoffHub:
         if self._opened:
             self._write_control()
 
+    def disk_status(self) -> Dict[str, Any]:
+        """사람용 파일(control.json·ack)에 쓸 상태 — 사유(에이전트 입력)는 가린 투영본(WS-78 T4, #215).
+
+        public_text(등록 비밀·토큰 주소) 다음 display_safe, 가린 뒤 자른다. 메모리의 self.reason 은 원문 그대로 둔다
+        (창·띠는 자기 가림이 있다). 쓸 때마다 새로 투영하므로 나중에 등록된 값도 다음 쓰기에 반영된다.
+        """
+        st = self.status()
+        st["reason"] = _projected(st.get("reason"), 500)
+        window = st.get("window")
+        if isinstance(window, dict) and window.get("sticky_reason"):
+            window["sticky_reason"] = _projected(window["sticky_reason"], 300)
+        return st
+
     def _write_control(self) -> None:
         try:
-            _write_private(self.dir / "control.json", self.status())
+            _write_private(self.dir / "control.json", self.disk_status())
         except OSError:
             pass
 
@@ -805,7 +839,7 @@ class HandoffHub:
     def _ack(self, nonce: str, ok: bool, message: str, **extra: Any) -> None:
         try:
             _write_private(self.dir / f"ack-{nonce}.json",
-                           {"ok": ok, "message": message, "control": self.status(), **extra})
+                           {"ok": ok, "message": message, "control": self.disk_status(), **extra})
         except OSError:
             pass
 
@@ -1146,6 +1180,7 @@ def cli_control(op: str, server_id: Optional[str], as_json: bool = False) -> int
         if st is None:
             print("agent-browser control: 상태 파일을 읽을 수 없습니다.", file=sys.stderr)
             return 2
+        st = _cli_status_view(st)
         if as_json:
             # JSON 은 제어문자를 이스케이프하고 비ASCII(양방향 제어 포함)도 u-표기로 낸다.
             print(json.dumps(st, ensure_ascii=True))

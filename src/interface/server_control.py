@@ -30,6 +30,11 @@ TELL_WINDOW_USER_CHROME = ("사용 중인 Chrome 에 뜬 작은 'agent-browser' 
 TELL_CLI = "브라우저 창에서 해결한 뒤 맥 터미널에서 `agent-browser control release` 를 실행하세요."
 TELL_HEADLESS = ("지금 서버는 사람이 볼 브라우저 창이 없습니다 — 운영자에게 창을 띄울 수 있는 방식"
                  "(`--browser on-demand`)으로 다시 실행해 달라고 하세요.")
+#: WS-78 T4(#215): 끝난 인계의 tell_user — 진행 중 문구(TELL_*)를 다시 쓰지 않는 종료용 고정 문구.
+TELL_ENDED = {
+    "released": "사람의 조작이 끝났습니다 — 더 하실 일은 없습니다. 결과를 확인해 알려 드리겠습니다.",
+    "request_expired": "조작 요청이 만료됐습니다 — 지금은 하실 일이 없습니다. 필요하면 다시 요청하겠습니다.",
+}
 NEXT_WAIT = "browser_control_wait 로 기다리세요(사람이 [다 했어요]를 누르면 바로 돌아옵니다)."
 NEXT_OBSERVE = ("browser_observe_page 로 다시 관찰해 결과(로그인·해결 여부)를 확인하세요 — human_activity_seen 이 "
                 "not_seen 이어도 확인하세요(제출 없는 입력·클릭은 활동으로 잡히지 않습니다).")
@@ -146,7 +151,11 @@ class ControlWindowMixin:
             return out
         if end is None:
             return None
-        out = {k: v for k, v in end.items() if k != "_tab_pairs"}
+        out = {"request_id": end.get("request_id"), "state": end.get("state"),
+               # WS-78 T4: 진행 중 응답과 같은 필드 — 끝난 요청은 만료가 없고(null), 창 상태는 지금 것, 고정 종료 문구.
+               "expires_at": None, "control_window": self._control_window_state(),
+               "tell_user": TELL_ENDED.get(str(end.get("state")))}
+        out.update({k: v for k, v in end.items() if k not in out and k != "_tab_pairs"})
         out["tab_origins"] = self._tab_origin_view(end.get("_tab_pairs") or [])  # 끝날 때 탭, 이 작업 공간 것만
         out["next_step"] = NEXT_OBSERVE
         return out

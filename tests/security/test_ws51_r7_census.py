@@ -74,6 +74,7 @@ TABLES = {
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
     ("interface/handoff.py", "_KEY_LABEL"): (FREE, "승인 불일치 사유 문장에 쓰는 사람용 이름"),
+    ("interface/server_control.py", "TELL_ENDED"): (FREE, "WS-78 끝난 인계 tell_user 고정 문장(키는 released·request_expired)"),
     ("interface/server_elicit.py", "_STATUS"): (FREE, "WS-56 data.elicitation.answer 낱말(declined·cancelled·timeout·"
                                                   "error) — 어휘 밖(등록 값이면 가림)"),
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
@@ -93,6 +94,9 @@ KEYS = {
     ("target_element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
     ("observation_error", "interface/server_batch.py"): (FREE, "WS-73 R1 응답 관찰 실패 — ErrorCode 값 또는 observe_failed "
                                                              "(원 오류 문구는 싣지 않음)"),
+    ("observation_omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 묶음 응답 관찰 생략 고정 문장"
+                                                               "(BATCH_OBSERVATION_OMITTED)"),
+    ("omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 step_result 본문 생략 고정 문장(STEP_RESULT_OMITTED)"),
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
