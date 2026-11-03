@@ -3653,24 +3653,152 @@ class ActionDispatcher:
     # -- WS-80 (#206): select 선택지 해석·확인·표시 -------------------------------------------
 
     async def _select_eval(self, fn: str, arg: Any, handle: Any, target: Any, fixed: bool) -> Any:
-        """select 페이지 함수 fn(el, arg) 평가. 최상위 문서·shadow 아님이면 **격리 world** 에서 css 경로의 노드로(페이지 world
-        prototype 위조가 닿지 않음), 못 하면(프레임·shadow·격리 world 실패·그 경로에 노드 없음) 입력할 그 노드에서. 실패면 None."""
+        """select 페이지 함수 fn(el, arg) 평가 — **격리 world** 에서만(페이지 world prototype·내장객체 위조가 닿지 않음).
+
+        최상위 문서·shadow 아님이면 css 경로의 노드로(isolated_eval). 프레임·shadow(R1)는 그 프레임의 격리 world 에서 같은
+        노드를 잡는다(_select_eval_scoped). 격리 world 를 못 얻음·노드를 못 정함·평가 실패면 None — 페이지 world 로 내려가지
+        않는다(fail-closed: 해석은 기준 호출 그대로, 확인은 기존 사후조건 판정)."""
         css = getattr(handle, "css_path", "") or ""
-        if self.ctx.root_page is None and css and not getattr(handle, "is_shadow", False):
+        if not css:
+            return None
+        if self.ctx.root_page is None and not getattr(handle, "is_shadow", False):
             from perception.select_options import node_expr
 
             try:
                 out = await self.isolated_eval(node_expr(fn, css, arg))
-            except Exception:  # noqa: BLE001 — 격리 world 를 못 만듦: 노드 평가로
-                out = None
-            if isinstance(out, dict) and out.get("verdict") != "gone":
-                return out
-        try:
-            if fixed:
-                return await target.evaluate(fn, arg)
-            return await target.evaluate(fn, arg, timeout=5000)
-        except Exception:  # noqa: BLE001 — 해석 불가: 기존 경로
+            except Exception:  # noqa: BLE001 — 격리 world 를 못 만듦: 판정 불가
+                return None
+            return out if isinstance(out, dict) and out.get("verdict") != "gone" else None
+        out = await self._select_eval_scoped(fn, arg, handle, target, fixed)
+        return out if isinstance(out, dict) and out.get("verdict") != "gone" else None
+
+    async def _select_frame_world(self) -> Optional[Tuple[Any, str, bool]]:
+        """지금 대상 문서(최상위 또는 switch_frame 한 프레임)의 (CDP 세션, frameId, 다른 출처 iframe 세션인가). 못 정하면 None.
+
+        다른 출처 iframe(OOPIF)은 그 프레임의 CDP 세션(루트 frameId), 같은 프로세스 프레임은 최상위 게이트 세션의 프레임
+        트리에서 (name, url) 조상 사슬이 정확히 하나로 맞는 frameId 를 쓴다(둘 이상이면 None — 다른 프레임을 읽지 않는다)."""
+        top = self._top_page()
+        frame = self.ctx.page if self.ctx.root_page is not None else None
+        if frame is None or frame is getattr(top, "main_frame", None):
+            return await self._gate_cdp_for(top), "", False
+        oopif = await self._select_oopif_cdp(top, frame)
+        if oopif is not None:
+            tree = (await oopif.send("Page.getFrameTree")).get("frameTree") or {}
+            root_id = str((tree.get("frame") or {}).get("id") or "")
+            return (oopif, root_id, True) if root_id else None
+        chain: List[Tuple[str, str]] = []
+        cur = frame
+        while cur is not None and cur is not getattr(top, "main_frame", None):
+            chain.append((str(cur.name or ""), str(cur.url or "")))
+            cur = cur.parent_frame
+        if cur is None:
             return None
+        chain.reverse()
+        cdp = await self._gate_cdp_for(top)
+        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
+        level = [tree]
+        for name, url in chain:
+            nxt = []
+            for node in level:
+                for child in node.get("childFrames") or []:
+                    f = child.get("frame") or {}
+                    if str(f.get("name") or "") == name and str(f.get("url") or "") + str(f.get("urlFragment") or "") == url:
+                        nxt.append(child)
+            level = nxt
+        if len(level) != 1:
+            return None
+        frame_id = str((level[0].get("frame") or {}).get("id") or "")
+        return (cdp, frame_id, False) if frame_id else None
+
+    async def _select_oopif_cdp(self, top: Any, frame: Any) -> Any:
+        """다른 출처 iframe 이면 그 프레임의 CDP 세션(프레임마다 하나, 재사용), 아니면 None(Playwright 가 거부)."""
+        cache = self.__dict__.setdefault("_select_oopif_sessions", {})
+        entry = cache.get(id(frame))
+        if entry is not None and entry[0] is frame:
+            return entry[1]
+        try:
+            session = await top.context.new_cdp_session(frame)
+        except Exception:  # noqa: BLE001 — 같은 프로세스 프레임: 최상위 세션으로
+            return None
+        cache[id(frame)] = (frame, session)
+        return session
+
+    async def _select_same_box(self, cdp: Any, object_id: str, target: Any, fixed: bool, oopif: bool) -> bool:
+        """격리 world 노드와 Playwright 입력 대상이 같은 자리(테두리 상자 1px 이내)인가 — role+name 로케이터·잡아 둔 노드처럼
+        css 경로로 지목하지 않는 대상의 동일성 확인. 두 값 모두 CDP 판독(페이지 JS 가 바꿀 수 없음). 못 읽으면 False."""
+        model = (await cdp.send("DOM.getBoxModel", {"objectId": object_id})).get("model") or {}
+        quad = model.get("border") or []
+        if len(quad) != 8:
+            return False
+        xs, ys = quad[0::2], quad[1::2]
+        mine = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+        if oopif:  # Playwright 는 다른 출처 iframe 의 상자에 프레임 요소 상자를 더한다 — 같은 기준으로 맞춘다
+            owner = await self.ctx.page.frame_element()
+            off = await owner.bounding_box()
+            if not off:
+                return False
+            mine[0] += off["x"]
+            mine[1] += off["y"]
+        box = await (target.bounding_box() if fixed else target.bounding_box(timeout=5000))
+        if not box:
+            return False
+        theirs = [box["x"], box["y"], box["width"], box["height"]]
+        return all(abs(a - b) <= 1.0 for a, b in zip(mine, theirs))
+
+    async def _select_eval_scoped(self, fn: str, arg: Any, handle: Any, target: Any, fixed: bool) -> Any:
+        """프레임·shadow 의 select 함수 평가(R1) — 그 프레임의 격리 world 에서 css 경로에 맞는 노드가 정확히 1개일 때만.
+
+        css 로 지목하지 않는 입력 대상(shadow 의 role+name 로케이터·잡아 둔 노드)은 그 노드와 같은 자리인지도 본다. 실패면 None."""
+        from perception.select_options import call_fn, deep_node_expr
+
+        css = handle.css_path
+        check_box = bool(fixed or getattr(handle, "is_shadow", False))
+        try:
+            world = await self._select_frame_world()
+            if world is None:
+                return None
+            cdp, frame_id, oopif = world
+
+            async def run(context_id: int) -> Any:
+                found = await cdp.send("Runtime.evaluate", {
+                    "expression": deep_node_expr(css), "contextId": context_id, "returnByValue": False})
+                object_id = (found.get("result") or {}).get("objectId")
+                if found.get("exceptionDetails") or not object_id:
+                    return None
+                try:
+                    if check_box and not await self._select_same_box(cdp, object_id, target, fixed, oopif):
+                        return None
+                    called = await cdp.send("Runtime.callFunctionOn", {
+                        "objectId": object_id, "functionDeclaration": call_fn(fn),
+                        "arguments": [{"value": arg}], "returnByValue": True})
+                finally:
+                    try:
+                        await cdp.send("Runtime.releaseObject", {"objectId": object_id})
+                    except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                        pass
+                if called.get("exceptionDetails"):
+                    return None
+                return (called.get("result") or {}).get("value")
+
+            return await self._in_gate_world(cdp, frame_id, run)
+        except Exception:  # noqa: BLE001 — 격리 world 를 못 얻음: 판정 불가(fail-closed)
+            return None
+
+    async def _select_display_scoped(self, expression: str) -> Any:
+        """프레임 관찰의 선택지 표시 식을 그 프레임의 격리 world 에서 평가(R1). 못 하면 RuntimeError(표시 생략)."""
+        world = await self._select_frame_world()
+        if world is None:
+            raise RuntimeError("프레임 격리 world 없음")
+        cdp, frame_id, _ = world
+
+        async def run(context_id: int) -> Any:
+            return await cdp.send("Runtime.evaluate", {
+                "expression": expression, "contextId": context_id, "returnByValue": True})
+
+        res = await self._in_gate_world(cdp, frame_id, run)
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            raise RuntimeError("프레임 격리 world 평가 실패")
+        return (res.get("result") or {}).get("value")
 
     async def _resolve_select(self, handle: Any, params: Dict[str, Any], target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
         """select_option 인자 해석(관문 앞 1회). 반환 verdict: ok(index·value·label) / fail(reason·indices) / index(total) /
@@ -3730,9 +3858,8 @@ class ActionDispatcher:
                 return
             if self.ctx.root_page is None:
                 raw = await self.isolated_eval(so.display_expr(targets))
-            else:
-                fn, arg = so.display_args(targets)
-                raw = await page.evaluate(fn, arg)
+            else:  # R1: 프레임도 그 프레임의 격리 world 에서만(페이지 world 에서 읽은 라벨 순서는 싣지 않는다)
+                raw = await self._select_display_scoped(so.display_expr(targets))
         except Exception as exc:  # noqa: BLE001 — 부가 정보
             logger.debug("select 선택지 수집 실패: %s", type(exc).__name__)
             return

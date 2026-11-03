@@ -10,7 +10,9 @@
   정규화(NFKC·공백 접기·앞뒤 공백) 라벨 정확 일치가 **정확히 1개**. 0개·2개 이상·disabled(optgroup disabled 포함)는
   즉시 실패(후보 index 만 — 라벨 글자 없음). 실행은 `index=` 로, 실행 뒤 고른 option 이 해석한 option 인지 확인한다.
 * 표시·해석·확인은 같은 페이지 함수(SO_COMMON_JS)를 쓰고, 최상위 문서면 **격리 world** 에서 css 경로로 평가한다
-  (페이지가 HTMLSelectElement.prototype.options getter 를 바꿔도 닿지 않음). 프레임·shadow 는 그 노드에서 평가한다.
+  (페이지가 HTMLSelectElement.prototype.options getter 를 바꿔도 닿지 않음). 프레임·shadow 도(R1) 그 프레임의 CDP 격리
+  world(다른 출처 iframe 은 그 프레임의 CDP 세션)에서 같은 노드를 잡아 평가한다 — 노드가 정확히 1개로 정해지지 않거나
+  격리 world 를 못 얻으면 페이지 world 로 내려가지 않는다(해석 없음 = 기준 호출 그대로, 표시 없음, 확인 없음).
 * 대리 위젯(select2·choices.js 류 — 보이는 combobox 가 select 가 아님)은 값 넣기·짝짓기를 하지 않고 고정 안내(T3).
 
 엔진·살균기·점수기는 건드리지 않는다(동결 — test_ws62_r12). 응답 크기 맞춤·내용 가림·주입 신호는 data.repeated 와 같은
@@ -148,10 +150,25 @@ def display_expr(targets: List[Dict[str, Any]]) -> str:
             f"{_RAW_LABEL_CHARS}, {_EXTRA_SELECTED})")
 
 
-def display_args(targets: List[Dict[str, Any]]) -> Tuple[str, List[Any]]:
-    """페이지 world 평가용(page.evaluate(fn, arg)) — 격리 world 를 못 쓰는 프레임 관찰."""
-    fn = (f"(a) => ({_DISPLAY_FN})(a[0], a[1], a[2], a[3])")
-    return fn, [targets, SELECT_MAX_OPTIONS, _RAW_LABEL_CHARS, _EXTRA_SELECTED]
+#: 프레임·shadow 격리 world 노드 찾기 상한(shadow root 수).
+_DEEP_ROOTS = 500
+
+
+def deep_node_expr(css: str) -> str:
+    """격리 world 식(R1): 문서 + 열린 shadow root 전부에서 css 에 맞는 노드가 **정확히 1개**면 그 노드, 아니면 null.
+
+    Playwright 로케이터(shadow 관통 css·role+name)의 '첫 일치' 와 이 world 의 노드가 갈릴 수 있는 경우(0·2개 이상)는
+    같은 노드라고 단정하지 않는다(부르는 쪽이 판정 불가 — fail-closed)."""
+    return (f"(() => {{ const css = {json.dumps(css)}; const hits = []; const stack = [document]; let n = 0; "
+            f"while (stack.length) {{ if (++n > {_DEEP_ROOTS}) return null; const root = stack.pop(); "
+            f"try {{ for (const h of root.querySelectorAll(css)) hits.push(h); }} catch (e) {{ return null; }} "
+            f"for (const x of root.querySelectorAll('*')) {{ if (x.shadowRoot) stack.push(x.shadowRoot); }} "
+            f"if (hits.length > 1) return null; }} return hits.length === 1 ? hits[0] : null; }})()")
+
+
+def call_fn(fn: str) -> str:
+    """Runtime.callFunctionOn 용 선언 — this(그 world 의 노드)에 fn(el, a) 을 적용한다."""
+    return f"function(a) {{ return ({fn})(this, a); }}"
 
 
 def _cut(text: Any) -> str:
