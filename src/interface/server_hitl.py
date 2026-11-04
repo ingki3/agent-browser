@@ -360,6 +360,11 @@ class HitlMixin:
         elif action is ActionType.PRESS_KEY:
             submits_form, name, unresolved, signals = await self._press_key_target(params)
             element_name = name or element_name
+        if action in (ActionType.CHECK_BOX, ActionType.CLICK) and element_id and dispatcher is not None \
+                and hasattr(dispatcher, "hidden_control_gate_signals"):
+            # WS-81 NB1: 숨긴 checkbox/radio 의 짝 라벨이면 그 input 의 aria-label·title 도 신호로(더 묻는 쪽만 — 아이콘
+            # 라벨의 실제 의미는 input 에 있다). 행 글자는 넣지 않는다('주문 확인' 메일 제목이 선택을 막지 않게).
+            signals = tuple(signals) + tuple(await dispatcher.hidden_control_gate_signals(element_id, action))
         return element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis
 
     async def _newline_submit_target(self, params: Dict[str, Any], element_id: Any, submits_form: bool,

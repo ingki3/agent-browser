@@ -365,6 +365,13 @@ class ToolsMixin:
             fit_select_options(result, max_chars,
                                finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
                                limit=self.max_result_chars)
+        if action is ActionType.OBSERVE_PAGE and "hidden_controls" in result.data:
+            from perception.hidden_controls import fit_hidden_controls
+
+            # WS-81: 숨긴 control 블록·추가 라벨 요소는 select 선택지 다음·반복 묶음 앞 — 원래 요소보다 먼저 줄인다.
+            fit_hidden_controls(result, max_chars,
+                                finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                                limit=self.max_result_chars)
         if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
             from perception.repeated import fit_repeated
 
@@ -383,6 +390,12 @@ class ToolsMixin:
 
             # WS-80: 요소를 자른 뒤 elements 밖 element_id 를 가리키는 항목이 남지 않게(WS-74 불변식) — 지웠으면 길이 다시.
             if drop_orphans(result.data, element_ids(result)):
+                settle_returned_chars(result)
+        if action is ActionType.OBSERVE_PAGE and "hidden_controls" in result.data:
+            from perception import hidden_controls as hc
+
+            # WS-81: 요소를 자른 뒤 elements 밖 element_id(라벨·행 링크)를 가리키는 항목이 남지 않게 — 지웠으면 길이 다시.
+            if hc.drop_orphans(result.data, hc.element_ids(result.data)):
                 settle_returned_chars(result)
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,

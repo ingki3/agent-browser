@@ -71,6 +71,8 @@ TABLES = {
     ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
     ("perception/select_options.py", "FAIL_MESSAGES"): (FREE, "WS-80 select_option 실패 error_message 고정 문장(키는 "
                                                               "data.select_candidates.reason 어휘)"),
+    ("perception/hidden_controls.py", "HINTS"): (FREE, "WS-81 check_box 거부 error_message·data.hint 고정 문장(키는 거부 "
+                                                       "사유 — 응답에 싣지 않음)"),
     ("interface/server_batch.py", "DETAILS"): (FREE, "WS-73 R1 data.batch.detail 고정 문장(키는 server_batch.REASONS 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"

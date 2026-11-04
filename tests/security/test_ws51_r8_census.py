@@ -84,6 +84,7 @@ ATTRS = {
     ("approval_id", "approval_id"): (ID, "ap_…"),
     ("element_id", "element_id"): (ID, "@eN·@sN"),
     ("id", "element_id"): (ID, "perception/repeated.py data.repeated.groups[].members[].id — @eN(WS-62)"),
+    ("row_element_id", "element_id"): (ID, "perception/hidden_controls.py data.hidden_controls[].row_element_id — @eN(WS-81)"),
     ("server_id", "server_id"): (ID, "{pid}-{hex6}"),
     ("tag", "tag"): (ID, "actions/dispatcher.py data.som_tags[].tag — vision.candidates.make_tag 두 글자(A1…)"),
     # --- URL

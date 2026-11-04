@@ -145,10 +145,10 @@ def scan_texts(texts: List[Tuple[str, str]],
     return signal
 
 
-#: 관찰 결과의 서버 부가 블록(WS-62 반복 묶음·WS-61 기억한 페이지·WS-80 select 선택지) — 응답 크기 맞춤이 요소보다
-#: 먼저 남기거나(묶음) 줄이므로 앞쪽 요소가 검사 예산을 다 써도 따로(자기 예산으로) 검사한다(WS-62 R1 R4). 블록 자체에
-#: 상한이 있다. select_options 는 목록(dict 가 아님)이다.
-SIDE_BLOCK_KEYS = ("repeated", "saved_pages", "select_options")
+#: 관찰 결과의 서버 부가 블록(WS-62 반복 묶음·WS-61 기억한 페이지·WS-80 select 선택지·WS-81 숨긴 control) — 응답 크기
+#: 맞춤이 요소보다 먼저 남기거나(묶음) 줄이므로 앞쪽 요소가 검사 예산을 다 써도 따로(자기 예산으로) 검사한다(WS-62 R1 R4).
+#: 블록 자체에 상한이 있다. select_options·hidden_controls 는 목록(dict 가 아님)이다(hidden_controls 는 페이지 글자 없음).
+SIDE_BLOCK_KEYS = ("repeated", "saved_pages", "select_options", "hidden_controls")
 
 
 def injection_signal(data: Any, error_message: Optional[str] = None,

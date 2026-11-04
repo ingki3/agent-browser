@@ -38,6 +38,9 @@ REVIEWED = {
     ("layer", "actions/covered_click.py", "layer"): "actions.covered_click.COVER_LAYERS(covered_by_view 거름)",
     # WS-80 data.select_candidates.reason — dispatcher._select_refusal 가 select_options.FAIL_MESSAGES 키만 통과
     ("reason", "actions/dispatcher.py", "reason"): "perception.select_options.FAIL_MESSAGES 키(_select_refusal 거름)",
+    # WS-81 data.hidden_controls[].kind — hidden_controls._parse 가 checkbox·radio 만 통과(CONTROL_VOCABULARY["kind"])
+    ("kind", "perception/hidden_controls.py", "p['kind']"): "perception.hidden_controls._parse(checkbox·radio 만)",
+    ("kind", "perception/hidden_controls.py", "e['kind']"): "perception.hidden_controls._parse(checkbox·radio 만)",
     # WS-73 browser_batch data.batch.reason — interface.server_batch.REASONS(_Stop 가 assert, 어휘 포함은 test_ws73_batch_units)
     ("reason", "interface/server_batch.py", "reason"): "server_batch.REASONS(_Stop.__init__ assert)",
     ("reason", "interface/server_batch.py", "stop.reason"): "server_batch.REASONS(_Stop.reason)",
@@ -269,6 +272,9 @@ ID_PRODUCERS = {
     ("interface/control_window.py", "secrets.token_hex(8)"): ("WS-77 제어 창 바인딩 이름(CDP 내부) — 출구 아님", None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
+    # WS-81 숨긴 control 짝 라벨 추가 요소 — 엔진과 같은 @eN 이어 붙이기
+    ("perception/hidden_controls.py", "f'@e{next_n + len(added)}'"): (EXEMPT, "element_id",
+                                                                     lambda: f"@e{secrets.randbelow(9999)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{secrets.randbelow(9999)}"),
     ("recipes/store.py", "_secrets.token_hex(4)"): (EXEMPT, "recipe_id", lambda: "r_" + secrets.token_hex(4)),
     ("interface/handoff.py", "secrets.token_urlsafe(9)"): (EXEMPT, "request_id",

@@ -41,6 +41,9 @@ CANDIDATES = {
     # --- 도구 식별자(등록 제외 + 제어 면제)
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{10 + secrets.randbelow(9990)}"),
+    ("perception/hidden_controls.py", "f'@e{next_n + len(added)}'"): (EXEMPT + " (WS-81 짝 라벨 추가 요소 — 엔진 @eN 이어 붙이기)",
+                                                                     "element_id",
+                                                                     lambda: f"@e{10 + secrets.randbelow(9990)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{10 + secrets.randbelow(9990)}"),
     ("vision/bridge.py", "f'{SOM_ID_PREFIX}{used + 1}'"): (EXEMPT + " (R6 신규 — 상수 이름 접두사·산술)", "element_id",
                                                          lambda: f"@s{10 + secrets.randbelow(9990)}"),
