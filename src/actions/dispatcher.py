@@ -1252,6 +1252,16 @@ class _SelectRefused(_TargetRefused):
 _SELECT_CONFIRMED_KEY = "_select_confirmed"
 
 
+class _HiddenRefused(_TargetRefused):
+    """WS-81: 숨긴 체크박스 짝 라벨의 check_box 거부(operable:false·짝 미확정) — 입력 없음, result 는 거부 응답."""
+
+
+#: WS-81: check_box(짝 라벨) 사후 격리 world 확인 결과(params 내부 키 — True 기대 상태, False 다름, 없음 = 못 읽음).
+_HIDDEN_CONFIRMED_KEY = "_hidden_confirmed"
+#: WS-81: click(짝 라벨) 전후 격리 world 값이 바뀌었다(params 내부 키 — {checked_before, checked_after}).
+_HIDDEN_CLICK_KEY = "_hidden_click"
+
+
 def _with_click_point(data: Dict[str, Any]) -> Dict[str, Any]:
     """성공 data 에 이 호출의 click_point(WS-79 — 다른 점을 썼을 때만)를 붙인다. 가운데 경로면 키를 더하지 않는다."""
     point = _CLICK_POINT.get()
@@ -2660,6 +2670,18 @@ class ActionDispatcher:
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
+        if not staleness.fresh and self._is_hidden_label(handle):
+            # WS-81 NB4: 숨긴 체크박스 짝 라벨 — 이름 없는 라벨이 여러 행에 같은 모양이라 치유가 다른 행 라벨로 바꿔 누를 수
+            # 있다. 치유하지 않고 재관찰을 요구한다.
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=f"숨긴 체크박스의 라벨이 바뀜({staleness.detail}) — 자가 치유하지 않음. 다시 관찰하세요.",
+                reobserve_required=True,
+                data={"heal_disabled": True},
+            )
         if not staleness.fresh and staleness.reason is StalenessReason.GROUP_CHANGED:
             # WS-62: 관찰 때 고른 묶음(달·행)이 아니다 — 같은 노드라도 다른 달을 뜻한다. 치유로 다른 묶음의 같은 이름
             # 대상을 고르지 않고 재관찰을 요구한다(액션 종류와 무관 — 읽기 액션도 다른 대상을 읽게 된다).
@@ -2975,14 +2997,41 @@ class ActionDispatcher:
         # WS-80: select_option 의 사후 확인(고른 option == 해석한 option)은 기대 상태 충족이다 — 이미 고른 값을 다시 골라
         # 페이지가 바뀌지 않아도 성공(재시도하지 않는다).
         confirmed = bool(params.pop(_SELECT_CONFIRMED_KEY, False))
+        # WS-81: 짝 라벨 check_box 의 격리 world 확인(기대값이면 성공 — 이미 그 상태 포함, 다르면 재시도 없이 실패)과
+        # click 의 전후 변화(토글 효과 — 성공 + data.hidden_control).
+        hidden_ok = params.pop(_HIDDEN_CONFIRMED_KEY, None)
+        toggled = params.pop(_HIDDEN_CLICK_KEY, None)
+        if hidden_ok is False:
+            from perception.hidden_controls import MISMATCH_MESSAGE
 
-        if post.satisfied or confirmed:
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                error_code=ErrorCode.TIMEOUT,
+                error_message=MISMATCH_MESSAGE,
+                reobserve_required=True,
+                healed=healed_flag,
+            )
+
+        if post.satisfied or confirmed or hidden_ok or toggled:
+            signals = post.signals
+            if hidden_ok and not signals:
+                # R1 NB: 격리 world 로 확인한 기대 상태를 기존 check_box 신호 어휘로 남긴다(레시피 기록 — 이미 그 상태인
+                # 무입력 성공도 기존 check_box 규칙처럼 checked_applied).
+                expected_checked = bool(params.get("checked", True))
+                signals = [f"checked_applied: {expected_checked}"]
+            out = {"signals": signals, "element_id": handle.element_id}
+            if toggled:
+                from perception.hidden_controls import CLICK_KEY
+
+                out[CLICK_KEY] = toggled
             return self._result(
                 success=True,
                 action=action,
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
-                data=_with_click_point({"signals": post.signals, "element_id": handle.element_id}),
+                data=_with_click_point(out),
             )
 
         return await self._retry_unsatisfied(action, handle, params, healed_flag, before, post)
@@ -3865,6 +3914,65 @@ class ActionDispatcher:
             return
         so.apply_block(data, raw, handles)
 
+    # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
+
+    def _hidden_label_entry(self, handle: Any) -> Optional[Tuple[Any, Any]]:
+        """마지막 관찰이 data.hidden_controls 로 노출한 그 라벨 핸들이면 (핸들, 노드 핀), 아니면 None(같은 객체만 —
+        재관찰로 같은 id 가 다른 노드를 가리키면 아님)."""
+        labels = self.__dict__.get("_hidden_labels") or {}
+        entry = labels.get(getattr(handle, "element_id", None)) if handle is not None else None
+        return entry if entry is not None and entry[0] is handle else None
+
+    def _is_hidden_label(self, handle: Any) -> bool:
+        return self._hidden_label_entry(handle) is not None
+
+    async def _hidden_state(self, handle: Any, target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
+        """라벨 핸들의 숨긴 control 짝·상태(격리 world 에서만 — _select_eval 재사용). shadow·못 읽음은 None(기준 동작).
+
+        R1 B1: 관찰이 노출한 라벨이면 관찰 때 격리 world 에 고정한 노드(라벨·input)와 지금 노드가 같은지 대조한다 — 다르거나
+        대조 불가(핀 없음·판독 실패)면 verdict moved(누르지 않음). id 유무와 무관."""
+        entry = self._hidden_label_entry(handle)
+        if getattr(handle, "is_shadow", False) or not getattr(handle, "css_path", ""):
+            return {"verdict": "moved"} if entry is not None else None
+        from perception import hidden_controls as hc
+
+        pin = entry[1] if entry is not None else None
+        if entry is not None and not (isinstance(pin, list) and len(pin) == 2 and pin[0]):
+            return {"verdict": "moved"}
+        arg = {"pin": pin} if entry is not None else {}
+        out = await self._select_eval(hc.fn(hc.STATE_FN), arg, handle, target, fixed)
+        if isinstance(out, dict) and out.get("verdict") in ("none", "unpaired", "moved", "paired"):
+            return out
+        return {"verdict": "moved"} if entry is not None else None
+
+    def _hidden_moved(self, action: ActionType) -> "_HiddenRefused":
+        from perception.hidden_controls import MOVED_MESSAGE
+
+        return _HiddenRefused(self._result(
+            success=False, action=action, retry_safe=True, error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=MOVED_MESSAGE, reobserve_required=True))
+
+    async def _annotate_hidden_controls(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
+        """관찰 data 에 숨긴 checkbox/radio 블록(data.hidden_controls)과, 짝 라벨이 프루닝됐으면 그 라벨 추가 요소를 싣는다.
+
+        격리 world 에서만 읽는다(프레임은 그 프레임의 격리 world). 숨긴 control 이 없거나 못 읽으면 아무것도 바꾸지 않는다."""
+        import secrets
+
+        from perception import hidden_controls as hc
+
+        self.__dict__["_hidden_labels"] = {}
+        try:
+            targets, handles = hc.scan_targets(self.ctx.engine, elements)
+            nonce = secrets.token_hex(8)  # R1 B1: 이 관찰의 노드 핀 묶음 식별(격리 world 전역)
+            expr = hc.scan_expr(targets, nonce)
+            if self.ctx.root_page is None:
+                raw = await self.isolated_eval(expr)
+            else:
+                raw = await self._select_display_scoped(expr)
+            self.__dict__["_hidden_labels"] = hc.apply_block(data, raw, handles, self.ctx.engine, nonce)
+        except Exception as exc:  # noqa: BLE001 — 부가 정보
+            logger.debug("숨긴 control 수집 실패: %s", type(exc).__name__)
+
     async def _send_to_target(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
         bind: Any = None, progress: Optional[Dict[str, bool]] = None, point: Optional[Dict[str, float]] = None,
@@ -3894,9 +4002,23 @@ class ActionDispatcher:
 
         if action is ActionType.CLICK:
             button = params.get("button", "left")
+            # WS-81: 관찰이 노출한 짝 라벨이면 전후 상태를 격리 world 에서 읽는다(관문 앞 — 토글 의미는 그대로).
+            params.pop(_HIDDEN_CLICK_KEY, None)
+            params.pop(_HIDDEN_CONFIRMED_KEY, None)
+            state = await self._hidden_state(handle, target, fixed) if self._is_hidden_label(handle) else None
+            if isinstance(state, dict) and state.get("verdict") == "moved":
+                raise self._hidden_moved(action)
             await self._pointer_call(action, params, target, guard, fk, point,
                                      lambda **kw: target.click(button=button, **kw))
             sent()
+            if isinstance(state, dict) and state.get("verdict") == "paired":
+                after = await self._hidden_state(handle, target, fixed)
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드 — 성공으로 보고하지 않는다
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
+                        isinstance(after.get("checked"), bool) and after["checked"] is not state.get("checked"):
+                    params[_HIDDEN_CLICK_KEY] = {"checked_before": not after["checked"],
+                                                 "checked_after": after["checked"]}
 
         elif action is ActionType.TYPE_TEXT:
             # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
@@ -3973,9 +4095,32 @@ class ActionDispatcher:
             sent()
 
         elif action is ActionType.CHECK_BOX:
-            toggle = target.check if params.get("checked", True) else target.uncheck
+            # WS-81: 대상이 숨긴 checkbox/radio 의 라벨이면 짝을 격리 world 에서 확인한다(관문 앞). operable:false·짝 미확정은
+            # 누르지 않고 고정 안내로 거부, 짝이면 기존 check()/_pointer_call 그대로 + 사후 확인(label.control.checked).
+            # 못 읽으면(None) 기준 동작 그대로(페이지 world 로 내려가지 않음).
+            from perception import hidden_controls as hc
+
+            params.pop(_HIDDEN_CONFIRMED_KEY, None)
+            want = bool(params.get("checked", True))
+            state = await self._hidden_state(handle, target, fixed)
+            verdict = state.get("verdict") if isinstance(state, dict) else None
+            if verdict == "moved":
+                raise self._hidden_moved(action)
+            if verdict == "unpaired" or (verdict == "paired" and state.get("operable") is not True):
+                hint = hc.HINTS["unpaired" if verdict == "unpaired" else "inoperable"]
+                raise _HiddenRefused(self._result(
+                    success=False, action=action, retry_safe=True, error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                    error_message=hint, data={"hint": hint}))
+            toggle = target.check if want else target.uncheck
             await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: toggle(**kw))
             sent()
+            if verdict == "paired":
+                after = await self._hidden_state(handle, target, fixed)
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
+                        isinstance(after.get("checked"), bool):
+                    params[_HIDDEN_CONFIRMED_KEY] = after["checked"] is want
 
         elif action is ActionType.HOVER:
             await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: target.hover(**kw))
@@ -4170,6 +4315,8 @@ class ActionDispatcher:
             data["repeated"] = repeated
         # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).
         await self._annotate_select_options(page, observed.elements, data)
+        # WS-81: 숨긴 checkbox/radio 의 짝 라벨·상태 — 없으면 키도 추가 요소도 없다(기존 바이트 그대로).
+        await self._annotate_hidden_controls(page, observed.elements, data)
         return self._result(
             success=True,
             action=action,

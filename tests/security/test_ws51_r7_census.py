@@ -71,6 +71,8 @@ TABLES = {
     ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
     ("perception/select_options.py", "FAIL_MESSAGES"): (FREE, "WS-80 select_option 실패 error_message 고정 문장(키는 "
                                                               "data.select_candidates.reason 어휘)"),
+    ("perception/hidden_controls.py", "HINTS"): (FREE, "WS-81 check_box 거부 error_message·data.hint 고정 문장(키는 거부 "
+                                                       "사유 — 응답에 싣지 않음)"),
     ("interface/server_batch.py", "DETAILS"): (FREE, "WS-73 R1 data.batch.detail 고정 문장(키는 server_batch.REASONS 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
@@ -168,6 +170,8 @@ KEYS = {
     "action": (NOT_OUT, "recipes/recorder.py 궤적 항목(레시피 파일) — 응답 action 은 ActionType 값(control_value)"),
     ("kind", "browser/site_session.py"): (NOT_OUT, "로그인 추적 이벤트 종류(tracer 파일 — interface 가 쓰지 않음)"),
     ("server_id", "browser/serve_profile.py"): (NOT_OUT, "프로필 잠금 파일 내용"),
+    ("verdict", "actions/dispatcher.py"): (NOT_OUT, "WS-81 R1 _hidden_state 내부 판정(moved — 노드 핀 대조 불가) — 응답에 "
+                                                    "싣지 않음"),
 }
 
 
