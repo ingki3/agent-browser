@@ -3015,7 +3015,13 @@ class ActionDispatcher:
             )
 
         if post.satisfied or confirmed or hidden_ok or toggled:
-            out = {"signals": post.signals, "element_id": handle.element_id}
+            signals = post.signals
+            if hidden_ok and not signals:
+                # R1 NB: 격리 world 로 확인한 기대 상태를 기존 check_box 신호 어휘로 남긴다(레시피 기록 — 이미 그 상태인
+                # 무입력 성공도 기존 check_box 규칙처럼 checked_applied).
+                expected_checked = bool(params.get("checked", True))
+                signals = [f"checked_applied: {expected_checked}"]
+            out = {"signals": signals, "element_id": handle.element_id}
             if toggled:
                 from perception.hidden_controls import CLICK_KEY
 
@@ -3910,8 +3916,8 @@ class ActionDispatcher:
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
-    def _hidden_label_entry(self, handle: Any) -> Optional[Tuple[Any, str]]:
-        """마지막 관찰이 data.hidden_controls 로 노출한 그 라벨 핸들이면 (핸들, 관찰 때 control id), 아니면 None(같은 객체만 —
+    def _hidden_label_entry(self, handle: Any) -> Optional[Tuple[Any, Any]]:
+        """마지막 관찰이 data.hidden_controls 로 노출한 그 라벨 핸들이면 (핸들, 노드 핀), 아니면 None(같은 객체만 —
         재관찰로 같은 id 가 다른 노드를 가리키면 아님)."""
         labels = self.__dict__.get("_hidden_labels") or {}
         entry = labels.get(getattr(handle, "element_id", None)) if handle is not None else None
@@ -3923,15 +3929,21 @@ class ActionDispatcher:
     async def _hidden_state(self, handle: Any, target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
         """라벨 핸들의 숨긴 control 짝·상태(격리 world 에서만 — _select_eval 재사용). shadow·못 읽음은 None(기준 동작).
 
-        관찰이 노출한 라벨이면 그때의 control id 와 지금 control id 를 비교한다(다르면 verdict moved)."""
+        R1 B1: 관찰이 노출한 라벨이면 관찰 때 격리 world 에 고정한 노드(라벨·input)와 지금 노드가 같은지 대조한다 — 다르거나
+        대조 불가(핀 없음·판독 실패)면 verdict moved(누르지 않음). id 유무와 무관."""
+        entry = self._hidden_label_entry(handle)
         if getattr(handle, "is_shadow", False) or not getattr(handle, "css_path", ""):
-            return None
+            return {"verdict": "moved"} if entry is not None else None
         from perception import hidden_controls as hc
 
-        entry = self._hidden_label_entry(handle)
-        arg = {"cid": entry[1]} if entry is not None and entry[1] else {}
+        pin = entry[1] if entry is not None else None
+        if entry is not None and not (isinstance(pin, list) and len(pin) == 2 and pin[0]):
+            return {"verdict": "moved"}
+        arg = {"pin": pin} if entry is not None else {}
         out = await self._select_eval(hc.fn(hc.STATE_FN), arg, handle, target, fixed)
-        return out if isinstance(out, dict) and out.get("verdict") in ("none", "unpaired", "moved", "paired") else None
+        if isinstance(out, dict) and out.get("verdict") in ("none", "unpaired", "moved", "paired"):
+            return out
+        return {"verdict": "moved"} if entry is not None else None
 
     def _hidden_moved(self, action: ActionType) -> "_HiddenRefused":
         from perception.hidden_controls import MOVED_MESSAGE
@@ -3940,40 +3952,24 @@ class ActionDispatcher:
             success=False, action=action, retry_safe=True, error_code=ErrorCode.TOCTOU_MISMATCH,
             error_message=MOVED_MESSAGE, reobserve_required=True))
 
-    async def hidden_control_gate_signals(self, element_id: Any, action: Any = None) -> List[Tuple[str, str]]:
-        """게이트 문맥 신호(NB1): 라벨의 control 이 숨긴 checkbox/radio 면 그 input 의 aria-label·title(격리 world).
-
-        더 묻는 쪽으로만 쓴다 — 못 읽으면 빈 목록(이름 판정은 그대로). click 은 관찰이 노출한 짝 라벨일 때만 읽는다."""
-        handle = self.ctx.engine.get_handle(str(element_id or ""))
-        if handle is None or getattr(handle, "is_shadow", False) or not getattr(handle, "css_path", ""):
-            return []
-        if action is not ActionType.CHECK_BOX and not self._is_hidden_label(handle):
-            return []
-        from perception import hidden_controls as hc
-
-        try:
-            out = await self._select_eval(hc.fn(hc.GATE_FN), {}, handle, None, False)
-        except Exception:  # noqa: BLE001 — 부가 신호
-            return []
-        sig = out.get("signals") if isinstance(out, dict) else None
-        return [(str(a), str(b)) for a, b in sig if isinstance(a, str) and isinstance(b, str)] \
-            if isinstance(sig, list) and all(isinstance(x, list) and len(x) == 2 for x in sig) else []
-
     async def _annotate_hidden_controls(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
         """관찰 data 에 숨긴 checkbox/radio 블록(data.hidden_controls)과, 짝 라벨이 프루닝됐으면 그 라벨 추가 요소를 싣는다.
 
         격리 world 에서만 읽는다(프레임은 그 프레임의 격리 world). 숨긴 control 이 없거나 못 읽으면 아무것도 바꾸지 않는다."""
+        import secrets
+
         from perception import hidden_controls as hc
 
         self.__dict__["_hidden_labels"] = {}
         try:
             targets, handles = hc.scan_targets(self.ctx.engine, elements)
-            expr = hc.scan_expr(targets)
+            nonce = secrets.token_hex(8)  # R1 B1: 이 관찰의 노드 핀 묶음 식별(격리 world 전역)
+            expr = hc.scan_expr(targets, nonce)
             if self.ctx.root_page is None:
                 raw = await self.isolated_eval(expr)
             else:
                 raw = await self._select_display_scoped(expr)
-            self.__dict__["_hidden_labels"] = hc.apply_block(data, raw, handles, self.ctx.engine)
+            self.__dict__["_hidden_labels"] = hc.apply_block(data, raw, handles, self.ctx.engine, nonce)
         except Exception as exc:  # noqa: BLE001 — 부가 정보
             logger.debug("숨긴 control 수집 실패: %s", type(exc).__name__)
 
@@ -4008,6 +4004,7 @@ class ActionDispatcher:
             button = params.get("button", "left")
             # WS-81: 관찰이 노출한 짝 라벨이면 전후 상태를 격리 world 에서 읽는다(관문 앞 — 토글 의미는 그대로).
             params.pop(_HIDDEN_CLICK_KEY, None)
+            params.pop(_HIDDEN_CONFIRMED_KEY, None)
             state = await self._hidden_state(handle, target, fixed) if self._is_hidden_label(handle) else None
             if isinstance(state, dict) and state.get("verdict") == "moved":
                 raise self._hidden_moved(action)
@@ -4016,7 +4013,9 @@ class ActionDispatcher:
             sent()
             if isinstance(state, dict) and state.get("verdict") == "paired":
                 after = await self._hidden_state(handle, target, fixed)
-                if isinstance(after, dict) and after.get("verdict") == "paired" and \
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드 — 성공으로 보고하지 않는다
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
                         isinstance(after.get("checked"), bool) and after["checked"] is not state.get("checked"):
                     params[_HIDDEN_CLICK_KEY] = {"checked_before": not after["checked"],
                                                  "checked_after": after["checked"]}
@@ -4117,7 +4116,10 @@ class ActionDispatcher:
             sent()
             if verdict == "paired":
                 after = await self._hidden_state(handle, target, fixed)
-                if isinstance(after, dict) and after.get("verdict") == "paired" and isinstance(after.get("checked"), bool):
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
+                        isinstance(after.get("checked"), bool):
                     params[_HIDDEN_CONFIRMED_KEY] = after["checked"] is want
 
         elif action is ActionType.HOVER:

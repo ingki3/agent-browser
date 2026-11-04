@@ -105,10 +105,26 @@ BODIES: Dict[str, str] = {
               'clip:rect(0 0 0 0)"><label for=sh1>Shadow label</label>\';</script>',
     "frame": '<p>top</p><iframe src="/frame_inner" style="width:400px;height:200px"></iframe>',
     "frame_inner": '<input type=checkbox id=f1 class=clip><label for=f1>Frame option</label>',
+    # R1 B2: 평범한 표시 설정 — input aria-label·title 에 위험 낱말이 섞여도 판정은 라벨 이름 기준(기준과 같음).
+    "plainaria": '<input type=checkbox id=pa1 class=clip aria-label="주문 내역 표시"><label for=pa1>선택</label>'
+                 '<input type=checkbox id=pa2 class=clip title="Delete 키 설명 표시"><label for=pa2>'
+                 '<span class=ic></span></label>'
+                 '<input type=checkbox id=pa3 class=clip aria-label="동의 문서 표시"><label for=pa3>보기 설정</label>',
+    "named": '<input type=checkbox id=na class=clip><label for=na>Alpha option</label>'
+             '<input type=checkbox id=nb class=clip checked><label for=nb>Beta option</label>',
 }
 
 
+def mrows(n: int, noid: bool) -> str:
+    """R1 B1: 이름 없는 라벨 n행(검증 newchecks 모양) — noid 면 input id 가 없다."""
+    return "".join(f'<div class=row data-row="R{i}"><label><input type=checkbox{"" if noid else f" id=m{i}"} '
+                   f'class=clip data-key="R{i}"><span class=ic></span></label><a href="#mail{i}">Subject {i}</a>'
+                   f'<span>Sender {i}</span><button>Archive</button></div>' for i in range(n))
+
+
 def _page(name: str) -> str:
+    if name.startswith("mrows"):
+        return HEAD + mrows(30, noid=name == "mrowsnoid") + "</body></html>"
     if name.startswith("gmail"):
         return HEAD + gmail(int(name[5:] or 30), checked=(3, 7)) + "</body></html>"
     if name.startswith("many"):
@@ -184,9 +200,9 @@ def _eid_by_name(obs: ActionResult, name: str) -> str:
 
 
 async def _truth(s: BrowserMCPServer) -> Dict[str, bool]:
-    """격리 world 판독 — 페이지 world 위조가 닿지 않는 실제 checked."""
+    """격리 world 판독 — 페이지 world 위조가 닿지 않는 실제 checked(id 가 없으면 data-key)."""
     out = await s._dispatcher.isolated_eval(  # noqa: SLF001
-        "Object.fromEntries([...document.querySelectorAll('input')].map(i=>[i.id,i.checked]))")
+        "Object.fromEntries([...document.querySelectorAll('input')].map(i=>[i.id||i.dataset.key,i.checked]))")
     return dict(out)
 
 
@@ -509,7 +525,8 @@ async def test_t9_injection_label_signalled_and_block_has_no_text(site, tmp_path
 
 
 @requires_chromium
-async def test_t10_unattended_hitl_follows_label_and_input_aria(site, tmp_path):
+async def test_t10_unattended_hitl_follows_label_name(site, tmp_path):
+    """HITL 은 라벨 이름 기준(R1 B2 — 숨긴 input 의 aria-label 은 판정에 쓰지 않는다, 기준 6f5c70d 와 같음)."""
     async with _server(tmp_path) as s:
         obs = await _open(s, site, "risky")
         ids = {await _label_of(s, e["element_id"]): e["element_id"] for e in _block(obs)}
@@ -520,10 +537,11 @@ async def test_t10_unattended_hitl_follows_label_and_input_aria(site, tmp_path):
         rm, _ = await _act(s, ActionType.CHECK_BOX, mail, m0, checked=True)
         rc, _ = await _act(s, ActionType.CLICK, mail, _block(mail)[1]["element_id"])
     assert set(ids) == {"all", "tos", "del", "ic1"}
-    for cid in ("tos", "del", "ic1"):
+    for cid in ("tos", "del"):
         assert res[cid].error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, (cid, res[cid].model_dump(mode="json"))
         assert truth[cid] is False
-    assert res["all"].success and truth["all"] is True, res["all"].model_dump(mode="json")
+    for cid in ("all", "ic1"):
+        assert res[cid].success and truth[cid] is True, (cid, res[cid].model_dump(mode="json"))
     assert rm.success, rm.model_dump(mode="json")  # 행 링크 '주문 확인' 은 선택을 막지 않는다
     assert rc.success and rc.data[hc.CLICK_KEY]["checked_after"] is True, rc.model_dump(mode="json")
 
@@ -732,6 +750,112 @@ async def test_row_removed_shifts_label_path_refused(site, tmp_path, action):
     assert r.success is False and r.error_code is ErrorCode.TOCTOU_MISMATCH, r.model_dump(mode="json")
     assert r.error_message == hc.MOVED_MESSAGE and r.reobserve_required is True
     assert truth == truth0 and rec["chg"] == [], (truth0, truth, rec)
+
+
+# ------------------------------------------------------------------ R1 B1 노드 핀(다른 행 조작 금지)
+
+
+def _added_label(s: BrowserMCPServer, obs: ActionResult) -> str:
+    e = next((x for x in _block(obs) if x.get("added")), None)
+    assert e is not None, "조건 불성립: 추가 요소 라벨 없음"
+    return e["element_id"]
+
+
+@requires_chromium
+@pytest.mark.parametrize("variant", ["noid", "reuse", "unique"])
+@pytest.mark.parametrize("action", [ActionType.CHECK_BOX, ActionType.CLICK])
+async def test_r1_row_shift_refused_regardless_of_input_id(site, tmp_path, variant, action):
+    """관찰 뒤 그 라벨의 행이 빠지면(input id 없음·같은 id 재사용 포함) 같은 css 경로의 다음 행 라벨을 누르지 않는다."""
+    async with _server(tmp_path) as s:
+        obs = await _open(s, site, "mrowsnoid" if variant == "noid" else "mrows")
+        eid = _added_label(s, obs)
+        css = json.dumps(s._dispatcher.ctx.engine.get_handle(eid).css_path)  # noqa: SLF001
+        reuse = "next.querySelector('input').id=old;" if variant == "reuse" else ""
+        await s._dispatcher.isolated_eval(  # noqa: SLF001
+            f"(()=>{{const r=document.querySelector({css}).closest('.row');const next=r.nextElementSibling;"
+            f"const old=r.querySelector('input').id;{reuse}r.remove();return true}})()")
+        truth0 = await _truth(s)
+        args = {"checked": True} if action is ActionType.CHECK_BOX else {}
+        r, _ = await _act(s, action, obs, eid, **args)
+        truth, rec = await _truth(s), await _rec(s)
+        again = await s.call_tool(tool_name(ActionType.OBSERVE_PAGE), {})
+        eid2 = _added_label(s, again)
+        ok, _ = await _act(s, action, again, eid2, **args)
+        truth2 = await _truth(s)
+    assert r.success is False and r.error_code is ErrorCode.TOCTOU_MISMATCH, r.model_dump(mode="json")
+    assert r.error_message == hc.MOVED_MESSAGE and r.reobserve_required is True and r.retry_safe is True
+    assert truth == truth0 and rec["chg"] == [], (variant, rec)
+    assert ok.success, ok.model_dump(mode="json")  # 다시 관찰한 정상 행은 그대로 성공
+    assert sum(truth2.values()) == sum(truth0.values()) + 1
+
+
+@requires_chromium
+@pytest.mark.parametrize("action", [ActionType.CHECK_BOX, ActionType.CLICK])
+async def test_r1_noid_rows_unchanged_page_succeeds_on_that_row(site, tmp_path, action):
+    async with _server(tmp_path) as s:
+        obs = await _open(s, site, "mrowsnoid")
+        eid = _added_label(s, obs)
+        css = json.dumps(s._dispatcher.ctx.engine.get_handle(eid).css_path)  # noqa: SLF001
+        key = await s._dispatcher.isolated_eval(  # noqa: SLF001
+            f"document.querySelector({css}).querySelector('input').dataset.key")
+        args = {"checked": True} if action is ActionType.CHECK_BOX else {}
+        r, _ = await _act(s, action, obs, eid, **args)
+        truth = await _truth(s)
+    assert r.success, r.model_dump(mode="json")
+    assert [k for k, v in truth.items() if v] == [key], (key, truth)
+
+
+@requires_chromium
+async def test_r1_unverifiable_pin_refuses_without_input(site, tmp_path, monkeypatch):
+    """관찰이 노출한 라벨인데 노드 대조를 못 하면(격리 world 판독 실패) 누르지 않는다."""
+    from actions.dispatcher import ActionDispatcher
+
+    async with _server(tmp_path) as s:
+        obs = await _open(s, site, "mrowsnoid")
+        eid = _added_label(s, obs)
+
+        async def gone(self, *a, **k):
+            return None
+
+        monkeypatch.setattr(ActionDispatcher, "_select_eval", gone)
+        r, _ = await _act(s, ActionType.CHECK_BOX, obs, eid, checked=True)
+        monkeypatch.undo()
+        truth = await _truth(s)
+    assert r.success is False and r.error_code is ErrorCode.TOCTOU_MISMATCH, r.model_dump(mode="json")
+    assert not any(truth.values()), truth
+
+
+# ------------------------------------------------------------------ R1 B2 HITL 라벨 기준
+
+
+@requires_chromium
+@pytest.mark.parametrize("action", [ActionType.CHECK_BOX, ActionType.CLICK])
+async def test_r1_plain_display_settings_not_hitl_by_input_aria(site, tmp_path, action):
+    async with _server(tmp_path) as s:
+        obs = await _open(s, site, "plainaria")
+        ids = {await _label_of(s, e["element_id"]): e["element_id"] for e in _block(obs)}
+        args = {"checked": True} if action is ActionType.CHECK_BOX else {}
+        res = {cid: (await _act(s, action, obs, eid, **args))[0] for cid, eid in ids.items()}
+        truth = await _truth(s)
+    assert set(ids) == {"pa1", "pa2", "pa3"}, ids
+    for cid, r in res.items():
+        assert r.error_code is not ErrorCode.HITL_UNATTENDED_BLOCKED, (cid, r.model_dump(mode="json"))
+        assert r.success and truth[cid] is True, (cid, r.model_dump(mode="json"))
+
+
+# ------------------------------------------------------------------ R1 NB 레시피 기록
+
+
+@requires_chromium
+async def test_r1_confirmed_check_box_leaves_checked_signal_and_recipe_saves(site, tmp_path):
+    async with _server(tmp_path, recipes=True) as s:
+        obs = await _open(s, site, "named")
+        r, _ = await _act(s, ActionType.CHECK_BOX, obs, _eid_by_name(obs, "Alpha option"), checked=True)
+        noop, _ = await _act(s, ActionType.CHECK_BOX, obs, _eid_by_name(obs, "Beta option"), checked=True)
+        saved = await s.call_server_tool("browser_recipe", {"op": "save", "name": "WS81 alpha", "last_n": 2})
+    assert r.success and "checked_applied: True" in r.data["signals"], r.model_dump(mode="json")
+    assert noop.success and "checked_applied: True" in noop.data["signals"], noop.model_dump(mode="json")
+    assert saved.get("success"), saved
 
 
 # ------------------------------------------------------------------ T13 동결 핀

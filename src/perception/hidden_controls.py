@@ -17,6 +17,8 @@
 * **동작**: check_box(라벨)는 기존 check()/_pointer_call 경로 그대로 실행하고 사후에 격리 world 에서 label.control.checked 를
   읽어 기대값이면 성공(이미 그 상태면 무입력 성공). click(라벨)은 토글 의미 유지 — 전후 값이 바뀌었으면 성공 +
   `data.hidden_control`. 판단 읽기는 모두 격리 world, 못 읽으면 기준 동작 그대로(페이지 world 로 내려가지 않음).
+* **노드 핀(R1)**: 관찰이 노출한 라벨은 스캔 때 격리 world 전역에 고정한 (라벨, input) 노드와 실행 직전·사후에 대조한다 —
+  다르거나 대조 불가면 누르지 않는다(TOCTOU). input id 유무와 무관.
 
 살균기의 규칙(가시성·role·css 경로·이름)은 sanitizer 원문(COLLECT_SCRIPT·ACCESSIBLE_NAME_JS — 바이트 동결)에서 함수를 그대로
 떼어 쓴다 — 추가 요소의 role·이름이 staleness 검증(같은 이름 규칙)과 어긋나지 않게. 엔진·살균기·점수기는 건드리지 않는다.
@@ -70,6 +72,7 @@ def _common_js() -> str:
 
 _HC_JS = r"""
   const HC_XHTML = 'http://www.w3.org/1999/xhtml';
+  const HC_PINS = '__agentBrowserHiddenControlPins';
   const HC_BAD = 'a[href],button,input,select,textarea,summary,iframe,object,embed,[contenteditable=""],' +
     '[contenteditable=true],[role=link],[role=button],[role=checkbox],[role=switch],[role=radio],[role=menuitem],' +
     '[role=tab],[role=option],[role=row],[onclick]';
@@ -107,8 +110,11 @@ _HC_JS = r"""
   }
 """
 
-#: 표시: (obs[{css, link}], lim) → {entries:[{i, kind, checked, operable, group?, row?, add?}], total}.
-_SCAN_FN = r"""(obs, lim) => {
+#: 표시: (obs[{css, link}], lim, nonce) → {entries:[{i, kind, checked, operable, pin, group?, row?, add?}], total}.
+#: R1 B1: 짝(라벨·input) 노드를 이 **격리 world** 의 전역에 고정한다({n: nonce, p: [[label, input], ...]}) — 페이지 world 는
+#: 이 전역에 닿지 못하고(위조 불가) 노드 동일성(===)은 id·css 경로와 무관하다. 문서가 바뀌거나 world 가 새로 만들어지면
+#: 핀이 사라져 대조 불가(=누르지 않음)가 된다.
+_SCAN_FN = r"""(obs, lim, nonce) => {
   __COMMON__
   const nodes = obs.map((o) => { try { return document.querySelector(o.css); } catch (e) { return null; } });
   const links = [];
@@ -130,10 +136,11 @@ _SCAN_FN = r"""(obs, lim) => {
   const groups = new Map();
   let gid = 0;
   const out = [];
+  const pins = [];
   for (const [inp, p] of pairs) {
     if (out.length >= lim) break;
-    const e = {i: nodes.indexOf(p.label), kind: p.kind, checked: p.checked, operable: p.operable,
-               cid: String(inp.id || '')};
+    const e = {i: nodes.indexOf(p.label), kind: p.kind, checked: p.checked, operable: p.operable, pin: pins.length};
+    pins.push([p.label, inp]);
     if (p.kind === 'radio' && inp.name) {
       const f = inp.form || document;
       if (!groups.has(f)) groups.set(f, new Map());
@@ -152,35 +159,27 @@ _SCAN_FN = r"""(obs, lim) => {
     if (name === '') { const k = row(p.label, inp); if (k >= 0) e.row = k; }
     out.push(e);
   }
+  globalThis[HC_PINS] = {n: nonce, p: pins};
   return {entries: out, total: pairs.length};
 }"""
 
-#: 동작: (라벨 노드, {cid?}) → {verdict: none|unpaired|moved|paired, kind?, checked?, operable?}.
-#: none = 라벨이 아니거나 그 control 이 숨긴 checkbox/radio 가 아님(기준 동작 그대로). moved = 관찰 때 이 라벨의 control id
-#: (cid)와 지금 control id 가 다름(행이 빠져 같은 css 경로가 다른 행 라벨을 가리킴 — 이름 없는 라벨은 이름 비교가 없다).
+#: 동작: (라벨 노드, {pin?: [nonce, k]}) → {verdict: none|unpaired|moved|paired, kind?, checked?, operable?}.
+#: none = 라벨이 아니거나 그 control 이 숨긴 checkbox/radio 가 아님(기준 동작 그대로). moved(R1 B1) = 관찰이 노출한 라벨인데
+#: 지금 css 경로의 노드·그 control 이 관찰 때 고정한 노드가 아니거나 핀이 없음(행이 빠져 같은 경로가 다른 행 — input id 가
+#: 없거나 같은 id 를 다시 써도) — 대조 불가도 moved.
 STATE_FN = r"""(el, a) => {
   __COMMON__
+  if (a && a.pin) {
+    const P = globalThis[HC_PINS];
+    const q = P && P.n === a.pin[0] && Array.isArray(P.p) ? P.p[a.pin[1]] : null;
+    if (!q || q[0] !== el || !el || el.control !== q[1]) return {verdict: 'moved'};
+  }
   if (!el || el.nodeType !== 1 || el.localName !== 'label' || el.namespaceURI !== HC_XHTML) return {verdict: 'none'};
   const c = el.control;
-  if (a && a.cid && (!c || c.id !== a.cid)) return {verdict: 'moved'};
   if (!hcKind(c) || c.getRootNode() !== document || hcVis(c)) return {verdict: 'none'};
   const p = hcPair(c);
   if (!p || !p.ok || p.label !== el) return {verdict: 'unpaired'};
   return {verdict: 'paired', kind: p.kind, checked: p.checked, operable: p.operable};
-}"""
-
-#: 게이트 신호: (라벨 노드, _) → {verdict: ok, signals: [[원천, 글자]]} — 라벨의 control 이 숨긴 checkbox/radio 면 그 input 의 aria-label·title.
-GATE_FN = r"""(el, a) => {
-  __COMMON__
-  const out = [];
-  if (!el || el.nodeType !== 1 || el.localName !== 'label') return {verdict: 'ok', signals: out};
-  const c = el.control;
-  if (!hcKind(c) || hcVis(c)) return {verdict: 'ok', signals: out};
-  for (const [src, attr] of [['aria', 'aria-label'], ['title', 'title']]) {
-    const v = c.getAttribute(attr);
-    if (v && v.trim()) out.push([src, v.trim().slice(0, 300)]);
-  }
-  return {verdict: 'ok', signals: out};
 }"""
 
 _COMMON: Optional[str] = None
@@ -194,12 +193,13 @@ def common_js() -> str:
 
 
 def fn(name: str) -> str:
-    """페이지 함수 원문(공통 부분 채움) — STATE_FN·GATE_FN."""
+    """페이지 함수 원문(공통 부분 채움) — STATE_FN."""
     return name.replace("__COMMON__", common_js())
 
 
-def scan_expr(targets: List[Dict[str, Any]]) -> str:
-    return f"({fn(_SCAN_FN)})({json.dumps(targets, ensure_ascii=False)}, {HC_MAX_ENTRIES})"
+def scan_expr(targets: List[Dict[str, Any]], nonce: str) -> str:
+    return (f"({fn(_SCAN_FN)})({json.dumps(targets, ensure_ascii=False)}, {HC_MAX_ENTRIES}, "
+            f"{json.dumps(nonce)})")
 
 
 def scan_targets(engine: Any, elements: Sequence[Any]) -> Tuple[List[Dict[str, Any]], List[Any]]:
@@ -254,9 +254,11 @@ def _parse(raw: Any, n_handles: int) -> Tuple[List[Dict[str, Any]], int]:
         group = e.get("group")
         if group is not None and (not isinstance(group, int) or isinstance(group, bool)):
             group = None
-        cid = e.get("cid") if isinstance(e.get("cid"), str) else ""
+        pin = e.get("pin")
+        if not isinstance(pin, int) or isinstance(pin, bool) or pin < 0:
+            continue  # 노드 핀 없는 항목은 노출하지 않는다(R1 B1 — 실행 때 대조할 수 없다)
         out.append({"i": i, "kind": e["kind"], "checked": e["checked"], "operable": e["operable"], "row": row,
-                    "group": group, "add": add if i < 0 else None, "cid": cid})
+                    "group": group, "add": add if i < 0 else None, "pin": pin})
     total = raw.get("total")
     total = total if isinstance(total, int) and not isinstance(total, bool) else len(out)
     return out, max(total, len(out))
@@ -280,9 +282,10 @@ def _rebuild_summary(obs: Dict[str, Any]) -> None:
     obs["token_count"] = estimate_tokens(summary)
 
 
-def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: Any) -> Dict[str, Tuple[Any, str]]:
-    """data 에 블록을 싣고(추가 요소는 elements 끝 + 핸들 등록) 노출한 라벨 {element_id: (핸들, 관찰 때 control id)} 를
-    돌려준다.
+def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: Any,
+                nonce: str = "") -> Dict[str, Tuple[Any, List[Any]]]:
+    """data 에 블록을 싣고(추가 요소는 elements 끝 + 핸들 등록) 노출한 라벨 {element_id: (핸들, 노드 핀 [nonce, k])} 를
+    돌려준다(핀 = 스캔이 격리 world 전역에 고정한 짝 노드의 자리 — STATE_FN 이 실행 직전·사후에 대조).
 
     숨긴 control 이 없으면 아무 키도 넣지 않는다. 상한(항목 수·글자)을 넘는 항목은 통째로 빼고 omitted 에 센다 — 뺀 항목의
     추가 요소는 만들지 않는다."""
@@ -298,7 +301,7 @@ def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: 
     next_n = len(obs["elements"]) + 1
     kept: List[Dict[str, Any]] = []
     added: List[Tuple[Any, Any]] = []
-    exposed: Dict[str, Tuple[Any, str]] = {}
+    exposed: Dict[str, Tuple[Any, List[Any]]] = {}
     for p in parsed:
         if p["i"] >= 0:
             handle = handles[p["i"]]
@@ -326,7 +329,7 @@ def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: 
         if _size(kept + [entry]) > HC_MAX_CHARS:
             continue
         kept.append(entry)
-        exposed[element_id] = (handle, p["cid"])
+        exposed[element_id] = (handle, [nonce, p["pin"]])
         if new is not None:
             added.append(new)
     omitted = total - len(kept)

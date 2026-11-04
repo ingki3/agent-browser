@@ -270,6 +270,8 @@ ID_PRODUCERS = {
     ("interface/control_window.py", "secrets.token_hex(6)"): ("WS-77 제어 창 isolated world 이름(CDP 내부) — 출구 아님",
                                                             None, None),
     ("interface/control_window.py", "secrets.token_hex(8)"): ("WS-77 제어 창 바인딩 이름(CDP 내부) — 출구 아님", None, None),
+    ("actions/dispatcher.py", "secrets.token_hex(8)"): ("WS-81 R1 숨긴 control 노드 핀 묶음 식별(격리 world 전역 안) — 출구 아님",
+                                                       None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
     # WS-81 숨긴 control 짝 라벨 추가 요소 — 엔진과 같은 @eN 이어 붙이기

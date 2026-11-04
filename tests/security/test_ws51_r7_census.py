@@ -170,6 +170,8 @@ KEYS = {
     "action": (NOT_OUT, "recipes/recorder.py 궤적 항목(레시피 파일) — 응답 action 은 ActionType 값(control_value)"),
     ("kind", "browser/site_session.py"): (NOT_OUT, "로그인 추적 이벤트 종류(tracer 파일 — interface 가 쓰지 않음)"),
     ("server_id", "browser/serve_profile.py"): (NOT_OUT, "프로필 잠금 파일 내용"),
+    ("verdict", "actions/dispatcher.py"): (NOT_OUT, "WS-81 R1 _hidden_state 내부 판정(moved — 노드 핀 대조 불가) — 응답에 "
+                                                    "싣지 않음"),
 }
 
 
