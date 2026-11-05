@@ -660,8 +660,9 @@ def b_html(c: Dict[str, Any]) -> str:
 
 # ------------------------------------------------------------------ 묶음(family) → [(이름, html | 흐름 이름)]
 
-#: 보존 캡처(로컬 검증 자료 — 저장소 밖 .hermes, 없으면 그 묶음은 건너뛴다).
-CAPTURE_DIR = Path(__file__).resolve().parents[2] / ".hermes" / "ws62-r4-evidence"
+#: 보존 캡처(2026-10-23 하나투어 실제 DOM, 스크립트 0개). WS-82(F8): 예전 경로(.hermes/ws62-r4-evidence)는 없는 경로라 이 묶음이
+#: 조용히 0쪽으로 돌았다 — 추적되는 사본(tests/fixtures/ws73, .hermes/plans/ws62-r4-evidence 와 바이트 동일)을 쓴다.
+CAPTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "ws73"
 CAPTURES = ("hana_calendar_wrap.html", "hana_full_calendar_open.html")
 #: 하나투어 시험 자료 흐름(관찰 여러 번 — 시험 쪽 _hanatour_states).
 FLOWS = ("hanatour_css", "hanatour_nocss")

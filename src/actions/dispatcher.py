@@ -1702,6 +1702,9 @@ class ActionDispatcher:
         out = {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
         if st.reason is StalenessReason.GROUP_CHANGED:
             out["group_changed"] = True  # WS-62 NB1: 승인 경로도 재관찰 요구(reobserve_required)
+        elif st.fresh and await self._panel_heading_changed(handle):
+            # WS-82(#157): 승인 신선도에도 같은 더하기 확인(패널 표제 첫 조각 — 원문은 detail 에 싣지 않는다)
+            out = {"fresh": False, "detail": "묶음 표제 바뀜", "group_changed": True}
         return out
 
     # -- WS-56 R1 B1: 승인 대상 노드 결속 ---------------------------------------
@@ -2761,8 +2764,13 @@ class ActionDispatcher:
                 # WS-62 R1 R2: 채택한 핸들은 원래 선택 근거(구분 조상·지문)를 잇는다 — 치유 후보 거르기가 이 근거로
                 # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다.
                 new_handle.group_path, new_handle.group_heading = handle.group_path, handle.group_heading
+            self._inherit_panel_entry(handle, new_handle)  # WS-82: 패널 표제 확인도 잇는다
             handle = new_handle
             healed_flag = True
+        if await self._panel_heading_changed(handle):
+            # WS-82(#157, 사용자 결정 D2=A): 기준 확인(v1.16.0 원문)은 통과했지만 관찰 때 이 날짜가 든 패널의 표제 첫 조각이
+            # 바뀌었다(표제만 바뀐 같은 배치의 달) — 기준에 거부를 더하기만 한다.
+            return self._panel_heading_refusal(action)
         return handle, healed_flag
 
     async def _handle_for_selector(self, action: ActionType, selector: str) -> Any:
@@ -3620,6 +3628,8 @@ class ActionDispatcher:
             expected_role=params.get("expected_role"), expected_name=params.get("expected_name"),
         )
         if st.fresh:
+            if await self._panel_heading_changed(handle):  # WS-82(#157): 다시 해석한 노드도 같은 더하기 확인
+                raise _TargetRefused(self._panel_heading_refusal(action))
             return
         if st.reason is StalenessReason.NODE_DETACHED:
             raise _NodeDetached(st.detail)
@@ -3913,6 +3923,73 @@ class ActionDispatcher:
             logger.debug("select 선택지 수집 실패: %s", type(exc).__name__)
             return
         so.apply_block(data, raw, handles)
+
+    # -- WS-82 (#157): 달 패널 표제 첫 조각 — 기준 확인에 더하기만 -------------------------------
+
+    def _record_panel_heads(self, repeated: Any, page: Any) -> None:
+        """관찰 때: 표시 형성(서로 다른 표제 세트)의 구성원 → 패널 경로·표제 첫 조각을 (element_id, css_path, epoch) 키 표에
+        둔다(관찰마다 새로). 표제 원문은 이 표에만 — 블록에서 꺼내(pop) 응답·로그·레시피에 싣지 않는다."""
+        from perception.repeated import HEADS_KEY
+
+        heads = repeated.pop(HEADS_KEY, None) if isinstance(repeated, dict) else None
+        table: Dict[Tuple[str, str, int], Tuple[str, Any, Any]] = {}
+        if isinstance(heads, dict):
+            for eid, entry in heads.items():
+                handle = self.ctx.engine.get_handle(eid)
+                if handle is None or not handle.css_path or not isinstance(entry, tuple) or len(entry) != 2:
+                    continue
+                table[(handle.element_id, handle.css_path, handle.epoch)] = (entry[0], entry[1], page)
+        self.__dict__["_panel_heads"] = table
+
+    def _panel_entry(self, handle: Any) -> Optional[Tuple[str, Any, Any]]:
+        table = self.__dict__.get("_panel_heads") or {}
+        key = (getattr(handle, "element_id", None), getattr(handle, "css_path", None), getattr(handle, "epoch", None))
+        return table.get(key)
+
+    def _inherit_panel_entry(self, old: Any, new: Any) -> None:
+        """치유로 채택한 핸들은 원래 핸들의 패널 표제 확인을 잇는다(group_path 승계와 같은 이유)."""
+        entry = self._panel_entry(old)
+        if entry is not None and getattr(new, "css_path", None):
+            self.__dict__.setdefault("_panel_heads", {})[(new.element_id, new.css_path, new.epoch)] = entry
+
+    async def _panel_heading_changed(self, handle: Any) -> bool:
+        """실행 직전: 대상이 관찰 때 달력 묶음 구성원이었으면 그 패널 표제 첫 조각을 **격리 world**·같은 프레임에서 다시 읽어
+        다르면 True(거부). 표에 없거나·다른 문서/프레임이거나·판독 실패면 False — 기준(v1.16.0) 판정만 남는다(더하기만)."""
+        entry = self._panel_entry(handle)
+        if entry is None:
+            return False
+        path, first, page = entry
+        if page is not self.ctx.page:
+            return False
+        from perception.repeated import panel_heading_expr
+
+        expr = panel_heading_expr(path)
+        try:
+            if self.ctx.root_page is None:
+                now = await self.isolated_eval(expr)
+            else:
+                now = await self._select_display_scoped(expr)
+        except Exception as exc:  # noqa: BLE001 — 판독 불가: 기준 판정만
+            logger.debug("패널 표제 판독 실패: %s", type(exc).__name__)
+            return False
+        if now is not None and not isinstance(now, str):
+            return False
+        return now != first
+
+    def _panel_heading_refusal(self, action: ActionType) -> ActionResult:
+        """기존 GROUP_CHANGED 거부와 같은 모양(TOCTOU·재관찰·changed.kinds=['text']) — 표제 원문은 싣지 않는다."""
+        from actions.group_changed import heading_refusal_data
+
+        group_changed, hint = heading_refusal_data()
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=f"Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: {hint}",
+            reobserve_required=True,
+            data={"group_changed": group_changed, "hint": hint},
+        )
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
@@ -4296,6 +4373,7 @@ class ActionDispatcher:
 
     async def _elementless_observe(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """observe_page(WS-48 분해)."""
+        self.__dict__["_panel_heads"] = {}  # WS-82: 관찰마다 새 표(엔진이 핸들을 다시 매기기 전에 비운다)
         observed = await self.ctx.engine.observe_page(
             prune_top_n=params.get("prune_top_n", 20),
             force_full_tree=params.get("force_full_tree", False),
@@ -4311,6 +4389,7 @@ class ActionDispatcher:
 
         await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
+        self._record_panel_heads(repeated, page)
         if repeated is not None:
             data["repeated"] = repeated
         # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).
