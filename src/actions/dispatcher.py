@@ -1222,6 +1222,12 @@ class _NodeDetached(Exception):
     """WS-64 R4: 입력 전 노드가 떨어짐(같은 문서 재렌더 등) — 아직 입력을 보내지 않았으면 다시 해석한다."""
 
 
+#: WS-82(#158): 페이지 안 모달 열림 신호를 붙이는 액션(포인터·키 — 레이어를 여는 입력).
+_OVERLAY_SIGNAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.PRESS_KEY})
+#: 그 판독의 상한(초) — 넘으면 신호 없음(액션 결과는 그대로).
+_OVERLAY_SIGNAL_TIMEOUT_S = 0.25
+
+
 class _TargetRefused(Exception):
     """WS-64 R4: 같은 문서 재해석에서 기존 신원 검사(role·이름 등)가 거부 — result 는 거부 응답(입력 없음)."""
 
@@ -2403,6 +2409,17 @@ class ActionDispatcher:
         if self._dialogs:
             # WS-30 4(c): 이 액션 중 뜬 다이얼로그(종류·문구·처리 결과)를 알린다.
             result.data.setdefault("dialogs", list(self._dialogs))
+        if (action in _OVERLAY_SIGNAL_ACTIONS and result.success
+                and not any(k in result.data for k in ("nav_wait_ms", "nav_committed", "nav_timed_out", "nav_aborted"))):
+            # WS-82(#158): 같은 감지기(격리 world)로 이 액션 뒤 페이지 안 모달·레이어가 새로 열렸는지 — JS 대화상자
+            # (dialog_opened·data.dialogs)와 다른 키. 종류 어휘만(페이지 글자 0). 못 읽거나 새로 열린 것이 없으면 키 없음.
+            # 문서 이동이 보였으면(대기 중·커밋·중단) 보지 않고, 판독은 짧은 상한 안에서만(이동 대기를 늘리지 않게).
+            try:
+                det = await asyncio.wait_for(self._overlay_detect(), _OVERLAY_SIGNAL_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                det = None
+            if det is not None and det["opened"]:
+                result.data.setdefault("overlay_opened", {"kinds": list(det["kinds"])})
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
@@ -3926,20 +3943,32 @@ class ActionDispatcher:
 
     # -- WS-82 (#157): 달 패널 표제 첫 조각 — 기준 확인에 더하기만 -------------------------------
 
-    def _record_panel_heads(self, repeated: Any, page: Any) -> None:
-        """관찰 때: 표시 형성(서로 다른 표제 세트)의 구성원 → 패널 경로·표제 첫 조각을 (element_id, css_path, epoch) 키 표에
-        둔다(관찰마다 새로). 표제 원문은 이 표에만 — 블록에서 꺼내(pop) 응답·로그·레시피에 싣지 않는다."""
-        from perception.repeated import HEADS_KEY
+    async def _record_panel_heads(self, repeated: Any, page: Any) -> None:
+        """관찰 때: 표시 형성(서로 다른 표제 세트)의 구성원 → 패널 경로·표제 첫 조각(격리 world 판독)을 (element_id, css_path,
+        epoch) 키 표에 둔다(관찰마다 새로). 표제 원문은 이 표에만 — 블록의 내부 키는 꺼내(pop) 응답·로그·레시피에 싣지 않는다.
+        첫 조각을 못 읽으면 표를 비운다(기준 판정만)."""
+        from perception.repeated import HEADS_KEY, panel_firsts_expr
 
         heads = repeated.pop(HEADS_KEY, None) if isinstance(repeated, dict) else None
         table: Dict[Tuple[str, str, int], Tuple[str, Any, Any]] = {}
-        if isinstance(heads, dict):
-            for eid, entry in heads.items():
-                handle = self.ctx.engine.get_handle(eid)
-                if handle is None or not handle.css_path or not isinstance(entry, tuple) or len(entry) != 2:
-                    continue
-                table[(handle.element_id, handle.css_path, handle.epoch)] = (entry[0], entry[1], page)
         self.__dict__["_panel_heads"] = table
+        if not isinstance(heads, dict) or not heads:
+            return
+        paths = sorted({p for p in heads.values() if isinstance(p, str) and p})
+        try:
+            firsts = await self._doc_isolated_eval(panel_firsts_expr(paths))
+        except Exception as exc:  # noqa: BLE001 — 판독 불가: 표 없음(기준 판정만)
+            logger.debug("패널 표제 판독 실패: %s", type(exc).__name__)
+            return
+        if not isinstance(firsts, list) or len(firsts) != len(paths):
+            return
+        first_of = dict(zip(paths, firsts))
+        for eid, path in heads.items():
+            handle = self.ctx.engine.get_handle(eid)
+            first = first_of.get(path)
+            if handle is None or not handle.css_path or not isinstance(first, str) or not first:
+                continue
+            table[(handle.element_id, handle.css_path, handle.epoch)] = (path, first, page)
 
     def _panel_entry(self, handle: Any) -> Optional[Tuple[str, Any, Any]]:
         table = self.__dict__.get("_panel_heads") or {}
@@ -3961,26 +3990,22 @@ class ActionDispatcher:
         path, first, page = entry
         if page is not self.ctx.page:
             return False
-        from perception.repeated import panel_heading_expr
+        from perception.repeated import panel_firsts_expr
 
-        expr = panel_heading_expr(path)
         try:
-            if self.ctx.root_page is None:
-                now = await self.isolated_eval(expr)
-            else:
-                now = await self._select_display_scoped(expr)
+            got = await self._doc_isolated_eval(panel_firsts_expr([path]))
         except Exception as exc:  # noqa: BLE001 — 판독 불가: 기준 판정만
             logger.debug("패널 표제 판독 실패: %s", type(exc).__name__)
             return False
-        if now is not None and not isinstance(now, str):
+        if not isinstance(got, list) or len(got) != 1 or (got[0] is not None and not isinstance(got[0], str)):
             return False
-        return now != first
+        return got[0] != first
 
     def _panel_heading_refusal(self, action: ActionType) -> ActionResult:
         """기존 GROUP_CHANGED 거부와 같은 모양(TOCTOU·재관찰·changed.kinds=['text']) — 표제 원문은 싣지 않는다."""
-        from actions.group_changed import heading_refusal_data
+        from actions.group_changed import MARK_CHANGED, MARK_SAME, refusal_data
 
-        group_changed, hint = heading_refusal_data()
+        group_changed, hint = refusal_data(MARK_SAME, MARK_CHANGED, heading_only=True)  # 자리값(표제 원문 아님)
         return self._result(
             success=False,
             action=action,
@@ -3990,6 +4015,98 @@ class ActionDispatcher:
             reobserve_required=True,
             data={"group_changed": group_changed, "hint": hint},
         )
+
+    # -- WS-82 (#198·#158): 활성 오버레이 — 감지(격리 world)·관찰 순서 후처리·클릭 뒤 열림 신호 ---------------
+
+    async def _doc_isolated_eval(self, expression: str) -> Any:
+        """관찰 대상 문서(최상위 또는 switch_frame 한 프레임)의 격리 world 평가. 못 하면 예외(부르는 쪽이 꺼짐 처리)."""
+        if self.ctx.root_page is None:
+            return await self.isolated_eval(expression)
+        return await self._select_display_scoped(expression)
+
+    async def _overlay_detect(self) -> Optional[Dict[str, Any]]:
+        """{"on", "kinds", "opened", "nonce"} 또는 None(판독 불가 = 꺼짐). 감지한 레이어 노드는 격리 world 전역에만 둔다."""
+        import secrets
+
+        from perception import overlay as ov
+
+        nonce = secrets.token_hex(8)
+        try:
+            raw = await self._doc_isolated_eval(ov.detect_expr(nonce))
+        except Exception as exc:  # noqa: BLE001 — 부가 처리: 꺼짐(관찰은 지금 그대로)
+            logger.debug("오버레이 감지 실패: %s", type(exc).__name__)
+            return None
+        det = ov.parse_detect(raw)
+        if det is not None:
+            det["nonce"] = nonce
+        return det
+
+    async def _overlay_order(self, page: Any, observed: Any, overlay: Dict[str, Any], top_n: int,
+                             full: bool) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        """감지가 켜진 관찰(엔진은 full 로 불렸다)의 순서 후처리(리뷰 B3). 반환: (관찰, data.overlay 또는 None).
+
+        * 기본(top-N): v1160 고정은 엔진 원래 순서·집합(= full[:N] — 점수기가 전부 정렬 뒤 자르므로 top-N 호출과 같다)으로
+          먼저. base 접두 N−q 는 그대로, base 밖 오버레이 구성원 q(≤N/2)개가 꼬리를 대신해 총 N(`overlay.plan_top_n`).
+          추가 구성원만 2차 고정을 받고 base 핸들의 고정은 원복한다. 반환하지 않은 full 핸들은 등록 해제(옛 id 오클릭 0).
+        * 전체(force_full_tree): 고정은 원래 순서로, 목록은 오버레이 구성원을 앞에(크기 상한이 접두만 남겨도 남게).
+        구성원 판독이 실패하면 base 그대로(기본은 top-N 결과와 같은 바이트).
+        """
+        from perception import overlay as ov
+        from perception import repeated_v1160
+        from perception.engine import _summarize, estimate_tokens
+
+        engine = self.ctx.engine
+        els = list(observed.elements)
+
+        def with_elements(items: List[Any]) -> Any:
+            summary = _summarize(items)
+            return observed.model_copy(update={"elements": items, "axtree_summary": summary,
+                                               "token_count": estimate_tokens(summary)})
+
+        members: Optional[List[bool]] = None
+        try:
+            paths = []
+            for e in els:
+                h = engine.get_handle(e.element_id)
+                paths.append(h.css_path if h is not None and h.css_path and not h.is_shadow else "")
+            members = ov.parse_members(await self._doc_isolated_eval(ov.members_expr(overlay["nonce"], paths)), len(els))
+        except Exception as exc:  # noqa: BLE001 — 구성원 판독 불가: base 그대로
+            logger.debug("오버레이 구성원 판독 실패: %s", type(exc).__name__)
+        if full:
+            await repeated_v1160.annotate_repeated(page, engine, els)
+            if members is None or not any(members):
+                return observed, None
+            order = ov.plan_full(len(els), members)
+            if order == list(range(len(els))):
+                return observed, None
+            return with_elements([els[i] for i in order]), {"kinds": overlay["kinds"], "promoted": sum(members)}
+        n = min(top_n, len(els))
+        base = els[:n]
+        await repeated_v1160.annotate_repeated(page, engine, base)
+        final_idx, _pushed = ov.plan_top_n(len(els), members, top_n) if members is not None else (list(range(n)), [])
+        keep = {els[i].element_id for i in final_idx}
+        store = getattr(engine, "_handles", None)
+        if isinstance(store, dict):
+            for e in els:
+                if e.element_id not in keep:
+                    store.pop(e.element_id, None)
+        added = [els[i] for i in final_idx if i >= n]
+        if not added:
+            return with_elements(base), None
+        final = [els[i] for i in final_idx]
+        saved = {}
+        for e in final:
+            h = engine.get_handle(e.element_id)
+            if h is not None:
+                saved[e.element_id] = (h.group_path, h.group_heading)
+        added_ids = {e.element_id for e in added}
+        await repeated_v1160.annotate_repeated(page, engine, final)
+        for eid, (path, pin) in saved.items():
+            if eid not in added_ids:
+                h = engine.get_handle(eid)
+                if h is not None:
+                    h.group_path, h.group_heading = path, pin
+        return with_elements(final), {"kinds": overlay["kinds"], "promoted": len(added)}
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
@@ -4374,22 +4491,35 @@ class ActionDispatcher:
     async def _elementless_observe(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """observe_page(WS-48 분해)."""
         self.__dict__["_panel_heads"] = {}  # WS-82: 관찰마다 새 표(엔진이 핸들을 다시 매기기 전에 비운다)
+        # WS-82(#198): 활성 오버레이 감지(격리 world). 꺼짐(없음·판독 실패)이면 엔진 호출·이하 전부 지금 바이트 그대로.
+        overlay = await self._overlay_detect()
+        if overlay is not None and not overlay["on"]:
+            overlay = None
+        top_n = params.get("prune_top_n", 20)
+        full = params.get("force_full_tree", False)
         observed = await self.ctx.engine.observe_page(
-            prune_top_n=params.get("prune_top_n", 20),
-            force_full_tree=params.get("force_full_tree", False),
+            prune_top_n=top_n,
+            force_full_tree=full or overlay is not None,
             page=page,
             cdp=self.ctx.cdp,
         )
-        data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
         # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
         # 관찰 정보 전용이라 핸들을 건드리지 않는다.
         from perception import repeated_v1160
         from perception.repeated import annotate_repeated
 
-        await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
+        overlay_data: Optional[Dict[str, Any]] = None
+        if overlay is None:
+            await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
+        else:
+            observed, overlay_data = await self._overlay_order(
+                page, observed, overlay, int(top_n or getattr(self.ctx.engine, "default_top_n", 20)), bool(full))
+        data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
+        if overlay_data is not None:
+            data["overlay"] = overlay_data
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
-        self._record_panel_heads(repeated, page)
+        await self._record_panel_heads(repeated, page)
         if repeated is not None:
             data["repeated"] = repeated
         # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).

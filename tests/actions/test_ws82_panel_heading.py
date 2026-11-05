@@ -25,10 +25,25 @@ import test_ws62_r4_hanatour as r4
 import test_ws62_r12 as r12
 import ws62_corpus as corpus
 
-#: 오라클: 패널 경로들 → 지금 표제 첫 조각(표시 형성의 headingOf 규칙: first 가 있으면 first, 없으면 text). 페이지 world.
+#: 오라클(시험 쪽 독립 구현 — 제품 rpHeadFirst 를 쓰지 않는다): 패널 경로들 → 지금 표제 첫 조각. 표제(headingOf)가 ARIA 이름이면
+#: 그 글자, 아니면 표제를 이루는 첫 텍스트 노드(대화형·반복 항목·숨김 안 제외). 페이지 world.
 ORACLE_JS = ("(paths) => {" + __import__("perception.repeated", fromlist=["COMMON_JS"]).COMMON_JS + """
+  function oracleFirst(g) {
+    const h = headingOf(g);
+    if (!h) return null;
+    if (h.source === 'aria') return h.text;
+    let scope = g;
+    if (h.source !== 'text') {
+      const sel = h.source === 'caption' ? 'caption' : h.source === 'legend' ? 'legend' : 'h1,h2,h3,h4,h5,h6,[role=heading]';
+      scope = Array.from(g.querySelectorAll(sel)).find(function (e) { return (e === g || !rpBlocked(e, g)) && rpText(e, g); }) || g;
+    }
+    const w = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+    let t;
+    while ((t = w.nextNode())) { if (t.nodeValue.trim() && !rpBlocked(t.parentElement, g)) return rpClean(t.nodeValue); }
+    return h.text;
+  }
   return paths.map(function (p) { let g = null; try { g = document.querySelector(p); } catch (x) { g = null; }
-    if (!g) return null; const h = headingOf(g); return h ? (h.first ? h.first : h.text) : null; }); }""")
+    return g ? oracleFirst(g) : null; }); }""")
 
 
 class ClickCensus(r12.Census):

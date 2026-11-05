@@ -127,14 +127,16 @@ def hint_for(kinds: List[str]) -> str:
     return HINT_TEMPLATE.format(kinds=", ".join(k for k in kinds if k in KINDS) or "unknown")
 
 
-def heading_refusal_data() -> Tuple[Dict[str, Any], str]:
-    """WS-82(#157): 기준 확인은 통과했지만 관찰 때 그 패널 표제 첫 조각이 바뀐 거부 — 종류는 `text` 하나(표제 원문 0)."""
-    kinds = ["text"]
-    return {"before": MARK_CHANGED, "after": MARK_CHANGED, "changed": {"kinds": kinds}}, hint_for(kinds)
+def heading_kinds() -> List[str]:
+    """WS-82(#157): 패널 표제 첫 조각만 바뀐 거부의 종류 — `text` 하나(KINDS 고정 어휘에서 고른다)."""
+    return [k for k in KINDS if k == KINDS[1]]
 
 
-def refusal_data(old_pin: Any, new_pin: Any) -> Tuple[Dict[str, Any], str]:
-    """GROUP_CHANGED 거부 응답의 (data.group_changed, hint). 문자열 값은 전부 고정 어휘·표식·안내 틀에서만 나온다."""
+def refusal_data(old_pin: Any, new_pin: Any, heading_only: bool = False) -> Tuple[Dict[str, Any], str]:
+    """GROUP_CHANGED 거부 응답의 (data.group_changed, hint). 문자열 값은 전부 고정 어휘·표식·안내 틀에서만 나온다.
+
+    heading_only(WS-82 #157): 기준 확인은 통과했고 패널 표제 첫 조각만 바뀐 거부 — 지문이 없으므로 종류는 heading_kinds(),
+    before/after 는 두 쪽 모두 '(바뀜)' 표식(호출자가 서로 다른 자리값을 넘긴다 — 표제 원문을 넘기지 않는다)."""
     before, after = display_pair(old_pin, new_pin)
-    kinds = changed_kinds(old_pin, new_pin)
+    kinds = heading_kinds() if heading_only else changed_kinds(old_pin, new_pin)
     return {"before": before, "after": after, "changed": {"kinds": kinds}}, hint_for(kinds)

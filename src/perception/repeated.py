@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import unicodedata
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -663,25 +663,41 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
 #: WS-82(#157): 관찰 블록에서 디스패처가 꺼내 가는 내부 키(응답·로그·레시피에 싣지 않는다 — pop 한다).
 HEADS_KEY = "_panel_heads"
 
-#: 실행 직전(격리 world) 패널 표제 첫 조각 — 관찰 때 REPEATED_JS 가 낸 `first or heading` 과 같은 규칙. 패널이 없으면 null.
-PANEL_HEADING_JS = ("(a) => {" + COMMON_JS + """
-  let g = null; try { g = document.querySelector(a.path); } catch (x) { g = null; }
-  if (!g) return null;
-  const h = headingOf(g); return h ? (h.first ? h.first : h.text) : null; }""")
+#: 패널 표제 첫 조각(관찰 때·실행 직전 모두 격리 world): 표제(headingOf)가 ARIA 이름이면 그 글자, 아니면 표제를 이루는 첫 글자
+#: 조각(문서 순서 첫 텍스트 노드 — 'caption/legend/h*' 출처면 그 요소 안, '정적 글자' 출처면 묶음 안 후보). 표제 줄에 붙는 롤링
+#: 안내·타이머·가격(뒤 조각)이나 같은 달 안내문은 비교하지 않는다 — 압축 표제 `first` 보다 좁다(WS-62 R13 동적 8조건 기준 동일).
+_HEAD_FIRST_JS = r"""
+  function rpHeadFirst(g) {
+    const h = headingOf(g);
+    if (!h) return null;
+    if (h.source === 'aria') return h.text;
+    const SEL = {caption: 'caption', legend: 'legend', heading: 'h1,h2,h3,h4,h5,h6,[role=heading]'};
+    const roots = h.source === 'text' ? [g] : Array.from(g.querySelectorAll(SEL[h.source] || 'h1')).filter(function (e) {
+      return e === g || !rpBlocked(e, g);
+    });
+    for (const r of roots) { const p = rpPieces(r, g); if (p.length) return rpClean(p[0]); }
+    return h.text;
+  }
+"""
+
+#: 경로들 → 지금 표제 첫 조각(패널이 없으면 null).
+PANEL_FIRSTS_JS = ("(a) => {" + COMMON_JS + _HEAD_FIRST_JS + """
+  return a.paths.map(function (p) { let g = null; try { g = document.querySelector(p); } catch (x) { g = null; }
+    return g ? rpHeadFirst(g) : null; }); }""")
 
 
-def panel_heading_expr(path: str) -> str:
-    """격리 world Runtime.evaluate 용 식(인자는 JSON 으로 고정)."""
-    return "(" + PANEL_HEADING_JS + ")(" + json.dumps({"path": str(path)}, ensure_ascii=False) + ")"
+def panel_firsts_expr(paths: Sequence[str]) -> str:
+    """격리 world Runtime.evaluate 용 식(인자는 JSON 으로 고정) — 결과는 경로 순서의 첫 조각 목록."""
+    return "(" + PANEL_FIRSTS_JS + ")(" + json.dumps({"paths": [str(p) for p in paths]}, ensure_ascii=False) + ")"
 
 
-def panel_heads(sets: Sequence[Any], handles: Sequence[Any]) -> Dict[str, Tuple[str, str]]:
-    """WS-82(#157): 표제가 모두 보이고 서로 다른 세트(두 달 달력 등)의 구성원 → (패널 경로, 표제 첫 조각).
+def panel_heads(sets: Sequence[Any], handles: Sequence[Any]) -> Dict[str, str]:
+    """WS-82(#157): 표제가 모두 보이고 서로 다른 세트(두 달 달력 등)의 구성원 → 패널 경로.
 
-    핸들을 바꾸지 않는다(R12 — 고정은 repeated_v1160). 첫 조각 = 정적 후보 첫 조각(`first`, 압축 표제 규칙)이 있으면 그것,
-    아니면 표제 전체 — 전체 글자로 비교하면 같은 달에 붙는 안내문(longnote)으로 과잉 거부한다(리뷰 F7).
+    핸들을 바꾸지 않는다(R12 — 고정은 repeated_v1160). 비교할 표제 첫 조각은 디스패처가 격리 world 에서 읽는다
+    (`panel_firsts_expr`) — 전체 글자로 비교하면 같은 달에 붙는 안내문(longnote)으로 과잉 거부한다(리뷰 F7).
     """
-    out: Dict[str, Tuple[str, str]] = {}
+    out: Dict[str, str] = {}
     for s in sets:
         groups = s.get("groups") if isinstance(s, dict) else None
         if not isinstance(groups, list) or len(groups) < 2 or not all(isinstance(g, dict) for g in groups):
@@ -691,13 +707,12 @@ def panel_heads(sets: Sequence[Any], handles: Sequence[Any]) -> Dict[str, Tuple[
             continue
         for g in groups:
             path = g.get("path")
-            first = g.get("first") if isinstance(g.get("first"), str) and g.get("first") else g.get("heading")
             if not isinstance(path, str) or not path:
                 continue
             for m in g.get("members") or []:
                 i = m.get("i") if isinstance(m, dict) else None
                 if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(handles):
-                    out[handles[i].element_id] = (path, first)
+                    out[handles[i].element_id] = path
     return out
 
 
