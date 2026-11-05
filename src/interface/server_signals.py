@@ -465,6 +465,10 @@ class SignalsMixin:
                              _host(target_href)) if h}
         in_call = [d for d in new if getattr(d, "main_document", False)
                    and any(getattr(d, "page", None) is p for p in pages if p is not None)]
+        if action is not ActionType.NAVIGATE and result.success:
+            relation = self._relation_block(result, in_call)
+            if relation is not None:
+                return self._relation_block_failure(action, result, relation)
         # WS-57 R3(B3): 탭 메인 프레임 문서 이동(과 그 리다이렉트 체인)의 차단만 — 같은 페이지 하위 자원(이미지·스크립트·
         # fetch·iframe 하위 문서)이 앞 홉 호스트가 같은 채 막혀도 문서 이동 차단이 아니다.
         hit = next((d for d in reversed(in_call)
@@ -633,6 +637,69 @@ class SignalsMixin:
                 if tab is not None:
                     pages.append(tab.page)
         return [p for p in pages if p is not None]
+
+    def _relation_pages(self, result: ActionResult) -> list:
+        """WS-83 R1(B1): 이 호출 성공이 기댄 탭 밖 효과의 Page — opener 관계 탭 이동(data.tabs_changed)과 닫힘 복귀 탭
+        (data.tab_closed 뒤 지금 최상위 Page). 관계 효과가 없으면 빈 목록(일반 click·이 탭 이동은 기존 판정 그대로)."""
+        data = result.data if isinstance(result.data, dict) else {}
+        changed = data.get("tabs_changed")
+        pages = []
+        get_tab = getattr(self._core, "get_tab", None)
+        if isinstance(changed, list) and callable(get_tab):
+            for item in changed:
+                tab = get_tab(item.get("tab_id")) if isinstance(item, dict) else None
+                if tab is not None:
+                    pages.append(tab.page)
+        if data.get("tab_closed") is not None:
+            pages.append(self._call_top_page())
+        return [p for p in pages if p is not None]
+
+    def _relation_block(self, result: ActionResult, in_call: list) -> Any:
+        """WS-83 R1(B1): 관계 효과로 성공한 호출의 최종 재판정 — 관계 탭 Page 의 main_document 차단 기록이 있고 그 Page 가
+        지금 오류 문서이면 그 기록(마지막). 차단 기록의 호스트가 클릭 대상과 달라도(팝업 스크립트가 opener 를 보냄) Page
+        신원으로 귀속한다. 없으면 None."""
+        if not in_call:
+            return None
+        from actions.dispatcher import _is_error_document
+
+        blocked = [p for p in self._relation_pages(result) if _is_error_document(getattr(p, "url", ""))]
+        return next((d for d in reversed(in_call) if any(getattr(d, "page", None) is p for p in blocked)), None)
+
+    def _relation_block_failure(self, action: ActionType, result: ActionResult, record: Any) -> ActionResult:
+        """관계 탭 이동이 egress 에 막힌 click — navigate 차단과 같은 분류(E_INVALID_URL + data.egress). 입력은 이미 나갔으니
+        재시도 안전이 아니고, 탭 밖 효과(tab_closed·tabs_changed)와 그 안내는 그대로 싣는다."""
+        info = record.to_agent()
+        src = result.data if isinstance(result.data, dict) else {}
+        data: Dict[str, Any] = {"egress": info}
+        for key in ("tab_closed", "tabs_changed", "hint"):
+            if src.get(key) is not None:
+                data[key] = src[key]
+        return ActionResult(
+            success=False, action=action, current_url=result.current_url, snapshot_epoch=result.snapshot_epoch,
+            tab_id=result.tab_id, healed=result.healed, reobserve_required=True, retry_safe=False,
+            error_code=ErrorCode.INVALID_URL, error_message=f"egress_blocked: {info['host']} ({info['category']})",
+            data=data,
+        )
+
+    async def _await_relation_block(self, action: ActionType, before: int, result: ActionResult) -> None:
+        """WS-83 R1(B1): 관계 탭 Page 에 이 호출 창의 main_document 차단 기록이 있는데 아직 오류 문서로 바뀌지 않았으면 그
+        커밋만 짧게 기다린다(상한 300ms). 관계 효과가 없거나 그런 기록이 없으면 기다리지 않는다."""
+        if action is ActionType.NAVIGATE or self._egress is None or not result.success:
+            return
+        pages = self._relation_pages(result)
+        if not pages:
+            return
+        import asyncio
+
+        from actions.dispatcher import _is_error_document
+
+        for _ in range(12):
+            pending = [p for p in pages if not _is_error_document(getattr(p, "url", ""))
+                       and any(getattr(d, "page", None) is p and getattr(d, "main_document", False)
+                               for d in self._egress.blocked_since(before))]
+            if not pending:
+                return
+            await asyncio.sleep(0.025)
 
     def _attach_popup_first_block(self, result: ActionResult, fresh: Any, call_pages: Any,
                                   link_host: Optional[str]) -> None:

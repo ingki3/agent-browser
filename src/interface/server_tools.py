@@ -725,6 +725,7 @@ class ToolsMixin:
         await self._await_blocked_document(action, blocks_before, self._call_state().pop("client_nav_watch", None),
                                            result.success, params.get("url"))
         await self._await_popup_block(action, blocks_before, target_href)
+        await self._await_relation_block(action, blocks_before, result)
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href,
                                            call_pages=self._call_pages(result))
         result = self._attach_upstream_failure(action, params, result, upstream_before)

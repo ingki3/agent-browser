@@ -27,6 +27,7 @@ OPENER = """<title>Opener</title><h1>OPENER</h1>
 <button onclick="window.open('/pop?a','cal','width=300,height=300')">named A</button>
 <button onclick="window.open('/pop?b','cal','width=300,height=300')">named B</button>
 <a href="{denied}" target="_blank">denied blank link</a>
+<button onclick="window.open('{denied}','cal','width=300,height=300')">named denied</button>
 <button id="noop">plain noop</button>"""
 POP = """<title>Pop</title><h1>POPUP</h1>
 <button onclick="opener.document.getElementById('f').value='2026-12-01';window.close()">fill and close</button>
@@ -35,6 +36,8 @@ POP = """<title>Pop</title><h1>POPUP</h1>
 <button onclick="window.open('/pop','_blank','width=200,height=200')">nested popup</button>
 <button onclick="opener.location.href='/changed';window.close()">change opener and close</button>
 <button onclick="window.close()">just close</button>
+<button onclick="opener.location.href='{denied}'">denied opener</button>
+<button onclick="opener.location.href='{denied}';window.close()">denied opener and close</button>
 <button id="noop">pop noop</button>"""
 
 STATE: Dict[str, Any] = {"trigger": threading.Event(), "hits": []}
@@ -48,7 +51,7 @@ def _page(path: str, urls: Dict[str, str]) -> bytes:
     if path == "/opener":
         return OPENER.format(denied=denied).encode()
     if path == "/pop":
-        return POP.encode()
+        return POP.replace("{denied}", denied).encode()
     if path == "/changed":
         return b"<title>Changed</title><h1>CHANGED_BY_POPUP</h1>"
     if path == "/bg":
@@ -436,3 +439,58 @@ async def test_concurrent_call_while_popup_closes_is_not_stuck(site):
         assert r1["success"] is True, r1
         o = await call(s, "observe_page", {})
         assert o["success"] and o["tab_id"] == nav["tab_id"]
+
+
+# ------------------------------------------------------------------ R1 B1: 관계 탭 차단은 성공으로 승격하지 않는다
+
+
+@requires_chromium
+@pytest.mark.parametrize("button", ["denied opener and close", "denied opener"])
+async def test_popup_sending_opener_to_denied_host_is_not_a_click_success(site, button):
+    """팝업이 opener 를 비허용 주소로 보낸 뒤 닫힘(또는 유지) — 닫힘 복귀·관계 탭 효과로 성공 승격 금지, E_INVALID_URL + egress."""
+    async with _server() as s:
+        nav = await call(s, "navigate", {"url": site["doc"] + "/opener"})
+        pop = await open_popup_and_switch(s)
+        r = await click(s, button)
+        assert r["success"] is False, r
+        assert r["error_code"] == "E_INVALID_URL", r
+        assert r["data"]["egress"]["host"] == "127.0.0.1" and r["data"]["egress"]["code"] == "egress_blocked", r
+        assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+        assert r["data"]["tabs_changed"] == [{"tab_id": nav["tab_id"], "change": "navigated"}], r
+        if button.endswith("close"):
+            assert r["data"]["tab_closed"] == {"closed_tab_id": pop, "active_tab_id": nav["tab_id"]}, r
+            assert r["tab_id"] == nav["tab_id"]
+
+
+@requires_chromium
+async def test_named_window_reuse_to_denied_host_is_not_a_click_success(site):
+    """형제 경로: 이름 있는 창 재사용이 그 창을 비허용 주소로 보냄 → E_INVALID_URL + egress(관계 탭 효과로 성공 승격 금지)."""
+    async with _server() as s:
+        await call(s, "navigate", {"url": site["doc"] + "/opener"})
+        a = await click(s, "named A")
+        pop = a["data"]["opened_tab_ids"][0]
+        r = await click(s, "named denied")
+        assert r["success"] is False and r["error_code"] == "E_INVALID_URL", r
+        assert r["data"]["egress"]["host"] == "127.0.0.1", r
+        assert r["data"]["tabs_changed"] == [{"tab_id": pop, "change": "navigated"}], r
+        assert (await tabs(s))["active"] == a["tab_id"]
+
+
+# ------------------------------------------------------------------ R1 NB2: batch 는 관계 탭이 바뀐 단계 뒤 멈춘다
+
+
+@requires_chromium
+async def test_batch_stops_after_click_changes_a_related_tab(site):
+    async with _server() as s:
+        await call(s, "navigate", {"url": site["doc"] + "/opener"})
+        a = await click(s, "named A")
+        pop = a["data"]["opened_tab_ids"][0]
+        out = await s.call_server_tool("browser_batch", {"steps": [
+            {"action": "click", "target": {"role": "button", "name": "named B"}},
+            {"action": "click", "target": {"role": "button", "name": "plain noop"}},
+        ]})
+        batch = out["data"]["batch"]
+        assert batch["stopped_at"] == 0 and batch["ran"] == 1 and batch["reason"] == "navigated", out
+        step = out["data"]["step_result"]
+        assert step["success"] is True, step
+        assert step["data"]["tabs_changed"] == [{"tab_id": pop, "change": "navigated"}], step

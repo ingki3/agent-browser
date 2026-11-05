@@ -753,6 +753,10 @@ class BatchMixin:
             return signal
         if data.get("nav_committed") is True or self._batch_epoch() > epoch_before:
             return "navigated", None
+        if data.get("tabs_changed") or data.get("tab_closed") is not None:
+            # WS-83 R1(NB2): 효과가 이 탭 밖(opener 관계 탭 이동·닫힘 복귀) — 브라우저 문맥이 바뀌었으니 멈추고, 그 단계
+            # 결과(step_result)에 tabs_changed 를 남긴다(다음 단계가 바뀐 탭 기준을 모른 채 이어 가지 않게).
+            return "navigated", None
         if data.get("opened_tab_ids"):
             return "new_tab", None
         return None
