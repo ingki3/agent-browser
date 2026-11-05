@@ -188,6 +188,15 @@ class RecipeService:
             return
         data = result.data or {}
         a = action.value
+        toggled = data.get("hidden_control")
+        if a == "click" and isinstance(toggled, dict) and isinstance(toggled.get("checked_after"), bool):
+            # WS-84 (#227, 리뷰 B5b): 숨긴 체크박스 짝 라벨 click(토글)은 결과 상태 설정 check_box{checked: 뒤 상태} 로
+            # 기록한다 — 재생 때 이미 그 상태면 풀지 않는다(멱등). 기록 click 의 신호 종류(토글 변화)는 재생 check_box 에서
+            # 나오지 않을 수 있어(이미 그 상태 = 무입력 성공) 기대 신호는 비운다 — check_box 성공 자체가 상태 확인이다.
+            a = "check_box"
+            params = {"checked": toggled["checked_after"]}
+        else:
+            toggled = None
         if data.get("egress"):
             # 이동이 egress 에 막혔다 — 오류 페이지 주소가 결과에 늦게 반영되면(click 이 먼저 끝남, CI 실측) nav 가
             # "none" 으로 보여 단계가 궤적에 들어갔다. 막힌 이동은 주소와 무관하게 기록하지 않는다.
@@ -203,6 +212,8 @@ class RecipeService:
             secret = True
             params = {k: v for k, v in params.items() if k != "key"}
         entry = make_entry(a, params, pre, str(result.current_url or ""), data, secret)
+        if toggled is not None:
+            entry["expect"]["signals"] = []
         if entry["expect"]["nav"] == "error":
             self.reset("nav_error")  # R1 NB-3: 오류 페이지(차단·실패)로 간 단계는 기록하지 않는다
             return

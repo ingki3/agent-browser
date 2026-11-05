@@ -47,10 +47,12 @@ MAX_CANDIDATES = 20
 
 #: 선택지를 다 싣지 못했을 때(more > 0) 항목의 안내(고정 문구).
 MORE_HINT = "선택지 일부만 실었습니다 — index 로 고르거나 보이는 라벨을 그대로 value 로 주세요(정확 일치)."
-#: 대리 위젯에 select_option 이 왔을 때(고정 문구, T3).
+#: 대리 위젯 항목(proxy:true)에서 선택지를 다 싣지 못했을 때(고정 문구, WS-84).
+PROXY_MORE_HINT = "선택지 일부만 실었습니다 — 위젯을 열고 다시 관찰하면 목록 전체가 보입니다."
+#: 대리 위젯에 select_option 이 왔을 때(고정 문구, T3 — WS-84: 관찰의 선택지 이름으로 항목 클릭 안내 추가).
 PROXY_HINT = ("이 대상은 실제 <select> 가 아닌 대리 위젯(select2 류)이라 select_option 으로 고를 수 없습니다 — "
               "browser_click 으로 위젯을 열고 browser_observe_page 로 다시 관찰한 뒤 나타난 항목(option)을 "
-              "browser_click 하세요.")
+              "browser_click 하세요(관찰의 data.select_options 에 proxy:true 로 실린 선택지 이름으로 항목을 고르세요).")
 #: 해석 실패(고정 문구 — 라벨 글자를 싣지 않는다).
 FAIL_MESSAGES: Dict[str, str] = {
     "no_match": ("value 와 같은 값이나 보이는 라벨(앞뒤 공백·NFKC 정규화 뒤 정확 일치)을 가진 선택지가 없습니다 — "
@@ -84,14 +86,129 @@ SO_COMMON_JS = r"""
   }
 """
 
-#: 표시: (targets[{i, css}], 상한들) → [{i, total, multiple, options}] (select 가 아니면 null).
+#: WS-84 (#224): 대리 위젯(보이는 combobox) ↔ 숨긴 select 짝 — **구조 규칙만**(리뷰 B1·F2: 둘 사이에는 ARIA 연결이 없다).
+#: * select2: proxy 의 aria-labelledby/aria-controls 가 `select2-<X>-container` 하나만 가리키고, 그 표시 칸이 proxy 안에
+#:   있고, `select#X.select2-hidden-accessible` 와 표시 칸 id 가 문서에 정확히 1개, select 바로 다음 형제가 proxy 의
+#:   `.select2-container`, 그 컨테이너 안 combobox 는 proxy 하나·select 0개, proxy(와 그 안) 밖의 다른 요소가 표시 칸 id 를
+#:   주장(aria-owns/controls/labelledby)하지 않음.
+#: * choices 류(컨테이너 포함): proxy 안 select 가 정확히 1개, proxy 안에 다른 combobox 없음, proxy 조상에 combobox 없음.
+#: * 공통: 숨긴 select 는 single(multiple 아님)·같은 문서·보이지 않음. proxy 가 가리키는(aria-owns/controls) id 는 문서에 1개
+#:   이하이고, listbox(가리킨 것 + proxy 안)가 2개 이상이면 거부, 1개면 그 id 가 유일·다른 요소의 소유 주장 없음·**listbox
+#:   option 라벨 집합 == 숨긴 select 라벨 집합**(잘못 연결된 목록·미끼·나중 주입 항목).
+#: 하나라도 어긋나면 null(표시 없음 — 지금의 고정 안내). 필드 라벨은 숨긴 select 의 보이는 label 이 정확히 1개일 때 그 글자.
+#: 판정은 부르는 쪽이 **격리 world** 에서만 한다(페이지 world 의 closest·options 위조가 닿지 않음).
+PX_JS = r"""
+  const PX_XHTML = 'http://www.w3.org/1999/xhtml';
+  const pxIds = (s) => String(s == null ? '' : s).split(/\s+/).filter(Boolean);
+  const pxRole = (n) => String(n.getAttribute('role') || '').trim().toLowerCase();
+  function pxCount(id) {
+    try { return document.querySelectorAll('[id="' + CSS.escape(id) + '"]').length; } catch (e) { return -1; }
+  }
+  function pxVis(n) { try { return !!visibility(n).visible; } catch (e) { return false; } }
+  function pxClaimed(id, mine) {
+    for (const e of document.querySelectorAll('[aria-owns],[aria-controls],[aria-labelledby]')) {
+      if (mine(e)) continue;
+      const t = pxIds(e.getAttribute('aria-owns')).concat(pxIds(e.getAttribute('aria-controls')),
+                                                         pxIds(e.getAttribute('aria-labelledby')));
+      if (t.indexOf(id) >= 0) return true;
+    }
+    return false;
+  }
+  function pxPair(p) {
+    if (!p || p.nodeType !== 1 || p.namespaceURI !== PX_XHTML || p.localName === 'select') return null;
+    if (p.getRootNode() !== document || pxRole(p) !== 'combobox') return null;
+    const inP = (e) => e === p || p.contains(e);
+    let sel = null;
+    const cont = p.closest('.select2-container');
+    if (cont) {
+      const xs = new Set();
+      for (const t of pxIds(p.getAttribute('aria-labelledby')).concat(pxIds(p.getAttribute('aria-controls')))) {
+        const m = /^select2-(.+)-container$/.exec(t);
+        if (m) xs.add(m[1]);
+      }
+      if (xs.size !== 1) return null;
+      const x = Array.from(xs)[0], rid = 'select2-' + x + '-container';
+      if (pxCount(x) !== 1 || pxCount(rid) !== 1) return null;
+      const s = document.getElementById(x), rend = document.getElementById(rid);
+      if (!s || s.localName !== 'select' || s.namespaceURI !== PX_XHTML || !s.classList.contains('select2-hidden-accessible')) return null;
+      if (s.nextElementSibling !== cont || !rend || !p.contains(rend)) return null;
+      const combos = cont.querySelectorAll('[role=combobox]');
+      if (combos.length !== 1 || combos[0] !== p || cont.querySelectorAll('select').length !== 0) return null;
+      if (pxClaimed(rid, inP)) return null;
+      sel = s;
+    } else {
+      const inside = p.querySelectorAll('select');
+      if (inside.length !== 1 || p.querySelectorAll('[role=combobox]').length !== 0) return null;
+      for (let a = p.parentElement; a; a = a.parentElement) { if (pxRole(a) === 'combobox') return null; }
+      sel = inside[0];
+    }
+    if (sel.multiple || sel.getRootNode() !== document || pxVis(sel)) return null;
+    const r = soRead(sel);
+    if (!r || !r.length) return null;
+    const lbs = new Set();
+    for (const t of pxIds(p.getAttribute('aria-owns')).concat(pxIds(p.getAttribute('aria-controls')))) {
+      const c = pxCount(t);
+      if (c < 0 || c > 1) return null;
+      const e = c === 1 ? document.getElementById(t) : null;
+      if (e && pxRole(e) === 'listbox') lbs.add(e);
+    }
+    for (const e of p.querySelectorAll('[role=listbox]')) lbs.add(e);
+    if (lbs.size > 1) return null;
+    const lb = lbs.size === 1 ? Array.from(lbs)[0] : null;
+    if (lb) {
+      if (lb.id) {
+        if (pxCount(lb.id) !== 1) return null;
+        let pop = p.contains(lb) ? p : (lb.parentElement || lb);
+        if (pop === document.body || pop === document.documentElement) pop = lb;
+        if (pxClaimed(lb.id, (e) => inP(e) || pop.contains(e))) return null;
+      }
+      const want = r.map((o) => soNorm(o.label)).sort().join('\u0001');
+      const have = Array.prototype.map.call(lb.querySelectorAll('[role=option]'), (o) => soNorm(o.textContent))
+        .sort().join('\u0001');
+      if (want !== have) return null;
+    }
+    const labs = Array.prototype.filter.call(sel.labels || [], pxVis);
+    return {sel: sel, field: labs.length === 1 ? soNorm(labs[0].textContent) : null, lb: lb};
+  }
+  // R1 (검증 B1): 게이트 대상 → 그 대상이 속한 증명된 짝. ① 자신 또는 가장 가까운 combobox 조상(위젯 안쪽 표시 칸·화살표
+  // 포함)의 짝. ② combobox 밖 listbox 항목(role=option)이면 그 listbox 를 aria-owns/controls 로 가리키는 combobox 가 문서에
+  // 정확히 1개이고 그 짝이 바로 그 listbox 를 증명할 때만. 어긋나면 null(기준 판정 그대로).
+  function pxOwner(el) {
+    if (!el || el.nodeType !== 1 || el.namespaceURI !== PX_XHTML || el.getRootNode() !== document) return null;
+    for (let a = el; a; a = a.parentElement) { if (pxRole(a) === 'combobox') return pxPair(a); }
+    let opt = null, lb = null;
+    for (let a = el; a; a = a.parentElement) {
+      const r = pxRole(a);
+      if (!opt && r === 'option') opt = a;
+      else if (opt && r === 'listbox') { lb = a; break; }
+    }
+    if (!lb || !lb.id || pxCount(lb.id) !== 1) return null;
+    const owners = [];
+    for (const e of document.querySelectorAll('[aria-owns],[aria-controls]')) {
+      if (pxRole(e) !== 'combobox') continue;
+      if (pxIds(e.getAttribute('aria-owns')).concat(pxIds(e.getAttribute('aria-controls'))).indexOf(lb.id) >= 0) owners.push(e);
+    }
+    if (owners.length !== 1) return null;
+    const px = pxPair(owners[0]);
+    return px && px.lb === lb ? px : null;
+  }
+"""
+
+#: 표시: (targets[{i, css}], 상한들) → [{i, total, multiple, options, proxy?, field?}] (select·증명된 대리 위젯이 아니면 null).
 _DISPLAY_FN = r"""(targets, lim, cut, extra) => {
   __COMMON__
+  __PX__
   return targets.map((t) => {
     let el = null;
     try { el = document.querySelector(t.css); } catch (e) { el = null; }
-    const r = soRead(el);
-    if (!r) return null;
+    let r = soRead(el);
+    let px = null;
+    if (!r) {
+      px = pxPair(el);
+      if (!px) return null;
+      el = px.sel;
+      r = soRead(el);
+    }
     const options = [];
     let extraN = 0;
     for (let i = 0; i < r.length; i++) {
@@ -102,9 +219,37 @@ _DISPLAY_FN = r"""(targets, lim, cut, extra) => {
                       group: o.group == null ? null : o.group.slice(0, cut)});
       }
     }
-    return {i: t.i, total: r.length, multiple: !!el.multiple, options};
+    const out = {i: t.i, total: r.length, multiple: !!el.multiple, options};
+    if (px) { out.proxy = true; if (px.field) out.field = px.field.slice(0, cut); }
+    return out;
   });
-}""".replace("__COMMON__", SO_COMMON_JS)
+}"""
+
+#: 판정(HITL 강화): (게이트 대상 노드 — 대리 위젯·그 안쪽 요소·그 위젯이 소유한 listbox 항목) → {verdict: proxy, field} |
+#: {verdict: none}. 짝 규칙은 표시와 같다(PX_JS), 대상 → 위젯 귀속은 pxOwner(R1).
+PROXY_FN = r"""(el, a) => {
+  __COMMON__
+  __PX__
+  const px = pxOwner(el);
+  return px ? {verdict: 'proxy', field: px.field} : {verdict: 'none'};
+}"""
+
+_PX_DONE: Dict[str, str] = {}
+
+
+def _with_px(fn: str) -> str:
+    """페이지 함수 원문에 공통 부분(SO_COMMON_JS + 살균기 visibility 등 + PX_JS)을 채운다(한 번 만들어 둔다)."""
+    done = _PX_DONE.get(fn)
+    if done is None:
+        from perception.hidden_controls import common_js
+
+        done = fn.replace("__COMMON__", SO_COMMON_JS).replace("__PX__", common_js() + PX_JS)
+        _PX_DONE[fn] = done
+    return done
+
+
+def proxy_fn() -> str:
+    return _with_px(PROXY_FN)
 
 #: 해석: (el, {value?|index?}) → {verdict: ok|fail|index|not_select|gone, …}.
 RESOLVE_FN = r"""(el, a) => {
@@ -146,7 +291,7 @@ def node_expr(fn: str, css: str, arg: Any) -> str:
 
 
 def display_expr(targets: List[Dict[str, Any]]) -> str:
-    return (f"({_DISPLAY_FN})({json.dumps(targets, ensure_ascii=False)}, {SELECT_MAX_OPTIONS}, "
+    return (f"({_with_px(_DISPLAY_FN)})({json.dumps(targets, ensure_ascii=False)}, {SELECT_MAX_OPTIONS}, "
             f"{_RAW_LABEL_CHARS}, {_EXTRA_SELECTED})")
 
 
@@ -197,7 +342,14 @@ def _entry(raw: Any, handle: Any) -> Optional[Dict[str, Any]]:
                              "more": total - len(options)}
     if raw.get("multiple") is True:
         entry["multiple"] = True
-    if entry["more"] > 0:
+    if raw.get("proxy") is True:
+        # WS-84: 구조로 증명된 대리 위젯 — 선택지는 숨긴 select 의 것(표시 전용, 고르기는 위젯 열고 항목 click).
+        entry["proxy"] = True
+        if isinstance(raw.get("field"), str) and raw["field"].strip():
+            entry["field"] = _cut(raw["field"])
+        if entry["more"] > 0:
+            entry["hint"] = PROXY_MORE_HINT
+    elif entry["more"] > 0:
         entry["hint"] = MORE_HINT
     return entry
 
