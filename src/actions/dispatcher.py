@@ -3899,14 +3899,37 @@ class ActionDispatcher:
     async def describe_proxy_for_gate(self, element_id: Any) -> Optional[Dict[str, Any]]:
         """WS-84 (#224): 대상이 구조로 증명된 대리 위젯(숨긴 select 의 짝)이면 {"field": 숨긴 select 의 필드 라벨}, 아니면 None.
 
-        HITL 강화 전용(판정 입력에 더하기만) — 판정은 격리 world(_select_eval)에서만, combobox 가 아니거나 못 읽거나 짝이
+        HITL 강화 전용(판정 입력에 더하기만) — 판정은 격리 world(_select_eval)에서만, combobox·option(R1: 위젯이 소유한 listbox
+        항목)이 아니거나 못 읽거나 짝이
         증명되지 않거나 필드 라벨이 없으면 None(기준 판정 그대로)."""
         from perception.select_options import proxy_fn
 
         handle = self.ctx.engine.get_handle(element_id) if element_id else None
-        if handle is None or getattr(handle, "role", None) != "combobox" or getattr(handle, "is_shadow", False):
+        if handle is None or getattr(handle, "role", None) not in ("combobox", "option") \
+                or getattr(handle, "is_shadow", False):
             return None
         out = await self._select_eval(proxy_fn(), {}, handle, None, False)
+        field = out.get("field") if isinstance(out, dict) and out.get("verdict") == "proxy" else None
+        return {"field": field} if isinstance(field, str) and field.strip() else None
+
+    async def describe_proxy_selector_for_gate(self, selector: str) -> Optional[Dict[str, Any]]:
+        """WS-84 R1 (검증 B1): click(selector) 대상의 증명된 대리 위젯 필드 라벨 — describe_proxy_for_gate 의 selector 판.
+
+        Playwright 로케이터가 정확히 1개이고, 격리 world 에서 같은 selector(css)가 문서·열린 shadow 전체에서 정확히 1개이며 두
+        노드가 같은 자리(테두리 상자, CDP 판독)일 때만 그 노드로 판정한다(_select_eval_scoped). 위젯 안쪽 요소(표시 칸·화살표)는
+        그 위젯으로, 위젯이 소유한 listbox 항목은 그 위젯으로 귀속(pxOwner). css 가 아닌 selector·못 읽음·짝 미증명은 None."""
+        from types import SimpleNamespace
+
+        from perception.select_options import proxy_fn
+
+        try:
+            locator = self.ctx.page.locator(selector)
+            if await locator.count() != 1:
+                return None
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 못 읽음 = 기준 판정 그대로(강화만)
+            return None
+        node = SimpleNamespace(css_path=selector, is_shadow=False)
+        out = await self._select_eval_scoped(proxy_fn(), {}, node, locator.first, True)
         field = out.get("field") if isinstance(out, dict) and out.get("verdict") == "proxy" else None
         return {"field": field} if isinstance(field, str) and field.strip() else None
 

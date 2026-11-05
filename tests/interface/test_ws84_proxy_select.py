@@ -119,7 +119,25 @@ BODIES: Dict[str, str] = {
 }
 
 
+#: R1 (검증 B1): 민감 필드 3개 + 검증의 흔한 필드 24개 — 필드마다 대리 위젯(fld-proxy-<i>)·네이티브(fld-native-<i>) 한 쪽씩.
+SENSITIVE = ["결제수단", "구독 해지 사유", "회원 탈퇴 사유"]
+ORDINARY = ["국가", "도시", "시/도", "우편번호", "표시 개수", "페이지 크기", "시간대", "거리 단위", "배송 방법", "좌석 등급",
+            "연령대", "인원", "주행거리", "연식", "지역", "정렬", "배송지", "카드사", "할부", "환불 계좌", "통화", "언어",
+            "색상", "수량"]
+FIELDS = SENSITIVE + ORDINARY
+
+
+def _field_body(name: str) -> str:
+    _, kind, idx = name.split("-")
+    field = FIELDS[int(idx)]
+    if kind == "proxy":
+        return LIB + s2("q", PAY, field)
+    return f"<label for=q>{field}</label><select id=q><option value=card>카드</option><option value=bank>계좌</option></select>"
+
+
 def _page(name: str) -> str:
+    if name.startswith("fld-"):
+        return HEAD + _field_body(name) + "</body></html>"
     return HEAD + BODIES[name] + "</body></html>"
 
 
@@ -414,3 +432,95 @@ def test_hitl_field_label_change_list_vs_baseline():
     assert "결제수단" in changed
     for keep in ("주행거리", "연식", "지역", "정렬", "배송지", "색상", "수량"):
         assert keep not in changed
+
+
+# ------------------------------------------------------------------ HITL R1(검증 B1): selector·항목 클릭 경로
+
+
+#: 대리 위젯을 가리키는 selector — 위젯 자체·안쪽 표시 칸(select2 의 rendered span).
+PROXY_SELECTORS = {"selector": "#p_q", "selector_inner": "#select2-q-container"}
+#: 열린 listbox 의 '계좌' 항목(두 번째 option).
+OPTION_SELECTOR = "#select2-q-results [role=option]:nth-child(2)"
+PROXY_ROUTES = ["handle_click", "handle_select", "selector", "selector_inner", "option_handle", "option_selector"]
+
+
+async def _open_widget(s: BrowserMCPServer) -> None:
+    """시험 준비: 게이트를 거치지 않고 위젯을 연다(페이지에 mousedown 직접 발송 — 항목 클릭 경로를 재기 위한 조건)."""
+    page = s._dispatcher.ctx.page  # noqa: SLF001
+    await page.evaluate("() => document.getElementById('p_q').dispatchEvent("
+                        "new MouseEvent('mousedown', {bubbles: true, cancelable: true}))")
+
+
+async def _route_params(s: BrowserMCPServer, base: str, idx: int, route: str) -> tuple:
+    """새 문서를 열고 경로의 (액션, 인자)를 만든다. 항목 경로는 위젯을 열고 다시 관찰한다."""
+    obs = await _open(s, base, f"fld-proxy-{idx}")
+    if route.startswith("option_"):
+        await _open_widget(s)
+        obs = await _observe(s)
+        if route == "option_handle":
+            return ActionType.CLICK, {"element_id": _eid(obs, "option", "계좌"), "epoch": obs.snapshot_epoch}
+        return ActionType.CLICK, {"selector": OPTION_SELECTOR}
+    if route in PROXY_SELECTORS:
+        return ActionType.CLICK, {"selector": PROXY_SELECTORS[route]}
+    params: Dict[str, Any] = {"element_id": _eid(obs, "combobox", "카드"), "epoch": obs.snapshot_epoch}
+    if route == "handle_select":
+        return ActionType.SELECT_OPTION, dict(params, value="계좌")
+    return ActionType.CLICK, params
+
+
+@requires_chromium
+@pytest.mark.parametrize("idx", range(len(SENSITIVE)))
+async def test_sensitive_proxy_every_route_matches_native_high(site, tmp_path, idx):
+    """민감 필드 3개 × 대리 위젯 경로 6개(핸들 click·select_option, selector 위젯·안쪽 칸, 항목 핸들·selector) =
+    네이티브 select 와 같은 HIGH 무인 차단 — 값·change 이벤트 그대로(페이지 상태로 확인)."""
+    native: Dict[str, Any] = {}
+    proxy: Dict[str, Any] = {}
+    async with _server(tmp_path) as s:
+        for route in ("click", "select", "selector"):
+            obs = await _open(s, site, f"fld-native-{idx}")
+            eid = _eid(obs, "combobox", "")
+            if route == "selector":
+                r = await s.call_tool(tool_name(ActionType.CLICK), {"selector": "#q"})
+            elif route == "select":
+                r = await s.call_tool(tool_name(ActionType.SELECT_OPTION),
+                                      {"element_id": eid, "epoch": obs.snapshot_epoch, "value": "계좌"})
+            else:
+                r = await _click(s, obs, eid)
+            native[route] = (r.error_code, (r.data or {}).get("risk"), await _state(s, "q"))
+        for route in PROXY_ROUTES:
+            action, params = await _route_params(s, site, idx, route)
+            r = await s.call_tool(tool_name(action), params)
+            st = await _state(s, "q")
+            proxy[route] = (r.error_code, (r.data or {}).get("risk"), st["value"], st["ev"])
+    blocked = (ErrorCode.HITL_UNATTENDED_BLOCKED, "high")
+    assert all(v[:2] == blocked and v[2]["value"] == "card" and v[2]["ev"] == [] for v in native.values()), native
+    assert all(v == blocked + ("card", []) for v in proxy.values()), proxy
+
+
+@requires_chromium
+async def test_ordinary_proxy_fields_no_extra_block_on_any_route(site, tmp_path):
+    """과잉 거부 0: 흔한 필드 24개 × 대리 위젯 경로 6개의 게이트 판정(_check_hitl — 판정만, 실행 없음)이 모두 통과.
+    조건 성립 확인: 같은 측정으로 민감 필드('결제수단')는 6경로 모두 막힌다."""
+    blocked: List[tuple] = []
+    async with _server(tmp_path) as s:
+        for idx in range(len(FIELDS)):
+            for route in PROXY_ROUTES:
+                action, params = await _route_params(s, site, idx, route)
+                r = await s._check_hitl(action, params)  # noqa: SLF001
+                if r is not None:
+                    blocked.append((FIELDS[idx], route, r.error_code))
+    ordinary = [b for b in blocked if b[0] in ORDINARY]
+    assert ordinary == [], ordinary
+    pay = {b[1] for b in blocked if b[0] == "결제수단"}
+    assert pay == set(PROXY_ROUTES), blocked
+
+
+@requires_chromium
+async def test_selector_on_unproven_pair_keeps_baseline(site, tmp_path):
+    """짝 미증명은 selector 경로도 기준 그대로 — '결제수단' 라벨이 있어도 위젯이 열린다."""
+    async with _server(tmp_path) as s:
+        await _open(s, site, "unproven")
+        c = await s.call_tool(tool_name(ActionType.CLICK), {"selector": "#p_s3"})
+        st = await _state(s, "s3")
+    assert c.error_code is not ErrorCode.HITL_UNATTENDED_BLOCKED, c.model_dump(mode="json")
+    assert st["open"] == 1, st

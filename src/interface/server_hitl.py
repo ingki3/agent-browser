@@ -360,17 +360,24 @@ class HitlMixin:
         elif action is ActionType.PRESS_KEY:
             submits_form, name, unresolved, signals = await self._press_key_target(params)
             element_name = name or element_name
-        if action in (ActionType.CLICK, ActionType.SELECT_OPTION) and element_id and dispatcher is not None \
-                and not unresolved:
-            signals = signals + await self._proxy_field_signals(action, params, element_id)
+        if action in (ActionType.CLICK, ActionType.SELECT_OPTION) and dispatcher is not None and not unresolved:
+            if element_id:
+                signals = signals + await self._proxy_field_signals(action, params, "describe_proxy_for_gate",
+                                                                    element_id)
+            elif action is ActionType.CLICK and selector:
+                # R1 (검증 B1): selector 로 해석한 1개 대상(모호함 검사 뒤)도 같은 짝 판독·필드 신호(네이티브 일관성).
+                signals = signals + await self._proxy_field_signals(action, params,
+                                                                    "describe_proxy_selector_for_gate", selector)
         return element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis
 
-    async def _proxy_field_signals(self, action: ActionType, params: Dict[str, Any], element_id: Any) -> tuple:
+    async def _proxy_field_signals(self, action: ActionType, params: Dict[str, Any], reader_name: str,
+                                   target: Any) -> tuple:
         """WS-84 (#224): 구조로 증명된 대리 위젯이면 숨긴 select 의 필드 라벨(예: '결제수단')을 판정 신호로 더한다 — 대리
         위젯의 이름은 현재 값('카드')이라 그것만 보면 결제 위젯이 LOW 로 통과한다(리뷰 F4). select_option 이면 고르려는
-        값도 더한다. 강화만(더하기) — 짝 미증명·못 읽음은 기준 그대로."""
-        reader = getattr(self._dispatcher, "describe_proxy_for_gate", None)
-        proxy = await _isolated(reader, element_id)
+        값도 더한다. 강화만(더하기) — 짝 미증명·못 읽음은 기준 그대로. R1: 대상은 element_id 또는 selector(판독기 이름으로 고름),
+        위젯 안쪽 요소·그 위젯이 소유한 listbox 항목도 그 위젯으로 귀속(판독기 쪽 pxOwner)."""
+        reader = getattr(self._dispatcher, reader_name, None)
+        proxy = await _isolated(reader, target)
         field = proxy.get("field") if proxy else None
         if not isinstance(field, str) or not field:
             return ()

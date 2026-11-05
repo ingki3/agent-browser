@@ -154,8 +154,8 @@ PX_JS = r"""
     }
     for (const e of p.querySelectorAll('[role=listbox]')) lbs.add(e);
     if (lbs.size > 1) return null;
-    if (lbs.size === 1) {
-      const lb = Array.from(lbs)[0];
+    const lb = lbs.size === 1 ? Array.from(lbs)[0] : null;
+    if (lb) {
       if (lb.id) {
         if (pxCount(lb.id) !== 1) return null;
         let pop = p.contains(lb) ? p : (lb.parentElement || lb);
@@ -168,7 +168,29 @@ PX_JS = r"""
       if (want !== have) return null;
     }
     const labs = Array.prototype.filter.call(sel.labels || [], pxVis);
-    return {sel: sel, field: labs.length === 1 ? soNorm(labs[0].textContent) : null};
+    return {sel: sel, field: labs.length === 1 ? soNorm(labs[0].textContent) : null, lb: lb};
+  }
+  // R1 (검증 B1): 게이트 대상 → 그 대상이 속한 증명된 짝. ① 자신 또는 가장 가까운 combobox 조상(위젯 안쪽 표시 칸·화살표
+  // 포함)의 짝. ② combobox 밖 listbox 항목(role=option)이면 그 listbox 를 aria-owns/controls 로 가리키는 combobox 가 문서에
+  // 정확히 1개이고 그 짝이 바로 그 listbox 를 증명할 때만. 어긋나면 null(기준 판정 그대로).
+  function pxOwner(el) {
+    if (!el || el.nodeType !== 1 || el.namespaceURI !== PX_XHTML || el.getRootNode() !== document) return null;
+    for (let a = el; a; a = a.parentElement) { if (pxRole(a) === 'combobox') return pxPair(a); }
+    let opt = null, lb = null;
+    for (let a = el; a; a = a.parentElement) {
+      const r = pxRole(a);
+      if (!opt && r === 'option') opt = a;
+      else if (opt && r === 'listbox') { lb = a; break; }
+    }
+    if (!lb || !lb.id || pxCount(lb.id) !== 1) return null;
+    const owners = [];
+    for (const e of document.querySelectorAll('[aria-owns],[aria-controls]')) {
+      if (pxRole(e) !== 'combobox') continue;
+      if (pxIds(e.getAttribute('aria-owns')).concat(pxIds(e.getAttribute('aria-controls'))).indexOf(lb.id) >= 0) owners.push(e);
+    }
+    if (owners.length !== 1) return null;
+    const px = pxPair(owners[0]);
+    return px && px.lb === lb ? px : null;
   }
 """
 
@@ -203,11 +225,12 @@ _DISPLAY_FN = r"""(targets, lim, cut, extra) => {
   });
 }"""
 
-#: 판정(HITL 강화): (대리 위젯 노드) → {verdict: proxy, field} | {verdict: none}. 짝 규칙은 표시와 같다(PX_JS).
+#: 판정(HITL 강화): (게이트 대상 노드 — 대리 위젯·그 안쪽 요소·그 위젯이 소유한 listbox 항목) → {verdict: proxy, field} |
+#: {verdict: none}. 짝 규칙은 표시와 같다(PX_JS), 대상 → 위젯 귀속은 pxOwner(R1).
 PROXY_FN = r"""(el, a) => {
   __COMMON__
   __PX__
-  const px = pxPair(el);
+  const px = pxOwner(el);
   return px ? {verdict: 'proxy', field: px.field} : {verdict: 'none'};
 }"""
 
