@@ -9,6 +9,8 @@
 * /item?id=N       — 기사 페이지("장바구니 담기" → /cart)
 * /cart            — "결제하기" 버튼(HITL 고위험) → /paid 요청이면 결제됨
 * /login           — 아이디·비밀번호 칸 + 로그인 버튼(WS-38b 비밀 단계 자동 저장 제외 확인용)
+* /terms           — 목록 밖 label 시나리오(WS-84, #227): 숨긴 체크박스 + 짝 라벨, 짝 없는 generic 라벨(`site.terms_html`)
+* /mark?...        — 체크박스 change·라벨 click 이 보내는 기록 요청(204) — 재생이 무엇을 바꿨는지 서버 쪽 독립 증거
 """
 
 from __future__ import annotations
@@ -72,6 +74,36 @@ def list_page(rows: Rows = ROWS, *, header: str = HEADER, lists: Optional[str] =
             "<footer><a href='/about'>about</a></footer></body></html>")
 
 
+TERMS_CSS = ("<style>input.h{position:absolute;opacity:0;width:1px;height:1px} "
+             "label{display:block;margin:8px;padding:6px;border:1px solid #888;width:200px}</style>")
+
+
+def terms_row(cid: str, text: str, checked: bool = False) -> str:
+    """숨긴 체크박스(id) + label[for] 짝 — change 가 /mark?id=..&v=.. 를 보낸다."""
+    c = " checked" if checked else ""
+    return (f"<div class='row'><input class='h' type='checkbox' id='{cid}'{c} "
+            f"onchange=\"fetch('/mark?id='+this.id+'&v='+this.checked)\"><label for='{cid}'>{html.escape(text)}</label></div>")
+
+
+def terms_wrapped(text: str) -> str:
+    """id 없는 숨긴 체크박스를 감싼 label — 짝 control 정체(id 없음)가 같은 라벨끼리는 구별되지 않는다."""
+    return ("<div class='row'><label><input class='h' type='checkbox' "
+            f"onchange=\"fetch('/mark?w='+this.checked)\">{html.escape(text)}</label></div>")
+
+
+def terms_generic(text: str) -> str:
+    """짝 control 이 없는 generic label(클릭하면 안내를 펼치고 /mark?g=1)."""
+    return ("<div class='row'><label onclick=\"fetch('/mark?g=1');"
+            f"document.getElementById('st').textContent='펼침'\">{html.escape(text)}</label></div>")
+
+
+def terms_page(rows_html: str, *, header: str = HEADER, button: bool = True) -> str:
+    btn = ("<button type='button' onclick=\"document.getElementById('st').textContent='다음'\">다음</button>"
+           if button else "")
+    return (HEAD.format(title="안내") + TERMS_CSS + header + "<main><form onsubmit='return false'>" + rows_html + btn
+            + "<p id='st'></p></form></main><footer><a href='/about'>about</a></footer></body></html>")
+
+
 class RecipeSite:
     """시나리오별로 페이지를 바꿔 끼우는 Mock 사이트."""
 
@@ -79,6 +111,7 @@ class RecipeSite:
         self.rows: List[Tuple[int, str]] = list(ROWS)
         self.list_html: Callable[[], str] = lambda: list_page(self.rows)
         self.search_rows: Callable[[str], Rows] = lambda q: [(300 + i, f"{q} 결과 {i}") for i in range(1, 6)]
+        self.terms_html: Callable[[], str] = lambda: terms_page(terms_row("c1", "안내 확인") + terms_row("c2", "알림 받기"))
         self.log: List[str] = []
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._lock = threading.Lock()
@@ -123,6 +156,10 @@ class RecipeSite:
                          "<input id='p' type='password' aria-label='비밀번호'>"
                          "<button type='button' onclick=\"document.getElementById('msg').textContent="
                          "'확인 중'\">로그인</button><p id='msg'></p></form></main></body></html>")
+        if parts.path == "/terms":
+            return 200, self.terms_html()
+        if parts.path == "/mark":
+            return 204, ""
         if parts.path == "/paid":
             return 200, HEAD.format(title="결제 완료") + "<p>paid</p></body></html>"
         return 404, HEAD.format(title="없음") + "<p>404</p></body></html>"

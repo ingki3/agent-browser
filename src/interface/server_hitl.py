@@ -360,7 +360,24 @@ class HitlMixin:
         elif action is ActionType.PRESS_KEY:
             submits_form, name, unresolved, signals = await self._press_key_target(params)
             element_name = name or element_name
+        if action in (ActionType.CLICK, ActionType.SELECT_OPTION) and element_id and dispatcher is not None \
+                and not unresolved:
+            signals = signals + await self._proxy_field_signals(action, params, element_id)
         return element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis
+
+    async def _proxy_field_signals(self, action: ActionType, params: Dict[str, Any], element_id: Any) -> tuple:
+        """WS-84 (#224): 구조로 증명된 대리 위젯이면 숨긴 select 의 필드 라벨(예: '결제수단')을 판정 신호로 더한다 — 대리
+        위젯의 이름은 현재 값('카드')이라 그것만 보면 결제 위젯이 LOW 로 통과한다(리뷰 F4). select_option 이면 고르려는
+        값도 더한다. 강화만(더하기) — 짝 미증명·못 읽음은 기준 그대로."""
+        reader = getattr(self._dispatcher, "describe_proxy_for_gate", None)
+        proxy = await _isolated(reader, element_id)
+        field = proxy.get("field") if proxy else None
+        if not isinstance(field, str) or not field:
+            return ()
+        out = [("detail", field)]
+        if action is ActionType.SELECT_OPTION and params.get("value") is not None:
+            out.append(("detail", str(params["value"])))
+        return tuple(out)
 
     async def _newline_submit_target(self, params: Dict[str, Any], element_id: Any, submits_form: bool,
                                      unresolved: str) -> tuple:
