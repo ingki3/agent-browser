@@ -69,11 +69,16 @@ TABLES = {
                                                          "어휘는 test_ws69 test_kinds_are_control_vocabulary)"),
     ("actions/nav_failure.py", "_EXACT_KINDS"): (NOT_OUT, "WS-69 net::ERR_* → kind 조회표(값은 data.nav_failure.kind)"),
     ("actions/nav_failure.py", "NAV_FAILURE_HINTS"): (FREE, "WS-69 data.hint 고정 문장(키는 kind 어휘)"),
+    ("perception/select_options.py", "FAIL_MESSAGES"): (FREE, "WS-80 select_option 실패 error_message 고정 문장(키는 "
+                                                              "data.select_candidates.reason 어휘)"),
+    ("perception/hidden_controls.py", "HINTS"): (FREE, "WS-81 check_box 거부 error_message·data.hint 고정 문장(키는 거부 "
+                                                       "사유 — 응답에 싣지 않음)"),
     ("interface/server_batch.py", "DETAILS"): (FREE, "WS-73 R1 data.batch.detail 고정 문장(키는 server_batch.REASONS 어휘)"),
     ("browser/headless_retry.py", "SKIP_NOTES"): (FREE, "data.retry_skipped.note 고정 문장(키는 reason 어휘)"),
     ("browser/headless_retry.py", "COOKIE_CHANGE_NOTES"): (FREE, "WS-52 data.retry_skipped.cookie_change_note 고정 문장"
                                                                "(키는 cookie_change 낱말)"),
     ("interface/handoff.py", "_KEY_LABEL"): (FREE, "승인 불일치 사유 문장에 쓰는 사람용 이름"),
+    ("interface/server_control.py", "TELL_ENDED"): (FREE, "WS-78 끝난 인계 tell_user 고정 문장(키는 released·request_expired)"),
     ("interface/server_elicit.py", "_STATUS"): (FREE, "WS-56 data.elicitation.answer 낱말(declined·cancelled·timeout·"
                                                   "error) — 어휘 밖(등록 값이면 가림)"),
     ("recipes/store.py", "_ACTION_WORD"): (FREE, "레시피 자동 이름의 사람용 낱말"),
@@ -93,10 +98,16 @@ KEYS = {
     ("target_element_id", "interface/server_batch.py"): (NOT_OUT, "server_batch._check_contract_args 검증용 자리표시(@e1)"),
     ("observation_error", "interface/server_batch.py"): (FREE, "WS-73 R1 응답 관찰 실패 — ErrorCode 값 또는 observe_failed "
                                                              "(원 오류 문구는 싣지 않음)"),
+    ("observation_omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 묶음 응답 관찰 생략 고정 문장"
+                                                               "(BATCH_OBSERVATION_OMITTED)"),
+    ("omitted", "interface/server_batch.py"): (FREE, "WS-78 R1 step_result 본문 생략 고정 문장(STEP_RESULT_OMITTED)"),
     "functionDeclaration": (NOT_OUT, "browser/manual_watch.py CDP Runtime.callFunctionOn 인자(WS-64 감지기)"),
     "expression": (NOT_OUT, "security/manual_origin.py CDP Runtime.evaluate 인자(WS-64 R2 격리 world 실효 출처)"),
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
     # --- CONTROL: 도구 열거 어휘
+    "layer": (CONTROL, "actions/covered_click.py data.covered_by.layer — COVER_LAYERS(WS-79)"),
+    ("tag", "actions/covered_click.py"): (FREE, "WS-79 data.covered_by.tag — 페이지 태그 이름([a-z0-9-]≤32 로 거름, "
+                                               "밖이면 unknown — 면제 없음)"),
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),
     "resolved_from": (CONTROL, "actions/dispatcher.py switch_frame — current_frame|root(server_schema 안내, R6-B1)"),
     "nav_aborted": (CONTROL, "actions/dispatcher.py _NavWatch.aborted(R6)"),
@@ -159,6 +170,8 @@ KEYS = {
     "action": (NOT_OUT, "recipes/recorder.py 궤적 항목(레시피 파일) — 응답 action 은 ActionType 값(control_value)"),
     ("kind", "browser/site_session.py"): (NOT_OUT, "로그인 추적 이벤트 종류(tracer 파일 — interface 가 쓰지 않음)"),
     ("server_id", "browser/serve_profile.py"): (NOT_OUT, "프로필 잠금 파일 내용"),
+    ("verdict", "actions/dispatcher.py"): (NOT_OUT, "WS-81 R1 _hidden_state 내부 판정(moved — 노드 핀 대조 불가) — 응답에 "
+                                                    "싣지 않음"),
 }
 
 

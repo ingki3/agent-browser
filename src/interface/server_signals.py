@@ -625,6 +625,12 @@ class SignalsMixin:
             logger.warning("차단 판정 실패 — challenge=None 으로 둔다", exc_info=True)
         result.data.setdefault("challenge", challenge)
         result.data.setdefault("last_http_status", last_status)
+        from interface.server_schema import PAGE_NOT_FOUND_HINT, PAGE_NOT_FOUND_STATUSES
+
+        if challenge is None and judge_status in PAGE_NOT_FOUND_STATUSES and "page_not_found" not in result.data:
+            # WS-78 T2(#139): 없는 주소를 '접근 막힘'으로 오해하지 않게 — 판정용 상태(현재 URL == 응답 URL)로만 본다
+            # (410 문서에서 pushState 로 옮긴 SPA 화면에는 붙이지 않음). 403/429 등 차단 신호와 겹치지 않는다.
+            result.data["page_not_found"] = {"status": judge_status, "hint": PAGE_NOT_FOUND_HINT}
         if self._window is not None and challenge is not None:
             # WS-34 D3: 창에서 해결했던 사이트에서 headless 복귀 뒤 다시 차단/캡차 → 알리고, 다음
             # 조작권 요청 때 창을 서버 수명 동안 유지(sticky).

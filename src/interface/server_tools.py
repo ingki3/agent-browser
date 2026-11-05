@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import AsyncExitStack
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
 from interface.server_common import _wait_timeout
@@ -291,6 +291,9 @@ class ToolsMixin:
             # 같은 응답의 주소 비밀까지 알고 만들어지게(직렬화 때만 등록하면 자른 뒤에야 알게 된다).
             register_url_fields({name: getattr(result, name) for name in type(result).model_fields})
             sink = batch_internal()
+            if sink is not None:
+                # WS-78 T3(#200): 묶음 응답 관찰 — 바깥 묶음 봉투(batch·step_result·next)가 쓸 만큼 실효 예산을 미리 줄인다.
+                max_chars -= int(sink.get("reserve") or 0)
             if sink is not None and action is ActionType.OBSERVE_PAGE and result.success:
                 # WS-73: 묶음의 대상 해석은 자르기 전 전체 후보로 센다(같은 관찰의 id·role·이름 — 핸들은 엔진에).
                 obs = result.data.get("observation") if isinstance(result.data, dict) else None
@@ -328,6 +331,11 @@ class ToolsMixin:
                     self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
+            if sink is not None and "reserve" in sink:
+                # WS-78 R1 R2: 묶음 응답 크기 맞춤용 — 관찰을 다시 실행하지 않고 **이 원본**(자르기 전)에서 더 작은
+                # 예산으로 다시 맞춘다(가림 → 크기 맞춤 순서·WS-74 요약 재구성·WS-68 max_chars/limit 경로 그대로).
+                sink["refit"] = self._batch_refitter(result, original, action, max_chars + int(sink.get("reserve") or 0),
+                                                     scan_chars)
             return result
         finally:
             try:
@@ -349,6 +357,21 @@ class ToolsMixin:
             # R3: 주입 신호까지 붙인 최종 크기로 잰다(신호는 후보를 뺀 뒤 원본에 다시 계산).
             fit_saved_pages(result, max_chars,
                             finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars))
+        if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
+            from perception.select_options import fit_select_options
+
+            # WS-80: select 선택지는 saved_pages 다음·반복 묶음 앞 — 요소보다 먼저 줄인다(잘릴 요소의 항목은 지우고, 그래도
+            # 넘으면 뒤 항목부터 통째로 뺀다).
+            fit_select_options(result, max_chars,
+                               finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                               limit=self.max_result_chars)
+        if action is ActionType.OBSERVE_PAGE and "hidden_controls" in result.data:
+            from perception.hidden_controls import fit_hidden_controls
+
+            # WS-81: 숨긴 control 블록·추가 라벨 요소는 select 선택지 다음·반복 묶음 앞 — 원래 요소보다 먼저 줄인다.
+            fit_hidden_controls(result, max_chars,
+                                finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
+                                limit=self.max_result_chars)
         if action is ActionType.OBSERVE_PAGE and "repeated" in result.data:
             from perception.repeated import fit_repeated
 
@@ -362,6 +385,18 @@ class ToolsMixin:
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
         cap_result_size(result, max_chars, limit=self.max_result_chars)
+        if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
+            from perception.select_options import drop_orphans, element_ids
+
+            # WS-80: 요소를 자른 뒤 elements 밖 element_id 를 가리키는 항목이 남지 않게(WS-74 불변식) — 지웠으면 길이 다시.
+            if drop_orphans(result.data, element_ids(result)):
+                settle_returned_chars(result)
+        if action is ActionType.OBSERVE_PAGE and "hidden_controls" in result.data:
+            from perception import hidden_controls as hc
+
+            # WS-81: 요소를 자른 뒤 elements 밖 element_id(라벨·행 링크)를 가리키는 항목이 남지 않게 — 지웠으면 길이 다시.
+            if hc.drop_orphans(result.data, hc.element_ids(result.data)):
+                settle_returned_chars(result)
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
                attach_injection_signal: Any, window: Any) -> None:
@@ -370,6 +405,33 @@ class ToolsMixin:
         if window is not None and isinstance(result.data, dict):
             result.data["window"] = window
         settle_returned_chars(result)
+
+    def _batch_refitter(self, result: ActionResult, original: Any, action: Any, base_chars: int,
+                        scan_chars: int) -> Any:
+        """WS-78 R1 R2: 묶음 응답 관찰을 **다시 실행하지 않고** 같은 원본(자르기 전 data)에서 더 작은 예산으로 다시 맞추는
+        함수 refit(reserve) -> ActionResult. 첫 맞춤과 같은 순서(가린 사본 → 크기 맞춤, version 이 흔들리면 원본에서 다시,
+        끝까지 흔들리면 내용 생략)이고, 이미 소비한 창 보고(data.window)는 옮겨 싣는다. 결과 객체는 바꾸지 않는다."""
+        from security import secret_registry
+        from security.injection_signal import attach_injection_signal
+        from security.public_url import content_masked, content_view, content_withheld
+
+        window = result.data.get("window") if isinstance(result.data, dict) else None
+
+        def refit(reserve: int) -> ActionResult:
+            trial = result.model_copy()
+            max_chars = base_chars - max(0, int(reserve))
+            for _ in range(self._MASK_ATTEMPTS):
+                version = secret_registry.version()
+                trial.data = content_view(original)
+                with content_masked(version):
+                    self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+                if secret_registry.version() == version:
+                    return trial
+            trial.data = content_withheld(original)
+            self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+            return trial
+
+        return refit
 
     def _attach_window_notices(self, result: ActionResult) -> None:
         """아직 알리지 않은 창 전환·복구 보고를 결과에 싣는다(1회 소비)."""
@@ -584,6 +646,10 @@ class ToolsMixin:
         """게이트를 통과한 액션 실행 → 신호 부착 → 헤드리스 재시도 → 레시피 기록."""
         # WS-38: 레시피 궤적 기록용 스냅숏(기록하는 동작만, 한 번의 evaluate).
         retry_boundary = action is ActionType.NAVIGATE and self._retry_recipe_boundary.get()
+        prefetch = getattr(self._dispatcher, "prefetch_key_judge", None)
+        if action is ActionType.PRESS_KEY and self._recipes is not None and callable(prefetch):
+            # WS-78 R1 R3: 키 전 민감 판정을 바로 아래 기존 평가(레시피 기록 스냅숏)와 겹쳐 돌린다 — 추가 대기 없음.
+            prefetch()
         recipe_pre = await self._recipes.pre(action, params) if self._recipes is not None and not retry_boundary else None
         # 누적 수로 이번 호출의 신규분을 센다(기록은 상한 deque 라 길이로는 못 센다, WS-29b R1).
         blocks_before = self._egress.blocked_total if self._egress is not None else 0
@@ -596,7 +662,34 @@ class ToolsMixin:
         # WS-58 R1 B2: 입력 대상 문서(활성 frame)의 주소를 실행 전에 잡는다 — 디스패처가 비밀 치환을 허용한 문서.
         input_url = (self._agent_input_url() if action is ActionType.TYPE_TEXT and hasattr(self, "_agent_input_url")
                      else "")
-        result, remembered = await self._dispatch_with_approval(action, params, used, heal_off=via is not None)
+        # WS-78 R1 R3: 일반 칸 press_key 의 키 뒤 확인(디스패처가 맡긴 Task)은 아래 기존 차단 판정과 겹쳐 돌린다 —
+        # 레시피 기록(last_key_sensitive)·크기 맞춤(가림) 전에 끝난다.
+        from actions.dispatcher import KEY_AFTER_DEFER
+
+        key_after: List[Any] = []
+        defer_token = KEY_AFTER_DEFER.set(key_after) if action is ActionType.PRESS_KEY else None
+        try:
+            result, remembered = await self._dispatch_with_approval(action, params, used, heal_off=via is not None)
+        finally:
+            if defer_token is not None:
+                KEY_AFTER_DEFER.reset(defer_token)
+            drop = getattr(self._dispatcher, "drop_key_prefetch", None)
+            if action is ActionType.PRESS_KEY and callable(drop):
+                drop()  # 쓰이지 않은 미리 판정(디스패치가 키까지 가지 않음)은 버린다
+        try:
+            return await self._finish_gated_action(name, arguments, action, params, result, remembered, key_after,
+                                                   recipe_pre, retry_boundary, blocks_before, upstream_before,
+                                                   target_href, used, via, input_url)
+        finally:
+            if key_after:
+                await asyncio.gather(*key_after, return_exceptions=True)  # 이른 예외 출구에서도 확인을 마친다
+
+    async def _finish_gated_action(self, name: str, arguments: Dict[str, Any], action: ActionType,
+                                   params: Dict[str, Any], result: ActionResult, remembered: Any,
+                                   key_after: List[Any], recipe_pre: Any, retry_boundary: bool, blocks_before: int,
+                                   upstream_before: int, target_href: Any, used: Any, via: Any,
+                                   input_url: str) -> ActionResult:
+        """_run_gated_action 의 디스패치 뒤 부분(신호 부착 → 헤드리스 재시도 → 레시피 기록)."""
         if (action is ActionType.TYPE_TEXT and result.success and result.data.get("secret_resolved") is True
                 and hasattr(self, "_record_login")):
             # WS-58: 자격증명 채우기(디스패처가 키를 값으로 치환해 입력함)는 도구가 아는 로그인 사건.
@@ -613,7 +706,14 @@ class ToolsMixin:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None
         if action in CHALLENGE_CHECK_ACTIONS and "document" not in result.data:
-            await self._attach_challenge(result)
+            if key_after:
+                pending, key_after[:] = list(key_after), []
+                await asyncio.gather(self._attach_challenge(result), *pending)
+            else:
+                await self._attach_challenge(result)
+        if key_after:
+            pending, key_after[:] = list(key_after), []
+            await asyncio.gather(*pending)
         self._attach_remembered_identity(remembered, result)
         if action is ActionType.NAVIGATE and "document" not in result.data:
             retried = await self._retry_headless_navigation(name, arguments, params, result)

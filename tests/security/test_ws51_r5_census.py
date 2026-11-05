@@ -34,6 +34,13 @@ NOT_OUT = "MCP 응답 출구 아님(에이전트 루프·LLM·하네스 내부·
 
 #: (키, 파일, 식) → 분류. 어휘 출처면 그 집합이 CONTROL_VOCABULARY[키] 에 든다(아래 enum 테스트).
 REVIEWED = {
+    # WS-79 data.covered_by.layer — covered_click.covered_by_view 가 COVER_LAYERS 안 값만 통과(밖이면 "other")
+    ("layer", "actions/covered_click.py", "layer"): "actions.covered_click.COVER_LAYERS(covered_by_view 거름)",
+    # WS-80 data.select_candidates.reason — dispatcher._select_refusal 가 select_options.FAIL_MESSAGES 키만 통과
+    ("reason", "actions/dispatcher.py", "reason"): "perception.select_options.FAIL_MESSAGES 키(_select_refusal 거름)",
+    # WS-81 data.hidden_controls[].kind — hidden_controls._parse 가 checkbox·radio 만 통과(CONTROL_VOCABULARY["kind"])
+    ("kind", "perception/hidden_controls.py", "p['kind']"): "perception.hidden_controls._parse(checkbox·radio 만)",
+    ("kind", "perception/hidden_controls.py", "e['kind']"): "perception.hidden_controls._parse(checkbox·radio 만)",
     # WS-73 browser_batch data.batch.reason — interface.server_batch.REASONS(_Stop 가 assert, 어휘 포함은 test_ws73_batch_units)
     ("reason", "interface/server_batch.py", "reason"): "server_batch.REASONS(_Stop.__init__ assert)",
     ("reason", "interface/server_batch.py", "stop.reason"): "server_batch.REASONS(_Stop.reason)",
@@ -57,6 +64,8 @@ REVIEWED = {
     ("state", "interface/server_window.py", "target"): "headed·headless",
     # WS-77 data.human_handoff(server_control) · 반납 출처(handoff)
     ("state", "interface/server_control.py", "event"): "_note_handoff_end 인자 — released·request_expired",
+    # WS-78 T4: 끝난 인계 응답 — _note_handoff_end 가 기록한 state(같은 어휘)
+    ("state", "interface/server_control.py", "end.get('state')"): "_handoff_end['state'] — released·request_expired",
     ("changed", "interface/server_control.py", "set(now) != set(before)"): "bool(문자열 아님) — tab_origins.changed",
     ("control_window", "interface/server_control.py", "self._control_window_state()"):
         "server_control._control_window_state — open·opening·unavailable·none",
@@ -88,6 +97,11 @@ REVIEWED = {
     ("reason", "harness/tier2_som.py", "reason"): NOT_OUT,
     ("reason", "interface/handoff.py", "self.reason"): FREE + " (browser_control_request 사유 — R4-B3)",
     ("reason", "interface/handoff.py", "str(reason or '')[:500]"): FREE + " (R4-B3)",
+    # WS-78 T4: 사람용 파일·CLI 의 사유 투영본(public_text → display_safe)
+    ("reason", "interface/handoff.py", "_projected(st.get('reason'), 500)"): FREE + " (WS-78 control.json·ack 투영 사유)",
+    ("reason", "interface/handoff.py", "_projected(out.get('reason'), 500)"): FREE + " (WS-78 CLI 표시 투영 사유)",
+    ("sticky_reason", "interface/handoff.py", "_projected(window['sticky_reason'], 300)"):
+        FREE + " (WS-78 control.json 투영 sticky 사유)",
     ("reason", "interface/run_cli.py", "challenge.reason"): FREE + " (challenge 사유 문장)",
     ("reason", "interface/server_hitl.py", "decision.reason"): FREE + " (hitl 사유 문장)",
     ("reason", "interface/server_hitl.py", "why"): FREE + " (check_approval 사유 문장)",
@@ -115,6 +129,7 @@ REVIEWED = {
     ("kind", "interface/on_demand.py", "str(challenge.get('kind') or '')"): "ChallengeKind",
     ("kind", "interface/run_cli.py", "challenge.kind.value"): "ChallengeKind",
     ("kind", "interface/server_signals.py", "found.kind.value"): "ChallengeKind",
+    ("status", "interface/server_signals.py", "judge_status"): "int(문자열 아님) — WS-78 data.page_not_found.status 404·410",
     ("reason", "interface/server_signals.py", "kind"): "ChallengeKind (WS-63 C data.handoff.reason = challenge kind)",
     ("kind", "llm/budget.py", "kind"): NOT_OUT,
     ("kind", "actions/nav_failure.py", "_EGRESS_KINDS[egress_code]"): "WS-69 nav_failure.kind — dns·connect·blocked",
@@ -255,8 +270,13 @@ ID_PRODUCERS = {
     ("interface/control_window.py", "secrets.token_hex(6)"): ("WS-77 제어 창 isolated world 이름(CDP 내부) — 출구 아님",
                                                             None, None),
     ("interface/control_window.py", "secrets.token_hex(8)"): ("WS-77 제어 창 바인딩 이름(CDP 내부) — 출구 아님", None, None),
+    ("actions/dispatcher.py", "secrets.token_hex(8)"): ("WS-81 R1 숨긴 control 노드 핀 묶음 식별(격리 world 전역 안) — 출구 아님",
+                                                       None, None),
     ("browser/core.py", "f'tab-{self._tab_counter}'"): (EXEMPT, "tab_id", lambda: f"tab-{secrets.randbelow(999)}"),
     ("perception/engine.py", "f'@e{idx}'"): (EXEMPT, "element_id", lambda: f"@e{secrets.randbelow(9999)}"),
+    # WS-81 숨긴 control 짝 라벨 추가 요소 — 엔진과 같은 @eN 이어 붙이기
+    ("perception/hidden_controls.py", "f'@e{next_n + len(added)}'"): (EXEMPT, "element_id",
+                                                                     lambda: f"@e{secrets.randbelow(9999)}"),
     ("recipes/service.py", "f'@r{self._seq}'"): (EXEMPT, "element_id", lambda: f"@r{secrets.randbelow(9999)}"),
     ("recipes/store.py", "_secrets.token_hex(4)"): (EXEMPT, "recipe_id", lambda: "r_" + secrets.token_hex(4)),
     ("interface/handoff.py", "secrets.token_urlsafe(9)"): (EXEMPT, "request_id",

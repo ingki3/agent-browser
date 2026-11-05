@@ -84,6 +84,7 @@ ATTRS = {
     ("approval_id", "approval_id"): (ID, "ap_…"),
     ("element_id", "element_id"): (ID, "@eN·@sN"),
     ("id", "element_id"): (ID, "perception/repeated.py data.repeated.groups[].members[].id — @eN(WS-62)"),
+    ("row_element_id", "element_id"): (ID, "perception/hidden_controls.py data.hidden_controls[].row_element_id — @eN(WS-81)"),
     ("server_id", "server_id"): (ID, "{pid}-{hex6}"),
     ("tag", "tag"): (ID, "actions/dispatcher.py data.som_tags[].tag — vision.candidates.make_tag 두 글자(A1…)"),
     # --- URL
@@ -123,6 +124,9 @@ ATTRS = {
     ("quota", "snapshot()"): (STRUCT, "youtube QuotaLedger.snapshot 숫자·시각 dict"),
     ("window", "info()"): (STRUCT, "on_demand 창 정보 dict(mode·state — R5/R7 census)"),
     ("step_result", "step_result"): (STRUCT, "레시피 단계 ActionResult dict(봉투 정제 대상)"),
+    ("click_point", "get()"): (STRUCT, "WS-79 actions/dispatcher.py data.click_point — reason(어휘)·숫자 dict"),
+    ("covered_by", "covered_by"): (STRUCT, "WS-79 actions/dispatcher.py data.covered_by — 고정 모양 dict(tag·role·layer "
+                                           "어휘, name 은 safe_page_text — R7 census)"),
     # --- NOT_STR
     ("count", "count()"): (NOT_STR, "int"),
     ("match_count", "count()"): (NOT_STR, "int"),

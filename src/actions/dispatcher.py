@@ -33,11 +33,26 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from contracts import ActionResult, ActionType, ErrorCode
+from playwright.async_api import ElementHandle as PlaywrightElementHandle
+from playwright.async_api import Locator as PlaywrightLocator
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from perception.engine import ElementHandle, PerceptionEngine
 from perception.sanitizer import ACCESSIBLE_NAME_JS
 from security.secrets import KEY_PATTERN as SECRET_KEY_PATTERN
 
+from actions.covered_click import (
+    COVER_CORE_JS,
+    COVER_JUDGE_ALL_JS,
+    COVER_JUDGE_JS,
+    COVERED_CLICK_BUDGET_MS,
+    COVERED_MESSAGE,
+    COVERED_POINT_TIMEOUT_MS,
+    click_point_view,
+    covered_by_view,
+    is_pointer_intercept,
+    parse_judge,
+    public_error_text,
+)
 from actions.healing import (
     FailurePhase,
     HealingCandidate,
@@ -1094,6 +1109,86 @@ _FOCUS_NODE_JS = """
 }
 """
 
+#: WS-78 T1(#142): 포커스 노드(_FOCUS_NODE_JS 의 결과)가 민감 칸인가와 그 칸의 현재 값. 노드가 아니면 null.
+#: 판정은 type_text 의 is_sensitive_field 와 같은 기준(input[type=password]).
+_KEY_FIELD_JS = (
+    "n => (n && typeof n === 'object' && n.tagName) ? "
+    "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
+    "v: typeof n.value === 'string' ? n.value : ''} : null"
+)
+#: WS-78 R1 R3: 노드 식별 열쇠(같은 문서 안 자식 위치 경로 — open shadow·같은 출처 iframe 경계는 표지) — 핸들 없이
+#: 키 전·키 뒤 포커스가 같은 노드인가를 본다(일반 칸은 핸들·해제 왕복을 쓰지 않는다).
+_NODE_KEY_JS = """
+(n) => {
+  const p = [];
+  let c = n;
+  for (let d = 0; c && d < 256; d++) {
+    const par = c.parentNode;
+    if (par) { p.push(Array.prototype.indexOf.call(par.childNodes, c)); c = par; continue; }
+    if (c.host) { p.push('s'); c = c.host; continue; }
+    const fe = c.defaultView && c.defaultView.frameElement;
+    if (fe) { p.push('f'); c = fe; continue; }
+    break;
+  }
+  return p.join('.');
+}
+"""
+#: WS-78 R1 R3: 키 **전** 판정을 평가 한 번으로 — 포커스 노드(_FOCUS_NODE_JS)가 민감 칸인가(s)·앞 키의 sticky 노드인가
+#: (same)·식별 열쇠(k)·값(v, 민감일 때만). 노드가 아니면(opaque·none) null.
+_KEY_FOCUS_JS = (
+    "(sticky) => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+    "if (!(n && typeof n === 'object' && n.tagName)) return null; "
+    "const s = n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password'; "
+    "const same = !!sticky && n === sticky; "
+    "return {s: s, same: same, k: (" + _NODE_KEY_JS.strip() + ")(n), "
+    "v: (s || same) && typeof n.value === 'string' ? n.value : ''}; }"
+)
+#: WS-78 R1 R3: 일반 칸 키 **뒤** 확인 — 지금 포커스 노드가 키 전 그 노드(식별 열쇠 k)일 때만 {s, v}, 아니면 null.
+_KEY_FOCUS_AFTER_JS = (
+    "(k) => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+    "if (!(n && typeof n === 'object' && n.tagName) || (" + _NODE_KEY_JS.strip() + ")(n) !== k) return null; "
+    "return {s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
+    "v: typeof n.value === 'string' ? n.value : ''}; }"
+)
+#: WS-78 T1: 포커스 노드 판정·키 뒤 값 읽기의 상한(초) — 문서 이동 중이면 평가가 이동 끝까지 멈출 수 있다(실측).
+_KEY_FIELD_TIMEOUT_S = 0.3
+#: WS-78 R1 R3: 서버가 미리 시작한 키 전 판정을 쓰는 최대 경과(초) — 그보다 오래면(승인 대기 등) 버리고 다시 판정한다.
+_KEY_PREFETCH_MAX_AGE_S = 0.25
+#: WS-78 R1 R3: 서버가 일반 칸의 키 뒤 확인을 기존 차단 판정(detect_challenge)과 겹쳐 돌릴 때 주는 자리(목록) —
+#: 디스패처는 확인 작업(Task)을 여기에 넣고 기다리지 않는다. 자리가 없으면(디스패처 직접 사용) 그 자리에서 기다린다.
+KEY_AFTER_DEFER: ContextVar[Optional[List[Any]]] = ContextVar("press_key_after_defer", default=None)
+#: WS-78 R1(#200): 미지원 키 오류 문구 상한 — 키 원문(에이전트 유래)을 가린 뒤 고정 길이로 자른다(WS-75 순서).
+KEY_ERROR_MAX_CHARS = 600
+_KEY_ERROR_TEXT_CHARS = 300
+_KEY_ERROR_ECHO_CHARS = 120
+#: WS-78 T1 B4: 민감 칸으로 간 키 뒤 그 칸 값을 읽지 못했다(문서 이동 등) — 키 전 값만 등록했다는 고정 신호(값 없음).
+SENSITIVE_VALUE_UNREAD = "민감 칸 키 입력 뒤 칸 값을 읽지 못해 키 전 값까지만 가림 대상으로 등록했습니다."
+
+
+@dataclass(frozen=True)
+class _PlainKey:
+    """WS-78 R1 R3: 키 전 일반 칸 — 핸들 대신 식별 열쇠만(키 뒤 같은 노드인가를 열쇠로 본다)."""
+
+    k: str
+
+
+class _NoNode:
+    """WS-78 R1 R3: 민감인데 노드 핸들을 못 잡은 경우 — 키 뒤 읽기가 실패해 fail-closed 신호로 간다."""
+
+    async def evaluate(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("포커스 노드 핸들 없음")
+
+    async def dispose(self) -> None:
+        return None
+
+
+def _bounded_echo(text: str, limit: int) -> str:
+    """WS-78 R1: 오류 문구에 싣는 글자 — 가린 뒤(WS-75 순서) limit 글자로 자른다."""
+    from security.public_url import public_text
+
+    masked = public_text(text)
+    return masked if len(masked) <= limit else masked[:limit] + "…"
+
 _MEANING_KEYS = ("href", "action", "method", "target")
 
 #: WS-56 R2 B1: 보호 폴더(프로필·서버 상태) 저장 거부 문구.
@@ -1135,6 +1230,61 @@ class _TargetRefused(Exception):
         self.result = result
 
 
+class _CoveredRefused(Exception):
+    """WS-79: 대상의 누를 자리가 모두 덮임(기존 대기 예산 뒤 재판정에서도) — 입력을 보내지 않았다. covered_by 는 고정 모양."""
+
+    def __init__(self, covered_by: Dict[str, Any]) -> None:
+        super().__init__("covered")
+        self.covered_by = covered_by
+
+
+#: WS-79 NB2: 이 호출에서 가운데 대신 덮이지 않은 대상 점을 썼다면 data.click_point(성공 때만 싣는다).
+_CLICK_POINT: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_click_point", default=None)
+
+
+class _SelectRefused(_TargetRefused):
+    """WS-80: select_option 해석·사후 확인 거부(선택지 없음·모호·비활성·범위 밖·대리 위젯·선택지 바뀜) — result 는 거부 응답.
+
+    _TargetRefused 와 같은 경로(목록 결속 재시도에서도 그대로 올림·발송 단계·재시도 단계가 result 를 돌려줌)를 탄다."""
+
+
+#: WS-80: 사후 확인이 '고른 option == 해석한 option' 을 확인했다(params 내부 키 — 기대 상태 충족, 이미 고른 값 재선택 포함).
+_SELECT_CONFIRMED_KEY = "_select_confirmed"
+
+
+class _HiddenRefused(_TargetRefused):
+    """WS-81: 숨긴 체크박스 짝 라벨의 check_box 거부(operable:false·짝 미확정) — 입력 없음, result 는 거부 응답."""
+
+
+#: WS-81: check_box(짝 라벨) 사후 격리 world 확인 결과(params 내부 키 — True 기대 상태, False 다름, 없음 = 못 읽음).
+_HIDDEN_CONFIRMED_KEY = "_hidden_confirmed"
+#: WS-81: click(짝 라벨) 전후 격리 world 값이 바뀌었다(params 내부 키 — {checked_before, checked_after}).
+_HIDDEN_CLICK_KEY = "_hidden_click"
+
+
+def _with_click_point(data: Dict[str, Any]) -> Dict[str, Any]:
+    """성공 data 에 이 호출의 click_point(WS-79 — 다른 점을 썼을 때만)를 붙인다. 가운데 경로면 키를 더하지 않는다."""
+    point = _CLICK_POINT.get()
+    if point is not None:
+        data["click_point"] = point
+    return data
+
+
+def _actionable_point(why: Any) -> Optional[Dict[str, float]]:
+    """_ACTIONABLE_JS 의 'point:x:y'(WS-79) → Playwright position. 다른 값이면 None."""
+    if not isinstance(why, str) or not why.startswith("point:"):
+        return None
+    parts = why.split(":")
+    try:
+        px, py = float(parts[1]), float(parts[2])
+        checked = int(parts[3]) if len(parts) == 4 else 0
+    except (ValueError, IndexError):
+        return None
+    if len(parts) > 4 or not (abs(px) < 1e6 and abs(py) < 1e6):
+        return None
+    return {"x": px, "y": py, "checked": float(max(0, min(checked, 1000)))}
+
+
 @dataclass
 class _FrameCtx:
     """R4 B2: 관문을 입력 노드의 실제 소유 프레임으로 돌리는 판정 문맥(manual_site_hit 가 읽는 page·root_page 만)."""
@@ -1163,6 +1313,7 @@ _ACTIONABLE_KIND: Dict[ActionType, str] = {
 #: select(보임·활성). 보이는 영역 밖이면 그 문서(결속 확인 직후, 같은 평가 안)에서 즉시 스크롤한다.
 _ACTIONABLE_JS = r"""
 async (n, [d, kind, ms]) => {
+  __COVER__
   const end = performance.now() + ms;
   const frame = () => new Promise(r => { let done = false; const f = () => { if (!done) { done = true; r(); } };
     requestAnimationFrame(f); setTimeout(f, 50); });
@@ -1197,7 +1348,13 @@ async (n, [d, kind, ms]) => {
         for (let e = hit; e; e = e.parentNode || e.host) {
           if (e === target || e === el || (e.tagName === 'LABEL' && e.control === el)) { ok = true; break; }
         }
-        if (!ok) why = 'not hit target';
+        if (!ok) {
+          // WS-79: 가운데가 덮였으면 같은 평가 안에서 덮이지 않은 대상 점을 고른다(B3·B4 — 모달·중첩 조작부 제외).
+          // 그 점은 비 force 로 보낸다(Playwright hit 검사 — 덮개 클릭 0). 없으면 기다림 그대로.
+          const j = __ws79Judge(el);
+          if (j && j.s === 'point') return 'point:' + j.x + ':' + j.y + ':' + j.checked;
+          why = 'not hit target';
+        }
       }
     }
     if (why === 'ok') return 'ok';
@@ -1205,7 +1362,7 @@ async (n, [d, kind, ms]) => {
     await frame();
   }
 }
-"""
+""".replace("__COVER__", COVER_CORE_JS)
 
 #: R2 B2: 좌표 hit-test 노드(_POINT_TARGET_JS 와 같은 판정)와 그 노드가 잡아 둔 노드인가.
 _POINT_NODE_JS = "([x, y]) => (" + _POINT_TARGET_JS.strip() + ")(x, y)"
@@ -1230,6 +1387,11 @@ class ActionDispatcher:
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
         self._nav_info: Dict[str, Any] = {}
+        #: WS-78 T1(#142): 마지막 press_key 가 민감 칸(키 전·키 뒤 password)으로 갔는가 — 레시피 기록이 그 단계를
+        #: 비밀로 끊는 데 쓴다(press_key 마다 다시 정한다).
+        self.last_key_sensitive: bool = False
+        #: WS-78 T1 sticky: 앞 press_key 에서 민감으로 판정한 포커스 노드(JSHandle) — 같은 노드면 type 이 바뀌어도 민감.
+        self._sticky_key_node: Any = None
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
@@ -2215,7 +2377,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=is_retry_safe(action, FailurePhase.PRE_DISPATCH),
                 error_code=ErrorCode.PAGE_CRASHED,
-                error_message=f"{type(exc).__name__}: {exc}",
+                error_message=f"{type(exc).__name__}: {public_error_text(exc)}",  # WS-79 B8: 호출 기록 제외
             )
         if self.ctx.root_page is not None and action not in _TOP_RECORDER_KEEP_ACTIONS:
             # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
@@ -2505,6 +2667,18 @@ class ActionDispatcher:
                 retry_safe=True,
                 error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
                 error_message=f"승인한 대상이 바뀜({staleness.detail}) — 자가 치유하지 않음",
+                reobserve_required=True,
+                data={"heal_disabled": True},
+            )
+        if not staleness.fresh and self._is_hidden_label(handle):
+            # WS-81 NB4: 숨긴 체크박스 짝 라벨 — 이름 없는 라벨이 여러 행에 같은 모양이라 치유가 다른 행 라벨로 바꿔 누를 수
+            # 있다. 치유하지 않고 재관찰을 요구한다.
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=True,
+                error_code=staleness.error_code or ErrorCode.ELEMENT_NOT_FOUND,
+                error_message=f"숨긴 체크박스의 라벨이 바뀜({staleness.detail}) — 자가 치유하지 않음. 다시 관찰하세요.",
                 reobserve_required=True,
                 data={"heal_disabled": True},
             )
@@ -2811,23 +2985,53 @@ class ActionDispatcher:
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
                 downloaded_path=downloaded,
-                data={
+                data=_with_click_point({
                     "signals": [f"file_saved: {downloaded}"],
                     "element_id": handle.element_id,
-                },
+                }),
             )
 
         post = await self._element_post_condition(
             action, handle, params, before, after, root_before, root_after
         )
+        # WS-80: select_option 의 사후 확인(고른 option == 해석한 option)은 기대 상태 충족이다 — 이미 고른 값을 다시 골라
+        # 페이지가 바뀌지 않아도 성공(재시도하지 않는다).
+        confirmed = bool(params.pop(_SELECT_CONFIRMED_KEY, False))
+        # WS-81: 짝 라벨 check_box 의 격리 world 확인(기대값이면 성공 — 이미 그 상태 포함, 다르면 재시도 없이 실패)과
+        # click 의 전후 변화(토글 효과 — 성공 + data.hidden_control).
+        hidden_ok = params.pop(_HIDDEN_CONFIRMED_KEY, None)
+        toggled = params.pop(_HIDDEN_CLICK_KEY, None)
+        if hidden_ok is False:
+            from perception.hidden_controls import MISMATCH_MESSAGE
 
-        if post.satisfied:
+            return self._result(
+                success=False,
+                action=action,
+                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                error_code=ErrorCode.TIMEOUT,
+                error_message=MISMATCH_MESSAGE,
+                reobserve_required=True,
+                healed=healed_flag,
+            )
+
+        if post.satisfied or confirmed or hidden_ok or toggled:
+            signals = post.signals
+            if hidden_ok and not signals:
+                # R1 NB: 격리 world 로 확인한 기대 상태를 기존 check_box 신호 어휘로 남긴다(레시피 기록 — 이미 그 상태인
+                # 무입력 성공도 기존 check_box 규칙처럼 checked_applied).
+                expected_checked = bool(params.get("checked", True))
+                signals = [f"checked_applied: {expected_checked}"]
+            out = {"signals": signals, "element_id": handle.element_id}
+            if toggled:
+                from perception.hidden_controls import CLICK_KEY
+
+                out[CLICK_KEY] = toggled
             return self._result(
                 success=True,
                 action=action,
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
-                data={"signals": post.signals, "element_id": handle.element_id},
+                data=_with_click_point(out),
             )
 
         return await self._retry_unsatisfied(action, handle, params, healed_flag, before, post)
@@ -2837,6 +3041,7 @@ class ActionDispatcher:
     ) -> Any:
         """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
+        _CLICK_POINT.set(None)
         before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
@@ -2880,6 +3085,12 @@ class ActionDispatcher:
             if watch is not None:
                 watch.close()
             return self._fixed_node_gone(action, healed_flag)
+        except _CoveredRefused as exc:
+            # WS-79: 누를 자리가 모두 덮임 — 입력을 보내지 않았다(고정 문구, Playwright 원문 없음).
+            self._off_popup(_on_popup)
+            if watch is not None:
+                watch.close()
+            return self._covered_result(action, exc, healed_flag)
         except _ProtectedSaveRefused as exc:
             # WS-56 R2 B1: 다운로드는 시작됐지만 보호 폴더라 저장하지 않았다(파일 쓰기 없음).
             self._off_popup(_on_popup)
@@ -2903,12 +3114,24 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
-                error_message=f"이벤트 발송 실패: {exc}",
+                error_message=f"이벤트 발송 실패: {public_error_text(exc)}",
                 healed=healed_flag,
             )
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
+
+    def _covered_result(self, action: ActionType, exc: "_CoveredRefused", healed_flag: bool) -> ActionResult:
+        """WS-79: 누를 자리가 모두 덮임 — 기존 코드(E_ELEMENT_NOT_INTERACTABLE), 입력 없음(retry_safe), 고정 문구 + covered_by."""
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+            error_message=COVERED_MESSAGE,
+            healed=healed_flag,
+            data={"covered_by": exc.covered_by},
+        )
 
     def _fixed_node_gone(self, action: ActionType, healed_flag: bool) -> ActionResult:
         """R3 B1: 고정 노드가 떨어짐 — 기존 '대상 바뀜' 계열(E_TOCTOU_MISMATCH·재관찰), 새 오류 코드 없음."""
@@ -2947,7 +3170,7 @@ class ActionDispatcher:
                 retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
                 healed=healed_flag,
                 reobserve_required=True,
-                data={"signals": ["navigation_started"], "element_id": handle.element_id},
+                data=_with_click_point({"signals": ["navigation_started"], "element_id": handle.element_id}),
             )
         root_after = await self._capture_root() if root_before is not None else None
         if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed"):
@@ -3052,19 +3275,22 @@ class ActionDispatcher:
             )
 
         # 멱등 액션만 1회 재시도
+        _CLICK_POINT.set(None)
         try:
             await self._execute_element_action(action, handle, params)
         except (_ManualSiteRefused, _TargetRefused) as exc:
             return exc.result
         except _FixedNodeGone:
             return self._fixed_node_gone(action, healed_flag)
+        except _CoveredRefused as exc:
+            return self._covered_result(action, exc, healed_flag)
         except Exception as exc:  # noqa: BLE001
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
-                error_message=f"재시도 실패: {exc}",
+                error_message=f"재시도 실패: {public_error_text(exc)}",
                 reobserve_required=True,
                 healed=healed_flag,
             )
@@ -3087,7 +3313,7 @@ class ActionDispatcher:
             error_message=(
                 None if retry_post.satisfied else f"재시도 후에도 미충족({retry_post.detail})"
             ),
-            data={"signals": retry_post.signals, "retried": True},
+            data=_with_click_point({"signals": retry_post.signals, "retried": True}),
             healed=healed_flag,
             reobserve_required=not retry_post.satisfied,
         )
@@ -3264,6 +3490,18 @@ class ActionDispatcher:
         register_secret_values([text])
         params[_CONCEAL_KEY] = True
 
+    @staticmethod
+    async def _register_field_value(target: Any) -> None:
+        """민감 칸의 현재 값 전체를 자격증명 등급으로 등록한다(WS-78 NB1). 못 읽으면 조용히(친 text 는 이미 등록)."""
+        try:
+            value = await target.evaluate("el => typeof el.value === 'string' ? el.value : ''")
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(value, str) and value:
+            from security.secret_registry import register_secret_values
+
+            register_secret_values([value])
+
     def _locator_for(self, handle: ElementHandle) -> Any:
         """요소를 지목하는 Playwright 로케이터를 만든다.
 
@@ -3345,15 +3583,15 @@ class ActionDispatcher:
                     await self._reresolved_check(action, handle, params, node, first_doc)
                 # 대기(스크롤 포함) 전에도 관문 — 치유·재해석 사이 목록 문서로 바뀌었으면 그 문서에서 기다리지도 않는다.
                 await self._manual_guard(action, params)
-                await self._wait_actionable(action, params, node, first_doc, deadline)
+                point = await self._wait_actionable(action, params, node, first_doc, deadline)
                 token = _BOUND_NODE.set(node)  # 민감 칸 판정도 입력할 그 노드로(is_sensitive_field)
                 try:
                     await self._send_to_target(action, handle, params, node, fixed=True, bind=first_doc,
-                                               progress=progress)
+                                               progress=progress, point=point)
                 finally:
                     _BOUND_NODE.reset(token)
                 return
-            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused):
+            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused, _CoveredRefused):
                 raise
             except _NodeDetached as exc:
                 last = exc
@@ -3395,30 +3633,41 @@ class ActionDispatcher:
 
     async def _wait_actionable(
         self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any, deadline: float
-    ) -> None:
+    ) -> Optional[Dict[str, float]]:
         """R4 2: 효과 없는 대기 — 조각마다 페이지 안에서 결속(소유 문서)과 actionability 를 함께 본다(_ACTIONABLE_JS).
 
-        다른 문서 소유(adoptNode)면 그 실제 소유 프레임으로 관문(_bind_or_gate), 떨어졌으면 _NodeDetached(다시 해석)."""
+        다른 문서 소유(adoptNode)면 그 실제 소유 프레임으로 관문(_bind_or_gate), 떨어졌으면 _NodeDetached(다시 해석).
+        WS-79: 반환 None = 가운데로(기존 force 입력), {x, y} = 가운데가 덮여 고른 덮이지 않은 대상 점(비 force 로 보냄).
+        기한까지 덮여 있었으면 _CoveredRefused."""
         kind = _ACTIONABLE_KIND.get(action)
         if kind is None:  # 업로드: set_input_files 는 actionability 대기가 없다 — 결속만
             await self._bind_or_gate(action, params, node, first_doc)
-            return
+            return None
         loop = asyncio.get_running_loop()
+        why: Any = None
         while True:
             remaining_ms = (deadline - loop.time()) * 1000
             if remaining_ms <= 0:
+                if why == "not hit target":
+                    raise _CoveredRefused(covered_by_view(await self._cover_judge(node)))
                 raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다")
             try:
                 why = await node.evaluate(_ACTIONABLE_JS, [first_doc, kind, int(min(_WAIT_SLICE_MS, remaining_ms))])
             except Exception as exc:  # noqa: BLE001 — 문서 소멸·문맥 교체
                 raise _NodeDetached(str(exc)) from exc
             if why == "ok":
-                return
+                return None
+            point = _actionable_point(why)
+            if point is not None:
+                return point  # WS-79: 가운데가 덮여 같은 평가에서 고른 덮이지 않은 대상 점(비 force 로 보냄)
             if why in ("detached", "moved"):
                 # moved → 실제 소유 프레임 관문(목록이면 manual_site)·'대상 바뀜', detached → 다시 해석(_NodeDetached)
                 await self._bind_or_gate(action, params, node, first_doc)
                 continue
             if (deadline - loop.time()) <= 0:
+                if why == "not hit target":
+                    # WS-79: 기한까지 덮여 있었다 — 고정 문구 + covered_by(입력 없음).
+                    raise _CoveredRefused(covered_by_view(await self._cover_judge(node)))
                 raise TimeoutError(f"대상이 {int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능해지지 않았습니다({why})")
 
     async def _bind_or_gate(self, action: ActionType, params: Dict[str, Any], node: Any, first_doc: Any) -> None:
@@ -3450,11 +3699,288 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001
             return False
 
+    # -- WS-80 (#206): select 선택지 해석·확인·표시 -------------------------------------------
+
+    async def _select_eval(self, fn: str, arg: Any, handle: Any, target: Any, fixed: bool) -> Any:
+        """select 페이지 함수 fn(el, arg) 평가 — **격리 world** 에서만(페이지 world prototype·내장객체 위조가 닿지 않음).
+
+        최상위 문서·shadow 아님이면 css 경로의 노드로(isolated_eval). 프레임·shadow(R1)는 그 프레임의 격리 world 에서 같은
+        노드를 잡는다(_select_eval_scoped). 격리 world 를 못 얻음·노드를 못 정함·평가 실패면 None — 페이지 world 로 내려가지
+        않는다(fail-closed: 해석은 기준 호출 그대로, 확인은 기존 사후조건 판정)."""
+        css = getattr(handle, "css_path", "") or ""
+        if not css:
+            return None
+        if self.ctx.root_page is None and not getattr(handle, "is_shadow", False):
+            from perception.select_options import node_expr
+
+            try:
+                out = await self.isolated_eval(node_expr(fn, css, arg))
+            except Exception:  # noqa: BLE001 — 격리 world 를 못 만듦: 판정 불가
+                return None
+            return out if isinstance(out, dict) and out.get("verdict") != "gone" else None
+        out = await self._select_eval_scoped(fn, arg, handle, target, fixed)
+        return out if isinstance(out, dict) and out.get("verdict") != "gone" else None
+
+    async def _select_frame_world(self) -> Optional[Tuple[Any, str, bool]]:
+        """지금 대상 문서(최상위 또는 switch_frame 한 프레임)의 (CDP 세션, frameId, 다른 출처 iframe 세션인가). 못 정하면 None.
+
+        다른 출처 iframe(OOPIF)은 그 프레임의 CDP 세션(루트 frameId), 같은 프로세스 프레임은 최상위 게이트 세션의 프레임
+        트리에서 (name, url) 조상 사슬이 정확히 하나로 맞는 frameId 를 쓴다(둘 이상이면 None — 다른 프레임을 읽지 않는다)."""
+        top = self._top_page()
+        frame = self.ctx.page if self.ctx.root_page is not None else None
+        if frame is None or frame is getattr(top, "main_frame", None):
+            return await self._gate_cdp_for(top), "", False
+        oopif = await self._select_oopif_cdp(top, frame)
+        if oopif is not None:
+            tree = (await oopif.send("Page.getFrameTree")).get("frameTree") or {}
+            root_id = str((tree.get("frame") or {}).get("id") or "")
+            return (oopif, root_id, True) if root_id else None
+        chain: List[Tuple[str, str]] = []
+        cur = frame
+        while cur is not None and cur is not getattr(top, "main_frame", None):
+            chain.append((str(cur.name or ""), str(cur.url or "")))
+            cur = cur.parent_frame
+        if cur is None:
+            return None
+        chain.reverse()
+        cdp = await self._gate_cdp_for(top)
+        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
+        level = [tree]
+        for name, url in chain:
+            nxt = []
+            for node in level:
+                for child in node.get("childFrames") or []:
+                    f = child.get("frame") or {}
+                    if str(f.get("name") or "") == name and str(f.get("url") or "") + str(f.get("urlFragment") or "") == url:
+                        nxt.append(child)
+            level = nxt
+        if len(level) != 1:
+            return None
+        frame_id = str((level[0].get("frame") or {}).get("id") or "")
+        return (cdp, frame_id, False) if frame_id else None
+
+    async def _select_oopif_cdp(self, top: Any, frame: Any) -> Any:
+        """다른 출처 iframe 이면 그 프레임의 CDP 세션(프레임마다 하나, 재사용), 아니면 None(Playwright 가 거부)."""
+        cache = self.__dict__.setdefault("_select_oopif_sessions", {})
+        entry = cache.get(id(frame))
+        if entry is not None and entry[0] is frame:
+            return entry[1]
+        try:
+            session = await top.context.new_cdp_session(frame)
+        except Exception:  # noqa: BLE001 — 같은 프로세스 프레임: 최상위 세션으로
+            return None
+        cache[id(frame)] = (frame, session)
+        return session
+
+    async def _select_same_box(self, cdp: Any, object_id: str, target: Any, fixed: bool, oopif: bool) -> bool:
+        """격리 world 노드와 Playwright 입력 대상이 같은 자리(테두리 상자 1px 이내)인가 — role+name 로케이터·잡아 둔 노드처럼
+        css 경로로 지목하지 않는 대상의 동일성 확인. 두 값 모두 CDP 판독(페이지 JS 가 바꿀 수 없음). 못 읽으면 False."""
+        model = (await cdp.send("DOM.getBoxModel", {"objectId": object_id})).get("model") or {}
+        quad = model.get("border") or []
+        if len(quad) != 8:
+            return False
+        xs, ys = quad[0::2], quad[1::2]
+        mine = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+        if oopif:  # Playwright 는 다른 출처 iframe 의 상자에 프레임 요소 상자를 더한다 — 같은 기준으로 맞춘다
+            owner = await self.ctx.page.frame_element()
+            off = await owner.bounding_box()
+            if not off:
+                return False
+            mine[0] += off["x"]
+            mine[1] += off["y"]
+        box = await (target.bounding_box() if fixed else target.bounding_box(timeout=5000))
+        if not box:
+            return False
+        theirs = [box["x"], box["y"], box["width"], box["height"]]
+        return all(abs(a - b) <= 1.0 for a, b in zip(mine, theirs))
+
+    async def _select_eval_scoped(self, fn: str, arg: Any, handle: Any, target: Any, fixed: bool) -> Any:
+        """프레임·shadow 의 select 함수 평가(R1) — 그 프레임의 격리 world 에서 css 경로에 맞는 노드가 정확히 1개일 때만.
+
+        css 로 지목하지 않는 입력 대상(shadow 의 role+name 로케이터·잡아 둔 노드)은 그 노드와 같은 자리인지도 본다. 실패면 None."""
+        from perception.select_options import call_fn, deep_node_expr
+
+        css = handle.css_path
+        check_box = bool(fixed or getattr(handle, "is_shadow", False))
+        try:
+            world = await self._select_frame_world()
+            if world is None:
+                return None
+            cdp, frame_id, oopif = world
+
+            async def run(context_id: int) -> Any:
+                found = await cdp.send("Runtime.evaluate", {
+                    "expression": deep_node_expr(css), "contextId": context_id, "returnByValue": False})
+                object_id = (found.get("result") or {}).get("objectId")
+                if found.get("exceptionDetails") or not object_id:
+                    return None
+                try:
+                    if check_box and not await self._select_same_box(cdp, object_id, target, fixed, oopif):
+                        return None
+                    called = await cdp.send("Runtime.callFunctionOn", {
+                        "objectId": object_id, "functionDeclaration": call_fn(fn),
+                        "arguments": [{"value": arg}], "returnByValue": True})
+                finally:
+                    try:
+                        await cdp.send("Runtime.releaseObject", {"objectId": object_id})
+                    except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                        pass
+                if called.get("exceptionDetails"):
+                    return None
+                return (called.get("result") or {}).get("value")
+
+            return await self._in_gate_world(cdp, frame_id, run)
+        except Exception:  # noqa: BLE001 — 격리 world 를 못 얻음: 판정 불가(fail-closed)
+            return None
+
+    async def _select_display_scoped(self, expression: str) -> Any:
+        """프레임 관찰의 선택지 표시 식을 그 프레임의 격리 world 에서 평가(R1). 못 하면 RuntimeError(표시 생략)."""
+        world = await self._select_frame_world()
+        if world is None:
+            raise RuntimeError("프레임 격리 world 없음")
+        cdp, frame_id, _ = world
+
+        async def run(context_id: int) -> Any:
+            return await cdp.send("Runtime.evaluate", {
+                "expression": expression, "contextId": context_id, "returnByValue": True})
+
+        res = await self._in_gate_world(cdp, frame_id, run)
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            raise RuntimeError("프레임 격리 world 평가 실패")
+        return (res.get("result") or {}).get("value")
+
+    async def _resolve_select(self, handle: Any, params: Dict[str, Any], target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
+        """select_option 인자 해석(관문 앞 1회). 반환 verdict: ok(index·value·label) / fail(reason·indices) / index(total) /
+        not_select / gone, 또는 None(해석 불가 — 기존 Playwright 호출 그대로)."""
+        from perception.select_options import RESOLVE_FN
+
+        if params.get("value") is not None:
+            arg: Dict[str, Any] = {"value": str(params["value"])}
+        else:
+            arg = {"index": int(params.get("index") or 0)}
+        out = await self._select_eval(RESOLVE_FN, arg, handle, target, fixed)
+        return out if isinstance(out, dict) and isinstance(out.get("verdict"), str) else None
+
+    def _select_refusal(self, action: ActionType, handle: Any, params: Dict[str, Any],
+                        resolved: Optional[Dict[str, Any]]) -> Optional[ActionResult]:
+        """해석 결과 → 거부 응답(입력 없음 — retry_safe) 또는 None(진행). 후보는 index 만(라벨 글자 없음)."""
+        from perception import select_options as so
+
+        if resolved is None:
+            return None
+        verdict = resolved.get("verdict")
+        if verdict == "fail":
+            reason = str(resolved.get("reason"))
+            if reason not in so.FAIL_MESSAGES:
+                return None
+            indices = [int(i) for i in resolved.get("indices") or [] if isinstance(i, int)][:so.MAX_CANDIDATES]
+            cand: Dict[str, Any] = {"reason": reason, "indices": indices}
+            total = resolved.get("total")
+            if isinstance(total, int) and total > len(indices):
+                cand["total"] = total
+            return self._result(success=False, action=action, retry_safe=True, error_code=ErrorCode.OPTION_NOT_FOUND,
+                                error_message=so.FAIL_MESSAGES[reason], data={"select_candidates": cand})
+        if verdict == "index":
+            total = resolved.get("total")
+            index = int(params.get("index") or 0)
+            if isinstance(total, int) and not 0 <= index < total:
+                return self._result(success=False, action=action, retry_safe=True,
+                                    error_code=ErrorCode.OPTION_NOT_FOUND,
+                                    error_message=so.FAIL_MESSAGES["out_of_range"],
+                                    data={"select_candidates": {"reason": "out_of_range", "total": total}})
+            return None
+        if verdict == "not_select" and getattr(handle, "role", None) == "combobox":
+            # T3: 대리 위젯 — 숨긴 select 에 값을 넣거나 짝을 짓지 않는다(고정 안내만).
+            return self._result(success=False, action=action, retry_safe=True,
+                                error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE, error_message=so.PROXY_HINT,
+                                data={"hint": so.PROXY_HINT})
+        return None
+
+    async def _annotate_select_options(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
+        """관찰 data 에 select 선택지 블록(data.select_options)을 싣는다 — 관찰된 combobox 가 없으면 평가하지 않는다(바이트·
+        비용 그대로). 표시 전용(핸들·실행 무관): 실패해도 관찰은 그대로 성공한다."""
+        from perception import select_options as so
+
+        try:
+            targets, handles = so.select_targets(self.ctx.engine, elements)
+            if not targets:
+                return
+            if self.ctx.root_page is None:
+                raw = await self.isolated_eval(so.display_expr(targets))
+            else:  # R1: 프레임도 그 프레임의 격리 world 에서만(페이지 world 에서 읽은 라벨 순서는 싣지 않는다)
+                raw = await self._select_display_scoped(so.display_expr(targets))
+        except Exception as exc:  # noqa: BLE001 — 부가 정보
+            logger.debug("select 선택지 수집 실패: %s", type(exc).__name__)
+            return
+        so.apply_block(data, raw, handles)
+
+    # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
+
+    def _hidden_label_entry(self, handle: Any) -> Optional[Tuple[Any, Any]]:
+        """마지막 관찰이 data.hidden_controls 로 노출한 그 라벨 핸들이면 (핸들, 노드 핀), 아니면 None(같은 객체만 —
+        재관찰로 같은 id 가 다른 노드를 가리키면 아님)."""
+        labels = self.__dict__.get("_hidden_labels") or {}
+        entry = labels.get(getattr(handle, "element_id", None)) if handle is not None else None
+        return entry if entry is not None and entry[0] is handle else None
+
+    def _is_hidden_label(self, handle: Any) -> bool:
+        return self._hidden_label_entry(handle) is not None
+
+    async def _hidden_state(self, handle: Any, target: Any, fixed: bool) -> Optional[Dict[str, Any]]:
+        """라벨 핸들의 숨긴 control 짝·상태(격리 world 에서만 — _select_eval 재사용). shadow·못 읽음은 None(기준 동작).
+
+        R1 B1: 관찰이 노출한 라벨이면 관찰 때 격리 world 에 고정한 노드(라벨·input)와 지금 노드가 같은지 대조한다 — 다르거나
+        대조 불가(핀 없음·판독 실패)면 verdict moved(누르지 않음). id 유무와 무관."""
+        entry = self._hidden_label_entry(handle)
+        if getattr(handle, "is_shadow", False) or not getattr(handle, "css_path", ""):
+            return {"verdict": "moved"} if entry is not None else None
+        from perception import hidden_controls as hc
+
+        pin = entry[1] if entry is not None else None
+        if entry is not None and not (isinstance(pin, list) and len(pin) == 2 and pin[0]):
+            return {"verdict": "moved"}
+        arg = {"pin": pin} if entry is not None else {}
+        out = await self._select_eval(hc.fn(hc.STATE_FN), arg, handle, target, fixed)
+        if isinstance(out, dict) and out.get("verdict") in ("none", "unpaired", "moved", "paired"):
+            return out
+        return {"verdict": "moved"} if entry is not None else None
+
+    def _hidden_moved(self, action: ActionType) -> "_HiddenRefused":
+        from perception.hidden_controls import MOVED_MESSAGE
+
+        return _HiddenRefused(self._result(
+            success=False, action=action, retry_safe=True, error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=MOVED_MESSAGE, reobserve_required=True))
+
+    async def _annotate_hidden_controls(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
+        """관찰 data 에 숨긴 checkbox/radio 블록(data.hidden_controls)과, 짝 라벨이 프루닝됐으면 그 라벨 추가 요소를 싣는다.
+
+        격리 world 에서만 읽는다(프레임은 그 프레임의 격리 world). 숨긴 control 이 없거나 못 읽으면 아무것도 바꾸지 않는다."""
+        import secrets
+
+        from perception import hidden_controls as hc
+
+        self.__dict__["_hidden_labels"] = {}
+        try:
+            targets, handles = hc.scan_targets(self.ctx.engine, elements)
+            nonce = secrets.token_hex(8)  # R1 B1: 이 관찰의 노드 핀 묶음 식별(격리 world 전역)
+            expr = hc.scan_expr(targets, nonce)
+            if self.ctx.root_page is None:
+                raw = await self.isolated_eval(expr)
+            else:
+                raw = await self._select_display_scoped(expr)
+            self.__dict__["_hidden_labels"] = hc.apply_block(data, raw, handles, self.ctx.engine, nonce)
+        except Exception as exc:  # noqa: BLE001 — 부가 정보
+            logger.debug("숨긴 control 수집 실패: %s", type(exc).__name__)
+
     async def _send_to_target(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
-        bind: Any = None, progress: Optional[Dict[str, bool]] = None,
+        bind: Any = None, progress: Optional[Dict[str, bool]] = None, point: Optional[Dict[str, float]] = None,
     ) -> None:
         """target(Locator, 또는 fixed=True 면 고정 노드 Playwright ElementHandle — 승인 결속·R3 고정)으로 입력을 보낸다.
+
+        WS-79: 포인터 입력(click·check·hover·download trigger)은 _pointer_call 로 — 가운데가 덮였으면 덮이지 않은 대상
+        점으로 비 force(point 는 결속 경로에서 _wait_actionable 이 고른 점).
 
         bind(R4, 목록이 있을 때 — 관문 통과 문서의 JS 핸들)가 있으면 관문 직후 결속 확인(_bind_or_gate)을 하고 대기 없는
         즉시 입력(force)을 보낸다 — actionability 대기는 _bound_input 이 효과 없이 먼저 끝냈다. progress 는 입력 호출이
@@ -3475,9 +4001,24 @@ class ActionDispatcher:
                 progress["sent"] = True
 
         if action is ActionType.CLICK:
-            await guard(action, params)
-            await target.click(button=params.get("button", "left"), timeout=5000, **fk)
+            button = params.get("button", "left")
+            # WS-81: 관찰이 노출한 짝 라벨이면 전후 상태를 격리 world 에서 읽는다(관문 앞 — 토글 의미는 그대로).
+            params.pop(_HIDDEN_CLICK_KEY, None)
+            params.pop(_HIDDEN_CONFIRMED_KEY, None)
+            state = await self._hidden_state(handle, target, fixed) if self._is_hidden_label(handle) else None
+            if isinstance(state, dict) and state.get("verdict") == "moved":
+                raise self._hidden_moved(action)
+            await self._pointer_call(action, params, target, guard, fk, point,
+                                     lambda **kw: target.click(button=button, **kw))
             sent()
+            if isinstance(state, dict) and state.get("verdict") == "paired":
+                after = await self._hidden_state(handle, target, fixed)
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드 — 성공으로 보고하지 않는다
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
+                        isinstance(after.get("checked"), bool) and after["checked"] is not state.get("checked"):
+                    params[_HIDDEN_CLICK_KEY] = {"checked_before": not after["checked"],
+                                                 "checked_after": after["checked"]}
 
         elif action is ActionType.TYPE_TEXT:
             # 치환된 값은 _resolve_secret에서 이미 params에 반영돼 있다.
@@ -3513,13 +4054,39 @@ class ActionDispatcher:
                 await guard(action, params)
                 await target.type(text, timeout=5000)
             await self._mark_sensitive_input(handle, params, text)
+            if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
+                # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
+                # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
+                await self._register_field_value(target)
             if params.get("press_enter"):
                 await guard(action, params)
                 await target.press("Enter", timeout=5000)
 
         elif action is ActionType.SELECT_OPTION:
+            # WS-80: Playwright 의 value-or-label 첫 일치 대신 한 번 해석한다(정확한 value → 정규화 라벨 1개). 해석은 관문
+            # 앞이다 — 관문과 입력 사이에 새 await 를 두지 않는다(WS-64). 해석 불가(평가 실패)면 기존 호출 그대로.
+            from perception import select_options as so
+
+            resolved = await self._resolve_select(handle, params, target, fixed)
+            refused = self._select_refusal(action, handle, params, resolved)
+            if refused is not None:
+                raise _SelectRefused(refused)
             await guard(action, params)
-            if params.get("value") is not None:
+            if resolved is not None and resolved.get("verdict") == "ok":
+                await target.select_option(index=int(resolved["index"]), timeout=5000, **fk)
+                sent()
+                # 사후 확인: 고른 option 이 해석한 그 option 인가(해석과 입력 사이 선택지 순서 변경 — TOCTOU). 확실히
+                # 다를 때만 거부한다(문서 이동 등으로 읽지 못하면 기존 사후조건 판정).
+                check = await self._select_eval(so.CONFIRM_FN, {
+                    "index": int(resolved["index"]), "value": resolved.get("value"), "label": resolved.get("label")},
+                    handle, target, fixed)
+                if isinstance(check, dict) and check.get("verdict") == "differ":
+                    raise _SelectRefused(self._result(
+                        success=False, action=action, retry_safe=True, error_code=ErrorCode.TOCTOU_MISMATCH,
+                        error_message=so.MISMATCH_MESSAGE, reobserve_required=True))
+                if isinstance(check, dict) and check.get("verdict") == "match":
+                    params[_SELECT_CONFIRMED_KEY] = True
+            elif params.get("value") is not None:
                 await target.select_option(value=params["value"], timeout=5000, **fk)
             else:
                 await target.select_option(
@@ -3528,16 +4095,35 @@ class ActionDispatcher:
             sent()
 
         elif action is ActionType.CHECK_BOX:
-            await guard(action, params)
-            if params.get("checked", True):
-                await target.check(timeout=5000, **fk)
-            else:
-                await target.uncheck(timeout=5000, **fk)
+            # WS-81: 대상이 숨긴 checkbox/radio 의 라벨이면 짝을 격리 world 에서 확인한다(관문 앞). operable:false·짝 미확정은
+            # 누르지 않고 고정 안내로 거부, 짝이면 기존 check()/_pointer_call 그대로 + 사후 확인(label.control.checked).
+            # 못 읽으면(None) 기준 동작 그대로(페이지 world 로 내려가지 않음).
+            from perception import hidden_controls as hc
+
+            params.pop(_HIDDEN_CONFIRMED_KEY, None)
+            want = bool(params.get("checked", True))
+            state = await self._hidden_state(handle, target, fixed)
+            verdict = state.get("verdict") if isinstance(state, dict) else None
+            if verdict == "moved":
+                raise self._hidden_moved(action)
+            if verdict == "unpaired" or (verdict == "paired" and state.get("operable") is not True):
+                hint = hc.HINTS["unpaired" if verdict == "unpaired" else "inoperable"]
+                raise _HiddenRefused(self._result(
+                    success=False, action=action, retry_safe=True, error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
+                    error_message=hint, data={"hint": hint}))
+            toggle = target.check if want else target.uncheck
+            await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: toggle(**kw))
             sent()
+            if verdict == "paired":
+                after = await self._hidden_state(handle, target, fixed)
+                if isinstance(after, dict) and after.get("verdict") == "moved":
+                    params[_HIDDEN_CONFIRMED_KEY] = False  # R1 B1: 사후 대조에서 다른 노드
+                elif isinstance(after, dict) and after.get("verdict") == "paired" and \
+                        isinstance(after.get("checked"), bool):
+                    params[_HIDDEN_CONFIRMED_KEY] = after["checked"] is want
 
         elif action is ActionType.HOVER:
-            await guard(action, params)
-            await target.hover(timeout=5000, **fk)
+            await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: target.hover(**kw))
             sent()
 
         elif action is ActionType.UPLOAD_FILE:
@@ -3551,8 +4137,7 @@ class ActionDispatcher:
             async with self.ctx.page.expect_download(
                 timeout=params.get("timeout_ms", 30000)
             ) as dl:
-                await guard(action, params)
-                await target.click(timeout=5000, **fk)
+                await self._pointer_call(action, params, target, guard, fk, point, lambda **kw: target.click(**kw))
                 sent()
             download = await dl.value
             # WS-51 R4 P7: 다운로드 대상 주소도 도구가 본 주소다 — 그 비밀 값을 레지스트리에(예외를 내지 않는다).
@@ -3576,6 +4161,82 @@ class ActionDispatcher:
 
         else:
             raise ValueError(f"요소 대상 액션이 아닙니다: {action.value}")
+
+    async def _cover_judge(self, target: Any) -> Optional[Dict[str, Any]]:
+        """WS-79 (1): 읽기 전용 덮임 판정 — 클릭할 그 locator/handle 에서 따로 평가한다(capture_state 와 합치지 않음, B7).
+
+        Locator 는 evaluate_all(기다리지 않음 — 없으면 판정 불가), 고정 노드는 ElementHandle.evaluate. 그 밖(가짜 대상)·
+        평가 실패·모르는 모양은 None(판정 불가 → 기존 경로)."""
+        try:
+            if isinstance(target, PlaywrightLocator):
+                raw = await target.evaluate_all(COVER_JUDGE_ALL_JS)
+            elif isinstance(target, PlaywrightElementHandle):
+                raw = await target.evaluate(COVER_JUDGE_JS)
+            else:
+                return None
+        except Exception:  # noqa: BLE001 — 판정 불가: 기존 경로(Playwright 의 대기·hit 검사)
+            return None
+        return parse_judge(raw)
+
+    async def _pointer_call(
+        self, action: ActionType, params: Dict[str, Any], target: Any, guard: Any, fk: Dict[str, Any],
+        point: Optional[Dict[str, float]], call: Any,
+    ) -> None:
+        """WS-79: 포인터 입력 — 가운데가 대상이면 기존 호출 그대로(바이트·지연 동일), 덮였으면 덮이지 않은 대상 점으로
+        **비 force** position 입력, 그런 점이 없으면 기존 호출을 COVERED_CLICK_BUDGET_MS 로(스크롤 재시도·덮개 사라짐
+        대기 유지). 덮임 시간 초과면 스크롤된 상태에서 한 번 더 판정 → 점이 있으면 그 점으로, 없으면 _CoveredRefused.
+        모든 입력 바로 앞에 관문(guard) — 관문과 입력 사이에 await 를 두지 않는다(WS-64)."""
+        if fk:
+            # 목록 사이트 결속 경로(R4): actionability 는 _wait_actionable 이 끝냈다. 가운데면 기존 force 입력,
+            # 고른 점이면 비 force(force 대체 점 금지 — 덮개가 그 사이 생겼으면 Playwright 가 거부).
+            await guard(action, params)
+            if point is None:
+                await call(timeout=5000, **fk)
+                return
+            try:
+                await call(position={"x": point["x"], "y": point["y"]}, timeout=COVERED_POINT_TIMEOUT_MS)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+                raise _CoveredRefused(covered_by_view(await self._cover_judge(target))) from None
+            _CLICK_POINT.set(click_point_view(point))
+            return
+        judge = await self._cover_judge(target)
+        state = judge.get("s") if judge else None
+        if judge is not None and state == "point":
+            pos = {"x": judge["x"], "y": judge["y"]}
+            await guard(action, params)
+            try:
+                await call(position=pos, timeout=5000)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+                again = await self._cover_judge(target)
+                raise _CoveredRefused(covered_by_view(again if again and again.get("cover") else judge)) from None
+            _CLICK_POINT.set(click_point_view(judge))
+            return
+        await guard(action, params)
+        try:
+            await call(timeout=5000 if state in (None, "center", "unknown") else COVERED_CLICK_BUDGET_MS)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if not is_pointer_intercept(exc):
+                raise
+        # (2) 시간 초과(가로채기): Playwright 가 스크롤한 상태에서 한 번 더 판정한다.
+        again = await self._cover_judge(target)
+        if again is not None and again.get("s") == "point":
+            pos = {"x": again["x"], "y": again["y"]}
+            await guard(action, params)
+            try:
+                await call(position=pos, timeout=COVERED_POINT_TIMEOUT_MS)
+            except Exception as exc:  # noqa: BLE001
+                if not is_pointer_intercept(exc):
+                    raise
+            else:
+                _CLICK_POINT.set(click_point_view(again))
+                return
+        best = again if again is not None and again.get("cover") else judge
+        raise _CoveredRefused(covered_by_view(best)) from None
 
     async def _execute_elementless(
         self, action: ActionType, params: Dict[str, Any]
@@ -3652,6 +4313,10 @@ class ActionDispatcher:
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
         if repeated is not None:
             data["repeated"] = repeated
+        # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).
+        await self._annotate_select_options(page, observed.elements, data)
+        # WS-81: 숨긴 checkbox/radio 의 짝 라벨·상태 — 없으면 키도 추가 요소도 없다(기존 바이트 그대로).
+        await self._annotate_hidden_controls(page, observed.elements, data)
         return self._result(
             success=True,
             action=action,
@@ -3927,6 +4592,133 @@ class ActionDispatcher:
             reobserve_required=changed,
         )
 
+    async def _key_field_before(self, top: Any) -> Tuple[Any, bool, str]:
+        """WS-78 T1 B2: 키 **전** 포커스 노드를 잡아 민감 여부·현재 값을 본다. 반환 (노드 핸들|None, 민감, 값).
+
+        판정 불가(포커스 없음·다른 출처 iframe 'opaque'·닫힌 shadow·평가 실패·상한 초과)는 (None, False, "") — 한계로
+        문서화(docs/security.md). 노드 핸들은 키 뒤 **그 노드**의 값을 읽는 데 쓴다(Tab 으로 포커스가 옮겨도 같은 노드).
+        WS-78 R1 R3: 서버가 미리 시작해 둔 판정(prefetch_key_judge — 기존 레시피 스냅숏 평가와 겹쳐 돈다)이 같은 Page·짧은
+        시간 안의 것이면 그것을 쓴다(새 왕복 없음). 아니면 버리고 지금 판정한다.
+        """
+        pre, self._key_prefetch = getattr(self, "_key_prefetch", None), None
+        if pre is not None:
+            if pre[0] is top and time.monotonic() - pre[2] <= _KEY_PREFETCH_MAX_AGE_S:
+                try:
+                    return await asyncio.wait_for(pre[1], _KEY_FIELD_TIMEOUT_S)
+                except Exception:  # noqa: BLE001
+                    return None, False, ""
+            self._drop_prefetch(pre)
+        try:
+            return await asyncio.wait_for(self._key_field_judge(top), _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 판정 불가(앞 이동이 진행 중이면 평가가 이동 끝까지 멈출 수 있다)
+            return None, False, ""
+
+    def prefetch_key_judge(self) -> None:
+        """WS-78 R1 R3: press_key 의 키 전 판정을 미리 시작한다 — 서버가 기존 평가(레시피 기록 스냅숏)와 겹쳐 돌린다.
+        판정은 읽기뿐이고 키보다 앞서 끝난다(press_key 가 키 전에 기다린다). 쓰이지 않으면 drop_key_prefetch."""
+        self.drop_key_prefetch()
+        try:
+            top = self._top_page()
+            task = asyncio.ensure_future(self._key_field_judge(top))
+        except Exception:  # noqa: BLE001 — 미리 못 하면 press_key 가 직접 판정
+            return
+        self._key_prefetch = (top, task, time.monotonic())
+
+    def drop_key_prefetch(self) -> None:
+        """쓰이지 않은 미리 판정을 버린다(잡은 핸들은 놓아 준다)."""
+        pre, self._key_prefetch = getattr(self, "_key_prefetch", None), None
+        if pre is not None:
+            self._drop_prefetch(pre)
+
+    def _drop_prefetch(self, pre: Any) -> None:
+        def _release(task: Any) -> None:
+            try:
+                node = task.result()[0]
+            except BaseException:  # noqa: BLE001 — 취소·실패 = 놓을 핸들 없음
+                return
+            if node is not None and not isinstance(node, _PlainKey):
+                self._dispose_later(node)
+
+        pre[1].add_done_callback(_release)
+
+    async def _key_field_judge(self, top: Any) -> Tuple[Any, bool, str]:
+        # WS-78 R1 R3: 평가 한 번으로 민감·sticky·식별 열쇠를 함께 본다 — 일반 칸은 핸들을 잡지 않는다(핸들·노드 평가·
+        # 해제 왕복 없음). 민감(또는 sticky 그 노드)일 때만 키 뒤 **그 노드**를 읽을 핸들을 잡는다.
+        sticky = getattr(self, "_sticky_key_node", None)
+        try:
+            info = await top.evaluate(_KEY_FOCUS_JS, sticky)
+        except Exception:  # noqa: BLE001 — 다른 문서의 sticky 핸들 등: 그 기준을 놓고 한 번 더(sticky 없이)
+            if sticky is None:
+                raise
+            self._sticky_key_node = None
+            self._dispose_later(sticky)
+            info = await top.evaluate(_KEY_FOCUS_JS, None)
+        if not isinstance(info, dict):
+            return None, False, ""
+        if not (info.get("s") or info.get("same")):
+            return _PlainKey(str(info.get("k") or "")), False, ""
+        node = await top.evaluate_handle(_FOCUS_NODE_JS)
+        if node.as_element() is None:
+            self._dispose_later(node)
+            return _NoNode(), True, str(info.get("v") or "")  # 키 뒤 못 읽음 = fail-closed 신호(키 전 값 등록)
+        return node, True, str(info.get("v") or "")
+
+    @staticmethod
+    def _dispose_later(node: Any) -> None:
+        """핸들을 놓아 준다 — 기다리지 않는다(문서 이동 중이면 해제 왕복도 이동 끝까지 멈출 수 있다)."""
+        async def _go() -> None:
+            try:
+                await asyncio.wait_for(node.dispose(), _KEY_FIELD_TIMEOUT_S)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            asyncio.get_running_loop().create_task(_go())
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    async def _key_field_read(node: Any) -> Optional[Dict[str, Any]]:
+        """키 뒤 그 노드의 {s, v}. 못 읽으면 None(문서 이동·노드 소멸)."""
+        try:
+            info = await node.evaluate(_KEY_FIELD_JS)
+        except Exception:  # noqa: BLE001
+            return None
+        return info if isinstance(info, dict) else None
+
+    async def _key_field_after(self, node: Any, sensitive: bool, before: str, data: Dict[str, Any],
+                               pending: Any = None) -> None:
+        """WS-78 T1 B2~B4: 키 **뒤** 그 노드의 값을 읽어, 키 전·키 뒤 어느 쪽이든 민감이면(sticky·OR) 칸 전체 값을
+        자격증명 등급으로 등록한다. 누적 값을 매번 통째로 등록하고 앞서 등록한 접두는 그대로 둔다(B3, 지우는 API 없음).
+        민감인데 키 뒤 값을 못 읽으면(상한 안에 못 읽음 포함) 키 전 값만 등록하고 data 에 고정 신호(B4, 값 없음).
+        일반 칸은 아무것도 붙이지 않는다. pending: 키 직후 시작해 둔 읽기(이동 대기와 겹쳐 돈다).
+        """
+        if pending is None:
+            pending = asyncio.ensure_future(self._key_field_read(node))
+        try:
+            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — Enter 제출 직후 평가가 새 문서 도착까지 멈추는 경우(실측) 등
+            info = None
+        after: Optional[str] = None
+        if info is not None:
+            sensitive = sensitive or bool(info.get("s"))
+            after = str(info.get("v") or "")
+        self.last_key_sensitive = sensitive
+        if sensitive and after is not None:
+            # 이 노드를 다음 키의 sticky 기준으로 둔다(앞 기준 노드는 놓아 준다).
+            old, self._sticky_key_node = getattr(self, "_sticky_key_node", None), node
+            if old is not None and old is not node:
+                self._dispose_later(old)
+        else:
+            self._dispose_later(node)
+        if not sensitive:
+            return
+        from security.secret_registry import register_secret_values
+
+        register_secret_values([v for v in (before, after) if v])
+        if after is None:
+            data["sensitive_input"] = {"value_read": False, "hint": SENSITIVE_VALUE_UNREAD}
+
     async def _elementless_press_key(self, action: ActionType, params: Dict[str, Any]) -> ActionResult:
         """press_key(WS-48 분해)."""
         raw_key = str(params.get("key", ""))
@@ -3934,6 +4726,7 @@ class ActionDispatcher:
         # 키보드·문서 이동은 최상위 Page 의 것이다 — 프레임 안이어도 포커스된 요소가
         # 키를 받는다(Frame 에는 .keyboard 가 없다, WS-30).
         top = self._top_page()
+        self.last_key_sensitive = False
         frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
         # WS-56 R2 B2: 사람 승인으로 연 키 입력 — 키를 받을 포커스 노드가 승인 때 잡은 그 노드(그 목적지)여야 한다.
         pin = self._current_pin()
@@ -3941,6 +4734,8 @@ class ActionDispatcher:
             action, pin, await self._pin_mismatch_for(pin, params) if pin is not None else None)
         if refused is not None:
             return refused
+        # WS-78 T1 B2: 민감 판정은 키 **전**(키의 input 이벤트로 type 이 바뀌기 전) — 목록 재판정(키 직전)보다 앞에 둔다.
+        node, sensitive, before = await self._key_field_before(top)
         watch = None
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
@@ -3949,26 +4744,85 @@ class ActionDispatcher:
         if refused is not None:
             if watch is not None:
                 watch.close()
+            if node is not None and not isinstance(node, _PlainKey):
+                self._dispose_later(node)
             return refused
         try:
             await top.keyboard.press(key)
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
                 watch.close()
+            if node is not None and not isinstance(node, _PlainKey):
+                await self._key_field_after(node, sensitive, before, {})
+            # WS-78 R1(#200): 키 원문(에이전트 유래 — Playwright 문구에도 반복된다)은 가린 뒤 고정 길이로 자른다.
             return self._result(
                 success=False,
                 action=action,
                 retry_safe=False,  # 키 입력은 발송 후 재시도 위험
                 error_code=ErrorCode.KEY_PRESS_FAILED,
-                error_message=f"{exc} (입력값: {raw_key!r} -> {key!r})",
+                error_message=(f"{_bounded_echo(str(exc), _KEY_ERROR_TEXT_CHARS)} (입력값: "
+                               f"{_bounded_echo(repr(raw_key), _KEY_ERROR_ECHO_CHARS)} -> "
+                               f"{_bounded_echo(repr(key), _KEY_ERROR_ECHO_CHARS)})"),
             )
+        data: Dict[str, Any] = {"key": key}
+        # 키 뒤 곧바로 그 노드 값 읽기를 시작하고 이동 대기와 겹쳐 돌린다 — Enter 제출 직후의 평가는 새 문서가 올
+        # 때까지 멈출 수 있어(실측) 기다리지 않고, 대기가 끝난 뒤 짧은 상한 안에서만 결과를 받는다.
+        pending = None
+        if isinstance(node, _PlainKey):
+            pending = asyncio.ensure_future(self._key_plain_read(top, node.k))
+        elif node is not None:
+            pending = asyncio.ensure_future(self._key_field_read(node))
         # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
         # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
         if watch is not None:
             self._nav_info = await watch.settle()
+        if isinstance(node, _PlainKey):
+            # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
+            task = asyncio.ensure_future(self._key_plain_after(top, pending))
+            defer = KEY_AFTER_DEFER.get()
+            if defer is not None:
+                defer.append(task)
+            else:
+                await task
+        elif node is not None:
+            await self._key_field_after(node, sensitive, before, data, pending)
         return self._result(
-            success=True, action=action, retry_safe=False, data={"key": key}
+            success=True, action=action, retry_safe=False, data=data
         )
+
+    @staticmethod
+    async def _key_plain_read(top: Any, k: str) -> Optional[Dict[str, Any]]:
+        """WS-78 R1 R3: 키 뒤 지금 포커스가 키 전 그 노드(열쇠 k)면 {s, v}, 아니면·못 읽으면 None."""
+        try:
+            info = await top.evaluate(_KEY_FOCUS_AFTER_JS, k)
+        except Exception:  # noqa: BLE001
+            return None
+        return info if isinstance(info, dict) else None
+
+    async def _key_plain_after(self, top: Any, pending: Any) -> None:
+        """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다."""
+        try:
+            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            info = None
+        if not (isinstance(info, dict) and info.get("s")):
+            return
+        self.last_key_sensitive = True
+        value = str(info.get("v") or "")
+        if value:
+            from security.secret_registry import register_secret_values
+
+            register_secret_values([value])
+        try:
+            node = await asyncio.wait_for(top.evaluate_handle(_FOCUS_NODE_JS), _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — sticky 를 못 잡아도 다음 키 전 판정이 password 를 본다
+            return
+        if node.as_element() is None:
+            self._dispose_later(node)
+            return
+        old, self._sticky_key_node = getattr(self, "_sticky_key_node", None), node
+        if old is not None and old is not node:
+            self._dispose_later(old)
 
     async def _elementless_screenshot(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """take_screenshot(WS-48 분해)."""
@@ -4384,7 +5238,7 @@ class ActionDispatcher:
                 action=ActionType.WAIT_FOR,
                 retry_safe=True,
                 error_code=ErrorCode.TIMEOUT,
-                error_message=f"{condition} 대기 실패: {exc}",
+                error_message=f"{condition} 대기 실패: {public_error_text(exc)}",  # WS-79 B8: 호출 기록(요소 HTML) 제외
             )
         return self._result(
             success=True,

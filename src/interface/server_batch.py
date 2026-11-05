@@ -97,6 +97,70 @@ REFUSED_NO_WATCH = "묶음 실행 불가: 문서 커밋·새 탭·다이얼로�
 NEXT = ("앞 단계 효과는 이미 일어났습니다(되돌리지 않음). 묶음 전에 받은 @eN id 는 무효 — 이 응답의 관찰 id 를 쓰고, "
         "멈췄다면 그 지점부터 평소대로 관찰·판단해 이어 가세요.")
 
+#: WS-78 R1(#200): 크기 맞춤으로도 상한 안에 못 드는 묶음 응답 — 현재 관찰을 생략했다는 고정 표지(data.observation_omitted).
+BATCH_OBSERVATION_OMITTED = "응답 크기 상한 때문에 현재 관찰을 생략했습니다 — browser_observe_page 로 다시 관찰하세요."
+#: WS-78 R1: 단계 결과까지 줄였다는 고정 표지(data.step_result.omitted — 성공 여부·오류 코드만 남김).
+STEP_RESULT_OMITTED = "응답 크기 상한 때문에 단계 결과 본문을 생략했습니다(성공 여부·오류 코드만)."
+#: WS-78 R1: 바깥 메타를 자르거나 관찰을 생략한 묶음 응답의 data.truncated.hint.
+BATCH_TRUNC_HINT = ("묶음 응답이 크기 상한을 넘어 단계 결과의 긴 글자를 자르거나 현재 관찰을 생략했습니다. "
+                    "필요하면 browser_observe_page 로 다시 관찰하세요.")
+#: WS-78 R1: 상한을 넘을 때 바깥 메타(step_result·batch.steps) 문자열의 고정 길이와 목록 항목 수(가린 뒤 자름).
+META_TEXT_CHARS = 200
+META_LIST_ITEMS = 20
+#: 응답 관찰에서 묶음 응답으로 옮기는 키.
+_OBS_KEYS = ("observation", "repeated", "select_options", "select_options_omitted", "hidden_controls",
+             "hidden_controls_omitted", "injection_suspected", "truncated", "challenge", "handoff", "hint", "robots",
+             "dialogs", "page_not_found")
+#: WS-78 R1 R2: 크기 맞춤·관찰 생략 뒤에도 남기는 검출 신호(처음 관찰에서 본 것 OR).
+_SIGNAL_KEYS = ("injection_suspected", "challenge", "handoff", "robots", "page_not_found", "dialogs",
+                "observation_error")
+
+
+def _clip(obj: Any, depth: int = 0) -> Any:
+    """WS-78 R1: 가린 구조의 문자열을 META_TEXT_CHARS 로, 목록을 META_LIST_ITEMS 로 자른 새 구조(입력 불변)."""
+    if isinstance(obj, str):
+        return obj if len(obj) <= META_TEXT_CHARS else obj[:META_TEXT_CHARS] + "…"
+    if depth > 12:
+        return None
+    if isinstance(obj, dict):
+        return {k: _clip(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clip(v, depth + 1) for v in list(obj)[:META_LIST_ITEMS]]
+    return obj
+
+
+def _clip_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """바깥 메타의 페이지/에이전트 유래 긴 글자를 가린 뒤(WS-75 순서) 고정 길이로 자른다 — batch 의 고정 칸은 그대로."""
+    from security.public_url import public_payload
+
+    out = dict(meta)
+    if "step_result" in out:
+        out["step_result"] = _clip(public_payload(out["step_result"]))
+    batch = out.get("batch")
+    if isinstance(batch, dict) and isinstance(batch.get("steps"), list):
+        out["batch"] = dict(batch, steps=_clip(public_payload(batch["steps"])))
+    return out
+
+
+def _minimal_step_result(step_result: Any) -> Dict[str, Any]:
+    """단계 결과의 고정 어휘(성공 여부·오류 코드)만 남긴 것."""
+    out: Dict[str, Any] = {}
+    if isinstance(step_result, dict):
+        if isinstance(step_result.get("success"), bool):
+            out["success"] = step_result["success"]
+        if step_result.get("error_code") in _CODES:
+            out["error_code"] = step_result["error_code"]
+    out["omitted"] = STEP_RESULT_OMITTED
+    return out
+
+
+def _keep_signals(out: Dict[str, Any], first: Dict[str, Any]) -> Dict[str, Any]:
+    """처음 관찰에서 검출한 신호를 다시 맞춘 관찰에 OR 로 보존한다."""
+    for k in _SIGNAL_KEYS:
+        if first.get(k) is not None and out.get(k) is None:
+            out[k] = first[k]
+    return out
+
 DESCRIPTION = ("여러 단계를 한 번에(1~10, target={role,name,group?}, id·selector·좌표 금지). 단계마다 같은 관문, "
                "위험·화면 변화·대상 불확실이면 멈춤(data.batch.reason + 현재 관찰)")
 
@@ -112,6 +176,27 @@ _INTERNAL: ContextVar[Optional[Dict[str, Any]]] = ContextVar("browser_batch_inte
 def batch_internal() -> Optional[Dict[str, Any]]:
     """지금 호출 문맥이 묶음의 내부 관찰이면 그 수집 dict, 아니면 None."""
     return _INTERNAL.get()
+
+
+def _wire_len(payload: Dict[str, Any]) -> int:
+    """서버 도구 응답의 최종 wire 길이(가린 뒤 — call_server_tool 의 public_payload 와 MCP 직렬화와 같은 모양)."""
+    from security.public_url import public_payload
+
+    return len(json.dumps(public_payload(payload), ensure_ascii=False, separators=(",", ":")))
+
+
+def _settle_batch_returned(payload: Dict[str, Any]) -> int:
+    """data.truncated.returned_chars 를 묶음 응답 최종 wire 길이로 맞추고(고정점) 그 길이를 돌려준다(WS-78 NB4)."""
+    trunc = (payload.get("data") or {}).get("truncated")
+    size = _wire_len(payload)
+    if not isinstance(trunc, dict) or "returned_chars" not in trunc:
+        return size
+    for _ in range(5):
+        if trunc["returned_chars"] == size:
+            break
+        trunc["returned_chars"] = size
+        size = _wire_len(payload)
+    return size
 
 
 def norm(text: Any) -> str:
@@ -364,14 +449,17 @@ class BatchMixin:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": "묶음 실행은 최상위 문서에서만 됩니다(프레임 안이면 switch_frame to_main 뒤 다시)."}
         payload = await self._run_batch(steps, observe_args)
-        data = payload.get("data")
+        self._batch_injection(payload.get("data"))
+        return payload
+
+    def _batch_injection(self, data: Any) -> None:
+        """묶음 응답 data 에 주입 신호(관찰이 이미 실었으면 그대로)."""
         if isinstance(data, dict) and "injection_suspected" not in data:
             from security.injection_signal import injection_signal
 
             signal = injection_signal(data, None, 10 * self.max_result_chars)
             if signal is not None:
                 data["injection_suspected"] = signal
-        return payload
 
     # -- 실행 루프 -------------------------------------------------------------
 
@@ -465,14 +553,11 @@ class BatchMixin:
                 data: Dict[str, Any] = {"batch": info}
                 if stop.step_result is not None:
                     data["step_result"] = stop.step_result
-                data.update(await self._batch_observation(observe_args))
-                data["next"] = NEXT
-                return {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}", "data": data}
+                return await self._batch_respond(
+                    {"success": False, "error_message": f"묶음 {i}단계에서 멈춤: {stop.reason}"}, data, observe_args)
             data = {"batch": {"ran": total, "of": total, "stopped_at": None, "reason": None, "detail": None, "steps": steps_out,
                               "ms": round((time.monotonic() - started) * 1000, 1)}}
-            data.update(await self._batch_observation(observe_args))
-            data["next"] = NEXT
-            return {"success": True, "data": data}
+            return await self._batch_respond({"success": True}, data, observe_args)
         finally:
             watch.close()  # 어떤 출구(취소 포함)에서도 구독을 뗀다
 
@@ -513,22 +598,102 @@ class BatchMixin:
             raise _Stop("target_unverifiable")
         return {"epoch": int(res.snapshot_epoch), "elements": elements}
 
-    async def _batch_observation(self, observe_args: Dict[str, Any]) -> Dict[str, Any]:
-        """응답에 싣는 현재 관찰 — 일반 observe_page 경로(같은 신호·같은 크기 상한), 인자는 에이전트가 고른 것."""
-        from interface.server_envelope import envelope_dict
+    async def _batch_respond(self, head: Dict[str, Any], meta: Dict[str, Any],
+                             observe_args: Dict[str, Any]) -> Dict[str, Any]:
+        """묶음 응답을 만든다(WS-78 T3, #200) — 최종 wire(가린 뒤, 주입 신호 포함)가 설정 상한 이하가 되게(모든 출구).
+
+        방식 (a): 바깥 메타(batch·step_result·next·성공/오류 문구)를 먼저 가린 직렬화로 재서 안쪽 관찰의 실효 예산을
+        그만큼 미리 줄인다(WS-68 max_chars/limit 이중 인자 그대로 — 가린 뒤 자름(WS-75)·요약 재구성(WS-74) 순서 불변).
+        WS-78 R1 R2: 그래도 넘으면 관찰을 **다시 실행하지 않고** 처음 얻은 원본에서 더 작은 예산으로 다시 맞춘다(관찰 1회).
+        그래도 넘으면 → 바깥 메타의 긴 글자를 가린 뒤 고정 길이로 자름 → 관찰 생략(고정 표지, 검출 신호는 OR 보존) →
+        신호 글자도 자름 → 단계 결과를 고정 어휘만으로. 바깥 메타가 상한의 절반을 넘으면 관찰 전에 먼저 자른다.
+        data.truncated.returned_chars 는 이 묶음 응답의 최종 wire 길이(NB4).
+        """
+        limit = int(self.max_result_chars)
+        meta_clipped = False
+        if _wire_len(dict(head, data=dict(meta, next=NEXT))) > limit // 2:
+            meta, meta_clipped = _clip_meta(meta), True
+        reserve = _wire_len(dict(head, data=dict(meta, next=NEXT)))
+        holder: Dict[str, Any] = {}
+        first = await self._batch_observation(observe_args, reserve, holder)
+        seen: Dict[str, Any] = {}  # 처음 조립에서 본 묶음 주입 신호(바깥 메타 포함 — 자른 뒤에도 OR)
+
+        def assemble(obs: Dict[str, Any], omitted: bool = False) -> Tuple[Dict[str, Any], int]:
+            data = dict(meta)
+            data.update(obs)
+            data["next"] = NEXT
+            self._batch_injection(data)
+            if "injection_suspected" in data:
+                seen.setdefault("injection_suspected", data["injection_suspected"])
+            elif "injection_suspected" in seen:
+                data["injection_suspected"] = seen["injection_suspected"]
+            if omitted:
+                data["truncated"] = {"observation_omitted": True, "returned_chars": 0, "hint": BATCH_TRUNC_HINT}
+            if meta_clipped:
+                trunc = data.get("truncated")
+                data["truncated"] = dict(trunc if isinstance(trunc, dict) else
+                                         {"returned_chars": 0, "hint": BATCH_TRUNC_HINT}, meta_truncated=True)
+            payload = dict(head, data=data)
+            return payload, _settle_batch_returned(payload)
+
+        obs = first
+        payload, size = assemble(obs)
+        for _ in range(3):
+            refit = holder.get("refit")
+            if size <= limit or refit is None:
+                break
+            reserve += size - limit
+            obs = _keep_signals(self._batch_obs_out(refit(reserve)), first)
+            payload, size = assemble(obs)
+        if size <= limit:
+            return payload
+        if not meta_clipped:
+            meta, meta_clipped = _clip_meta(meta), True
+            payload, size = assemble(obs)
+            if size <= limit:
+                return payload
+        signals = {k: first[k] for k in _SIGNAL_KEYS if first.get(k) is not None}
+        omitted = dict(signals, observation_omitted=BATCH_OBSERVATION_OMITTED)
+        payload, size = assemble(omitted, omitted=True)
+        if size > limit:
+            from security.public_url import public_payload
+
+            omitted = dict(_clip(public_payload(signals)), observation_omitted=BATCH_OBSERVATION_OMITTED)
+            payload, size = assemble(omitted, omitted=True)
+        if size > limit and "step_result" in meta:
+            meta = dict(meta, step_result=_minimal_step_result(meta["step_result"]))
+            payload, size = assemble(omitted, omitted=True)
+        return payload
+
+    async def _batch_observation(self, observe_args: Dict[str, Any], reserve: int = 0,
+                                 holder: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """응답에 싣는 현재 관찰 — 일반 observe_page 경로(같은 신호·같은 크기 상한), 인자는 에이전트가 고른 것.
+
+        reserve(WS-78 T3): 바깥 묶음 봉투가 쓸 글자 수 — 안쪽 관찰의 실효 예산에서 미리 뺀다(call_tool 이 읽음).
+        holder(WS-78 R1 R2): 주면 holder["refit"] 에 같은 원본에서 더 작은 예산으로 다시 맞추는 함수를 둔다(재관찰 없음).
+        """
         from recipes.store import clean_text
 
-        token = _INTERNAL.set({})
+        sink: Dict[str, Any] = {"reserve": max(0, int(reserve))}
+        token = _INTERNAL.set(sink)
         try:
             res = await self.call_tool(_observe_tool(), dict(observe_args))
         except Exception as exc:  # noqa: BLE001 - 관찰 실패로 묶음 응답을 망치지 않는다
             return {"observation_error": clean_text(type(exc).__name__)}
         finally:
             _INTERNAL.reset(token)
+        if holder is not None and callable(sink.get("refit")):
+            holder["refit"] = sink["refit"]
+        return self._batch_obs_out(res)
+
+    @staticmethod
+    def _batch_obs_out(res: Any) -> Dict[str, Any]:
+        """관찰 결과(ActionResult)에서 묶음 응답에 옮길 칸."""
+        from interface.server_envelope import envelope_dict
+
         data = envelope_dict(res).get("data") or {}
         out: Dict[str, Any] = {}
-        for k in ("observation", "repeated", "injection_suspected", "truncated", "challenge", "handoff", "hint",
-                  "robots", "dialogs"):
+        for k in _OBS_KEYS:
             if data.get(k) is not None:
                 out[k] = data[k]
         if not res.success:
