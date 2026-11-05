@@ -656,6 +656,11 @@ class ToolsMixin:
         upstream_before = self._egress.upstream_total if self._egress is not None else 0
         # WS-38 R1 NB-3: 클릭한 링크의 주소(실행 전 핸들) — 클릭으로 나간 이동의 차단을 알아보는 데 쓴다.
         target_href = self._handle_href(params)
+        # WS-83(B2): 이 호출의 탭(호출 전 최상위 Page) — 차단 기록 귀속 후보(호출 뒤 탭·연 팝업과 함께).
+        self._call_state()["call_top_before"] = self._call_top_page()
+        # WS-83(B1): wait_until=commit 은 '커밋 즉시 반환' 의미라 뒤이은 스크립트 이동을 기다리지 않는다(동기 확인만).
+        self._call_state()["client_nav_watch"] = (self._watch_client_navigation(action)
+                                                  if params.get("wait_until") != "commit" else None)
         used, self._used_approval = self._used_approval, None
         # WS-56: 정책·elicitation 으로 연 호출도 승인한 그 요소만 — 치유 끔, 결과에 via·outcome.
         via, self._approval_via = self._approval_via, None
@@ -681,6 +686,7 @@ class ToolsMixin:
                                                    recipe_pre, retry_boundary, blocks_before, upstream_before,
                                                    target_href, used, via, input_url)
         finally:
+            self._unwatch_client_navigation(self._call_state().pop("client_nav_watch", None))  # 예외 출구(WS-83)
             if key_after:
                 await asyncio.gather(*key_after, return_exceptions=True)  # 이른 예외 출구에서도 확인을 마친다
 
@@ -700,7 +706,27 @@ class ToolsMixin:
             self._attach_approval_outcome(used, result)
         elif via is not None:
             self._attach_via_outcome(via, result)
-        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href)
+        notice, self._tab_closed_notice = self._tab_closed_notice, None
+        if result.data.get("tab_closed") is not None:
+            ctx = getattr(self._dispatcher, "ctx", None)
+            page = getattr(self, "_page", None)
+            from actions.dispatcher import _page_closed
+
+            if ctx is not None and (page is None or _page_closed(page)):
+                self._page, self._cdp = ctx.page, ctx.cdp  # 호출 중 복구(디스패처) — 서버 핸들도 살아 있는 탭으로
+        if notice is not None and "tab_closed" not in result.data:
+            # WS-83(B4 iii): 이번 호출 직전 복구 — 닫힌 활성 탭에서 옮긴 사실을 한 번 알린다(탭 id 만).
+            from actions.dispatcher import TAB_CLOSED_HINT
+
+            result.data["tab_closed"] = notice
+            hint = str(result.data.get("hint") or "")
+            if TAB_CLOSED_HINT not in hint:
+                result.data["hint"] = (hint + " " + TAB_CLOSED_HINT).strip()
+        await self._await_blocked_document(action, blocks_before, self._call_state().pop("client_nav_watch", None),
+                                           result.success, params.get("url"))
+        await self._await_popup_block(action, blocks_before, target_href)
+        result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href,
+                                           call_pages=self._call_pages(result))
         result = self._attach_upstream_failure(action, params, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
@@ -723,6 +749,9 @@ class ToolsMixin:
             # WS-38: 성공 + 사후 확인 통과만 궤적에(승인 재생·실패·치유는 끊음), 관찰에는 후보.
             if action is ActionType.NAVIGATE and result.data.get("challenge") is not None:
                 self._recipes.reset("navigation_blocked")
+            elif result.data.get("tab_closed") is not None or result.data.get("tabs_changed"):
+                # WS-83: 효과가 이 탭 밖(닫힘·opener 관계 탭 이동)이라 재생 사후 확인이 볼 수 없다 — 궤적을 끊는다.
+                self._recipes.reset("tab_changed")
             else:
                 self._recipes.post(action, params, recipe_pre, result, used is not None or via is not None)
             from interface.server_batch import batch_internal

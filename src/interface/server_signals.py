@@ -20,6 +20,13 @@ from interface.server_common import _stderr_line
 #: 분리 전과 같은 로거 이름을 쓴다(로그 레코드 불변).
 logger = logging.getLogger("interface.mcp_server")
 
+#: WS-83(B1): 주 프레임 문서의 0초 meta refresh(`content="0"`·`"0;url=…"`·`"0.5, url"`) 유무 — 격리 world 에서만 평가한다.
+_META_REFRESH_NOW_JS = r"""(() => { for (const m of document.querySelectorAll('meta[http-equiv]')) {
+  if (String(m.getAttribute('http-equiv') || '').trim().toLowerCase() !== 'refresh') continue;
+  const c = String(m.getAttribute('content') || '').trim();
+  if (/^0*(\.\d*)?\s*([;,]|$)/.test(c) && !/^\.?\s*([;,]|$)/.test(c)) return true; }
+  return false; })()"""
+
 
 UNOBSERVED_HINT = (
     "이 페이지를 아직 관찰하지 않았습니다 — browser_observe_page 로 요소를 확인한 뒤 element_id 로 고르세요"
@@ -417,7 +424,7 @@ class SignalsMixin:
 
     def _attach_egress_block(
         self, action: ActionType, params: Dict[str, Any], result: ActionResult, before: int,
-        *, target_href: Optional[str] = None,
+        *, target_href: Optional[str] = None, call_pages: Optional[list] = None,
     ) -> ActionResult:
         """이번 호출 중 Egress 가 막은 이동을 에이전트에게 알린다 (WS-29b).
 
@@ -431,28 +438,46 @@ class SignalsMixin:
         내 오류로 복사되지 않게. 대상 호스트(또는 그 이동의 리다이렉트 앞 홉)와 맞는 기록만 — 출처 없는 fallback 없음.
         WS-57 R3(B3): 그 탭 메인 프레임 문서 요청(과 리다이렉트 체인)의 기록만 — 하위 자원 차단은 싣지 않는다. 막힌 기록이
         있어도 navigate 가 성공했고 탭이 지금 주소로 200 문서를 받았으면 성공 그대로.
+        WS-83(B2, #138(1)): 귀속 후보는 이 호출의 탭(호출 전·후 최상위 Page)과 이 호출이 연 팝업·이 호출이 바꾼 opener 관계
+        탭뿐이다 — 같은 작업 공간의 배경 탭이 막힌 기록을 이 탭 오류로 붙이지 않는다(Page 신원). WS-83(B1, #138(2)): JS 이동·
+        0초 meta refresh 처럼 리다이렉트 체인 없이 막힌 문서 이동은 호출 창 안에 이 탭 Page 의 main_document 차단이 있고
+        지금 주 프레임이 오류 문서이면 HTTP 리다이렉트 차단과 같은 분류(E_INVALID_URL + data.egress). WS-83(B3): 이 호출이 연
+        팝업이 오류 문서이고 귀속 불가 기록(page 없음)의 호스트가 클릭한 링크 호스트와 같으면 click 에 data.egress(성공 유지).
         """
         if self._egress is None:
             return result
-        new = [d for d in self._egress.blocked_since(before) if self._egress_record_mine(d)]
-        if not new:
+        fresh = self._egress.blocked_since(before)
+        if not fresh:
             return result
+        new = [d for d in fresh if self._egress_record_mine(d)]
         from urllib.parse import urlparse
 
-        hosts = set()
-        for raw in (params.get("url"), getattr(self._page, "url", None), result.current_url, target_href):
+        def _host(raw: Any) -> Optional[str]:
             try:
                 h = urlparse(raw or "").hostname
             except ValueError:
                 h = None
-            if h:
-                hosts.add(h.lower())
+            return h.lower() if h else None
+
+        top = self._call_top_page()
+        pages = list(call_pages) if call_pages is not None else [top]
+        hosts = {h for h in (_host(params.get("url")), _host(getattr(top, "url", None)), _host(result.current_url),
+                             _host(target_href)) if h}
+        in_call = [d for d in new if getattr(d, "main_document", False)
+                   and any(getattr(d, "page", None) is p for p in pages if p is not None)]
         # WS-57 R3(B3): 탭 메인 프레임 문서 이동(과 그 리다이렉트 체인)의 차단만 — 같은 페이지 하위 자원(이미지·스크립트·
         # fetch·iframe 하위 문서)이 앞 홉 호스트가 같은 채 막혀도 문서 이동 차단이 아니다.
-        hit = next((d for d in reversed(new)
-                    if getattr(d, "main_document", False)
-                    and ((d.host and d.host.lower() in hosts) or any(h in hosts for h in d.chain_hosts))), None)
+        hit = next((d for d in reversed(in_call)
+                    if (d.host and d.host.lower() in hosts) or any(h in hosts for h in d.chain_hosts)), None)
+        if hit is None and action is ActionType.NAVIGATE and top is not None:
+            from actions.dispatcher import _is_error_document
+
+            own = [d for d in in_call if getattr(d, "page", None) is top]
+            if own and _is_error_document(getattr(top, "url", "")):
+                hit = own[-1]  # B1: 스크립트 이동·meta refresh 차단 — 동기 확인으로 지금 오류 문서
         if hit is None:
+            if action is not ActionType.NAVIGATE and call_pages is not None:
+                self._attach_popup_first_block(result, fresh, call_pages, _host(target_href))
             return result
         info = hit.to_agent()
         if action is ActionType.NAVIGATE and result.success and self._main_document_loaded(hit):
@@ -462,10 +487,168 @@ class SignalsMixin:
                 action,
                 ErrorCode.INVALID_URL,
                 f"egress_blocked: {info['host']} ({info['category']})",
-                data={"egress": info, "url": getattr(self._page, "url", "")},
+                data={"egress": info, "url": getattr(top, "url", "") or getattr(self._page, "url", "")},
             )
         result.data["egress"] = info
         return result
+
+    def _watch_client_navigation(self, action: ActionType) -> Optional[Dict[str, Any]]:
+        """WS-83(B1): navigate 동안 이 탭 주 프레임의 문서 요청(리다이렉트 홉 제외)을 센다 — 응답·실패가 오면 뺀다. 반환 때
+        남은 것은 문서가 뜬 뒤 스크립트·0초 meta refresh 가 시작한 이동이다(_await_blocked_document 가 결과를 기다린다)."""
+        if action is not ActionType.NAVIGATE or self._egress is None:
+            return None
+        top = self._call_top_page()
+        on = getattr(top, "on", None)
+        frame = getattr(top, "main_frame", None)
+        if not callable(on) or frame is None:
+            return None
+        state: Dict[str, Any] = {"page": top, "pending": [], "started": 0, "handlers": []}
+
+        def _request(req: Any) -> None:
+            try:
+                if req.is_navigation_request() and req.frame is frame and req.redirected_from is None:
+                    state["pending"].append(req)
+                    state["started"] += 1
+            except Exception:  # noqa: BLE001 — 판정 불가 요청은 세지 않는다
+                pass
+
+        def _finished(req: Any) -> None:
+            state["pending"] = [r for r in state["pending"] if r is not req]
+
+        def _response(resp: Any) -> None:
+            _finished(getattr(resp, "request", None))
+
+        for event, handler in (("request", _request), ("response", _response), ("requestfailed", _finished)):
+            try:
+                on(event, handler)
+                state["handlers"].append((event, handler))
+            except Exception:  # noqa: BLE001
+                pass
+        return state
+
+    async def _await_blocked_document(self, action: ActionType, before: int, watch: Optional[Dict[str, Any]],
+                                      success: bool, url: Any = None) -> None:
+        """WS-83(B1): navigate 반환 직전, 이 탭에서 문서 뒤에 시작된 이동(스크립트·0초 meta refresh)이 아직 응답 전이거나 이 탭
+        Page 의 main_document 차단 기록이 있는데 주 프레임이 아직 오류 문서로 바뀌지 않았으면 그 결과만 짧게 기다린다(상한
+        300ms — 실측: 차단 응답 뒤 오류 문서 커밋까지 수십 ms). 0초 meta refresh 는 load 뒤에야 요청이 나가므로(실측: 반환
+        시점엔 요청 없음) 성공한 navigate 는 격리 world 에서 그 태그가 있는지 한 번 보고, 있을 때만 그 요청의 결과를 기다린다.
+        그런 이동이 없는 일반 경로는 기다리지 않는다."""
+        if watch is None:
+            return
+        import asyncio
+
+        from actions.dispatcher import _is_error_document
+
+        top = watch["page"]
+        started = watch["started"]
+        checked = not success
+        expect = False
+        from urllib.parse import urlparse
+
+        try:
+            target = (urlparse(url or "").hostname or "").lower()
+        except ValueError:
+            target = ""
+        try:
+            if target and any(getattr(d, "page", None) is top and getattr(d, "main_document", False)
+                              and ((d.host or "").lower() == target or target in d.chain_hosts)
+                              for d in self._egress.blocked_since(before)):
+                return  # 이동 대상(또는 그 리다이렉트 홉) 차단 — 기존 판정 그대로(기다리지 않음, 응답 바이트 불변)
+            for _ in range(12):
+                if _is_error_document(getattr(top, "url", "")):
+                    return
+                own = any(getattr(d, "page", None) is top and getattr(d, "main_document", False)
+                          for d in self._egress.blocked_since(before))
+                if not own and not watch["pending"]:
+                    if not checked:
+                        checked = True
+                        expect = await self._meta_refresh_due()
+                    if not expect or watch["started"] > started:
+                        return
+                await asyncio.sleep(0.025)
+        finally:
+            self._unwatch_client_navigation(watch)
+
+    async def _await_popup_block(self, action: ActionType, before: int, target_href: Any) -> None:
+        """WS-83(B3): 이 호출이 연 팝업의 첫 문서가 막혔을 수 있으면(귀속 불가 차단 기록의 호스트 == 클릭한 링크 호스트) 그
+        팝업이 오류 문서로 바뀌기를 짧게 기다린다(상한 300ms). 팝업이 없거나 그런 기록이 없으면 기다리지 않는다."""
+        opened = list(getattr(self._dispatcher, "last_opened_pages", None) or [])
+        if action is ActionType.NAVIGATE or self._egress is None or not opened or not target_href:
+            return
+        import asyncio
+        from urllib.parse import urlparse
+
+        from actions.dispatcher import _is_error_document
+
+        try:
+            host = (urlparse(target_href).hostname or "").lower()
+        except ValueError:
+            return
+        if not host or not any(getattr(d, "page", None) is None and (d.host or "").lower() == host
+                               for d in self._egress.blocked_since(before)):
+            return
+        for _ in range(12):
+            if any(_is_error_document(getattr(p, "url", "")) for p in opened):
+                return
+            await asyncio.sleep(0.025)
+
+    async def _meta_refresh_due(self) -> bool:
+        """주 프레임 문서에 0초 meta refresh 가 있는가 — 격리 world 에서 읽는다(페이지가 판정을 속이지 못하게). 못 읽으면 False."""
+        evaluate = getattr(self._dispatcher, "isolated_eval", None)
+        if not callable(evaluate):
+            return False
+        from interface.server_signals import _META_REFRESH_NOW_JS  # 이 모듈 함수는 mcp_server 전역으로 돈다(WS-48)
+
+        try:
+            return bool(await evaluate(_META_REFRESH_NOW_JS))
+        except Exception:  # noqa: BLE001 — 판정 불가 = 기다리지 않음(기존 동작)
+            return False
+
+    @staticmethod
+    def _unwatch_client_navigation(watch: Optional[Dict[str, Any]]) -> None:
+        if not watch:
+            return
+        handlers, watch["handlers"] = watch["handlers"], []
+        for event, handler in handlers:
+            try:
+                watch["page"].remove_listener(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _call_top_page(self) -> Any:
+        """이 호출 디스패처의 최상위 Page(프레임 안이면 root_page) — 없으면 서버 첫 페이지."""
+        ctx = getattr(self._dispatcher, "ctx", None)
+        return getattr(ctx, "root_page", None) or getattr(ctx, "page", None) or self._page
+
+    def _call_pages(self, result: ActionResult) -> list:
+        """WS-83(B2): 이 호출의 차단 귀속 후보 Page — 호출 전·후 최상위 Page, 이 호출이 연 팝업, 이 호출 중 이동한 opener
+        관계 탭(data.tabs_changed). 같은 작업 공간의 다른 탭은 넣지 않는다."""
+        pages = [self._call_state().get("call_top_before"), self._call_top_page()]
+        pages.extend(getattr(self._dispatcher, "last_opened_pages", None) or [])
+        changed = result.data.get("tabs_changed") if isinstance(result.data, dict) else None
+        get_tab = getattr(self._core, "get_tab", None)
+        if isinstance(changed, list) and callable(get_tab):
+            for item in changed:
+                tab = get_tab(item.get("tab_id")) if isinstance(item, dict) else None
+                if tab is not None:
+                    pages.append(tab.page)
+        return [p for p in pages if p is not None]
+
+    def _attach_popup_first_block(self, result: ActionResult, fresh: Any, call_pages: Any,
+                                  link_host: Optional[str]) -> None:
+        """B3: 이 호출이 연 팝업의 첫 문서 차단(귀속 불가 기록 — 새 탭 첫 요청은 Page 를 얻지 못한다)을 클릭에 단다.
+
+        이 호출이 연 팝업이 오류 문서이고, 귀속되지 않은(page 없음) 차단 기록의 호스트가 클릭한 링크 호스트와 같을 때만.
+        '귀속 불가 = 남의 것'(_egress_record_mine)은 그대로 — 이 판단은 팝업 상태 + 링크 호스트의 두 근거로만 한다.
+        """
+        opened = list(getattr(self._dispatcher, "last_opened_pages", None) or [])
+        if not link_host or not opened or "egress" in result.data:
+            return
+        from actions.dispatcher import _is_error_document
+
+        orphan = [d for d in fresh if getattr(d, "page", None) is None and (d.host or "").lower() == link_host]
+        if orphan and any(_is_error_document(getattr(p, "url", "")) for p in opened if any(p is c for c in call_pages)):
+            result.data["egress"] = orphan[-1].to_agent()
 
     def _main_document_loaded(self, record: Any) -> bool:
         """차단 기록의 탭이 지금 주소로 200 메인 문서를 받았는가 (WS-57 R3) — 막힌 이동 뒤 다른 문서가 정상으로 열렸다."""

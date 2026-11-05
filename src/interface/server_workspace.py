@@ -56,6 +56,8 @@ class WorkspaceRuntime:
     tab_notice: Optional[Dict[str, Any]] = None
     #: WS-57 R1: 이 작업 공간이 아직 듣지 못한 창 전환(재기동) — 작업 공간마다 한 번씩 알린다.
     window_unreported: bool = False
+    #: WS-83(B4 iii): 다음 호출 직전 복구로 닫힌 활성 탭에서 옮겼다는 알림(data.tab_closed) — 다음 액션 결과에 한 번.
+    tab_closed_notice: Optional[Dict[str, Any]] = None
 
 
 def _runtime_field(field: str) -> property:
@@ -100,6 +102,7 @@ class WorkspaceMixin:
     _used_approval = _call_field("_used_approval")
     _tab_notice = _runtime_field("tab_notice")
     _window_unreported = _runtime_field("window_unreported")
+    _tab_closed_notice = _runtime_field("tab_closed_notice")
 
     @property
     def _recipes(self) -> Any:
@@ -251,14 +254,26 @@ class WorkspaceMixin:
 
     def _default_needs_recovery(self) -> bool:
         """기본 작업 공간의 디스패처 탭이 닫혔고, 다른 작업 공간 탭이 살아 있는가(그 경우만 — 혼자일 때의 기존
-        경로[on-demand 브라우저 복구·기존 오류]는 그대로)."""
+        경로[on-demand 브라우저 복구·기존 오류]는 그대로).
+        WS-83(B4 iii): 같은 작업 공간에 살아 있는 탭이 남았어도(팝업이 스스로 닫힘 — 브라우저는 살아 있다) 같은 규칙으로
+        복구한다. 사람이 조작권을 쥔 동안은 예전대로 반납 때 복구(tab_closed_by_human)에 맡긴다."""
         core = self._core
         ctx = getattr(self._dispatcher, "ctx", None)
         counter = getattr(core, "foreign_tab_count", None)
-        if ctx is None or not callable(counter) or not counter():
+        if ctx is None or not callable(counter):
             return False
         page = getattr(ctx, "root_page", None) or getattr(ctx, "page", None)
-        return core.get_tab(getattr(ctx, "tab_id", None)) is None or _closed(page)
+        gone = core.get_tab(getattr(ctx, "tab_id", None)) is None or _closed(page)
+        if not gone:
+            return False
+        if counter():
+            return True
+        from interface.handoff import HOLDER_AGENT
+
+        hub = getattr(self, "hub", None)
+        if hub is not None and getattr(hub, "holder", HOLDER_AGENT) != HOLDER_AGENT:
+            return False
+        return any(not _closed(t.page) for t in core.tabs())
 
     async def _ensure_workspace_locked(self, name: str) -> None:
         core = self._core
@@ -286,10 +301,15 @@ class WorkspaceMixin:
             return
         cdp = await core.new_cdp_session(tab.tab_id)
         if ctx is not None:
+            closed_id = ctx.tab_id
+            was_closed = core.get_tab(closed_id) is None or _closed(getattr(ctx, "root_page", None) or ctx.page)
             # 디스패처는 그대로(그 작업 공간의 레시피·자가 치유 상태 유지), 활성 탭만 바꾼다.
             runtime.dispatcher._set_active_page(tab.page, tab.tab_id)
             ctx.cdp = cdp
             runtime.engine.bump_epoch("workspace_tab_restored")
+            if was_closed and closed_id and closed_id != tab.tab_id:
+                # WS-83(B4 iii): 호출 중 복구(data.tab_closed)와 같은 모양 — 기본·이름 있는 작업 공간 같은 규칙.
+                runtime.tab_closed_notice = {"closed_tab_id": closed_id, "active_tab_id": tab.tab_id}
         else:
             had_page = runtime.page is not None
             runtime.dispatcher = ActionDispatcher(
