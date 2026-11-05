@@ -729,6 +729,7 @@ class ToolsMixin:
         result = self._attach_egress_block(action, params, result, blocks_before, target_href=target_href,
                                            call_pages=self._call_pages(result))
         result = self._attach_upstream_failure(action, params, result, upstream_before)
+        result = self._relation_error_failure(action, result, upstream_before)
         if self._pending_gate_basis is not None:
             result.data.setdefault("gate_basis", self._pending_gate_basis)
             self._pending_gate_basis = None

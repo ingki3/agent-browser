@@ -681,6 +681,100 @@ class SignalsMixin:
             data=data,
         )
 
+    def _relation_error_documents(self, result: ActionResult, upstream_before: int) -> list:
+        """WS-83 R2(R1-B1): 이 호출 중 이동한 opener 관계 탭(data.tabs_changed) 가운데 최종 주 프레임 문서가 오류 문서인 것 —
+        egress 차단 기록과 무관하게. 오류 문서는 (a) 브라우저 오류 문서(_is_error_document — chrome-error://) 또는 (b) 프록시가
+        업스트림에 닿지 못해 만든 502 문서(그 탭 마지막 문서 요청이 502 이고, 이 호출 창에 그 호스트·포트의 업스트림 실패
+        기록이 있음 — 사이트가 실제로 준 502 는 기록이 없어 정상). [(tab_id, page, failure 문구, 업스트림 기록)] 를 돌려준다."""
+        data = result.data if isinstance(result.data, dict) else {}
+        changed = data.get("tabs_changed")
+        get_tab = getattr(self._core, "get_tab", None)
+        if not isinstance(changed, list) or not callable(get_tab):
+            return []
+        from urllib.parse import urlsplit
+
+        from actions.dispatcher import _is_error_document
+
+        navs = getattr(self._dispatcher, "last_related_nav", None) or {}
+        upstream = []
+        if self._egress is not None:
+            upstream = [f for f in self._egress.upstream_failures_since(upstream_before) if self._egress_record_mine(f)]
+        out = []
+        for item in changed:
+            tid = item.get("tab_id") if isinstance(item, dict) else None
+            tab = get_tab(tid) if isinstance(tid, str) else None
+            page = getattr(tab, "page", None)
+            if page is None:
+                continue
+            state = navs.get(tid) if isinstance(navs, dict) else None
+            if _is_error_document(getattr(page, "url", "")):
+                out.append((tid, page, getattr(state, "failure", None), None))
+                continue
+            if getattr(state, "status", None) != 502 or not upstream:
+                continue
+            targets = set()
+            for raw in (getattr(state, "url", None), getattr(page, "url", None)):
+                try:
+                    parts = urlsplit(raw or "")
+                    host = (parts.hostname or "").lower()
+                    port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
+                except ValueError:
+                    continue
+                if host:
+                    targets.add((host, port))
+            hit = next((f for f in reversed(upstream) if (f.host.lower().strip("[]"), f.port) in targets), None)
+            if hit is not None:
+                out.append((tid, page, None, hit))
+        return out
+
+    def _relation_error_failure(self, action: ActionType, result: ActionResult, upstream_before: int) -> ActionResult:
+        """WS-83 R2(R1-B1): 성공 근거였던 관계 탭 효과의 그 탭이 오류 문서로 끝났으면(차단 기록 없음 — 리다이렉트 고리·연결
+        거부) 그 효과를 인정하지 않고 관계 효과를 뺀 기준 판정으로 돌린다: 닫힘 복귀 탭이 그 오류 탭이면 기준(닫힌 탭
+        E_PAGE_CRASHED), 아니고 성공 근거가 관계 탭 이동 신호뿐이었으면 기준(Silent Failure E_TIMEOUT, 같은 문구). 입력은 이미
+        나갔으니 재시도 안전이 아니다. tabs_changed·tab_closed·안내는 그대로, 그 이동 실패 종류는 기존 어휘(data.nav_failure·
+        업스트림 실패면 data.egress)로 싣는다. 다른 효과가 성공 근거면 그대로 둔다. 닫힘 복귀(활성 탭 전환) 자체는 이미 끝났다."""
+        if action is ActionType.NAVIGATE or not result.success or not isinstance(result.data, dict):
+            return result
+        prior = result.data.get("egress")
+        if isinstance(prior, dict) and prior.get("code") == "egress_blocked":
+            return result  # 차단 기록 경로(R1)가 먼저다
+        errored = self._relation_error_documents(result, upstream_before)
+        if not errored:
+            return result
+        src = result.data
+        top = self._call_top_page()
+        if src.get("tab_closed") is not None:
+            mine = next((e for e in errored if e[1] is top), None)
+            if mine is None:
+                return result
+            code = ErrorCode.PAGE_CRASHED
+            message = f"이 탭이 닫혔고 opener 관계 탭({mine[0]}) 이동은 오류 문서로 끝났습니다 — 클릭 효과로 보지 않습니다."
+        else:
+            detail = getattr(self._dispatcher, "last_relation_only", None)
+            if not isinstance(detail, str):
+                return result
+            mine = errored[0]
+            code = ErrorCode.TIMEOUT
+            message = f"사후조건 미충족({detail}). {action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
+        data: Dict[str, Any] = {}
+        for key in ("tab_closed", "tabs_changed", "hint", "dialogs"):
+            if src.get(key) is not None:
+                data[key] = src[key]
+        upstream = mine[3]
+        if upstream is not None:
+            data["egress"] = upstream.to_agent()
+        elif isinstance(src.get("egress"), dict):
+            data["egress"] = src["egress"]
+        from actions.nav_failure import attach_nav_failure
+
+        egress_code = data["egress"].get("code") if isinstance(data.get("egress"), dict) else None
+        attach_nav_failure(data, mine[2] or "", egress_code)
+        return ActionResult(
+            success=False, action=action, current_url=result.current_url, snapshot_epoch=result.snapshot_epoch,
+            tab_id=result.tab_id, healed=result.healed, reobserve_required=True, retry_safe=False,
+            error_code=code, error_message=message, data=data,
+        )
+
     async def _await_relation_block(self, action: ActionType, before: int, result: ActionResult) -> None:
         """WS-83 R1(B1): 관계 탭 Page 에 이 호출 창의 main_document 차단 기록이 있는데 아직 오류 문서로 바뀌지 않았으면 그
         커밋만 짧게 기다린다(상한 300ms). 관계 효과가 없거나 그런 기록이 없으면 기다리지 않는다."""

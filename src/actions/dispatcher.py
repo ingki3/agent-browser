@@ -138,6 +138,19 @@ def _is_target_closed(exc: BaseException) -> bool:
     return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 
+class RelatedNav:
+    """WS-83 R2(R1-B1): 관계 탭 마지막 주 프레임 문서 요청의 결과 — 내부 상태(MCP 응답 출구 아님). 서버가 오류 문서 판정에 읽는다."""
+
+    __slots__ = ("req", "url", "status", "failure", "done")
+
+    def __init__(self, req: Any, url: str) -> None:
+        self.req = req
+        self.url = url
+        self.status: Optional[int] = None
+        self.failure: Optional[str] = None
+        self.done = False
+
+
 def _is_error_document(url: Any) -> bool:
     """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
     return str(url or "").startswith("chrome-error://")
@@ -1419,6 +1432,12 @@ class ActionDispatcher:
         #: WS-83(B6): 이번 액션 중 opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)에서 일어난 문서 이동의 탭 id.
         self._related_navs: List[str] = []
         self._related_watch: List[Tuple[Any, str, Any]] = []
+        #: WS-83 R2(R1-B1): 관계 탭별 마지막 주 프레임 문서 요청의 결과(진행 중이면 done=False) — 액션 동안만.
+        self._related_nav_state: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 의 관계 탭 문서 이동 결과 {tab_id: RelatedNav} — 서버가 오류 문서 판정에 읽는다.
+        self.last_related_nav: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 성공이 관계 탭 이동 신호만으로 났으면 그 신호를 빼기 전 사후조건 detail(아니면 None).
+        self.last_relation_only: Optional[str] = None
         #: WS-83(B4): 이번 dispatch 에서 요소 입력을 실제로 보냈는가(보낸 뒤 대상 탭이 닫히면 그 닫힘이 효과다).
         self._input_sent = False
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
@@ -1577,12 +1596,29 @@ class ActionDispatcher:
 
             def _req(req: Any, _f: Any = frame, _id: str = tab_id) -> None:
                 try:
-                    if req.is_navigation_request() and req.frame is _f and _id not in self._related_navs:
-                        self._related_navs.append(_id)
+                    if req.is_navigation_request() and req.frame is _f:
+                        if _id not in self._related_navs:
+                            self._related_navs.append(_id)
+                        # R2: 마지막 문서 요청(리다이렉트 홉이면 새 요청이 앞 것을 대신한다)의 결과를 따라간다.
+                        self._related_nav_state[_id] = RelatedNav(req, req.url)
                 except Exception:  # noqa: BLE001
                     pass
 
-            for event, handler in (("framenavigated", _nav), ("request", _req)):
+            def _resp(resp: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and getattr(resp, "request", None) is state.req:
+                    code = resp.status
+                    state.status = code if isinstance(code, int) else None
+                    state.done = not (isinstance(code, int) and 300 <= code < 400)  # 3xx 는 다음 홉이 온다
+
+            def _failed(req: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and req is state.req:
+                    state.failure = str(req.failure or "")
+                    state.done = True
+
+            for event, handler in (("framenavigated", _nav), ("request", _req), ("response", _resp),
+                                   ("requestfailed", _failed)):
                 try:
                     page.on(event, handler)
                     self._related_watch.append((page, event, handler))
@@ -1597,6 +1633,36 @@ class ActionDispatcher:
                 page.remove_listener(event, handler)
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _settle_related(self) -> None:
+        """WS-83 R2(R1-B1): 관계 탭의 마지막 문서 요청이 아직 끝나지 않았거나(응답·실패 전) 실패했는데 오류 문서가 아직
+        커밋되지 않았으면 그것만 짧게 기다린다(상한 300ms) — 서버가 그 탭 최종 문서가 오류인지 판정한다. 관계 탭 이동이
+        없으면 기다리지 않는다. 끝나면 결과(url·status·failure)를 last_related_nav 에 남긴다."""
+        states = self.__dict__.get("_related_nav_state") or {}
+        if not states:
+            return
+        core = getattr(self.ctx, "core", None)
+
+        def _pending() -> bool:
+            for tid, st in states.items():
+                if not st.done:
+                    return True
+                failure = st.failure or ""
+                if failure and "ERR_ABORTED" not in failure:
+                    try:
+                        tab = core.get_tab(tid) if core is not None else None
+                    except Exception:  # noqa: BLE001 — 가짜 코어
+                        tab = None
+                    page = getattr(tab, "page", None)
+                    if page is not None and not _page_closed(page) and not _is_error_document(page.url):
+                        return True
+            return False
+
+        for _ in range(12):
+            if not _pending():
+                break
+            await asyncio.sleep(0.025)
+        self.last_related_nav = dict(states)
 
     def _related_signals(self) -> List[str]:
         return [f"{TAB_NAVIGATED_SIGNAL}: {tid}" for tid in self.__dict__.get("_related_navs") or []]
@@ -2535,6 +2601,9 @@ class ActionDispatcher:
         self._opened_pages = []
         self.last_opened_pages = []
         self._related_navs = []
+        self._related_nav_state = {}
+        self.last_related_nav = {}
+        self.last_relation_only = None
         self._input_sent = False
         self._dialogs = []
         self._install_dialog_listener()
@@ -2579,6 +2648,8 @@ class ActionDispatcher:
             self._nav_info = {}
         if self._opened_pages:
             self._attach_opened_tabs(result)
+        if self._related_navs:
+            await self._settle_related()
         self._unwatch_related()
         if self._related_navs:
             # WS-83(B6): opener 관계 탭의 문서 이동 — 탭 id 와 고정 어휘만(주소·제목 없음).
@@ -3125,7 +3196,11 @@ class ActionDispatcher:
         if not _has_expected_state(action, params):
             extra.extend(self._effect_beyond_target(root_before, root_after, top_weak_ok))
             # WS-83(B6·D3): opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)의 문서 이동 — 같은 작업 공간의 다른 탭은 아님.
-            extra.extend(self._related_signals())
+            related = self._related_signals()
+            if related and not extra:
+                # R2: 성공 근거가 관계 탭 이동뿐 — 그 탭이 오류 문서로 끝나면 서버가 이 detail 로 기준 판정을 되살린다.
+                self.last_relation_only = post.detail
+            extra.extend(related)
         elif dialog_signals and extra:
             extra.extend(dialog_signals)
         if not extra:

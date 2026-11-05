@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +29,8 @@ OPENER = """<title>Opener</title><h1>OPENER</h1>
 <button onclick="window.open('/pop?b','cal','width=300,height=300')">named B</button>
 <a href="{denied}" target="_blank">denied blank link</a>
 <button onclick="window.open('{denied}','cal','width=300,height=300')">named denied</button>
+<button onclick="window.open('{doc}/loop','cal')">named loop</button>
+<button onclick="window.open('{dead}','cal')">named dead</button>
 <button id="noop">plain noop</button>"""
 POP = """<title>Pop</title><h1>POPUP</h1>
 <button onclick="opener.document.getElementById('f').value='2026-12-01';window.close()">fill and close</button>
@@ -38,6 +41,10 @@ POP = """<title>Pop</title><h1>POPUP</h1>
 <button onclick="window.close()">just close</button>
 <button onclick="opener.location.href='{denied}'">denied opener</button>
 <button onclick="opener.location.href='{denied}';window.close()">denied opener and close</button>
+<button onclick="opener.location.href='{doc}/loop'">loop opener</button>
+<button onclick="opener.location.href='{doc}/loop';window.close()">loop opener and close</button>
+<button onclick="opener.location.href='{dead}'">dead opener</button>
+<button onclick="opener.location.href='{dead}';window.close()">dead opener and close</button>
 <button id="noop">pop noop</button>"""
 
 STATE: Dict[str, Any] = {"trigger": threading.Event(), "hits": []}
@@ -49,9 +56,9 @@ def _page(path: str, urls: Dict[str, str]) -> bytes:
     if path == "/robots.txt":
         return b"User-agent: *\nAllow: /\n"
     if path == "/opener":
-        return OPENER.format(denied=denied).encode()
+        return OPENER.format(denied=denied, doc=doc, dead=urls["dead"]).encode()
     if path == "/pop":
-        return POP.replace("{denied}", denied).encode()
+        return POP.replace("{denied}", denied).replace("{doc}", doc).replace("{dead}", urls["dead"]).encode()
     if path == "/changed":
         return b"<title>Changed</title><h1>CHANGED_BY_POPUP</h1>"
     if path == "/bg":
@@ -123,7 +130,12 @@ def site():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
-    urls.update(doc=f"http://localhost:{port}", denied=f"http://127.0.0.1:{port}/denied")
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()  # 닫힌 허용 호스트 포트 — 프록시가 connect_failed 문서를 만든다(R2)
+    urls.update(doc=f"http://localhost:{port}", denied=f"http://127.0.0.1:{port}/denied",
+                dead=f"http://localhost:{dead_port}/unreachable")
     try:
         yield urls
     finally:
@@ -494,3 +506,59 @@ async def test_batch_stops_after_click_changes_a_related_tab(site):
         step = out["data"]["step_result"]
         assert step["success"] is True, step
         assert step["data"]["tabs_changed"] == [{"tab_id": pop, "change": "navigated"}], step
+
+
+# ------------------------------------------------------------------ R2 (R1-B1): 차단 기록 없는 관계 탭 오류 문서
+
+
+_LOOP_FAILURE = {"kind": "other", "net_error": "ERR_TOO_MANY_REDIRECTS"}
+
+
+@requires_chromium
+@pytest.mark.parametrize("target", ["loop", "dead"])
+@pytest.mark.parametrize("route", ["opener", "opener and close", "named"])
+async def test_related_tab_error_document_is_not_a_click_success(site, target, route):
+    """관계 탭(opener 이동·닫힘 복귀·이름 창 재사용)이 egress 차단 없이 오류 문서(리다이렉트 고리 chrome-error·연결 거부
+    프록시 connect_failed 문서)로 끝나면 그 효과로 성공 승격 금지 — 기준(6f435cc)과 같은 계열(E_TIMEOUT·닫힘 E_PAGE_CRASHED)."""
+    async with _server() as s:
+        nav = await call(s, "navigate", {"url": site["doc"] + "/opener"})
+        if route == "named":
+            a = await click(s, "named A")
+            rel = a["data"]["opened_tab_ids"][0]
+            r = await click(s, f"named {target}")
+        else:
+            pop = await open_popup_and_switch(s)
+            rel = nav["tab_id"]
+            r = await click(s, f"{target} {route}")
+        assert r["success"] is False, r
+        assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+        assert r["data"]["tabs_changed"] == [{"tab_id": rel, "change": "navigated"}], r
+        assert r["data"]["nav_failure"] == (_LOOP_FAILURE if target == "loop" else {"kind": "connect"}), r
+        if target == "dead":
+            assert r["data"]["egress"]["code"] == "connect_failed", r
+        else:
+            assert "egress" not in r["data"], r
+        if route == "opener and close":
+            assert r["error_code"] == "E_PAGE_CRASHED", r
+            assert r["data"]["tab_closed"] == {"closed_tab_id": pop, "active_tab_id": nav["tab_id"]}, r
+            assert r["tab_id"] == nav["tab_id"]
+            o = await call(s, "observe_page", {})  # 닫힌 탭에 갇히지 않는다
+            assert o["success"] is True and o["tab_id"] == nav["tab_id"], o
+        else:
+            assert r["error_code"] == "E_TIMEOUT", r
+            assert "tab_closed" not in r["data"], r
+
+
+@requires_chromium
+@pytest.mark.parametrize("button", ["change opener", "change opener and close", "named B"])
+async def test_related_tab_healthy_navigation_stays_a_click_success(site, button):
+    """대조: 같은 관계 경로의 허용·정상 문서 이동은 성공 그대로(오류 문서 판정이 정상 문서를 오류로 보지 않는다)."""
+    async with _server() as s:
+        await call(s, "navigate", {"url": site["doc"] + "/opener"})
+        if button == "named B":
+            await click(s, "named A")
+        else:
+            await open_popup_and_switch(s)
+        r = await click(s, button)
+        assert r["success"] is True and r.get("error_code") is None, r
+        assert "nav_failure" not in r["data"] and "egress" not in r["data"], r
