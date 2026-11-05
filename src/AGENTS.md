@@ -417,7 +417,7 @@ python -m harness.ipi_test
 # 9. 세션 만료 프로브 오탐율 (FPR <= 1.0%)
 python -m harness.session_probe --runs 50
 
-# 10. 동작 캐시(레시피) 재생 — 시나리오 10종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38·38b)
+# 10. 동작 캐시(레시피) 재생 — 시나리오 15종 전수, 오클릭 0 (하나라도 누르면 exit 2) (WS-38·38b)
 python -m harness.recipe_replay
 ```
 
@@ -1122,8 +1122,8 @@ WS-38b 자동 저장(2026-10-10 사용자 결정): 통과 단계를 **구간**(n
 | 텍스트 유사도·좌표 재생 금지 | M-1 오일치 사례(해외여행→해외여행자보험, 같은 자리 다른 광고) — 이름은 정확히 같음, 위치는 ui 450px 가드에만 |
 | 기본 경로 비용 | 레시피 없는 출처의 관찰은 dict 조회 하나(골격 계산 없음). 기록은 액션당 evaluate 1회 |
 
-측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 10종(⑩ save 없이 자동 저장 → 새 세션 run), 오클릭 하나라도
-exit 2, 커버리지 10/10. 사보타주
+측정: `python -m harness.recipe_replay`(Gate 3-B #10) — Mock 15종(⑩ save 없이 자동 저장 → 새 세션 run, ⑪~⑮ 목록 밖 label 재생 — WS-84), 오클릭 하나라도
+exit 2, 커버리지 15/15. 사보타주
 (틀 확인 제거·순번 무시·골격 확인 제거·URL 패턴 확인 제거)에서 exit 2 확인. 뮤테이션 표·성능은 `.hermes/state/ws38/report.md`,
 R1(독립 검증 NB 수정)은 `.hermes/state/ws38-r1/report.md`.
 

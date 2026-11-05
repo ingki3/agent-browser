@@ -345,6 +345,8 @@ KEYS_JS = r"""
       ui: {group: group(role), name: nameNorm, landmark: landmark(t), pos: center(t), href_pat: hrefPat(t)},
       slot: null, identity: null, identity_refused: null,
     };
+    // WS-84 (#227): label 대상은 짝 control 의 정체를 함께 적는다(같은 글자·같은 자리의 다른 체크박스 라벨 구별).
+    if (tagName === 'label') out.ui.ctl = ctlOf(t);
     const li = findItem(t);
     if (li) {
       const rel = relPath(li.item, t);
@@ -414,11 +416,28 @@ KEYS_JS = r"""
     }
     return n;
   }
+  // WS-84 (#227): label 의 짝 control 정체(태그·type·id·name·value). 짝이 없으면 null.
+  function ctlOf(l) {
+    const c = l.control;
+    if (!c) return null;
+    return {tag: c.tagName.toLowerCase(), type: (c.getAttribute('type') || '').toLowerCase(), id: c.id || '',
+            name: c.getAttribute('name') || '', value: c.getAttribute('value')};
+  }
+  function sameCtl(a, b) {
+    if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return a === b;
+    return ['tag', 'type', 'id', 'name', 'value'].every(k => a[k] === b[k]);
+  }
   function locateUi(u) {
     const cands = [];
     let best = Infinity;
-    for (const el of document.querySelectorAll(SEL)) {
+    // label 은 후보에만 더한다(준비 수 SEL 은 그대로 — 리뷰 B5a). ctl 을 적은 대상(label 기록)은 같은 짝의 label 만,
+    // ctl 이 없는 대상(이전 기록·label 아닌 대상)은 SEL 에 들지 않는 label 을 보지 않는다(기존 동작 그대로).
+    for (const el of document.querySelectorAll(SEL + ',label')) {
       if (gone(el)) continue;
+      const isLabel = el.localName === 'label';
+      if (u.ctl !== undefined) {
+        if (!isLabel || !sameCtl(ctlOf(el), u.ctl)) continue;
+      } else if (isLabel && !el.matches(SEL)) continue;
       if (group(inferRole(el)) !== u.group) continue;
       if (norm(accessibleName(el)) !== u.name) continue;
       if (hrefPat(el) !== (u.href_pat === undefined ? null : u.href_pat)) continue;

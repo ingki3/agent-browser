@@ -110,7 +110,8 @@ PDF 읽기는 텍스트 문서 결과이며, headless 탭에는 PDF 뷰어가 �
   - 하이픈 슬러그·호스트 라벨은 소문자·숫자·`-`만 있고 각 부분이 12자 이하이며 영문·숫자가 섞인 6자 이상 부분이 없으면 허용합니다(`electronics-accessories`, `samsung-galaxy-s24-ultra`, `my-online-shop-store.test`). 한계(NB-A): 이 예외 밖의 16자 이상 토큰형 파일명·슬러그는 거부될 수 있어 평범한 흐름의 저장 기회를 잃을 수 있습니다.
   - 한계(NB-C): 16자 미만 토큰이나 여러 짧은 경로 조각으로 나뉜 토큰은 이 길이 규칙으로 탐지하지 못합니다.
   - 한계(NB-D): 전화번호 검사는 국내 01x 휴대전화·`+국가번호` 형식에 한정하며 유선(02-…) 등은 탐지하지 못합니다.
-- `browser_recipe {op:"list"}`·`{op:"delete", id}`. 측정: `uv run python -m harness.recipe_replay`(Mock 10종 — 콘텐츠 교체·순서 변경·params 치환·save 없이 자동 저장 뒤 새 세션 재생은 성공, A/B 미기록·덜 로드·모호 목록·광고 틀 위조·결제 승인·같은 틀 다른 URL 패턴은 정해진 사유로 멈춤. 하나라도 잘못 누르면 exit 2).
+- **목록 밖 label (WS-84, #227)** — 반복 목록 밖의 `<label>`(관찰 role `generic`)도 ui 대상으로 재생합니다. label 은 대상 찾기 후보에만 더하고 준비 수(상호작용 요소 수)에는 넣지 않습니다. label 대상은 짝 control 의 정체(태그·type·id·name·value)를 함께 저장해, 같은 글자·같은 자리라도 다른 체크박스에 묶인 label 이면 `target_not_found` 입니다. 숨긴 체크박스 짝 라벨의 click 은 `check_box{checked: 기록 때 결과 상태}` 로 저장해 재생이 상태를 뒤집지 않습니다. 짝이 아닌 generic label 의 click 은 그대로 click 으로 저장합니다(토글이 아닌 동작이라는 가정 — 짝 control 이 같으면 같은 label 로 봅니다).
+- `browser_recipe {op:"list"}`·`{op:"delete", id}`. 측정: `uv run python -m harness.recipe_replay`(Mock 15종 — 콘텐츠 교체·순서 변경·params 치환·save 없이 자동 저장 뒤 새 세션 재생·목록 밖 label(짝 체크박스 멱등·generic 라벨)은 성공, A/B 미기록·덜 로드·모호 목록·광고 틀 위조·결제 승인·같은 틀 다른 URL 패턴·다른 체크박스에 묶인 같은 label·가까운 같은 이름 label 2개·label 만 많은 덜 로드는 정해진 사유로 멈춤. 하나라도 잘못 누르면 exit 2).
 
 ### 도착 페이지 기억 (`browser_recipe` remember_page·pages·forget_page, WS-61)
 
