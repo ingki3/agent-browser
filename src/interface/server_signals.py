@@ -927,6 +927,21 @@ class SignalsMixin:
         result.data["egress"] = info
         return result
 
+    async def _isolated_challenge(self, page: Any, judge_status: Optional[int]) -> Any:
+        """WS-85 (#171): 최상위 문서 격리 world 의 challenge 판정(같은 프로브·classify). 판정 page 가 디스패처의 최상위
+        Page 가 아니거나 격리 판독기가 없거나 실패하면 None — 페이지 결과만 쓴다(지금 동작)."""
+        from browser import challenge as challenge_mod
+
+        dispatcher = self._dispatcher
+        reader = getattr(dispatcher, "isolated_top_evaluate", None)
+        top = getattr(dispatcher, "_top_page", None)
+        try:
+            if reader is None or top is None or top() is not page:
+                return None
+            return await challenge_mod.detect_challenge_strict(page, last_status=judge_status, isolated=reader)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 격리 판독 실패 = 페이지 결과만(신호는 보조 정보, B2)
+            return None
+
     async def _attach_challenge(self, result: ActionResult) -> None:
         """활성 탭 화면의 차단·캡차 판정을 result.data 에 병합한다 (WS-26).
 
@@ -956,9 +971,17 @@ class SignalsMixin:
             logger.warning("문서 상태 조회 실패 — null 로 둔다", exc_info=True)
         challenge: Optional[Dict[str, str]] = None
         try:
+            import asyncio
+
             from browser import challenge as challenge_mod
 
-            found = await challenge_mod.detect_challenge(page, last_status=judge_status)
+            # WS-85 (#171, 리뷰 B1·NB2): 같은 프로브를 격리 world 에서도(페이지가 innerText·title getter 를 바꿔도 원본)
+            # 평가해 격리 결과를 먼저, 없으면 페이지 결과(OR). 격리 판독 실패는 지금처럼 페이지 결과만(challenge.py·loop 불변).
+            found, isolated = await asyncio.gather(
+                challenge_mod.detect_challenge(page, last_status=judge_status),
+                self._isolated_challenge(page, judge_status))
+            if isolated is not None and isolated.detected:
+                found = isolated
             if found.detected:
                 challenge = {
                     "kind": found.kind.value,

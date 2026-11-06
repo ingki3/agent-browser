@@ -1149,6 +1149,8 @@ _KEY_FIELD_JS = (
     "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
     "v: typeof n.value === 'string' ? n.value : ''} : null"
 )
+#: WS-85 (#218): 격리 world 에서 평가하는 포커스 노드 민감 판정 — _KEY_FIELD_JS 와 같은 기준(원본 type·value getter).
+_ISOLATED_KEY_FIELD_EXPR = "((n) => (" + _KEY_FIELD_JS + ")(n))((" + _FOCUS_NODE_JS.strip() + ")())"
 #: WS-78 R1 R3: 노드 식별 열쇠(같은 문서 안 자식 위치 경로 — open shadow·같은 출처 iframe 경계는 표지) — 핸들 없이
 #: 키 전·키 뒤 포커스가 같은 노드인가를 본다(일반 칸은 핸들·해제 왕복을 쓰지 않는다).
 _NODE_KEY_JS = """
@@ -2404,6 +2406,27 @@ class ActionDispatcher:
         if not isinstance(info, dict) or info.get("opaque") or not info.get("tag"):
             return None
         return info
+
+    async def _isolated_focus_field(self) -> Optional[Dict[str, Any]]:
+        """WS-85 (#218): 지금 키를 받는 노드(_FOCUS_NODE_JS)가 비밀번호 칸인가와 그 값 — **격리 world** 판독({s, v}).
+
+        페이지 main world 의 type·value getter 위조가 닿지 않는다. 못 읽으면(격리 world 없음·다른 출처 iframe·예외) None —
+        부르는 쪽은 지금 판정(페이지 world)만 쓴다(민감 처리로 넘기지 않는다, 리뷰 B4)."""
+        try:
+            top = self._top_page()
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": _ISOLATED_KEY_FIELD_EXPR, "contextId": context_id, "returnByValue": True})
+
+            res = await self._in_gate_world(cdp, "", run)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 격리 판독 실패 = 지금 판정 그대로
+            return None
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            return None
+        info = (res.get("result") or {}).get("value")
+        return info if isinstance(info, dict) and isinstance(info.get("s"), bool) else None
 
     async def isolated_point_target(self, x: int, y: int) -> Optional[Dict[str, Any]]:
         """좌표 클릭이 누를 요소를 **격리 world** 에서 판정한다 (WS-67). 반환: {"name", "info"} 또는 None.
@@ -3770,7 +3793,7 @@ class ActionDispatcher:
             return False
 
     async def _mark_sensitive_input(
-        self, handle: ElementHandle, params: Dict[str, Any], text: str
+        self, handle: ElementHandle, params: Dict[str, Any], text: str, after_input: bool = False
     ) -> None:
         """입력 액션의 한 시점에서 민감 칸을 판정하고, 민감이면 친 값을 등록한다(WS-55 R2).
 
@@ -3781,7 +3804,14 @@ class ActionDispatcher:
         if params.get(_CONCEAL_KEY):
             return
         if not await self.is_sensitive_field(handle):
-            return
+            # WS-85 (#218, 리뷰 B4): 입력 직후 격리 world 의 activeElement(키가 실제로 간 곳)가 비밀번호 칸이면 OR — 페이지가
+            # type getter 를 바꿔도 원본 type 을 본다. 결속이 필요 없는 판독이라 입력 직후에만 보고, 못 읽으면 지금 동작 그대로
+            # (일반 입력을 비밀로 등록하는 과잉 가림 금지).
+            if not after_input:
+                return
+            focus = await self._isolated_focus_field()
+            if not (isinstance(focus, dict) and focus.get("s") is True):
+                return
         from security.secret_registry import register_secret_values
 
         register_secret_values([text])
@@ -4556,7 +4586,7 @@ class ActionDispatcher:
             else:
                 await guard(action, params)
                 await target.type(text, timeout=5000)
-            await self._mark_sensitive_input(handle, params, text)
+            await self._mark_sensitive_input(handle, params, text, after_input=True)
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
@@ -5163,18 +5193,24 @@ class ActionDispatcher:
         # WS-78 R1 R3: 평가 한 번으로 민감·sticky·식별 열쇠를 함께 본다 — 일반 칸은 핸들을 잡지 않는다(핸들·노드 평가·
         # 해제 왕복 없음). 민감(또는 sticky 그 노드)일 때만 키 뒤 **그 노드**를 읽을 핸들을 잡는다.
         sticky = getattr(self, "_sticky_key_node", None)
+        # WS-85 (#218): 같은 포커스 노드의 민감 판정을 격리 world 에서도(병렬) — 페이지가 type getter 를 바꿔도 원본(OR).
+        iso_task = asyncio.ensure_future(self._isolated_focus_field())
         try:
             info = await top.evaluate(_KEY_FOCUS_JS, sticky)
         except Exception:  # noqa: BLE001 — 다른 문서의 sticky 핸들 등: 그 기준을 놓고 한 번 더(sticky 없이)
             if sticky is None:
+                iso_task.cancel()
                 raise
             self._sticky_key_node = None
             self._dispose_later(sticky)
             info = await top.evaluate(_KEY_FOCUS_JS, None)
+        iso = await iso_task
         if not isinstance(info, dict):
             return None, False, ""
         if not (info.get("s") or info.get("same")):
-            return _PlainKey(str(info.get("k") or "")), False, ""
+            if not (isinstance(iso, dict) and iso.get("s") is True):
+                return _PlainKey(str(info.get("k") or "")), False, ""
+            info = dict(info, s=True, v=str(iso.get("v") or ""))  # 격리 world 가 비밀번호 칸으로 봄 — 민감 경로로
         node = await top.evaluate_handle(_FOCUS_NODE_JS)
         if node.as_element() is None:
             self._dispose_later(node)
