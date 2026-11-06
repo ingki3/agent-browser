@@ -135,6 +135,7 @@ KEYS = {
     "reason_code": (CONTROL, "interface/server_hitl.py check_approval 사유 코드"),
     "op": (CONTROL, "interface/handoff.py·server_handoff.py 명령 op"),
     "kind": (CONTROL, "actions/pdf_document.py·recipes/keys.py 대상 종류"),
+    "change": (FREE, "WS-83 actions/dispatcher.py data.tabs_changed[].change — 고정 어휘 navigated(정제해도 그대로)"),
     "mode": (CONTROL, "interface/on_demand.py data.window.mode"),
     "state": (CONTROL, "interface/on_demand.py data.window.state"),
     "browser_mode": (CONTROL, "interface/handoff.py browser_mode"),

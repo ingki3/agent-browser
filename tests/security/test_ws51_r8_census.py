@@ -76,6 +76,8 @@ ATTRS = {
     ("active_tab_id", "tab_id"): (ID, "interface/server_lifecycle.py 탭 복구 안내 — tab-N"),
     ("closed", "tab_id"): (ID, "actions/dispatcher.py tab close data.closed — tab-N"),
     ("closed_tab_id", "tab_id"): (ID, "interface/server_lifecycle.py — tab-N"),
+    ("opener_tab_id", "opener_tab_id"): (ID, "WS-83 actions/dispatcher.py data.popup_opened[].opener_tab_id — tab-N"),
+    ("opener_tab_id", "tab_id"): (ID, "WS-83 actions/dispatcher.py data.popup_opened[].opener_tab_id — tab-N"),
     ("tab_id", "tab_id"): (ID, "tab-N"),
     # WS-77 data.human_handoff
     ("request_id", "request_id"): (ID, "interface/server_control.py data.human_handoff.request_id — hub.request_id(rq_…)"),

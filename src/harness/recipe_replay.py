@@ -3,7 +3,7 @@
     python -m harness.recipe_replay
 
 제품 경로(MCP 서버 `BrowserMCPServer.call_tool` + 서버 도구 `browser_recipe`)로 Mock 사이트에서
-"기록 → save → 페이지 변형 → run" 을 시나리오 10종으로 잰다. 외부 접속 없음(로컬 HTTP).
+"기록 → save → 페이지 변형 → run" 을 시나리오 15종(WS-38 10종 + WS-84 목록 밖 label 5종)으로 잰다. 외부 접속 없음(로컬 HTTP).
 
 양성(재생 성공 + 맞는 대상을 눌렀는가)
   ① content_swap   기사 교체 → 같은 자리(1번째)의 새 기사
@@ -19,10 +19,18 @@
   ⑥ ad_forgery          같은 자리·같은 모양 광고(href 패턴 다름) → target_not_found
   ⑦ payment_approval    결제 단계(HITL 고위험) → approval_required (승인 증표 저장 안 함)
   ⑨ pattern_changed     같은 틀·같은 골격, 다른 URL 패턴(/list?new=1) → page_changed (R1 NB-4)
+목록 밖 label (WS-84, #227 — 증거는 /mark 요청: 체크박스 change·라벨 click 이 보낸다)
+  ⑪ label_idempotent    숨긴 체크박스 짝 라벨 click 기록(→ check_box{checked:true}) → 시작이 체크면 그대로(요청 0),
+                        해제면 체크(요청 1). 사보타주: check_box 변환 제거 → 체크된 칸을 풀어 실패
+  ⑫ label_generic       짝 control 없는 generic label click → 재생 성공(/mark?g=1 한 번). 사보타주: locateUi label 후보 제거
+  ⑬ label_swapped       같은 글자·같은 자리의 label 이 다른 체크박스(c9)의 짝 → target_not_found
+  ⑭ label_ambiguous     id 없는 체크박스를 감싼 같은 이름 label 2개가 가까이 → target_ambiguous
+  ⑮ label_partial_load  상호작용 요소가 덜 로드되고 label 만 많음 → not_ready(label 은 준비 수에 넣지 않는다).
+                        사보타주: 준비 수 SEL 에 label 추가 → 덜 로드를 놓쳐 실패
 
 판정
 * 오클릭(음성에서 무엇이든 누름, 양성에서 다른 대상을 누름)이 하나라도 있으면 **exit 2**.
-* 커버리지(scenarios_covered) 10/10 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
+* 커버리지(scenarios_covered) 15/15 미만이면 exit 2. 시나리오가 의도한 사유가 아닌 다른 사유로 멈추면
   실패(규칙 2) — 값에 반영돼 exit 1.
 * 오클릭 판정은 하네스 쪽 독립 증거(Mock 서버 요청 기록 + 재생 응답의 실행 단계)로 한다.
 """
@@ -51,7 +59,14 @@ SCENARIOS: Dict[str, Tuple[str, Optional[str]]] = {
     "payment_approval": ("negative", "approval_required"),
     "pattern_changed": ("negative", "page_changed"),
     "autosave": ("positive", None),
+    "label_idempotent": ("positive", None),
+    "label_generic": ("positive", None),
+    "label_swapped": ("negative", "target_not_found"),
+    "label_ambiguous": ("negative", "target_ambiguous"),
+    "label_partial_load": ("negative", "not_ready"),
 }
+#: label 시나리오의 /mark 요청이 서버에 닿을 시간(초) — change·click 의 fetch 는 비동기다.
+_MARK_SETTLE_S = 0.4
 
 
 async def _call(srv: Any, action: Any, **args: Any) -> Any:
@@ -137,6 +152,8 @@ async def _scenario(name: str, site: Any) -> Dict[str, Any]:
 
     if name == "autosave":
         return await _autosave(site)
+    if name.startswith("label_"):
+        return await _label(name, site)
 
     async with BrowserMCPServer(headless=True) as srv:
         if name == "params":
@@ -237,6 +254,69 @@ async def _autosave(site: Any) -> Dict[str, Any]:
     if leaked:
         res["detail"] = "레시피 파일에 입력 원문이 남음(자동 params 치환 파손)"
     return res
+
+
+async def _label(name: str, site: Any) -> Dict[str, Any]:
+    """⑪~⑮ 목록 밖 label(WS-84) — 기록·재생 모두 /terms, 무엇을 바꿨는지는 /mark 요청 기록으로 본다."""
+    from contracts import ActionType
+    from harness import recipe_mock as m
+    from interface import BrowserMCPServer
+
+    def marks() -> List[str]:
+        return site.opened("/mark")
+
+    async def run(srv: Any, rid: str) -> Tuple[Dict[str, Any], List[str]]:
+        out = await _run(srv, site, rid, "/terms")
+        await asyncio.sleep(_MARK_SETTLE_S)
+        return out, marks()
+
+    paired = lambda checked=False: m.terms_page(m.terms_row("c1", "안내 확인", checked)  # noqa: E731
+                                                 + m.terms_row("c2", "알림 받기"))
+    try:
+        async with BrowserMCPServer(headless=True) as srv:
+            if name == "label_generic":
+                site.terms_html = lambda: m.terms_page(m.terms_generic("자세히 보기") + m.terms_row("c2", "알림 받기"))
+                await _call(srv, ActionType.NAVIGATE, url=site.url("/terms"))
+                await _click(srv, await _observe(srv), "자세히 보기")
+                rid = await _save(srv, name="자세히 보기", last_n=1)
+                out, got = await run(srv, rid)
+                return _judge(name, out, misclick=got not in ([], ["/mark?g=1"]), positive_check=got == ["/mark?g=1"])
+            if name == "label_ambiguous":
+                # 기록 화면도 감싼 label 2개(골격 같음) — 재생 화면에서 둘째 글자만 같아진다.
+                site.terms_html = lambda: m.terms_page(m.terms_wrapped("안내 확인") + m.terms_wrapped("소식 보기")
+                                                       + m.terms_row("c2", "알림 받기"))
+            else:
+                site.terms_html = paired
+            await _call(srv, ActionType.NAVIGATE, url=site.url("/terms"))
+            await _click(srv, await _observe(srv), "안내 확인")
+            rid = await _save(srv, name="안내 확인", last_n=1)
+            if name == "label_idempotent":
+                site.terms_html = lambda: paired(True)
+                out1, got1 = await run(srv, rid)  # 이미 체크 — 그대로(요청 0)
+                site.terms_html = paired
+                out2, got2 = await run(srv, rid)  # 해제 — 체크(요청 1)
+                bad = got1 != [] or got2 not in ([], ["/mark?id=c1&v=true"])
+                res = _judge(name, out2, misclick=bad,
+                             positive_check=bool(out1.get("success")) and got1 == [] and got2 == ["/mark?id=c1&v=true"])
+                if not out1.get("success"):
+                    res["detail"] = "이미 체크된 시작 상태 재생 실패: " + str(((out1.get("data") or {}).get("recipe") or {})
+                                                                .get("detail") or out1.get("error_message"))
+                return res
+            if name == "label_swapped":
+                site.terms_html = lambda: m.terms_page(m.terms_row("c9", "안내 확인") + m.terms_row("c2", "알림 받기"))
+            elif name == "label_ambiguous":
+                site.terms_html = lambda: m.terms_page(m.terms_wrapped("안내 확인") + m.terms_wrapped("안내 확인")
+                                                       + m.terms_row("c2", "알림 받기"))
+            elif name == "label_partial_load":
+                site.terms_html = lambda: m.terms_page(
+                    m.terms_row("c1", "안내 확인") + "".join(f"<label>설명 {i}</label>" for i in range(15)),
+                    header="<header><nav><span>…</span></nav></header>", button=False)
+            else:
+                raise RuntimeError(f"알 수 없는 시나리오: {name}")
+            out, got = await run(srv, rid)
+            return _judge(name, out, misclick=bool(got) or _dispatched(out) > 0)
+    finally:
+        site.terms_html = paired
 
 
 def _judge(name: str, out: Dict[str, Any], *, misclick: bool,

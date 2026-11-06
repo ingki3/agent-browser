@@ -306,6 +306,7 @@ def census_installed(census: Census):
     original = ActionDispatcher._elementless_observe
 
     async def wrapped(self, action, params, page):
+        census.dispatcher = self  # WS-82: 클릭 경로 census(test_ws82_panel_heading)가 디스패처 확인을 부른다
         await census.checkpoint(page)
         engine = self.ctx.engine
         seen: Dict[str, Any] = {}
@@ -421,13 +422,13 @@ async def hanatour_states(d, page, css: bool) -> None:
     await _observe(d, HANA)
 
 
-async def run_family(family: str, only: Optional[List[str]] = None) -> Census:
+async def run_family(family: str, only: Optional[List[str]] = None, census: Optional[Census] = None) -> Census:
     from playwright.async_api import async_playwright
 
     from actions import ActionDispatcher, DispatchContext
     from perception import PerceptionEngine
 
-    census = Census()
+    census = census if census is not None else Census()
     pages = [p for p in corpus.family_pages(family) if only is None or p[0] in only]
     with census_installed(census):
         async with async_playwright() as pw:
@@ -473,8 +474,8 @@ async def test_baseline_identity_and_behavior(family):
     B 45. 측정 조건(규칙 4): 고정 핸들·기준 거부·기준 통과가 각각 있어야 한다.
     """
     archive()
-    if family == "captures" and not corpus.family_pages("captures"):
-        pytest.skip("보존 캡처(.hermes/ws62-r4-evidence) 없음 — 로컬 검증 자료")
+    if family == "captures":  # WS-82(F8): 보존 캡처 2쪽이 실제로 돈다(없으면 실패 — 조용히 0쪽 금지)
+        assert [n for n, _h in corpus.family_pages("captures")] == list(corpus.CAPTURES)
     got = await run_family(family)
     print(f"\nWS62R12-CENSUS {family} {_summary(got)}")
     assert got.observes and got.pinned and got.refused and got.passed, _summary(got)

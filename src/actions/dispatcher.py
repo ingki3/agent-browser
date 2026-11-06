@@ -138,9 +138,42 @@ def _is_target_closed(exc: BaseException) -> bool:
     return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 
+class RelatedNav:
+    """WS-83 R2(R1-B1): 관계 탭 마지막 주 프레임 문서 요청의 결과 — 내부 상태(MCP 응답 출구 아님). 서버가 오류 문서 판정에 읽는다."""
+
+    __slots__ = ("req", "url", "status", "failure", "done")
+
+    def __init__(self, req: Any, url: str) -> None:
+        self.req = req
+        self.url = url
+        self.status: Optional[int] = None
+        self.failure: Optional[str] = None
+        self.done = False
+
+
 def _is_error_document(url: Any) -> bool:
     """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
     return str(url or "").startswith("chrome-error://")
+
+
+def _page_closed(page: Any) -> bool:
+    """Page 가 확실히 닫혔는가(WS-83). 가짜 페이지·읽기 실패는 닫히지 않은 것으로 본다(is_closed() 가 정확히 True 일 때만)."""
+    is_closed = getattr(page, "is_closed", None)
+    if not callable(is_closed):
+        return False
+    try:
+        return is_closed() is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: WS-83(B4): 대상 탭이 닫혀 opener(없으면 남은 첫 탭)로 돌아왔다는 고정 안내(주소·제목 없음).
+TAB_CLOSED_HINT = ("이 탭이 닫혀 opener(없으면 남은 첫 탭)로 돌아왔습니다 — 다시 관찰하세요. "
+                   "browser_tab_control(command=\"list\") 로 탭을 확인할 수 있습니다.")
+#: 대상 탭이 닫힌 것을 입력의 효과로 인정하는 액션(기대 상태값이 없는 요소 클릭).
+_CLOSE_EFFECT_ACTIONS = frozenset({ActionType.CLICK})
+#: WS-83(B6): opener 관계 탭의 이동을 효과로 실은 신호 접두.
+TAB_NAVIGATED_SIGNAL = "tab_navigated"
 
 
 #: WS-69 B4: extract·shadow_root_selector 의 표준 CSS(document.querySelector[All]) 문법 오류 안내.
@@ -1222,6 +1255,12 @@ class _NodeDetached(Exception):
     """WS-64 R4: 입력 전 노드가 떨어짐(같은 문서 재렌더 등) — 아직 입력을 보내지 않았으면 다시 해석한다."""
 
 
+#: WS-82(#158): 페이지 안 모달 열림 신호를 붙이는 액션(포인터·키 — 레이어를 여는 입력).
+_OVERLAY_SIGNAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.PRESS_KEY})
+#: 그 판독의 상한(초) — 넘으면 신호 없음(액션 결과는 그대로).
+_OVERLAY_SIGNAL_TIMEOUT_S = 0.25
+
+
 class _TargetRefused(Exception):
     """WS-64 R4: 같은 문서 재해석에서 기존 신원 검사(role·이름 등)가 거부 — result 는 거부 응답(입력 없음)."""
 
@@ -1394,6 +1433,19 @@ class ActionDispatcher:
         self._sticky_key_node: Any = None
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
+        #: WS-83(B2·B3): 직전 dispatch 가 연 팝업 Page 들 — 서버가 egress 차단 귀속 후보(이 호출이 연 팝업)로 읽는다.
+        self.last_opened_pages: List[Any] = []
+        #: WS-83(B6): 이번 액션 중 opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)에서 일어난 문서 이동의 탭 id.
+        self._related_navs: List[str] = []
+        self._related_watch: List[Tuple[Any, str, Any]] = []
+        #: WS-83 R2(R1-B1): 관계 탭별 마지막 주 프레임 문서 요청의 결과(진행 중이면 done=False) — 액션 동안만.
+        self._related_nav_state: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 의 관계 탭 문서 이동 결과 {tab_id: RelatedNav} — 서버가 오류 문서 판정에 읽는다.
+        self.last_related_nav: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 성공이 관계 탭 이동 신호만으로 났으면 그 신호를 빼기 전 사후조건 detail(아니면 None).
+        self.last_relation_only: Optional[str] = None
+        #: WS-83(B4): 이번 dispatch 에서 요소 입력을 실제로 보냈는가(보낸 뒤 대상 탭이 닫히면 그 닫힘이 효과다).
+        self._input_sent = False
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
         self._dialogs: List[Dict[str, Any]] = []
         #: handle_dialog 가 예약한 다음 다이얼로그 처리(1회용). None 이면 기본값(거절).
@@ -1496,25 +1548,212 @@ class ActionDispatcher:
         덮어쓰지 않는다.
         """
         pages, self._opened_pages = self._opened_pages, []
+        self.last_opened_pages = list(pages)
         core = self.ctx.core
         finder = getattr(core, "tab_for_page", None)
         if not callable(finder):
             return
         ids = []
+        opened = []
         for page in pages:
             tab = finder(page)
             if tab is not None and tab.tab_id not in ids:
                 ids.append(tab.tab_id)
+                # WS-83(D1·B5): 신호만 — 활성 탭은 바꾸지 않는다(전환은 tab_control). 주소는 응답 봉투의 주소 칸 가림 규칙.
+                opened.append({"tab_id": tab.tab_id, "opener_tab_id": getattr(tab, "opener_tab_id", None) or self.ctx.tab_id,
+                               "url": str(getattr(page, "url", "") or "")})
         if ids:
             result.data.setdefault("opened_tab_ids", ids)
+            result.data.setdefault("popup_opened", opened)
 
     def _off_popup(self, listener: Any) -> None:
         # 붙인 곳(최상위 Page)에서 뗀다 — 프레임 안에서는 ctx.page 가 Frame 이라 떼지 못하고
         # 리스너가 액션마다 쌓였다(WS-30 R1 NB-8).
+        self._unwatch_related()
         try:
             self._top_page().remove_listener("popup", listener)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+
+    # -- 탭 관계 (WS-83) ------------------------------------------------------
+
+    def _watch_related(self) -> None:
+        """B6: 이 탭과 opener 관계인 탭(이 탭이 연 팝업·이 탭의 opener)의 주 프레임 문서 이동을 액션 동안 듣는다.
+
+        같은 작업 공간의 다른 탭(자발 이동)은 듣지 않는다 — 진짜 Silent Failure 를 거짓 성공으로 바꾸지 않게.
+        코어 관계 기록(core.related_tabs)만 쓴다(왕복 없음). 서버 제어 창은 코어가 뺀다.
+        """
+        self._unwatch_related()
+        related = getattr(getattr(self.ctx, "core", None), "related_tabs", None)
+        if not callable(related):
+            return
+        try:
+            tabs = list(related(self.ctx.tab_id))
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return
+        for tab in tabs:
+            page = tab.page
+            frame = getattr(page, "main_frame", None)
+            tab_id = tab.tab_id
+
+            def _nav(fr: Any, _f: Any = frame, _id: str = tab_id) -> None:
+                if fr is _f and _id not in self._related_navs:
+                    self._related_navs.append(_id)
+
+            def _req(req: Any, _f: Any = frame, _id: str = tab_id) -> None:
+                try:
+                    if req.is_navigation_request() and req.frame is _f:
+                        if _id not in self._related_navs:
+                            self._related_navs.append(_id)
+                        # R2: 마지막 문서 요청(리다이렉트 홉이면 새 요청이 앞 것을 대신한다)의 결과를 따라간다.
+                        self._related_nav_state[_id] = RelatedNav(req, req.url)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def _resp(resp: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and getattr(resp, "request", None) is state.req:
+                    code = resp.status
+                    state.status = code if isinstance(code, int) else None
+                    state.done = not (isinstance(code, int) and 300 <= code < 400)  # 3xx 는 다음 홉이 온다
+
+            def _failed(req: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and req is state.req:
+                    state.failure = str(req.failure or "")
+                    state.done = True
+
+            for event, handler in (("framenavigated", _nav), ("request", _req), ("response", _resp),
+                                   ("requestfailed", _failed)):
+                try:
+                    page.on(event, handler)
+                    self._related_watch.append((page, event, handler))
+                except Exception:  # noqa: BLE001 — 가짜·닫힌 페이지
+                    pass
+
+    def _unwatch_related(self) -> None:
+        watch = self.__dict__.get("_related_watch") or []
+        self.__dict__["_related_watch"] = []
+        for page, event, handler in watch:
+            try:
+                page.remove_listener(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _settle_related(self) -> None:
+        """WS-83 R2(R1-B1): 관계 탭의 마지막 문서 요청이 아직 끝나지 않았거나(응답·실패 전) 실패했는데 오류 문서가 아직
+        커밋되지 않았으면 그것만 짧게 기다린다(상한 300ms) — 서버가 그 탭 최종 문서가 오류인지 판정한다. 관계 탭 이동이
+        없으면 기다리지 않는다. 끝나면 결과(url·status·failure)를 last_related_nav 에 남긴다."""
+        states = self.__dict__.get("_related_nav_state") or {}
+        if not states:
+            return
+        core = getattr(self.ctx, "core", None)
+
+        def _pending() -> bool:
+            for tid, st in states.items():
+                if not st.done:
+                    return True
+                failure = st.failure or ""
+                if failure and "ERR_ABORTED" not in failure:
+                    try:
+                        tab = core.get_tab(tid) if core is not None else None
+                    except Exception:  # noqa: BLE001 — 가짜 코어
+                        tab = None
+                    page = getattr(tab, "page", None)
+                    if page is not None and not _page_closed(page) and not _is_error_document(page.url):
+                        return True
+            return False
+
+        for _ in range(12):
+            if not _pending():
+                break
+            await asyncio.sleep(0.025)
+        self.last_related_nav = dict(states)
+
+    def _related_signals(self) -> List[str]:
+        return [f"{TAB_NAVIGATED_SIGNAL}: {tid}" for tid in self.__dict__.get("_related_navs") or []]
+
+    def _is_popup_tab(self) -> bool:
+        """이 호출의 탭이 코어가 opener 를 기록한 팝업인가(B4 — 스크립트가 스스로 닫을 수 있는 창)."""
+        core = getattr(self.ctx, "core", None)
+        try:
+            tab = core.get_tab(self.ctx.tab_id) if core is not None else None
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return False
+        return isinstance(getattr(tab, "opener_tab_id", None), str)
+
+    def _return_tab(self) -> Any:
+        """B4: 이 호출의 탭이 닫힌 뒤 돌아갈 같은 작업 공간의 살아 있는 탭(코어 활성 — opener 우선). 없으면 None."""
+        core = getattr(self.ctx, "core", None)
+        try:
+            tab = core.get_tab(core.active_tab_id) if core is not None else None
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return None
+        if tab is None or tab.tab_id == self.ctx.tab_id or _page_closed(tab.page):
+            return None
+        return tab
+
+    @staticmethod
+    async def _closed_soon(page: Any) -> bool:
+        """page 가 곧(상한 1초) 닫힘 사건까지 왔는가 — TargetClosedError 가 'close' 사건보다 먼저 올 수 있다(이 경로만)."""
+        for _ in range(40):
+            if _page_closed(page):
+                return True
+            await asyncio.sleep(0.025)
+        return _page_closed(page)
+
+    @staticmethod
+    async def _closing(page: Any) -> bool:
+        """page 문서가 닫히는 중인가(window.closed — window.close() 를 부르면 탭이 실제로 닫히기 전에 참). 이미 닫혔으면 참."""
+        try:
+            return (await asyncio.wait_for(page.evaluate("window.closed"), 1.0)) is True
+        except Exception as exc:  # noqa: BLE001 — 시간 초과·가짜 페이지는 닫히는 중이 아님
+            return _is_target_closed(exc)
+
+    async def _after_tab_closed(self, action: ActionType, params: Dict[str, Any], result: ActionResult,
+                                top: Any, closed_by_exc: bool) -> ActionResult:
+        """B4: 이번 액션 중 이 호출의 탭(top)이 닫혔으면 코어가 정한 같은 작업 공간 활성 탭(살아 있는 opener, 없으면 남은
+        첫 탭)으로 옮기고 data.tab_closed={closed_tab_id, active_tab_id} 를 싣는다. 입력을 보낸 뒤 닫힌 클릭은 그 닫힘이
+        효과라 성공이다(retry_safe=True 인 거짓 PAGE_CRASHED 없음). 돌아갈 탭이 없으면(브라우저째 닫힘) 기존 결과 그대로."""
+        core = getattr(self.ctx, "core", None)
+        if core is None:
+            return result
+        if not _page_closed(top) and closed_by_exc:
+            # TargetClosedError 가 페이지 'close' 사건보다 먼저 올 수 있다 — 닫힘 사건만 짧게 기다린다(이 경로만).
+            for _ in range(40):  # 상한 1초(이 경로만)
+                await asyncio.sleep(0.025)
+                if _page_closed(top):
+                    break
+        if not _page_closed(top):
+            return result
+        closed_id = self.ctx.tab_id
+        tab = self._return_tab()
+        if tab is None:
+            return result
+        self._set_active_page(tab.page, tab.tab_id)
+        try:
+            self.ctx.cdp = await core.new_cdp_session(tab.tab_id)
+        except Exception:  # noqa: BLE001 — 관찰이 새 세션을 다시 만든다
+            logger.debug("닫힌 탭 복귀 뒤 CDP 세션 실패", exc_info=True)
+        self.ctx.engine.bump_epoch("tab_closed")
+        data = dict(result.data or {})
+        data["tab_closed"] = {"closed_tab_id": closed_id, "active_tab_id": tab.tab_id}
+        hint = str(data.get("hint") or "")
+        data["hint"] = (hint + " " + TAB_CLOSED_HINT).strip() if TAB_CLOSED_HINT not in hint else hint
+        effect = (result.success or (action in _CLOSE_EFFECT_ACTIONS and self._input_sent
+                                     and not _has_expected_state(action, params)))
+        if effect:
+            signals = list(data.get("signals") or [])
+            if "tab_closed" not in signals:
+                signals.append("tab_closed")
+            data["signals"] = signals
+            return self._result(success=True, action=action,
+                                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                                healed=result.healed, reobserve_required=True, data=data)
+        retry_safe = result.retry_safe and not self._input_sent
+        return self._result(success=False, action=action, retry_safe=retry_safe,
+                            error_code=result.error_code, error_message=result.error_message,
+                            healed=result.healed, reobserve_required=True, data=data)
 
     # -- 프레임·다이얼로그 (WS-30) --------------------------------------------
 
@@ -1702,6 +1941,9 @@ class ActionDispatcher:
         out = {"fresh": bool(st.fresh), "detail": str(st.detail or "")}
         if st.reason is StalenessReason.GROUP_CHANGED:
             out["group_changed"] = True  # WS-62 NB1: 승인 경로도 재관찰 요구(reobserve_required)
+        elif st.fresh and await self._panel_heading_changed(handle):
+            # WS-82(#157): 승인 신선도에도 같은 더하기 확인(패널 표제 첫 조각 — 원문은 detail 에 싣지 않는다)
+            out = {"fresh": False, "detail": "묶음 표제 바뀜", "group_changed": True}
         return out
 
     # -- WS-56 R1 B1: 승인 대상 노드 결속 ---------------------------------------
@@ -2366,12 +2608,22 @@ class ActionDispatcher:
             return result
         self._nav_info = {}
         self._opened_pages = []
+        self.last_opened_pages = []
+        self._related_navs = []
+        self._related_nav_state = {}
+        self.last_related_nav = {}
+        self.last_relation_only = None
+        self._input_sent = False
         self._dialogs = []
         self._install_dialog_listener()
+        top_at_start = self._top_page()
+        open_at_start = not _page_closed(top_at_start)
+        closed_by_exc = False
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
             logger.exception("액션 실행 중 예외: %s", action.value)
+            closed_by_exc = _is_target_closed(exc)
             result = self._result(
                 success=False,
                 action=action,
@@ -2379,6 +2631,14 @@ class ActionDispatcher:
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"{type(exc).__name__}: {public_error_text(exc)}",  # WS-79 B8: 호출 기록 제외
             )
+        if open_at_start and self._top_page() is top_at_start and action is not ActionType.TAB_CONTROL:
+            if (not result.success and not closed_by_exc and action in _CLOSE_EFFECT_ACTIONS and self._input_sent
+                    and not _page_closed(top_at_start) and self._is_popup_tab()):
+                # 효과 없음으로 끝난 팝업 탭 클릭: 그 문서가 스스로 닫히는 중(window.close() 뒤 탭 닫힘은 비동기)인지 한 번
+                # 본다 — 실패한 팝업 클릭에서만(성공 경로·일반 탭 왕복 0).
+                closed_by_exc = await self._closing(top_at_start)
+            # WS-83(B4): 이번 액션 중 이 호출의 탭이 닫혔다(팝업이 스스로 닫음 등) — 닫힌 탭에 남지 않는다.
+            result = await self._after_tab_closed(action, params, result, top_at_start, closed_by_exc)
         if self.ctx.root_page is not None and action not in _TOP_RECORDER_KEEP_ACTIONS:
             # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
             # 읽기 전용 액션(관찰·추출·스크린샷·대기)은 기준선을 끊지 않는다 — 에이전트는 보통
@@ -2397,9 +2657,26 @@ class ActionDispatcher:
             self._nav_info = {}
         if self._opened_pages:
             self._attach_opened_tabs(result)
+        if self._related_navs:
+            await self._settle_related()
+        self._unwatch_related()
+        if self._related_navs:
+            # WS-83(B6): opener 관계 탭의 문서 이동 — 탭 id 와 고정 어휘만(주소·제목 없음).
+            result.data.setdefault("tabs_changed", [{"tab_id": t, "change": "navigated"} for t in self._related_navs])
         if self._dialogs:
             # WS-30 4(c): 이 액션 중 뜬 다이얼로그(종류·문구·처리 결과)를 알린다.
             result.data.setdefault("dialogs", list(self._dialogs))
+        if (action in _OVERLAY_SIGNAL_ACTIONS and result.success
+                and not any(k in result.data for k in ("nav_wait_ms", "nav_committed", "nav_timed_out", "nav_aborted"))):
+            # WS-82(#158): 같은 감지기(격리 world)로 이 액션 뒤 페이지 안 모달·레이어가 새로 열렸는지 — JS 대화상자
+            # (dialog_opened·data.dialogs)와 다른 키. 종류 어휘만(페이지 글자 0). 못 읽거나 새로 열린 것이 없으면 키 없음.
+            # 문서 이동이 보였으면(대기 중·커밋·중단) 보지 않고, 판독은 짧은 상한 안에서만(이동 대기를 늘리지 않게).
+            try:
+                det = await asyncio.wait_for(self._overlay_detect(), _OVERLAY_SIGNAL_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                det = None
+            if det is not None and det["opened"]:
+                result.data.setdefault("overlay_opened", {"kinds": list(det["kinds"])})
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
@@ -2761,8 +3038,13 @@ class ActionDispatcher:
                 # WS-62 R1 R2: 채택한 핸들은 원래 선택 근거(구분 조상·지문)를 잇는다 — 치유 후보 거르기가 이 근거로
                 # 골랐으므로 같은 값이며, 반환한 id 를 다시 써도 달이 바뀌면 거부된다.
                 new_handle.group_path, new_handle.group_heading = handle.group_path, handle.group_heading
+            self._inherit_panel_entry(handle, new_handle)  # WS-82: 패널 표제 확인도 잇는다
             handle = new_handle
             healed_flag = True
+        if await self._panel_heading_changed(handle):
+            # WS-82(#157, 사용자 결정 D2=A): 기준 확인(v1.16.0 원문)은 통과했지만 관찰 때 이 날짜가 든 패널의 표제 첫 조각이
+            # 바뀌었다(표제만 바뀐 같은 배치의 달) — 기준에 거부를 더하기만 한다.
+            return self._panel_heading_refusal(action)
         return handle, healed_flag
 
     async def _handle_for_selector(self, action: ActionType, selector: str) -> Any:
@@ -2938,6 +3220,12 @@ class ActionDispatcher:
             extra.append(f"navigated: {self._current_url()}")
         if not _has_expected_state(action, params):
             extra.extend(self._effect_beyond_target(root_before, root_after, top_weak_ok))
+            # WS-83(B6·D3): opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)의 문서 이동 — 같은 작업 공간의 다른 탭은 아님.
+            related = self._related_signals()
+            if related and not extra:
+                # R2: 성공 근거가 관계 탭 이동뿐 — 그 탭이 오류 문서로 끝나면 서버가 이 detail 로 기준 판정을 되살린다.
+                self.last_relation_only = post.detail
+            extra.extend(related)
         elif dialog_signals and extra:
             extra.extend(dialog_signals)
         if not extra:
@@ -3058,6 +3346,8 @@ class ActionDispatcher:
             top_page.on("popup", _on_popup)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+        # WS-83(B6): opener 관계 탭의 문서 이동(이름 있는 창 재사용·팝업이 opener 를 바꿈)도 액션 전에 듣는다.
+        self._watch_related()
         # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
         frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
         watch = (
@@ -3109,6 +3399,11 @@ class ActionDispatcher:
             self._off_popup(_on_popup)
             if watch is not None:
                 watch.close()
+            if _is_target_closed(exc) and await self._closed_soon(top_page) and self._return_tab() is not None:
+                # WS-83(B4): 클릭 처리 중에 그 탭이 닫혔다(onclick 의 window.close() 가 입력 응답보다 먼저 탭을 닫음 — 부하 시
+                # 실측). 입력이 처리되는 중 닫힌 것이라 '보내지 않음'이 아니다 — dispatch 가 닫힘 복귀·효과로 정리한다.
+                self._input_sent = True
+                raise
             return self._result(
                 success=False,
                 action=action,
@@ -3117,6 +3412,7 @@ class ActionDispatcher:
                 error_message=f"이벤트 발송 실패: {public_error_text(exc)}",
                 healed=healed_flag,
             )
+        self._input_sent = True
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
@@ -3173,7 +3469,8 @@ class ActionDispatcher:
                 data=_with_click_point({"signals": ["navigation_started"], "element_id": handle.element_id}),
             )
         root_after = await self._capture_root() if root_before is not None else None
-        if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed"):
+        if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed") \
+                and not self.__dict__.get("_related_navs"):
             # 효과가 전혀 없을 때만 짧게 더 기다렸다가 **다시 본다**. 실제 사이트는
             # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
             # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
@@ -3620,6 +3917,8 @@ class ActionDispatcher:
             expected_role=params.get("expected_role"), expected_name=params.get("expected_name"),
         )
         if st.fresh:
+            if await self._panel_heading_changed(handle):  # WS-82(#157): 다시 해석한 노드도 같은 더하기 확인
+                raise _TargetRefused(self._panel_heading_refusal(action))
             return
         if st.reason is StalenessReason.NODE_DETACHED:
             raise _NodeDetached(st.detail)
@@ -3896,6 +4195,43 @@ class ActionDispatcher:
                                 data={"hint": so.PROXY_HINT})
         return None
 
+    async def describe_proxy_for_gate(self, element_id: Any) -> Optional[Dict[str, Any]]:
+        """WS-84 (#224): 대상이 구조로 증명된 대리 위젯(숨긴 select 의 짝)이면 {"field": 숨긴 select 의 필드 라벨}, 아니면 None.
+
+        HITL 강화 전용(판정 입력에 더하기만) — 판정은 격리 world(_select_eval)에서만, combobox·option(R1: 위젯이 소유한 listbox
+        항목)이 아니거나 못 읽거나 짝이
+        증명되지 않거나 필드 라벨이 없으면 None(기준 판정 그대로)."""
+        from perception.select_options import proxy_fn
+
+        handle = self.ctx.engine.get_handle(element_id) if element_id else None
+        if handle is None or getattr(handle, "role", None) not in ("combobox", "option") \
+                or getattr(handle, "is_shadow", False):
+            return None
+        out = await self._select_eval(proxy_fn(), {}, handle, None, False)
+        field = out.get("field") if isinstance(out, dict) and out.get("verdict") == "proxy" else None
+        return {"field": field} if isinstance(field, str) and field.strip() else None
+
+    async def describe_proxy_selector_for_gate(self, selector: str) -> Optional[Dict[str, Any]]:
+        """WS-84 R1 (검증 B1): click(selector) 대상의 증명된 대리 위젯 필드 라벨 — describe_proxy_for_gate 의 selector 판.
+
+        Playwright 로케이터가 정확히 1개이고, 격리 world 에서 같은 selector(css)가 문서·열린 shadow 전체에서 정확히 1개이며 두
+        노드가 같은 자리(테두리 상자, CDP 판독)일 때만 그 노드로 판정한다(_select_eval_scoped). 위젯 안쪽 요소(표시 칸·화살표)는
+        그 위젯으로, 위젯이 소유한 listbox 항목은 그 위젯으로 귀속(pxOwner). css 가 아닌 selector·못 읽음·짝 미증명은 None."""
+        from types import SimpleNamespace
+
+        from perception.select_options import proxy_fn
+
+        try:
+            locator = self.ctx.page.locator(selector)
+            if await locator.count() != 1:
+                return None
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 못 읽음 = 기준 판정 그대로(강화만)
+            return None
+        node = SimpleNamespace(css_path=selector, is_shadow=False)
+        out = await self._select_eval_scoped(proxy_fn(), {}, node, locator.first, True)
+        field = out.get("field") if isinstance(out, dict) and out.get("verdict") == "proxy" else None
+        return {"field": field} if isinstance(field, str) and field.strip() else None
+
     async def _annotate_select_options(self, page: Any, elements: Any, data: Dict[str, Any]) -> None:
         """관찰 data 에 select 선택지 블록(data.select_options)을 싣는다 — 관찰된 combobox 가 없으면 평가하지 않는다(바이트·
         비용 그대로). 표시 전용(핸들·실행 무관): 실패해도 관찰은 그대로 성공한다."""
@@ -3913,6 +4249,173 @@ class ActionDispatcher:
             logger.debug("select 선택지 수집 실패: %s", type(exc).__name__)
             return
         so.apply_block(data, raw, handles)
+
+    # -- WS-82 (#157): 달 패널 표제 첫 조각 — 기준 확인에 더하기만 -------------------------------
+
+    async def _record_panel_heads(self, repeated: Any, page: Any) -> None:
+        """관찰 때: 표시 형성(서로 다른 표제 세트)의 구성원 → 패널 경로·표제 첫 조각(격리 world 판독)을 (element_id, css_path,
+        epoch) 키 표에 둔다(관찰마다 새로). 표제 원문은 이 표에만 — 블록의 내부 키는 꺼내(pop) 응답·로그·레시피에 싣지 않는다.
+        첫 조각을 못 읽으면 표를 비운다(기준 판정만)."""
+        from perception.repeated import HEADS_KEY, panel_firsts_expr
+
+        heads = repeated.pop(HEADS_KEY, None) if isinstance(repeated, dict) else None
+        table: Dict[Tuple[str, str, int], Tuple[str, Any, Any]] = {}
+        self.__dict__["_panel_heads"] = table
+        if not isinstance(heads, dict) or not heads:
+            return
+        paths = sorted({p for p in heads.values() if isinstance(p, str) and p})
+        try:
+            firsts = await self._doc_isolated_eval(panel_firsts_expr(paths))
+        except Exception as exc:  # noqa: BLE001 — 판독 불가: 표 없음(기준 판정만)
+            logger.debug("패널 표제 판독 실패: %s", type(exc).__name__)
+            return
+        if not isinstance(firsts, list) or len(firsts) != len(paths):
+            return
+        first_of = dict(zip(paths, firsts))
+        for eid, path in heads.items():
+            handle = self.ctx.engine.get_handle(eid)
+            first = first_of.get(path)
+            if handle is None or not handle.css_path or not isinstance(first, str) or not first:
+                continue
+            table[(handle.element_id, handle.css_path, handle.epoch)] = (path, first, page)
+
+    def _panel_entry(self, handle: Any) -> Optional[Tuple[str, Any, Any]]:
+        table = self.__dict__.get("_panel_heads") or {}
+        key = (getattr(handle, "element_id", None), getattr(handle, "css_path", None), getattr(handle, "epoch", None))
+        return table.get(key)
+
+    def _inherit_panel_entry(self, old: Any, new: Any) -> None:
+        """치유로 채택한 핸들은 원래 핸들의 패널 표제 확인을 잇는다(group_path 승계와 같은 이유)."""
+        entry = self._panel_entry(old)
+        if entry is not None and getattr(new, "css_path", None):
+            self.__dict__.setdefault("_panel_heads", {})[(new.element_id, new.css_path, new.epoch)] = entry
+
+    async def _panel_heading_changed(self, handle: Any) -> bool:
+        """실행 직전: 대상이 관찰 때 달력 묶음 구성원이었으면 그 패널 표제 첫 조각을 **격리 world**·같은 프레임에서 다시 읽어
+        다르면 True(거부). 표에 없거나·다른 문서/프레임이거나·판독 실패면 False — 기준(v1.16.0) 판정만 남는다(더하기만)."""
+        entry = self._panel_entry(handle)
+        if entry is None:
+            return False
+        path, first, page = entry
+        if page is not self.ctx.page:
+            return False
+        from perception.repeated import panel_firsts_expr
+
+        try:
+            got = await self._doc_isolated_eval(panel_firsts_expr([path]))
+        except Exception as exc:  # noqa: BLE001 — 판독 불가: 기준 판정만
+            logger.debug("패널 표제 판독 실패: %s", type(exc).__name__)
+            return False
+        if not isinstance(got, list) or len(got) != 1 or (got[0] is not None and not isinstance(got[0], str)):
+            return False
+        return got[0] != first
+
+    def _panel_heading_refusal(self, action: ActionType) -> ActionResult:
+        """기존 GROUP_CHANGED 거부와 같은 모양(TOCTOU·재관찰·changed.kinds=['text']) — 표제 원문은 싣지 않는다."""
+        from actions.group_changed import MARK_CHANGED, MARK_SAME, refusal_data
+
+        group_changed, hint = refusal_data(MARK_SAME, MARK_CHANGED, heading_only=True)  # 자리값(표제 원문 아님)
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=f"Staleness 검증 실패(묶음 바뀜) — 치유하지 않음: {hint}",
+            reobserve_required=True,
+            data={"group_changed": group_changed, "hint": hint},
+        )
+
+    # -- WS-82 (#198·#158): 활성 오버레이 — 감지(격리 world)·관찰 순서 후처리·클릭 뒤 열림 신호 ---------------
+
+    async def _doc_isolated_eval(self, expression: str) -> Any:
+        """관찰 대상 문서(최상위 또는 switch_frame 한 프레임)의 격리 world 평가. 못 하면 예외(부르는 쪽이 꺼짐 처리)."""
+        if self.ctx.root_page is None:
+            return await self.isolated_eval(expression)
+        return await self._select_display_scoped(expression)
+
+    async def _overlay_detect(self) -> Optional[Dict[str, Any]]:
+        """{"on", "kinds", "opened", "nonce"} 또는 None(판독 불가 = 꺼짐). 감지한 레이어 노드는 격리 world 전역에만 둔다."""
+        import secrets
+
+        from perception import overlay as ov
+
+        nonce = secrets.token_hex(8)
+        try:
+            raw = await self._doc_isolated_eval(ov.detect_expr(nonce))
+        except Exception as exc:  # noqa: BLE001 — 부가 처리: 꺼짐(관찰은 지금 그대로)
+            logger.debug("오버레이 감지 실패: %s", type(exc).__name__)
+            return None
+        det = ov.parse_detect(raw)
+        if det is not None:
+            det["nonce"] = nonce
+        return det
+
+    async def _overlay_order(self, page: Any, observed: Any, overlay: Dict[str, Any], top_n: int,
+                             full: bool) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        """감지가 켜진 관찰(엔진은 full 로 불렸다)의 순서 후처리(리뷰 B3). 반환: (관찰, data.overlay 또는 None).
+
+        * 기본(top-N): v1160 고정은 엔진 원래 순서·집합(= full[:N] — 점수기가 전부 정렬 뒤 자르므로 top-N 호출과 같다)으로
+          먼저. base 접두 N−q 는 그대로, base 밖 오버레이 구성원 q(≤N/2)개가 꼬리를 대신해 총 N(`overlay.plan_top_n`).
+          추가 구성원만 2차 고정을 받고 base 핸들의 고정은 원복한다. 반환하지 않은 full 핸들은 등록 해제(옛 id 오클릭 0).
+        * 전체(force_full_tree): 고정은 원래 순서로, 목록은 오버레이 구성원을 앞에(크기 상한이 접두만 남겨도 남게).
+        구성원 판독이 실패하면 base 그대로(기본은 top-N 결과와 같은 바이트).
+        """
+        from perception import overlay as ov
+        from perception import repeated_v1160
+        from perception.engine import _summarize, estimate_tokens
+
+        engine = self.ctx.engine
+        els = list(observed.elements)
+
+        def with_elements(items: List[Any]) -> Any:
+            summary = _summarize(items)
+            return observed.model_copy(update={"elements": items, "axtree_summary": summary,
+                                               "token_count": estimate_tokens(summary)})
+
+        members: Optional[List[bool]] = None
+        try:
+            paths = []
+            for e in els:
+                h = engine.get_handle(e.element_id)
+                paths.append(h.css_path if h is not None and h.css_path and not h.is_shadow else "")
+            members = ov.parse_members(await self._doc_isolated_eval(ov.members_expr(overlay["nonce"], paths)), len(els))
+        except Exception as exc:  # noqa: BLE001 — 구성원 판독 불가: base 그대로
+            logger.debug("오버레이 구성원 판독 실패: %s", type(exc).__name__)
+        if full:
+            await repeated_v1160.annotate_repeated(page, engine, els)
+            if members is None or not any(members):
+                return observed, None
+            order = ov.plan_full(len(els), members)
+            if order == list(range(len(els))):
+                return observed, None
+            return with_elements([els[i] for i in order]), {"kinds": overlay["kinds"], "promoted": sum(members)}
+        n = min(top_n, len(els))
+        base = els[:n]
+        await repeated_v1160.annotate_repeated(page, engine, base)
+        final_idx, _pushed = ov.plan_top_n(len(els), members, top_n) if members is not None else (list(range(n)), [])
+        keep = {els[i].element_id for i in final_idx}
+        store = getattr(engine, "_handles", None)
+        if isinstance(store, dict):
+            for e in els:
+                if e.element_id not in keep:
+                    store.pop(e.element_id, None)
+        added = [els[i] for i in final_idx if i >= n]
+        if not added:
+            return with_elements(base), None
+        final = [els[i] for i in final_idx]
+        saved = {}
+        for e in final:
+            h = engine.get_handle(e.element_id)
+            if h is not None:
+                saved[e.element_id] = (h.group_path, h.group_heading)
+        added_ids = {e.element_id for e in added}
+        await repeated_v1160.annotate_repeated(page, engine, final)
+        for eid, (path, pin) in saved.items():
+            if eid not in added_ids:
+                h = engine.get_handle(eid)
+                if h is not None:
+                    h.group_path, h.group_heading = path, pin
+        return with_elements(final), {"kinds": overlay["kinds"], "promoted": len(added)}
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
@@ -4296,21 +4799,36 @@ class ActionDispatcher:
 
     async def _elementless_observe(self, action: ActionType, params: Dict[str, Any], page: Any) -> ActionResult:
         """observe_page(WS-48 분해)."""
+        self.__dict__["_panel_heads"] = {}  # WS-82: 관찰마다 새 표(엔진이 핸들을 다시 매기기 전에 비운다)
+        # WS-82(#198): 활성 오버레이 감지(격리 world). 꺼짐(없음·판독 실패)이면 엔진 호출·이하 전부 지금 바이트 그대로.
+        overlay = await self._overlay_detect()
+        if overlay is not None and not overlay["on"]:
+            overlay = None
+        top_n = params.get("prune_top_n", 20)
+        full = params.get("force_full_tree", False)
         observed = await self.ctx.engine.observe_page(
-            prune_top_n=params.get("prune_top_n", 20),
-            force_full_tree=params.get("force_full_tree", False),
+            prune_top_n=top_n,
+            force_full_tree=full or overlay is not None,
             page=page,
             cdp=self.ctx.cdp,
         )
-        data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         # WS-62: 쌍둥이 묶음(두 달 달력·상품 행)이 있을 때만 data.repeated — 없으면 키도 없다(기존 바이트 그대로).
         # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
         # 관찰 정보 전용이라 핸들을 건드리지 않는다.
         from perception import repeated_v1160
         from perception.repeated import annotate_repeated
 
-        await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
+        overlay_data: Optional[Dict[str, Any]] = None
+        if overlay is None:
+            await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
+        else:
+            observed, overlay_data = await self._overlay_order(
+                page, observed, overlay, int(top_n or getattr(self.ctx.engine, "default_top_n", 20)), bool(full))
+        data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
+        if overlay_data is not None:
+            data["overlay"] = overlay_data
         repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
+        await self._record_panel_heads(repeated, page)
         if repeated is not None:
             data["repeated"] = repeated
         # WS-80: 관찰된 네이티브 select 의 선택지(표시 전용) — select 가 없으면 키도 없다(기존 바이트 그대로).

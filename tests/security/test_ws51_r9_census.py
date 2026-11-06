@@ -53,6 +53,7 @@ CONTAINERS = {
     ("extra", "actions/dispatcher.py"): (SIGNALS, "_with_outside_effects → post.signals + extra → data.signals"),
     ("<return:_dialog_signals>", "actions/dispatcher.py"): (SIGNALS, "dialog_opened:{type} → data.signals"),
     ("<return:_top_effect_signals>", "actions/dispatcher.py"): (SIGNALS, "top:{신호} → data.signals"),
+    ("<return:_related_signals>", "actions/dispatcher.py"): (SIGNALS, "WS-83 tab_navigated: tab-N → data.signals"),
     ("__all__", None): (NOT_OUT, "모듈 재수출 목록"),
     ("<expr>", "actions/pdf_document.py"): (NOT_OUT, "_rss_bytes — /bin/ps argv"),
     ("<expr>", "interface/handoff.py"): (NOT_OUT, "_process_start_time — ps argv"),
@@ -116,6 +117,7 @@ SIGNAL_FREE = {
     "focus_moved: {before.active_element} -> {after.active_element}": "페이지 tag#id",
     "navigated: {self._current_url()}": "주소 원문",
     "file_saved: {downloaded}": "내려받은 파일 경로(페이지 유래 파일 이름)",
+    "{TAB_NAVIGATED_SIGNAL}: {tid}": "WS-83 tab_navigated: tab-N — 탭 id(숫자, 위 new_tab 과 같은 이유로 면제 불가)",
 }
 _HOLE = re.compile(r"\{[^{}]*\}")
 

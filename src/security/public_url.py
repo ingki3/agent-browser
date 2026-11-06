@@ -794,9 +794,10 @@ CONTROL_LIST_VOCABULARY: Dict[str, FrozenSet[str]] = {
     # (R9 R8-B1 — tests/security/test_ws51_r9_census.py 가 heal() 의 실제 원소 틀에서 도출해 이 표와 같음을 고정)
     "healing_attempts": frozenset(
         set(_HEAL_STRATEGIES) | {f"{s}({o})" for s in _HEAL_STRATEGIES for o in _HEAL_OUTCOMES}),
-    # verify_post_condition 고정 신호 + dispatcher "navigation_started" + _top_effect_signals f"top:{s}"
+    # verify_post_condition 고정 신호 + dispatcher "navigation_started"·"tab_closed"(WS-83) + _top_effect_signals f"top:{s}"
     # + _dialog_signals f"dialog_opened:{type}"(dialogs[].type 어휘)
-    "signals": frozenset(_VERIFY_SIGNAL_CODES | {"navigation_started"} | {f"top:{c}" for c in _VERIFY_SIGNAL_CODES}
+    "signals": frozenset(_VERIFY_SIGNAL_CODES | {"navigation_started", "tab_closed"}
+                         | {f"top:{c}" for c in _VERIFY_SIGNAL_CODES}
                          | {f"dialog_opened:{t}" for t in _DIALOG_TYPES}),
 }
 #: 어휘 외에 형식으로 정해진 제어 값(키 → 전체 일치 형식).

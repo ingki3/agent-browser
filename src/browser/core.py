@@ -47,6 +47,9 @@ class ManagedTab:
     profile_name: str
     #: WS-57: 이 탭의 주인 작업 공간. 탭 목록·활성 탭·닫기는 주인 작업 공간 안에서만 보인다.
     workspace: str = DEFAULT_WORKSPACE
+    #: WS-83(#162): 이 탭을 연 탭(popup 이벤트의 opener). 팝업이 스스로 닫히면 활성을 여기로 돌린다. opener 가 먼저
+    #: 닫히면 그 opener 의 opener 로 이어 붙인다(사슬). 팝업이 아닌 탭은 None.
+    opener_tab_id: Optional[str] = None
 
 
 @dataclass
@@ -612,23 +615,43 @@ class BrowserCore:
                 opener.profile_name, page, popup=True, owner=opener.workspace)
             if tab is not None:
                 tab.workspace = opener.workspace
+                if tab.tab_id != opener.tab_id and opener.tab_id in self._tab_index:
+                    tab.opener_tab_id = opener.tab_id  # WS-83: 닫힘 때 돌아갈 곳(코어 내부 기록, 계약 무관)
         except Exception:  # noqa: BLE001 - 이벤트 처리 중 — 받을 사람이 없다
             logger.warning("팝업 탭 주인 지정 실패", exc_info=True)
 
     def _forget_tab(self, tab_id: str) -> Optional[ManagedTab]:
-        """탭 목록에서 뺀다. 활성 탭이었으면 남은 첫 탭으로(close_tab 과 같은 규칙)."""
+        """탭 목록에서 뺀다. 활성 탭이었으면 살아 있는 같은 작업 공간 opener 로(WS-83), 없으면 남은 첫 탭으로
+        (close_tab 과 같은 규칙). 이 탭이 연 팝업들의 opener 는 이 탭의 opener 로 이어 붙인다(사슬 유지)."""
         tab = self._tab_index.pop(tab_id, None)
         if tab is None:
             return None
         managed = self._contexts.get(tab.profile_name)
         if managed:
             managed.tabs.pop(tab_id, None)
+        for child in self._tab_index.values():
+            if child.opener_tab_id == tab_id:
+                child.opener_tab_id = tab.opener_tab_id
         owner = tab.workspace
         if self._active_by_ws.get(owner) == tab_id:
-            # 같은 작업 공간의 남은 첫 탭으로 — 다른 작업 공간의 탭으로 새지 않는다(WS-57).
-            self._active_by_ws[owner] = next(
-                (tid for tid, t in self._tab_index.items() if t.workspace == owner), None)
+            opener = self._tab_index.get(tab.opener_tab_id or "")
+            if opener is not None and opener.workspace == owner and not self.is_excluded(opener.page):
+                self._active_by_ws[owner] = opener.tab_id
+            else:
+                # 같은 작업 공간의 남은 첫 탭으로 — 다른 작업 공간의 탭으로 새지 않는다(WS-57).
+                self._active_by_ws[owner] = next(
+                    (tid for tid, t in self._tab_index.items() if t.workspace == owner), None)
         return tab
+
+    def related_tabs(self, tab_id: Optional[str]) -> List[ManagedTab]:
+        """WS-83(B6): tab_id 와 opener 관계인 같은 작업 공간 탭 — 그 탭이 연 팝업과 그 탭의 opener 만(같은 작업 공간의 다른
+        탭으로 넓히지 않는다). 서버 제어 창(제외 페이지)은 빠진다."""
+        me = self.get_tab(tab_id)
+        if me is None:
+            return []
+        return [t for t in self._tab_index.values()
+                if t is not me and t.workspace == me.workspace and not self.is_excluded(t.page)
+                and (t.opener_tab_id == me.tab_id or t.tab_id == me.opener_tab_id)]
 
     def _on_page_closed(self, tab_id: str) -> None:
         """페이지가 (사이트 JS·사용자·close_tab 등으로) 닫히면 탭 목록에서 뺀다."""

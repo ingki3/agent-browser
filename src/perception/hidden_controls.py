@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -298,7 +299,10 @@ def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: 
         if total and isinstance(obs, dict):
             data[OMITTED_KEY] = total
         return {}
-    next_n = len(obs["elements"]) + 1
+    # WS-82: 오버레이 순서 후처리가 base 밖 구성원(@e45 등)을 실으면 id 가 연속이 아니다 — 가장 큰 @eN 다음부터(연속이면
+    # 지금과 같은 len+1). 다른 요소의 id 와 겹치지 않게.
+    next_n = max([len(obs["elements"])] + [int(e["element_id"][2:]) for e in obs["elements"] if isinstance(e, dict)
+                 and isinstance(e.get("element_id"), str) and re.fullmatch(r"@e\d+", e["element_id"])]) + 1
     kept: List[Dict[str, Any]] = []
     added: List[Tuple[Any, Any]] = []
     exposed: Dict[str, Tuple[Any, List[Any]]] = {}
