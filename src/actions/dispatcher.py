@@ -2726,6 +2726,10 @@ class ActionDispatcher:
             return {"unresolved": "격리 판독 대상 없음"}
         locator = self._locator_for(handle)
         try:
+            # 지금 DOM 에 없으면(관찰 뒤 바뀜 — 디스패처가 치유·거부) 판독하지 않는다: 상자를 기다리면(최대 2초) 페이지
+            # 판독과 병렬인 게이트가 그동안 멈춰, 대기 중 바뀐 **새 문서**로 치유·입력이 넘어간다(test_ws64_r3_server heal).
+            if await locator.count() == 0:
+                return {"missing": True}
             if getattr(handle, "is_shadow", False) and handle.name:
                 need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
             else:
@@ -5521,24 +5525,19 @@ class ActionDispatcher:
         # WS-78 R1 R3: 평가 한 번으로 민감·sticky·식별 열쇠를 함께 본다 — 일반 칸은 핸들을 잡지 않는다(핸들·노드 평가·
         # 해제 왕복 없음). 민감(또는 sticky 그 노드)일 때만 키 뒤 **그 노드**를 읽을 핸들을 잡는다.
         sticky = getattr(self, "_sticky_key_node", None)
-        # WS-85 (#218): 같은 포커스 노드의 민감 판정을 격리 world 에서도(병렬) — 페이지가 type getter 를 바꿔도 원본(OR).
-        iso_task = asyncio.ensure_future(self._isolated_focus_field())
         try:
             info = await top.evaluate(_KEY_FOCUS_JS, sticky)
         except Exception:  # noqa: BLE001 — 다른 문서의 sticky 핸들 등: 그 기준을 놓고 한 번 더(sticky 없이)
             if sticky is None:
-                iso_task.cancel()
                 raise
             self._sticky_key_node = None
             self._dispose_later(sticky)
             info = await top.evaluate(_KEY_FOCUS_JS, None)
-        iso = await iso_task
         if not isinstance(info, dict):
             return None, False, ""
         if not (info.get("s") or info.get("same")):
-            if not (isinstance(iso, dict) and iso.get("s") is True):
-                return _PlainKey(str(info.get("k") or "")), False, ""
-            info = dict(info, s=True, v=str(iso.get("v") or ""))  # 격리 world 가 비밀번호 칸으로 봄 — 민감 경로로
+            # WS-85 (#218): 격리 world 판독은 키 **뒤**(_key_plain_after, 리뷰 B4 '입력 직후') — 키 전 왕복을 늘리지 않는다.
+            return _PlainKey(str(info.get("k") or "")), False, ""
         node = await top.evaluate_handle(_FOCUS_NODE_JS)
         if node.as_element() is None:
             self._dispose_later(node)
@@ -5650,8 +5649,11 @@ class ActionDispatcher:
         # 키 뒤 곧바로 그 노드 값 읽기를 시작하고 이동 대기와 겹쳐 돌린다 — Enter 제출 직후의 평가는 새 문서가 올
         # 때까지 멈출 수 있어(실측) 기다리지 않고, 대기가 끝난 뒤 짧은 상한 안에서만 결과를 받는다.
         pending = None
+        iso_pending = None
         if isinstance(node, _PlainKey):
             pending = asyncio.ensure_future(self._key_plain_read(top, node.k))
+            # WS-85 (#218, 리뷰 B4): 키 직후 격리 world 의 activeElement 도 읽는다(OR) — 페이지가 type getter 를 바꿔도 원본.
+            iso_pending = asyncio.ensure_future(self._isolated_focus_field())
         elif node is not None:
             pending = asyncio.ensure_future(self._key_field_read(node))
         # WS-25: Enter 폼 제출은 키 입력이 즉시 끝나도 결과 문서는 늦게 온다
@@ -5660,7 +5662,7 @@ class ActionDispatcher:
             self._nav_info = await watch.settle()
         if isinstance(node, _PlainKey):
             # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
-            task = asyncio.ensure_future(self._key_plain_after(top, pending))
+            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending))
             defer = KEY_AFTER_DEFER.get()
             if defer is not None:
                 defer.append(task)
@@ -5681,14 +5683,25 @@ class ActionDispatcher:
             return None
         return info if isinstance(info, dict) else None
 
-    async def _key_plain_after(self, top: Any, pending: Any) -> None:
-        """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다."""
+    async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None) -> None:
+        """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다.
+
+        WS-85 (#218): iso_pending = 키 직후 격리 world 판독({s, v}) — 페이지 판독이 일반이어도 격리 world 가 비밀번호 칸으로
+        보면 민감(OR, 값은 격리 world 의 원본 value). 못 읽으면 페이지 판독 그대로(민감 처리로 넘기지 않는다)."""
         try:
             info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
         except Exception:  # noqa: BLE001
             info = None
+        iso = None
+        if iso_pending is not None:
+            try:
+                iso = await asyncio.wait_for(iso_pending, _KEY_FIELD_TIMEOUT_S)
+            except Exception:  # noqa: BLE001 — 격리 판독 실패 = 지금 판정 그대로
+                iso = None
         if not (isinstance(info, dict) and info.get("s")):
-            return
+            if not (isinstance(iso, dict) and iso.get("s") is True):
+                return
+            info = {"s": True, "v": str(iso.get("v") or "")}
         self.last_key_sensitive = True
         value = str(info.get("v") or "")
         if value:

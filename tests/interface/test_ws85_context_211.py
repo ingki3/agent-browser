@@ -166,8 +166,14 @@ async def _press(server: BrowserMCPServer, base: str, case: Dict[str, Any], path
         await page.focus("#t")
         r = await server.call_tool("browser_press_key", {"key": "Enter" if path == "enter" else "Space"})
     elif path == "batch":
+        # 에이전트가 보는 role·이름(관찰 결과)으로 지목한다 — 페이지 world 위조(spoof-role-tablist)는 관찰 role 도 'tab' 으로
+        # 바꾸므로, 표본의 원래 role 로 지목하면 대상 없음(target_not_found)으로 멈춰 게이트를 재지 못한다.
+        obs = await server.call_tool("browser_observe_page", {})
+        seen = next(e for e in obs.data["observation"]["elements"]
+                    if (server._engine.get_handle(e["element_id"]).css_path or "").endswith("#t"))  # noqa: SLF001
+        assert seen["name"] == case["name"], (case["id"], seen)
         r = await server.call_server_tool("browser_batch", {"steps": [
-            {"action": "click", "target": {"role": case["role"], "name": case["name"]}}]})
+            {"action": "click", "target": {"role": seen["role"], "name": seen["name"]}}]})
     else:
         obs = await server.call_tool("browser_observe_page", {})
         eid = next(e["element_id"] for e in obs.data["observation"]["elements"]
