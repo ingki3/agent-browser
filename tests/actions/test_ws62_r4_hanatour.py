@@ -5,7 +5,7 @@
 (2) 같은 '다음달' id 2회째가 E_TOCTOU_MISMATCH, (3) 달 이동 뒤 '항공권 검색' 도 거부,
 (4) 무 CSS 에선 레이아웃 묶음 지문(1000자)이 메뉴 글자로 차 월 표제가 지문 밖 — 옛 '19' 가 통과.
 R12(사용자 결정 B): 고정·실행 직전 확인은 v1.16.0 원문으로 되돌렸다 — 이 파일은 묶음 표시(data.repeated) 시험과 v1.16.0 한계
-(엄격 xfail)만 남긴다. 같은 다음달 id 연속·치유 승계 css 조건 시험은 지웠다(진행성은 test_ws62_r12 의 '거부 → observe → 새 id').
+시험만 남긴다(WS-82 #157: 표제만 바뀐 달은 '패널 표제 첫 조각' 더하기 확인으로 이제 통과 단정). 같은 다음달 id 연속·치유 승계 css 조건 시험은 지웠다(진행성은 test_ws62_r12 의 '거부 → observe → 새 id').
 모든 시험은 로컬 Chromium set_content(공개 사이트 접속 없음).
 """
 
@@ -103,13 +103,12 @@ async def test_full_observe_has_two_month_groups():
 # ------------------------------------------------------------------ 안전: 표제만 바뀐 달의 옛 '19' 는 거부
 
 
-#: R12(사용자 결정 B — 고정은 v1.16.0 원문): 표제만 바뀌고 날짜 배치·바깥 글자가 같은 달은 v1.16.0 이 구분하지 못한다(옛 날짜 id 가
-#: 다른 달을 누름 — v1.16.0 한계 '바깥 정적 글자가 없고 항목 순서열도 같은 두 묶음'). 기준 동일성 불변식이 이 동작을 고정한다.
-V1160_LIMIT = pytest.mark.xfail(strict=True, reason="v1.16.0 동일 한계(R12 결정 B) — 표제만 바뀐 같은 배치의 달")
+#: R12(사용자 결정 B — 고정은 v1.16.0 원문): 표제만 바뀌고 날짜 배치·바깥 글자가 같은 달은 v1.16.0 이 구분하지 못했다(옛 날짜 id 가
+#: 다른 달을 누름 — 엄격 xfail V1160_LIMIT 4건). WS-82(#157, 사용자 결정 D2=A): 기준 확인은 그대로 두고 실행 직전 '관찰 때 패널 표제
+#: 첫 조각이 바뀌면 거부'를 더했다(dispatcher._panel_heading_changed) — 이제 통과 단정이다.
 
 
 @requires_chromium
-@V1160_LIMIT
 @pytest.mark.parametrize("css,longnote", [(True, False), (False, False), (True, True)], ids=["css", "nocss", "longnote"])
 async def test_heading_only_change_refuses_old_day(css, longnote):
     """무 CSS(RED v1.16.0 — 지문 1000자가 메뉴 글자로 차 옛 '19' 통과)·LONGNOTE(달 패널 1000자+ 안내문)에서도 거부."""
@@ -142,7 +141,6 @@ async def test_heading_only_change_refuses_old_day(css, longnote):
 
 
 @requires_chromium
-@V1160_LIMIT
 async def test_lone_last_week_day_is_pinned_and_refused_after_move():
     """2027년 10월은 6주 — 마지막 주가 '31' 하나뿐(li 하나 = 반복 항목 아님)이고 11월(30일·5주)에는 31 이 없다(자기 낱말
     충돌 없음). 같은 행 틀(ul.day > li)이므로 고정되고, 표제가 바뀌면 옛 id 는 거부된다(B2)."""
