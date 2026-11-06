@@ -57,6 +57,17 @@ add("spoof-proto-block", "차단", script=SPOOF_HAS)
 SPOOF_CLOSEST = ("const oc=Element.prototype.closest;Element.prototype.closest=function(s){"
                  "if(String(s).indexOf('tablist')>=0)return document.body;return oc.call(this,s)};")
 add("spoof-closest-block", "차단", script=SPOOF_CLOSEST)
+# 페이지 world 판독을 통째로 속이는 위조(사보타주 '예외를 페이지 판독으로' 가 잡히게): role·closest·querySelectorAll 을 바꿔
+# 대상을 '보이는 탭 2개 목록' 의 탭으로 보이게 한다 — 격리 world 에는 role 이 없다.
+SPOOF_ROLE = ("const T=document.getElementById('t');const P=T.parentElement;const S=document.createElement('button');"
+              "S.type='button';S.textContent='전체';P.insertBefore(S,T);const ga=Element.prototype.getAttribute;"
+              "Element.prototype.getAttribute=function(n){if(n==='role'){if(this===T||this===S)return 'tab';"
+              "if(this===P)return 'tablist';}return ga.call(this,n)};const cl=Element.prototype.closest;"
+              "Element.prototype.closest=function(q){q=String(q);if(q.indexOf('tablist')>=0&&(this===P||P.contains(this)))"
+              "return P;if(q.indexOf('\"tab\"')>=0&&this===T)return T;return cl.call(this,q)};"
+              "const qa=Element.prototype.querySelectorAll;Element.prototype.querySelectorAll=function(q){"
+              "if(this===P&&String(q).indexOf('tab')>=0)return [S,T];return qa.call(this,q)};")
+add("spoof-role-tablist", "차단", script=SPOOF_ROLE)
 # --- 추가 3변형
 add("attack-tablist-wrap", "차단", attrs="role=tab ", wrap="<div role=tablist>@@</div>")
 add("attack-offscreen-input", "비우기", before='<input style="position:absolute;left:-9999px" value="x">')
@@ -200,6 +211,6 @@ async def test_211_context_exceptions_only_from_isolated_visible_layout(site, pa
 
 def test_211_sample_census():
     kinds = [c["kind"] for c in CASES]
-    # 원 9 + 추가 3 + markup 0 위조 2 = 14(그중 1 한계) + NB2 2, 대조 8 + 실사용 LOW 8, 의도 변화 2, 위험 2 + 4.
-    assert kinds.count("attack") == 15 and kinds.count("limit") == 1
+    # 원 9 + 추가 3 + markup 0 위조 2 = 14(그중 1 한계) + 페이지 판독 통째 위조 1 + NB2 2, 대조 8 + 실사용 LOW 8, 의도 변화 2, 위험 2 + 4.
+    assert kinds.count("attack") == 16 and kinds.count("limit") == 1
     assert kinds.count("control") == 16 and kinds.count("changed") == 2 and kinds.count("risky") == 6
