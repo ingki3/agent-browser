@@ -1259,6 +1259,8 @@ class _NodeDetached(Exception):
 _OVERLAY_SIGNAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.PRESS_KEY})
 #: 그 판독의 상한(초) — 넘으면 신호 없음(액션 결과는 그대로).
 _OVERLAY_SIGNAL_TIMEOUT_S = 0.25
+#: WS-87(#222, 리뷰 B1): 실행 직전 '열린 모달 밖 대상' 신호(data.outside_modal)를 보는 요소 액션 — 신호만, 누름은 그대로.
+_OUTSIDE_MODAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.HOVER, ActionType.CHECK_BOX, ActionType.SELECT_OPTION})
 
 
 class _TargetRefused(Exception):
@@ -1446,6 +1448,8 @@ class ActionDispatcher:
         self.last_relation_only: Optional[str] = None
         #: WS-83(B4): 이번 dispatch 에서 요소 입력을 실제로 보냈는가(보낸 뒤 대상 탭이 닫히면 그 닫힘이 효과다).
         self._input_sent = False
+        #: WS-87: 이번 dispatch 에서 입력 직전 판정한 '열린 모달 밖 대상'(data.outside_modal) — 없으면 None.
+        self._outside_modal_info: Optional[Dict[str, List[str]]] = None
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
         self._dialogs: List[Dict[str, Any]] = []
         #: handle_dialog 가 예약한 다음 다이얼로그 처리(1회용). None 이면 기본값(거절).
@@ -2614,6 +2618,7 @@ class ActionDispatcher:
         self.last_related_nav = {}
         self.last_relation_only = None
         self._input_sent = False
+        self._outside_modal_info = None
         self._dialogs = []
         self._install_dialog_listener()
         top_at_start = self._top_page()
@@ -2666,6 +2671,13 @@ class ActionDispatcher:
         if self._dialogs:
             # WS-30 4(c): 이 액션 중 뜬 다이얼로그(종류·문구·처리 결과)를 알린다.
             result.data.setdefault("dialogs", list(self._dialogs))
+        outside, self._outside_modal_info = self._outside_modal_info, None
+        if outside is not None and self._input_sent:
+            # WS-87(#222, 리뷰 B1): 입력을 보낸 대상이 열린 모달 밖이었다 — 거부 없이 종류 어휘 + 고정 hint 만(기존 hint 우선).
+            from perception.overlay import OUTSIDE_MODAL_HINT
+
+            result.data.setdefault("outside_modal", outside)
+            result.data.setdefault("hint", OUTSIDE_MODAL_HINT)
         if (action in _OVERLAY_SIGNAL_ACTIONS and result.success
                 and not any(k in result.data for k in ("nav_wait_ms", "nav_committed", "nav_timed_out", "nav_aborted"))):
             # WS-82(#158): 같은 감지기(격리 world)로 이 액션 뒤 페이지 안 모달·레이어가 새로 열렸는지 — JS 대화상자
@@ -3355,6 +3367,8 @@ class ActionDispatcher:
             if self.ctx.nav_settle and _may_navigate(action, params)
             else None
         )
+        if action in _OUTSIDE_MODAL_ACTIONS:
+            self._outside_modal_info = await self._outside_modal(handle)
         try:
             await self._execute_element_action(action, handle, params)
         except _ManualSiteRefused as exc:
@@ -4350,6 +4364,27 @@ class ActionDispatcher:
             det["nonce"] = nonce
         return det
 
+    async def _outside_modal(self, handle: Any) -> Optional[Dict[str, List[str]]]:
+        """WS-87(#222, 리뷰 B1): 실행 직전 — 열린 모달(top layer·보이는 aria-modal) 밖 대상이면 {"kinds": [...]}, 아니면 None.
+
+        같은 감지(격리 world, WS-82)와 판정 노드 = 실행 노드(핸들 css_path) 결속. shadow 핸들(경로 없음)·판독 실패·상한 초과는
+        None(신호 생략, fail-open). 관찰 문서(최상위 또는 switch_frame 한 프레임)만 본다 — 프레임 안에서 최상위 모달은 범위 밖(NB5).
+        """
+        import secrets
+
+        from perception import overlay as ov
+
+        path = getattr(handle, "css_path", "") or ""
+        if not path or getattr(handle, "is_shadow", False):
+            return None
+        try:
+            raw = await asyncio.wait_for(self._doc_isolated_eval(ov.outside_modal_expr(secrets.token_hex(8), path)),
+                                         _OVERLAY_SIGNAL_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — 부가 신호: 생략(액션은 그대로)
+            logger.debug("모달 밖 대상 판독 실패: %s", type(exc).__name__)
+            return None
+        return ov.parse_outside_modal(raw)
+
     async def _overlay_order(self, page: Any, observed: Any, overlay: Dict[str, Any], top_n: int,
                              full: bool) -> Tuple[Any, Optional[Dict[str, Any]]]:
         """감지가 켜진 관찰(엔진은 full 로 불렸다)의 순서 후처리(리뷰 B3). 반환: (관찰, data.overlay 또는 None).
@@ -5024,13 +5059,13 @@ class ActionDispatcher:
         if code is ErrorCode.NAVIGATE_TIMEOUT:
             from actions.nav_failure import attach_nav_failure
 
-            attach_nav_failure(data, str(exc))
+            attach_nav_failure(data, str(exc))  # 분류는 원문(바이트 불변) — 응답 문구만 첫 줄
         return self._result(
             success=False,
             action=action,
             retry_safe=True,
             error_code=code,
-            error_message=str(exc),
+            error_message=public_error_text(exc),  # WS-87(U1): 호출 기록(이동 대상 중복·여러 줄) 제외
             data=data or None,
         )
 
@@ -5488,7 +5523,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.ELEMENT_NOT_INTERACTABLE,
-                error_message=f"좌표 클릭 발송 실패: {exc}",
+                error_message=f"좌표 클릭 발송 실패: {public_error_text(exc)}",  # WS-87(B5)
             )
         if stray is not None:
             if watch is not None:
@@ -5705,7 +5740,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=False,
                 error_code=ErrorCode.PAGE_CRASHED,
-                error_message=f"탭 제어 실패: {exc}",
+                error_message=f"탭 제어 실패: {public_error_text(exc)}",  # WS-87(B4): 분류(fail_data)는 원문
                 data=fail_data,
             )
 
@@ -5847,7 +5882,7 @@ class ActionDispatcher:
                 action=action,
                 retry_safe=True,
                 error_code=ErrorCode.SCREENSHOT_FAILED,
-                error_message=f"SoM 캡처 실패: {exc}",
+                error_message=f"SoM 캡처 실패: {type(exc).__name__}",  # WS-87(B3): 첫 줄도 페이지가 던진 문구 — 스크린샷과 같게
             )
 
         return self._result(
