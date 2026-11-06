@@ -56,6 +56,7 @@ REVIEWED = {
     ("status", "interface/handoff.py", "self.login.status"): "LoginJob.status — opening·ready",
     ("status", "interface/handoff.py", "status"): "handoff._set_status 인자 — _APPROVAL_STATUS",
     ("status", "interface/youtube_search.py", "status"): "HTTP 상태 정수(문자열 아님)",
+    ("status", "actions/dispatcher.py", "code"): "WS-83 R2 RelatedNav.status — HTTP 상태 정수(문자열 아님, 내부 상태)",
     ("state", "browser/headless_retry.py", "self.states.get(origin)"): "Literal['succeeded','failed']",
     ("state", "browser/login_flow.py", "state"): "LoginState",
     ("state", "browser/site_session.py", "state"): "LoginState",

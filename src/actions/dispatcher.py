@@ -138,9 +138,42 @@ def _is_target_closed(exc: BaseException) -> bool:
     return type(exc).__name__ == "TargetClosedError" or _TARGET_CLOSED in str(exc)
 
 
+class RelatedNav:
+    """WS-83 R2(R1-B1): 관계 탭 마지막 주 프레임 문서 요청의 결과 — 내부 상태(MCP 응답 출구 아님). 서버가 오류 문서 판정에 읽는다."""
+
+    __slots__ = ("req", "url", "status", "failure", "done")
+
+    def __init__(self, req: Any, url: str) -> None:
+        self.req = req
+        self.url = url
+        self.status: Optional[int] = None
+        self.failure: Optional[str] = None
+        self.done = False
+
+
 def _is_error_document(url: Any) -> bool:
     """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
     return str(url or "").startswith("chrome-error://")
+
+
+def _page_closed(page: Any) -> bool:
+    """Page 가 확실히 닫혔는가(WS-83). 가짜 페이지·읽기 실패는 닫히지 않은 것으로 본다(is_closed() 가 정확히 True 일 때만)."""
+    is_closed = getattr(page, "is_closed", None)
+    if not callable(is_closed):
+        return False
+    try:
+        return is_closed() is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: WS-83(B4): 대상 탭이 닫혀 opener(없으면 남은 첫 탭)로 돌아왔다는 고정 안내(주소·제목 없음).
+TAB_CLOSED_HINT = ("이 탭이 닫혀 opener(없으면 남은 첫 탭)로 돌아왔습니다 — 다시 관찰하세요. "
+                   "browser_tab_control(command=\"list\") 로 탭을 확인할 수 있습니다.")
+#: 대상 탭이 닫힌 것을 입력의 효과로 인정하는 액션(기대 상태값이 없는 요소 클릭).
+_CLOSE_EFFECT_ACTIONS = frozenset({ActionType.CLICK})
+#: WS-83(B6): opener 관계 탭의 이동을 효과로 실은 신호 접두.
+TAB_NAVIGATED_SIGNAL = "tab_navigated"
 
 
 #: WS-69 B4: extract·shadow_root_selector 의 표준 CSS(document.querySelector[All]) 문법 오류 안내.
@@ -1394,6 +1427,19 @@ class ActionDispatcher:
         self._sticky_key_node: Any = None
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
+        #: WS-83(B2·B3): 직전 dispatch 가 연 팝업 Page 들 — 서버가 egress 차단 귀속 후보(이 호출이 연 팝업)로 읽는다.
+        self.last_opened_pages: List[Any] = []
+        #: WS-83(B6): 이번 액션 중 opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)에서 일어난 문서 이동의 탭 id.
+        self._related_navs: List[str] = []
+        self._related_watch: List[Tuple[Any, str, Any]] = []
+        #: WS-83 R2(R1-B1): 관계 탭별 마지막 주 프레임 문서 요청의 결과(진행 중이면 done=False) — 액션 동안만.
+        self._related_nav_state: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 의 관계 탭 문서 이동 결과 {tab_id: RelatedNav} — 서버가 오류 문서 판정에 읽는다.
+        self.last_related_nav: Dict[str, RelatedNav] = {}
+        #: WS-83 R2: 직전 dispatch 성공이 관계 탭 이동 신호만으로 났으면 그 신호를 빼기 전 사후조건 detail(아니면 None).
+        self.last_relation_only: Optional[str] = None
+        #: WS-83(B4): 이번 dispatch 에서 요소 입력을 실제로 보냈는가(보낸 뒤 대상 탭이 닫히면 그 닫힘이 효과다).
+        self._input_sent = False
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
         self._dialogs: List[Dict[str, Any]] = []
         #: handle_dialog 가 예약한 다음 다이얼로그 처리(1회용). None 이면 기본값(거절).
@@ -1496,25 +1542,212 @@ class ActionDispatcher:
         덮어쓰지 않는다.
         """
         pages, self._opened_pages = self._opened_pages, []
+        self.last_opened_pages = list(pages)
         core = self.ctx.core
         finder = getattr(core, "tab_for_page", None)
         if not callable(finder):
             return
         ids = []
+        opened = []
         for page in pages:
             tab = finder(page)
             if tab is not None and tab.tab_id not in ids:
                 ids.append(tab.tab_id)
+                # WS-83(D1·B5): 신호만 — 활성 탭은 바꾸지 않는다(전환은 tab_control). 주소는 응답 봉투의 주소 칸 가림 규칙.
+                opened.append({"tab_id": tab.tab_id, "opener_tab_id": getattr(tab, "opener_tab_id", None) or self.ctx.tab_id,
+                               "url": str(getattr(page, "url", "") or "")})
         if ids:
             result.data.setdefault("opened_tab_ids", ids)
+            result.data.setdefault("popup_opened", opened)
 
     def _off_popup(self, listener: Any) -> None:
         # 붙인 곳(최상위 Page)에서 뗀다 — 프레임 안에서는 ctx.page 가 Frame 이라 떼지 못하고
         # 리스너가 액션마다 쌓였다(WS-30 R1 NB-8).
+        self._unwatch_related()
         try:
             self._top_page().remove_listener("popup", listener)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+
+    # -- 탭 관계 (WS-83) ------------------------------------------------------
+
+    def _watch_related(self) -> None:
+        """B6: 이 탭과 opener 관계인 탭(이 탭이 연 팝업·이 탭의 opener)의 주 프레임 문서 이동을 액션 동안 듣는다.
+
+        같은 작업 공간의 다른 탭(자발 이동)은 듣지 않는다 — 진짜 Silent Failure 를 거짓 성공으로 바꾸지 않게.
+        코어 관계 기록(core.related_tabs)만 쓴다(왕복 없음). 서버 제어 창은 코어가 뺀다.
+        """
+        self._unwatch_related()
+        related = getattr(getattr(self.ctx, "core", None), "related_tabs", None)
+        if not callable(related):
+            return
+        try:
+            tabs = list(related(self.ctx.tab_id))
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return
+        for tab in tabs:
+            page = tab.page
+            frame = getattr(page, "main_frame", None)
+            tab_id = tab.tab_id
+
+            def _nav(fr: Any, _f: Any = frame, _id: str = tab_id) -> None:
+                if fr is _f and _id not in self._related_navs:
+                    self._related_navs.append(_id)
+
+            def _req(req: Any, _f: Any = frame, _id: str = tab_id) -> None:
+                try:
+                    if req.is_navigation_request() and req.frame is _f:
+                        if _id not in self._related_navs:
+                            self._related_navs.append(_id)
+                        # R2: 마지막 문서 요청(리다이렉트 홉이면 새 요청이 앞 것을 대신한다)의 결과를 따라간다.
+                        self._related_nav_state[_id] = RelatedNav(req, req.url)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def _resp(resp: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and getattr(resp, "request", None) is state.req:
+                    code = resp.status
+                    state.status = code if isinstance(code, int) else None
+                    state.done = not (isinstance(code, int) and 300 <= code < 400)  # 3xx 는 다음 홉이 온다
+
+            def _failed(req: Any, _id: str = tab_id) -> None:
+                state = self._related_nav_state.get(_id)
+                if state is not None and req is state.req:
+                    state.failure = str(req.failure or "")
+                    state.done = True
+
+            for event, handler in (("framenavigated", _nav), ("request", _req), ("response", _resp),
+                                   ("requestfailed", _failed)):
+                try:
+                    page.on(event, handler)
+                    self._related_watch.append((page, event, handler))
+                except Exception:  # noqa: BLE001 — 가짜·닫힌 페이지
+                    pass
+
+    def _unwatch_related(self) -> None:
+        watch = self.__dict__.get("_related_watch") or []
+        self.__dict__["_related_watch"] = []
+        for page, event, handler in watch:
+            try:
+                page.remove_listener(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _settle_related(self) -> None:
+        """WS-83 R2(R1-B1): 관계 탭의 마지막 문서 요청이 아직 끝나지 않았거나(응답·실패 전) 실패했는데 오류 문서가 아직
+        커밋되지 않았으면 그것만 짧게 기다린다(상한 300ms) — 서버가 그 탭 최종 문서가 오류인지 판정한다. 관계 탭 이동이
+        없으면 기다리지 않는다. 끝나면 결과(url·status·failure)를 last_related_nav 에 남긴다."""
+        states = self.__dict__.get("_related_nav_state") or {}
+        if not states:
+            return
+        core = getattr(self.ctx, "core", None)
+
+        def _pending() -> bool:
+            for tid, st in states.items():
+                if not st.done:
+                    return True
+                failure = st.failure or ""
+                if failure and "ERR_ABORTED" not in failure:
+                    try:
+                        tab = core.get_tab(tid) if core is not None else None
+                    except Exception:  # noqa: BLE001 — 가짜 코어
+                        tab = None
+                    page = getattr(tab, "page", None)
+                    if page is not None and not _page_closed(page) and not _is_error_document(page.url):
+                        return True
+            return False
+
+        for _ in range(12):
+            if not _pending():
+                break
+            await asyncio.sleep(0.025)
+        self.last_related_nav = dict(states)
+
+    def _related_signals(self) -> List[str]:
+        return [f"{TAB_NAVIGATED_SIGNAL}: {tid}" for tid in self.__dict__.get("_related_navs") or []]
+
+    def _is_popup_tab(self) -> bool:
+        """이 호출의 탭이 코어가 opener 를 기록한 팝업인가(B4 — 스크립트가 스스로 닫을 수 있는 창)."""
+        core = getattr(self.ctx, "core", None)
+        try:
+            tab = core.get_tab(self.ctx.tab_id) if core is not None else None
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return False
+        return isinstance(getattr(tab, "opener_tab_id", None), str)
+
+    def _return_tab(self) -> Any:
+        """B4: 이 호출의 탭이 닫힌 뒤 돌아갈 같은 작업 공간의 살아 있는 탭(코어 활성 — opener 우선). 없으면 None."""
+        core = getattr(self.ctx, "core", None)
+        try:
+            tab = core.get_tab(core.active_tab_id) if core is not None else None
+        except Exception:  # noqa: BLE001 — 가짜 코어
+            return None
+        if tab is None or tab.tab_id == self.ctx.tab_id or _page_closed(tab.page):
+            return None
+        return tab
+
+    @staticmethod
+    async def _closed_soon(page: Any) -> bool:
+        """page 가 곧(상한 1초) 닫힘 사건까지 왔는가 — TargetClosedError 가 'close' 사건보다 먼저 올 수 있다(이 경로만)."""
+        for _ in range(40):
+            if _page_closed(page):
+                return True
+            await asyncio.sleep(0.025)
+        return _page_closed(page)
+
+    @staticmethod
+    async def _closing(page: Any) -> bool:
+        """page 문서가 닫히는 중인가(window.closed — window.close() 를 부르면 탭이 실제로 닫히기 전에 참). 이미 닫혔으면 참."""
+        try:
+            return (await asyncio.wait_for(page.evaluate("window.closed"), 1.0)) is True
+        except Exception as exc:  # noqa: BLE001 — 시간 초과·가짜 페이지는 닫히는 중이 아님
+            return _is_target_closed(exc)
+
+    async def _after_tab_closed(self, action: ActionType, params: Dict[str, Any], result: ActionResult,
+                                top: Any, closed_by_exc: bool) -> ActionResult:
+        """B4: 이번 액션 중 이 호출의 탭(top)이 닫혔으면 코어가 정한 같은 작업 공간 활성 탭(살아 있는 opener, 없으면 남은
+        첫 탭)으로 옮기고 data.tab_closed={closed_tab_id, active_tab_id} 를 싣는다. 입력을 보낸 뒤 닫힌 클릭은 그 닫힘이
+        효과라 성공이다(retry_safe=True 인 거짓 PAGE_CRASHED 없음). 돌아갈 탭이 없으면(브라우저째 닫힘) 기존 결과 그대로."""
+        core = getattr(self.ctx, "core", None)
+        if core is None:
+            return result
+        if not _page_closed(top) and closed_by_exc:
+            # TargetClosedError 가 페이지 'close' 사건보다 먼저 올 수 있다 — 닫힘 사건만 짧게 기다린다(이 경로만).
+            for _ in range(40):  # 상한 1초(이 경로만)
+                await asyncio.sleep(0.025)
+                if _page_closed(top):
+                    break
+        if not _page_closed(top):
+            return result
+        closed_id = self.ctx.tab_id
+        tab = self._return_tab()
+        if tab is None:
+            return result
+        self._set_active_page(tab.page, tab.tab_id)
+        try:
+            self.ctx.cdp = await core.new_cdp_session(tab.tab_id)
+        except Exception:  # noqa: BLE001 — 관찰이 새 세션을 다시 만든다
+            logger.debug("닫힌 탭 복귀 뒤 CDP 세션 실패", exc_info=True)
+        self.ctx.engine.bump_epoch("tab_closed")
+        data = dict(result.data or {})
+        data["tab_closed"] = {"closed_tab_id": closed_id, "active_tab_id": tab.tab_id}
+        hint = str(data.get("hint") or "")
+        data["hint"] = (hint + " " + TAB_CLOSED_HINT).strip() if TAB_CLOSED_HINT not in hint else hint
+        effect = (result.success or (action in _CLOSE_EFFECT_ACTIONS and self._input_sent
+                                     and not _has_expected_state(action, params)))
+        if effect:
+            signals = list(data.get("signals") or [])
+            if "tab_closed" not in signals:
+                signals.append("tab_closed")
+            data["signals"] = signals
+            return self._result(success=True, action=action,
+                                retry_safe=is_retry_safe(action, FailurePhase.POST_DISPATCH),
+                                healed=result.healed, reobserve_required=True, data=data)
+        retry_safe = result.retry_safe and not self._input_sent
+        return self._result(success=False, action=action, retry_safe=retry_safe,
+                            error_code=result.error_code, error_message=result.error_message,
+                            healed=result.healed, reobserve_required=True, data=data)
 
     # -- 프레임·다이얼로그 (WS-30) --------------------------------------------
 
@@ -2366,12 +2599,22 @@ class ActionDispatcher:
             return result
         self._nav_info = {}
         self._opened_pages = []
+        self.last_opened_pages = []
+        self._related_navs = []
+        self._related_nav_state = {}
+        self.last_related_nav = {}
+        self.last_relation_only = None
+        self._input_sent = False
         self._dialogs = []
         self._install_dialog_listener()
+        top_at_start = self._top_page()
+        open_at_start = not _page_closed(top_at_start)
+        closed_by_exc = False
         try:
             result = await self._dispatch_inner(action, params)
         except Exception as exc:  # noqa: BLE001 - 어떤 실패도 계약 형태로 반환
             logger.exception("액션 실행 중 예외: %s", action.value)
+            closed_by_exc = _is_target_closed(exc)
             result = self._result(
                 success=False,
                 action=action,
@@ -2379,6 +2622,14 @@ class ActionDispatcher:
                 error_code=ErrorCode.PAGE_CRASHED,
                 error_message=f"{type(exc).__name__}: {public_error_text(exc)}",  # WS-79 B8: 호출 기록 제외
             )
+        if open_at_start and self._top_page() is top_at_start and action is not ActionType.TAB_CONTROL:
+            if (not result.success and not closed_by_exc and action in _CLOSE_EFFECT_ACTIONS and self._input_sent
+                    and not _page_closed(top_at_start) and self._is_popup_tab()):
+                # 효과 없음으로 끝난 팝업 탭 클릭: 그 문서가 스스로 닫히는 중(window.close() 뒤 탭 닫힘은 비동기)인지 한 번
+                # 본다 — 실패한 팝업 클릭에서만(성공 경로·일반 탭 왕복 0).
+                closed_by_exc = await self._closing(top_at_start)
+            # WS-83(B4): 이번 액션 중 이 호출의 탭이 닫혔다(팝업이 스스로 닫음 등) — 닫힌 탭에 남지 않는다.
+            result = await self._after_tab_closed(action, params, result, top_at_start, closed_by_exc)
         if self.ctx.root_page is not None and action not in _TOP_RECORDER_KEEP_ACTIONS:
             # R1 BLOCKING-4: 다음 액션까지의 대기 시간을 최상위 자발 변화 기준선으로 쓴다.
             # 읽기 전용 액션(관찰·추출·스크린샷·대기)은 기준선을 끊지 않는다 — 에이전트는 보통
@@ -2397,6 +2648,12 @@ class ActionDispatcher:
             self._nav_info = {}
         if self._opened_pages:
             self._attach_opened_tabs(result)
+        if self._related_navs:
+            await self._settle_related()
+        self._unwatch_related()
+        if self._related_navs:
+            # WS-83(B6): opener 관계 탭의 문서 이동 — 탭 id 와 고정 어휘만(주소·제목 없음).
+            result.data.setdefault("tabs_changed", [{"tab_id": t, "change": "navigated"} for t in self._related_navs])
         if self._dialogs:
             # WS-30 4(c): 이 액션 중 뜬 다이얼로그(종류·문구·처리 결과)를 알린다.
             result.data.setdefault("dialogs", list(self._dialogs))
@@ -2938,6 +3195,12 @@ class ActionDispatcher:
             extra.append(f"navigated: {self._current_url()}")
         if not _has_expected_state(action, params):
             extra.extend(self._effect_beyond_target(root_before, root_after, top_weak_ok))
+            # WS-83(B6·D3): opener 관계 탭(이 탭이 연 팝업·이 탭의 opener)의 문서 이동 — 같은 작업 공간의 다른 탭은 아님.
+            related = self._related_signals()
+            if related and not extra:
+                # R2: 성공 근거가 관계 탭 이동뿐 — 그 탭이 오류 문서로 끝나면 서버가 이 detail 로 기준 판정을 되살린다.
+                self.last_relation_only = post.detail
+            extra.extend(related)
         elif dialog_signals and extra:
             extra.extend(dialog_signals)
         if not extra:
@@ -3058,6 +3321,8 @@ class ActionDispatcher:
             top_page.on("popup", _on_popup)
         except Exception:  # noqa: BLE001 — 가짜 페이지
             pass
+        # WS-83(B6): opener 관계 탭의 문서 이동(이름 있는 창 재사용·팝업이 opener 를 바꿈)도 액션 전에 듣는다.
+        self._watch_related()
         # WS-25: 문서 요청 감지는 액션 **전에** 붙여야 즉시 시작되는 요청도 잡는다.
         frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
         watch = (
@@ -3109,6 +3374,11 @@ class ActionDispatcher:
             self._off_popup(_on_popup)
             if watch is not None:
                 watch.close()
+            if _is_target_closed(exc) and await self._closed_soon(top_page) and self._return_tab() is not None:
+                # WS-83(B4): 클릭 처리 중에 그 탭이 닫혔다(onclick 의 window.close() 가 입력 응답보다 먼저 탭을 닫음 — 부하 시
+                # 실측). 입력이 처리되는 중 닫힌 것이라 '보내지 않음'이 아니다 — dispatch 가 닫힘 복귀·효과로 정리한다.
+                self._input_sent = True
+                raise
             return self._result(
                 success=False,
                 action=action,
@@ -3117,6 +3387,7 @@ class ActionDispatcher:
                 error_message=f"이벤트 발송 실패: {public_error_text(exc)}",
                 healed=healed_flag,
             )
+        self._input_sent = True
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
@@ -3173,7 +3444,8 @@ class ActionDispatcher:
                 data=_with_click_point({"signals": ["navigation_started"], "element_id": handle.element_id}),
             )
         root_after = await self._capture_root() if root_before is not None else None
-        if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed"):
+        if not popups and action is ActionType.CLICK and not self._nav_info.get("nav_committed") \
+                and not self.__dict__.get("_related_navs"):
             # 효과가 전혀 없을 때만 짧게 더 기다렸다가 **다시 본다**. 실제 사이트는
             # 클릭 → 요청 → 렌더링으로 효과가 늦게 뜨고, 새 탭도 20~50ms 늦게
             # 생긴다. 기다리기만 하고 다시 보지 않으면 늦은 효과를 놓친다.
