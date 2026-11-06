@@ -146,14 +146,22 @@ async def test_218_spoofed_password_type_text_hides_secret(site):
 
 @requires_chromium
 async def test_218_spoofed_password_press_key_is_sensitive(site):
-    PAGES["/p"] = HEAD + "<input id=p type=password aria-label='pw'>" + _script(T_TYPE)
+    """격리 판독은 키 **뒤**(리뷰 B4 '입력 직후') — 키 뒤 칸 전체 값(원본 value)을 가림 대상으로 등록한다."""
+    PAGES["/p"] = HEAD + "<input id=p type=password aria-label='pw' value='SYNTHpk85Q'>" + _script(T_TYPE)
     async with BrowserMCPServer() as server:
         await _call(server, ActionType.NAVIGATE, {"url": site + "/p"})
         await _page(server).focus("#p")
+        await _page(server).evaluate("(()=>{const p=document.getElementById('p');p.setSelectionRange(99,99)})()")
         k = await _call(server, ActionType.PRESS_KEY, {"key": "z"})
         sensitive = server._dispatcher.last_key_sensitive  # noqa: SLF001
+        typed = await _truth(server, "document.getElementById('p').value")
+        from security.secret_registry import mask_registered
+
+        masked = mask_registered("x SYNTHpk85Qz y")
     assert k.success, k.error_message
+    assert typed == "SYNTHpk85Qz"
     assert sensitive is True
+    assert "SYNTHpk85Qz" not in masked, masked
 
 
 @requires_chromium
@@ -406,3 +414,61 @@ async def test_163_meaning_swap_after_pin_is_refused(site, target):
     assert same == {"fresh": True, "detail": ""}, same  # 과잉 0: 바뀌지 않았으면 그대로 통과
     assert page_now.endswith("/account/delete") and truth.endswith("delete-all?confirm=1")
     assert swapped["fresh"] is False and "action" in swapped["detail"], swapped
+
+
+@pytest.fixture
+def other_origin():
+    """같은 기계의 다른 출처(다른 사이트 — Chromium 이 다른 프로세스 iframe=OOPIF 로 띄운다)."""
+    srv = _serve("127.0.0.1")
+    try:
+        yield f"http://localhost:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@requires_chromium
+async def test_163_oopif_element_id_spoof_blocked_and_benign_passes(site, other_origin, monkeypatch):
+    """다른 출처 iframe(OOPIF): 그 프레임 세션의 격리 world 로 읽는다 — 위조는 막고, 평범한 버튼은 새 승인 없이 눌린다.
+
+    기본 headless 는 localhost iframe 을 같은 프로세스로 띄운다(WS-85 리뷰 F8) — `--site-per-process` 로 실제 분리한다."""
+    import browser.core as core
+
+    orig = core.BrowserCore._launch_kwargs
+
+    def launch_kwargs(self):  # noqa: ANN001, ANN202
+        kw = orig(self)
+        kw["args"] = list(kw.get("args") or []) + ["--site-per-process"]
+        return kw
+
+    monkeypatch.setattr(core.BrowserCore, "_launch_kwargs", launch_kwargs)
+    PAGES["/oinner"] = ("<!doctype html><meta charset=utf-8><body style=margin:0><p id=out>대기</p>"
+                        f"<form action='/account/delete' method=post {ON_SUBMIT}><button id=b>계속</button></form>"
+                        f"<button id=v {ON_CLICK}>보기</button>" + _script(T_FORM))
+    PAGES["/otop"] = (HEAD + f"<iframe id=fr name=fr src='{other_origin}/oinner' "
+                      "style='width:400px;height:200px;border:0'></iframe>")
+    async with BrowserMCPServer() as server:
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/otop"})
+        await _page(server).wait_for_timeout(300)
+        sw = await _call(server, ActionType.SWITCH_FRAME, {"frame_selector": "#fr"})
+        assert sw.success, sw.error_message
+        obs = await _call(server, ActionType.OBSERVE_PAGE, {})
+        world = await server._dispatcher._select_frame_world()  # noqa: SLF001
+        # 전제(실제 분리): Chromium 사이트 격리(--site-per-process, 데스크톱 기본)로 그 iframe 이 별도 렌더러 target 이다 —
+        # 디스패처 판단(world[2])과 별개로 브라우저 target 목록으로 단정한다.
+        top = server._dispatcher._top_page()  # noqa: SLF001
+        probe = await top.context.new_cdp_session(top)
+        targets = (await probe.send("Target.getTargets")).get("targetInfos") or []
+        await probe.detach()
+        oopif_targets = [t for t in targets if t.get("type") == "iframe" and "/oinner" in str(t.get("url"))]
+        r = await _call(server, ActionType.CLICK, {"element_id": _eid(obs, _by_name("계속")),
+                                                   "epoch": obs.snapshot_epoch})
+        obs = await _call(server, ActionType.OBSERVE_PAGE, {})
+        ok = await _call(server, ActionType.CLICK, {"element_id": _eid(obs, _by_name("보기")),
+                                                    "epoch": obs.snapshot_epoch})
+        status = await _page(server).evaluate("document.getElementById('out').textContent")
+    assert world is not None and world[2] is True, world
+    assert len(oopif_targets) == 1, targets
+    assert _blocked(r), (r.success, r.error_message)
+    assert ok.success, ok.error_message
+    assert status == "눌림"  # 위조 폼은 제출되지 않았고 평범한 버튼만 눌렸다
