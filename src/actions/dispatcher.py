@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import time
@@ -559,37 +560,72 @@ function gateSignals(el) {
   } catch (e) { /* 판정 못 하면 링크 완화 없음 */ }
   const link = el.closest ? el.closest('a[href]') : null;
   if (link) push('href', link.getAttribute('href'));
-  // WS-76 R1: 판정 보조 사실(META — 키워드 매칭 안 함). role = 명시 role 첫 토큰 또는 암묵 역할(button·link),
-  // tab_context = 탭·탭 목록 안 또는 aria-selected/aria-controls(상태 필터 탭 — 탐색), edit_context = 텍스트
-  // 입력칸 옆(같은 label·이웃 형제 2칸·aria-controls 대상 — 검색어 지우기). 못 읽으면 내보내지 않는다(= 예외 없음).
+  // WS-76 R1: 판정 보조 사실(META — 키워드 매칭 안 함). role = 명시 role 첫 토큰 또는 암묵 역할(button·link).
+  // WS-85 (#211, WS-86 리뷰 B1·NB2·D1): 탐색·편집 문맥 예외는 **보이는 배치**로만 — tab_context = 대상(또는 가장 가까운
+  // role=tab)이 실제 role=tablist 안이고, 그 목록에 보이는 탭이 2개 이상이며, 탭이 목록 상자 안에 있고 탭들이 가로 또는
+  // 세로 한 줄로 놓임. edit_context = 같은 label·이웃 형제 2칸·aria-controls 대상 중 보이고(checkVisibility·opacity·문서 밖
+  // 아님) 비활성이 아니며, 화면 안이면 중심 hit-test 가 그 칸(또는 자손)인 텍스트 입력칸(가림·clip-path 제외). 리뷰 후보의
+  // '24px 인접' 조건은 넣지 않았다 — 막는 우회가 없고(14 변형 모두 보임·hit-test·탭 규칙으로 막힘) 상태 문구를 사이에 둔
+  // 정상 지우기 버튼(test_ws76_r1_paths batch)을 막는다. 게이트는 이 사실을 **격리 world 판독에서만** 쓴다(server_hitl).
+  // 못 읽으면 내보내지 않는다(= 예외 없음).
   try {
     const explicitRole = ((el.getAttribute('role') || '').trim().toLowerCase().split(/\\s+/)[0]) || '';
     let implicitRole = '';
     if (tag === 'BUTTON' || (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].indexOf(type) !== -1)) implicitRole = 'button';
     else if (tag === 'A' && el.hasAttribute('href')) implicitRole = 'link';
     push('role', explicitRole || implicitRole);
-    if ((explicitRole === 'tab') || el.hasAttribute('aria-selected') || el.hasAttribute('aria-controls')
-        || (el.closest && el.closest('[role="tab"], [role="tablist"]'))) {
-      push('tab_context', '1');
+    const cview = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const vis = (n) => {
+      if (!n || n.nodeType !== 1) return false;
+      try {
+        if (n.checkVisibility && !n.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) return false;
+      } catch (e) { /* 없음 */ }
+      const cs = cview.getComputedStyle(n);
+      if (cs.display === 'none' || cs.visibility !== 'visible' || parseFloat(cs.opacity) === 0) return false;
+      const r = n.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      if (r.right + cview.scrollX <= 0 || r.bottom + cview.scrollY <= 0) return false;  // 문서 밖(left:-9999px)
+      return true;
+    };
+    const roleOf = (n) => ((n.getAttribute('role') || '').trim().toLowerCase().split(/\\s+/)[0]) || '';
+    const tabNode = explicitRole === 'tab' ? el : (el.closest ? el.closest('[role="tab"]') : null);
+    const list = tabNode && tabNode.parentElement ? tabNode.parentElement.closest('[role="tablist"]') : null;
+    if (tabNode && list && roleOf(list) === 'tablist' && vis(tabNode) && vis(list)) {
+      const tabs = Array.prototype.filter.call(list.querySelectorAll('[role="tab"]'),
+        (t) => roleOf(t) === 'tab' && t.parentElement && t.parentElement.closest('[role="tablist"]') === list && vis(t));
+      const r = tabNode.getBoundingClientRect(), L = list.getBoundingClientRect();
+      const inside = r.left >= L.left - 2 && r.right <= L.right + 2 && r.top >= L.top - 2 && r.bottom <= L.bottom + 2;
+      const cy = r.top + r.height / 2, cx = r.left + r.width / 2;
+      const row = tabs.every((t) => { const q = t.getBoundingClientRect(); return Math.abs(q.top + q.height / 2 - cy) <= Math.max(q.height, r.height) / 2; });
+      const col = tabs.every((t) => { const q = t.getBoundingClientRect(); return Math.abs(q.left + q.width / 2 - cx) <= Math.max(q.width, r.width) / 2; });
+      if (inside && tabs.length >= 2 && tabs.indexOf(tabNode) !== -1 && (row || col)) push('tab_context', '1');
     }
     const TEXT_TYPES = ['', 'text', 'search', 'email', 'url', 'tel'];
     const isText = (n) => !!n && n.nodeType === 1 && ((n.tagName === 'INPUT'
         && TEXT_TYPES.indexOf((n.getAttribute('type') || '').trim().toLowerCase()) !== -1)
       || n.tagName === 'TEXTAREA' || n.isContentEditable);
-    const holdsText = (n) => !!n && n.nodeType === 1 && n !== el && !n.contains(el)
-      && (isText(n) || !!Array.prototype.find.call(n.querySelectorAll('input, textarea, [contenteditable]'), isText));
-    let edit = false;
+    const inputsOf = (n) => (!n || n.nodeType !== 1 || n === el || n.contains(el)) ? []
+      : (isText(n) ? [n] : Array.prototype.filter.call(n.querySelectorAll('input, textarea, [contenteditable]'), isText));
+    const cands = [];
     const lab = el.closest ? el.closest('label') : null;
-    if (lab && Array.prototype.find.call(lab.querySelectorAll('input, textarea, [contenteditable]'), isText)) edit = true;
+    if (lab) Array.prototype.forEach.call(lab.querySelectorAll('input, textarea, [contenteditable]'), (n) => { if (isText(n)) cands.push(n); });
     let sib = el.previousElementSibling;
-    for (let k = 0; !edit && sib && k < 2; k++, sib = sib.previousElementSibling) if (holdsText(sib)) edit = true;
+    for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) cands.push(...inputsOf(sib));
     sib = el.nextElementSibling;
-    for (let k = 0; !edit && sib && k < 2; k++, sib = sib.nextElementSibling) if (holdsText(sib)) edit = true;
+    for (let k = 0; sib && k < 2; k++, sib = sib.nextElementSibling) cands.push(...inputsOf(sib));
     const ctl = el.getAttribute('aria-controls');
-    if (!edit && ctl) {
-      for (const id of ctl.trim().split(/\\s+/)) { if (isText(el.ownerDocument.getElementById(id))) edit = true; }
+    if (ctl) {
+      for (const id of ctl.trim().split(/\\s+/)) { const n = el.ownerDocument.getElementById(id); if (isText(n)) cands.push(n); }
     }
-    if (edit) push('edit_context', '1');
+    const hitOk = (n) => {
+      const q = n.getBoundingClientRect();
+      const x = q.left + q.width / 2, y = q.top + q.height / 2;
+      if (x < 0 || y < 0 || x >= cview.innerWidth || y >= cview.innerHeight) return true;  // 화면 밖: 기하 검사만
+      const root = n.getRootNode ? n.getRootNode() : el.ownerDocument;
+      const hit = (root && root.elementFromPoint) ? root.elementFromPoint(x, y) : el.ownerDocument.elementFromPoint(x, y);
+      return !!hit && (hit === n || n.contains(hit));
+    };
+    if (cands.length && vis(el) && cands.some((n) => vis(n) && !n.disabled && hitOk(n))) push('edit_context', '1');
   } catch (e) { /* 판정 보조 사실 없음 = 예외 없음(fail-closed) */ }
   const submitter = (tag === 'BUTTON' && (type === '' || type === 'submit'))
     || (tag === 'INPUT' && (type === 'submit' || type === 'image'));
@@ -802,6 +838,33 @@ function () {
 }
 """.replace("__POINT__", _POINT_INFO_JS.strip())
 )
+
+#: WS-85 (#163): 격리 world 에서 결속한 노드(this)의 게이트 판정 정보 — 페이지 world 와 같은 _TARGET_INFO_JS.
+_ISOLATED_TARGET_FN = "function () { return (" + _TARGET_INFO_JS.strip() + ")(this); }"
+#: WS-85 (#163 B3): 상자 일치로 고를 후보 상한·shadow root 탐색 상한(넘으면 결속 불가 — 판정 불가 규칙으로).
+_ISO_BOX_CANDIDATES = 8
+_ISO_COUNT_CAP = 50
+_ISO_ROOTS = 500
+
+
+def _iso_candidates_expr(css: str, size: Any) -> str:
+    """격리 world 식: css 에 맞는 노드 배열(문서 + 열린 shadow root). size=[w, h] 면 그 크기(1px 안)인 노드만, 해석 못 하는
+    css(Playwright 확장 selector)면 모든 요소 중 그 크기인 것. 상한(_ISO_COUNT_CAP·크기 지정 시 _ISO_BOX_CANDIDATES)을
+    넘거나 해석 실패면 null."""
+    cap = _ISO_BOX_CANDIDATES if size else _ISO_COUNT_CAP
+    return (
+        "(() => { const css = " + json.dumps(css) + "; const size = " + json.dumps(size) + "; let sel = css; "
+        "try { document.querySelectorAll(sel); } catch (e) { if (!size) return null; sel = '*'; } "
+        "const fits = (h) => { if (!size) return true; const r = h.getBoundingClientRect(); "
+        "return Math.abs(r.width - size[0]) <= 1 && Math.abs(r.height - size[1]) <= 1; }; "
+        "const hits = []; const stack = [document]; let n = 0; "
+        "while (stack.length) { if (++n > " + str(_ISO_ROOTS) + ") return null; const root = stack.pop(); let list; "
+        "try { list = root.querySelectorAll(sel); } catch (e) { return null; } "
+        "for (const h of list) { if (fits(h)) { hits.push(h); if (hits.length > " + str(cap) + ") return null; } } "
+        "for (const x of root.querySelectorAll('*')) { if (x.shadowRoot) stack.push(x.shadowRoot); } } "
+        "return hits; })()"
+    )
+
 
 #: iframe 요소를 다시 가리킬 수 있는 짧은 셀렉터 (switch_frame 안내용).
 _FRAME_HINT_JS = """
@@ -2427,6 +2490,136 @@ class ActionDispatcher:
             return None
         info = (res.get("result") or {}).get("value")
         return info if isinstance(info, dict) and isinstance(info.get("s"), bool) else None
+
+    # -- WS-85 (#163): 클릭·selector·개행 대상의 격리 world 판독(노드 결속 B3) ---------------------------------
+
+    async def _iso_bind(self, cdp: Any, context_id: int, css: str, target: Any, need_box: bool,
+                        oopif: bool, group: str) -> Optional[str]:
+        """격리 world 에서 Playwright 대상(target)과 같은 노드의 objectId (WS-85 리뷰 B3). 못 정하면 None.
+
+        css 에 맞는 노드(문서 + 열린 shadow root)가 정확히 1개이고 need_box 가 아니면(=Playwright 도 같은 css 로 1개) 그 노드.
+        여러 개·shadow role+name 대상·Playwright 확장 selector 면, Playwright 대상의 네이티브 상자(bounding_box)와 CDP
+        DOM.getBoxModel 상자가 1px 안에서 같은 후보가 **정확히 1개**일 때만 그 노드. 두 상자 모두 페이지 JS 가 바꿀 수 없다."""
+        async def candidates(size: Any) -> Tuple[Optional[str], int]:
+            found = await cdp.send("Runtime.evaluate", {
+                "expression": _iso_candidates_expr(css, size), "contextId": context_id, "returnByValue": False,
+                "objectGroup": group})
+            object_id = (found.get("result") or {}).get("objectId")
+            if found.get("exceptionDetails") or not object_id or (found.get("result") or {}).get("subtype") != "array":
+                return None, -1
+            props = await cdp.send("Runtime.getProperties", {"objectId": object_id, "ownProperties": True})
+            ids = [str((p.get("value") or {}).get("objectId") or "") for p in props.get("result") or []
+                   if str(p.get("name") or "").isdigit()]
+            return (ids[0] if len(ids) == 1 else None), len(ids)
+
+        if not need_box:
+            only, count = await candidates(None)
+            if count == 1 and only:
+                return only
+            if count == 0:
+                return None
+        # 잡아 둔 노드(ElementHandle — 승인 결속)는 timeout 인자가 없다.
+        box = await (target.bounding_box() if hasattr(target, "as_element") else target.bounding_box(timeout=2000))
+        if not box:
+            return None
+        found = await cdp.send("Runtime.evaluate", {
+            "expression": _iso_candidates_expr(css, [box["width"], box["height"]]), "contextId": context_id,
+            "returnByValue": False, "objectGroup": group})
+        object_id = (found.get("result") or {}).get("objectId")
+        if found.get("exceptionDetails") or not object_id or (found.get("result") or {}).get("subtype") != "array":
+            return None
+        props = await cdp.send("Runtime.getProperties", {"objectId": object_id, "ownProperties": True})
+        ids = [str((p.get("value") or {}).get("objectId") or "") for p in props.get("result") or []
+               if str(p.get("name") or "").isdigit()]
+        offset = (0.0, 0.0)
+        if oopif:  # Playwright 는 다른 출처 iframe 의 상자에 프레임 요소 상자를 더한다 — 같은 기준으로 맞춘다
+            owner = await self.ctx.page.frame_element()
+            off = await owner.bounding_box()
+            if not off:
+                return None
+            offset = (off["x"], off["y"])
+        theirs = [box["x"], box["y"], box["width"], box["height"]]
+        same = []
+        for oid in ids[:_ISO_BOX_CANDIDATES]:
+            model = (await cdp.send("DOM.getBoxModel", {"objectId": oid})).get("model") or {}
+            quad = model.get("border") or []
+            if len(quad) != 8:
+                continue
+            xs, ys = quad[0::2], quad[1::2]
+            mine = [min(xs) + offset[0], min(ys) + offset[1], max(xs) - min(xs), max(ys) - min(ys)]
+            if all(abs(a - b) <= 1.0 for a, b in zip(mine, theirs)):
+                same.append(oid)
+        return same[0] if len(ids) <= _ISO_BOX_CANDIDATES and len(same) == 1 else None
+
+    async def _iso_on_target(self, css: str, target: Any, need_box: bool, function: str,
+                             want_backend: bool = False) -> Any:
+        """Playwright 대상과 결속한 격리 world 노드에 function(this) 을 적용한 값 — 실패는 RuntimeError(부르는 쪽이 판정 불가).
+
+        want_backend 면 (값, (cdp, frameId, backendNodeId, oopif)) — 승인 결속 의미(WS-85 #163 B3)가 실행 직전 같은 노드를 다시 잡는 데 쓴다."""
+        world = await self._select_frame_world()
+        if world is None:
+            raise RuntimeError("격리 world 프레임을 정하지 못함")
+        cdp, frame_id, oopif = world
+        group = f"ws85-gate-{id(self)}"
+
+        async def run(context_id: int) -> Any:
+            try:
+                object_id = await self._iso_bind(cdp, context_id, css, target, need_box, oopif, group)
+                if not object_id:
+                    raise RuntimeError("격리 world 노드를 결속하지 못함")
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": function, "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    raise RuntimeError("격리 world 판독 예외")
+                value = (called.get("result") or {}).get("value")
+                if not want_backend:
+                    return value
+                node = await cdp.send("DOM.describeNode", {"objectId": object_id, "depth": 0})
+                backend = (node.get("node") or {}).get("backendNodeId")
+                if not backend:
+                    raise RuntimeError("격리 world 노드 식별 실패")
+                return value, (cdp, frame_id, int(backend), oopif)
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                    pass
+
+        out = await self._in_gate_world(cdp, frame_id, run)
+        if out is None:
+            raise RuntimeError("격리 world 를 만들지 못함")
+        return out
+
+    async def isolated_element_info_for_gate(self, element_id: Any) -> Dict[str, Any]:
+        """WS-85 (#163): element_id 대상의 게이트 판정 정보(_TARGET_INFO_JS)를 **격리 world** 에서 읽는다.
+
+        반환 {"info": …} 또는 {"unresolved": 사유}. 판독할 수 있어야 하는 대상(페이지 world 로는 읽힘)인데 실패하면 게이트가
+        페이지 판정 < HIGH 일 때 승인 경로로 보낸다(리뷰 B2 — 페이지 world 로 내려가지 않는다)."""
+        handle = self.ctx.engine.get_handle(element_id) if element_id else None
+        css = getattr(handle, "css_path", "") or ""
+        if handle is None or not css:
+            return {"unresolved": "격리 판독 대상 없음"}
+        locator = self._locator_for(handle)
+        try:
+            if getattr(handle, "is_shadow", False) and handle.name:
+                need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
+            else:
+                need_box = await self.ctx.page.locator(css).count() != 1
+            info = await self._iso_on_target(css, locator, need_box, _ISOLATED_TARGET_FN)
+        except Exception as exc:  # noqa: BLE001 — 판정 불가(부르는 쪽 규칙 B2)
+            return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
+        return {"info": info} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
+
+    async def isolated_selector_info_for_gate(self, selector: str) -> Dict[str, Any]:
+        """WS-85 (#163): selector 클릭 대상(정확히 1개)의 판정 정보를 격리 world 에서 — {"info"} 또는 {"unresolved"}."""
+        try:
+            locator = self.ctx.page.locator(selector)
+            if await locator.count() != 1:
+                return {"unresolved": "selector 대상이 1개가 아님"}
+            info = await self._iso_on_target(selector, locator.first, False, _ISOLATED_TARGET_FN)
+        except Exception as exc:  # noqa: BLE001
+            return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
+        return {"info": info} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
 
     async def isolated_point_target(self, x: int, y: int) -> Optional[Dict[str, Any]]:
         """좌표 클릭이 누를 요소를 **격리 world** 에서 판정한다 (WS-67). 반환: {"name", "info"} 또는 None.

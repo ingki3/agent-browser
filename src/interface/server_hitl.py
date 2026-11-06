@@ -157,6 +157,29 @@ class HitlMixin:
     #: WS-56 R1 B1: 증표별로 잡아 둔 대상 노드 장부 상한(서버 메모리 — 넘치면 오래된 것부터 놓는다).
     #: (클래스 속성 — WS-48 분리 모듈의 함수는 mcp_server 전역으로 돌아 모듈 전역을 새로 둘 수 없다.)
     _PIN_BOOK_CAP = 32
+    #: WS-85 (#211, WS-86 리뷰 B1): 위험을 낮추는 문맥 예외(탭·편집)의 META 원천 — 격리 world 판독이 확인할 때만 쓴다.
+    _CONTEXT_SOURCES = frozenset({"tab_context", "edit_context"})
+    #: WS-85 (#163, 리뷰 B2): 판독할 수 있어야 하는 대상인데 격리 world 판독이 실패했다(페이지 판정 < HIGH 면 승인 경로).
+    ISOLATED_UNRESOLVED = "격리 판정 불가"
+
+    @classmethod
+    def _context_signals(cls, signals: tuple) -> tuple:
+        return tuple(s for s in signals if s[0] in cls._CONTEXT_SOURCES)
+
+    @classmethod
+    def _without_context(cls, signals: tuple) -> tuple:
+        return tuple(s for s in signals if s[0] not in cls._CONTEXT_SOURCES)
+
+    @classmethod
+    def _with_isolated_context(cls, info: Any, isolated_info: Any) -> Any:
+        """페이지 world 판독 정보의 문맥 예외 사실을 버리고 격리 world 판독의 것으로 바꾼 사본(WS-85 #211 B1). 격리 판독이
+        없으면 예외 없음(강화만). info 가 dict 가 아니면 그대로."""
+        if not isinstance(info, dict):
+            return info
+        out = dict(info)
+        iso = _signals_of(isolated_info) if isinstance(isolated_info, dict) else ()
+        out["signals"] = [list(s) for s in cls._without_context(_signals_of(info)) + cls._context_signals(iso)]
+        return out
 
     def _current_origin(self) -> str:
         from urllib.parse import urlsplit
@@ -334,9 +357,13 @@ class HitlMixin:
             if dispatcher is None:
                 unresolved = "대상을 읽을 수 없음"
             else:
-                target = await dispatcher.describe_element_for_gate(element_id)
+                target, iso = await self._page_and_isolated(
+                    dispatcher.describe_element_for_gate(element_id), "isolated_element_info_for_gate", element_id)
                 unresolved = str(target.get("unresolved") or "")
                 signals = _signals_of(target.get("info"))
+                if not unresolved and "info" in target:
+                    _name, signals, unresolved = self._combine_isolated(element_name, target.get("info"), iso,
+                                                                        keep_name=True)
         elif action is ActionType.CLICK and selector:
             # WS-30 추가 A: selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정한다.
             # 0개·여러 개·읽기 실패면 판정 불가 → 고위험(fail-closed).
@@ -350,6 +377,9 @@ class HitlMixin:
                 ambiguous = self._ambiguous_low_risk(action, selector, target.get("ambiguous"))
                 if ambiguous is not None:
                     return ambiguous
+                if not unresolved and "info" in target:
+                    iso = await self._isolated_read("isolated_selector_info_for_gate", selector)
+                    element_name, signals, unresolved = self._combine_isolated(element_name, target.get("info"), iso)
         elif action is ActionType.CLICK and params.get("x") is not None:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
@@ -369,6 +399,47 @@ class HitlMixin:
                 signals = signals + await self._proxy_field_signals(action, params,
                                                                     "describe_proxy_selector_for_gate", selector)
         return element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis
+
+    async def _page_and_isolated(self, page_read: Any, reader_name: str, *args: Any) -> tuple:
+        """WS-85 (#163): 페이지 world 판독(page_read 코루틴)과 같은 대상의 격리 world 판독을 **병렬로**(지연 최소). 반환
+        (페이지 결과, 격리 결과 — 판독기가 없으면 None, 예외·모양 틀림은 {"unresolved"})."""
+        import asyncio
+
+        return tuple(await asyncio.gather(page_read, self._isolated_read(reader_name, *args)))
+
+    async def _isolated_read(self, reader_name: str, *args: Any) -> Optional[Dict[str, Any]]:
+        reader = getattr(self._dispatcher, reader_name, None)
+        if reader is None:
+            return None
+        try:
+            out = await reader(*args)
+        except Exception as exc:  # noqa: BLE001 — 판독 실패는 부르는 쪽 규칙(B2)으로
+            return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
+        return out if isinstance(out, dict) else {"unresolved": "격리 판독 실패"}
+
+    def _combine_isolated(self, name: str, info: Any, iso: Any, keep_name: bool = False) -> tuple:
+        """WS-85 (#163 B1·B2, #211 B1): 페이지·격리 world 판독을 각각 _gate_rank 로 분류해 높은 쪽(같으면 페이지).
+
+        문맥 예외(탭·편집)는 격리 판독의 것만 두 판정에 쓴다. 판독기가 없으면(가짜 디스패처) 기존 판정 그대로. 판독할 수
+        있어야 하는데(페이지 world 로는 읽힘) 격리 판독이 실패했고 페이지 판정이 HIGH 보다 낮으면 판정 불가(승인 경로) — 페이지
+        world 로 내려가지 않는다. 반환 (이름, 신호, 판정 불가 사유). keep_name: element_id(이름은 관찰 값 — NB4)."""
+        page_signals = _signals_of(info)
+        if iso is None:
+            return name, page_signals, ""
+        domain = self._current_domain()
+        iso_info = iso.get("info") if isinstance(iso, dict) else None
+        if not isinstance(iso_info, dict):
+            page_signals = self._without_context(page_signals)
+            if _gate_rank(ActionType.CLICK, domain, name, False, "", page_signals)[0] < 2:
+                return name, page_signals, self.ISOLATED_UNRESOLVED
+            return name, page_signals, ""
+        iso_signals = _signals_of(iso_info)
+        page_signals = self._without_context(page_signals) + self._context_signals(iso_signals)
+        iso_name = name if keep_name else str(iso_info.get("name") or "")
+        if (_gate_rank(ActionType.CLICK, domain, iso_name, False, "", iso_signals)
+                > _gate_rank(ActionType.CLICK, domain, name, False, "", page_signals)):
+            return iso_name, iso_signals, ""
+        return name, page_signals, ""
 
     async def _proxy_field_signals(self, action: ActionType, params: Dict[str, Any], reader_name: str,
                                    target: Any) -> tuple:
@@ -393,11 +464,22 @@ class HitlMixin:
         text = str(params.get("text") or "")
         if "\n" in text or "\r" in text:
             # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
-            info = await dispatcher.describe_element(element_id) if dispatcher else None
+            if dispatcher is None:
+                return submits_form, "입력 대상을 읽을 수 없음"
+            info, iso = await self._page_and_isolated(dispatcher.describe_element(element_id),
+                                                      "isolated_element_info_for_gate", element_id)
             if info is None:
                 unresolved = "입력 대상을 읽을 수 없음"
             elif info.get("tag") == "INPUT" and info.get("in_form"):
                 submits_form = True
+            elif iso is not None:
+                # WS-85 (#163 B1·B2): 격리 world 판독도 본다(페이지가 form getter 를 지워도 원본 소속 폼) — 폼 제출이면 높은 쪽.
+                # 판독할 수 있어야 하는데 실패했으면 판정 불가(승인 경로, 페이지 world 로 내려가지 않음).
+                iso_info = iso.get("info") if isinstance(iso, dict) else None
+                if not isinstance(iso_info, dict):
+                    unresolved = self.ISOLATED_UNRESOLVED
+                elif iso_info.get("tag") == "INPUT" and iso_info.get("in_form"):
+                    submits_form = True
         return submits_form, unresolved
 
     async def _approval_or_pass(self, action: ActionType, params: Dict[str, Any], approval_id: Any,
@@ -537,11 +619,14 @@ class HitlMixin:
             return False, "", "포커스 요소를 읽을 수 없음", ()
         if info.get("opaque"):
             return False, "", "포커스가 다른 출처 프레임 안에 있음", ()
-        verdict = _focus_verdict(kind, info)
         # WS-67 (#141): 같은 포커스를 격리 world 에서도 읽어(페이지가 form getter 등을 지워도 원본)
         # 각각 위험 분류한 뒤 높은 쪽을 쓴다. 격리 판정이 없으면(실패·OOPIF) 기존 판정 그대로.
         reader = getattr(dispatcher, "isolated_focus_target", None)
         isolated = await _isolated(reader)
+        if reader is not None:
+            # WS-85 (#211 B1): 문맥 예외(탭·편집)는 격리 world 판독이 확인할 때만 — 페이지 world 의 것은 버린다.
+            info = self._with_isolated_context(info, isolated)
+        verdict = _focus_verdict(kind, info)
         if isinstance(isolated, dict):
             other = _focus_verdict(kind, isolated)
             domain = self._current_domain()
@@ -570,11 +655,15 @@ class HitlMixin:
         target = await dispatcher.describe_point(x, y)
         if target.get("unresolved"):
             return "", (), str(target["unresolved"]), {"coordinate_target": "unresolved"}
-        verdict = _point_verdict(target)
         # WS-67 (#141): 같은 좌표를 격리 world 에서도 판정해(DOM.getNodeForLocation → 원본 prototype)
         # 각각 위험 분류한 뒤 높은 쪽을 쓴다. 격리 판정이 없으면(IFRAME 위·실패) 기존 판정 그대로.
         reader = getattr(dispatcher, "isolated_point_target", None)
         isolated = await _isolated(reader, x, y)
+        if reader is not None:
+            # WS-85 (#211 B1): 문맥 예외(탭·편집)는 격리 world 판독이 확인할 때만 — 페이지 world 의 것은 버린다.
+            target = dict(target, info=self._with_isolated_context(target.get("info") or {},
+                                                              (isolated or {}).get("info")))
+        verdict = _point_verdict(target)
         if isinstance(isolated, dict):
             other = _point_verdict(isolated)
             domain = self._current_domain()
