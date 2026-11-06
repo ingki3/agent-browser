@@ -1071,6 +1071,9 @@ class PinnedTarget:
     key: str
     #: WS-56 R2 B3: 승인 시점 실행 의미(a[href]·form action/formaction·method·target 절대값). 실행 직전 같아야 한다.
     meaning: Optional[Dict[str, str]] = None
+    #: WS-85 (#163 B2·B3): 같은 노드를 **격리 world** 에서 읽은 실행 의미와 그 노드 정체 (CDP 세션, frameId, backendNodeId,
+    #: 의미, 다른 출처 iframe 세션인가). 페이지가 HTMLFormElement.prototype.action getter 로 옛 값을 돌려줘도 실행 직전 원본 의미로 비교한다.
+    iso: Optional[Tuple[Any, str, int, Dict[str, str], bool]] = None
 
 
 #: 지금 대상이 잡아 둔 그 노드인가(같은 문맥에서 === , 연결됨, 같은 문서).
@@ -1152,6 +1155,9 @@ _MEANING_JS = """
   return out;
 }
 """
+
+#: WS-85 (#163): 격리 world 노드(this)의 실행 의미 — _MEANING_JS 그대로(원본 prototype getter).
+_ISOLATED_MEANING_FN = "function () { return (" + _MEANING_JS.strip() + ")(this); }"
 
 #: R3 B2: 포커스 노드가 사용자 정의 요소(폼 연계 요소·closed shadow host)면 Enter 의 실제 제출 의미를 판별할 수 없다.
 _FOCUS_OPAQUE_JS = "(el) => !!(el && el.tagName && el.tagName.includes('-'))"
@@ -2073,12 +2079,126 @@ class ActionDispatcher:
                 # R3 B2: 판별 불가 포커스 — 결속하지 않는다(버튼 승인·정책 제외, 증표는 사용 때 거부).
                 return {"unresolved": "포커스가 사용자 정의 요소 위(키 입력의 실제 동작 판별 불가)"}
             meaning = await node.evaluate(_MEANING_JS)
+            # WS-85 (#163 B2·B3): 같은 노드의 실행 의미를 격리 world 에서도 — 못 읽으면 결속 불가(지금 규칙과 같다).
+            iso = await self._iso_pin_meaning(key, params, node)
         except Exception as exc:  # noqa: BLE001 — 못 잡으면 결속할 수 없다(fail-closed)
             return {"unresolved": f"대상 노드 확인 실패: {type(exc).__name__}"}
         if not isinstance(meaning, dict):
             return {"unresolved": "대상 실행 의미를 읽을 수 없음"}
         return {"pin": PinnedTarget(node=node, frame=frame, key=key,
-                                    meaning={k: str(meaning.get(k) or "") for k in _MEANING_KEYS})}
+                                    meaning={k: str(meaning.get(k) or "") for k in _MEANING_KEYS}, iso=iso)}
+
+    async def _iso_pin_meaning(self, key: str, params: Dict[str, Any],
+                               node: Any) -> Tuple[Any, str, int, Dict[str, str], bool]:
+        """WS-85 (#163 B3): 승인 노드(node)와 같은 노드를 격리 world 에서 잡아 (세션, frameId, backendNodeId, 실행 의미).
+
+        요소 대상은 클릭 판정과 같은 결속(css + 네이티브 상자), 좌표는 DOM.getNodeForLocation 노드, 포커스는 격리 world 의
+        activeElement — 좌표·포커스는 그 노드 상자가 승인 노드 상자와 같아야 한다. 못 하면 RuntimeError(결속 불가)."""
+        if key.startswith("element_id:") or key.startswith("selector:"):
+            if key.startswith("element_id:"):
+                handle = self.ctx.engine.get_handle(params.get("element_id"))
+                css = getattr(handle, "css_path", "") or ""
+                if handle is None or not css:
+                    raise RuntimeError("격리 결속 대상 없음")
+                need_box = bool(getattr(handle, "is_shadow", False) and handle.name) \
+                    or await self.ctx.page.locator(css).count() != 1
+            else:
+                css, need_box = str(params.get("selector") or ""), False
+            value, ident = await self._iso_on_target(css, node, need_box, _ISOLATED_MEANING_FN, want_backend=True)
+        else:
+            value, ident = await self._iso_pin_top_node(key, params, node)
+        if not isinstance(value, dict):
+            raise RuntimeError("격리 world 실행 의미를 읽을 수 없음")
+        cdp, frame_id, backend, oopif = ident
+        return cdp, frame_id, backend, {k: str(value.get(k) or "") for k in _MEANING_KEYS}, oopif
+
+    async def _iso_pin_top_node(self, key: str, params: Dict[str, Any],
+                                node: Any) -> Tuple[Any, Tuple[Any, str, int, bool]]:
+        """좌표·포커스 승인 노드의 격리 world 짝 — (실행 의미, (세션, frameId, backendNodeId)). 상자가 다르면 RuntimeError."""
+        top = self._top_page()
+        cdp = await self._gate_cdp_for(top)
+        if key.startswith("point:"):
+            metrics = await cdp.send("Page.getLayoutMetrics")
+            vp = metrics.get("cssLayoutViewport") or metrics.get("layoutViewport") or {}
+            hit = await cdp.send("DOM.getNodeForLocation", {
+                "x": int(params["x"]) + int(vp.get("pageX") or 0), "y": int(params["y"]) + int(vp.get("pageY") or 0),
+                "includeUserAgentShadowDOM": False})
+            backend, frame_id = hit.get("backendNodeId"), str(hit.get("frameId") or "")
+        else:
+            backend, frame_id = None, ""
+        group = f"ws85-pin-{id(self)}"
+
+        async def run(context_id: int) -> Any:
+            try:
+                if backend:
+                    found = await cdp.send("DOM.resolveNode", {"backendNodeId": backend, "executionContextId": context_id,
+                                                                "objectGroup": group})
+                    object_id = (found.get("object") or {}).get("objectId")
+                else:
+                    found = await cdp.send("Runtime.evaluate", {
+                        "expression": f"({_FOCUS_NODE_JS.strip()})()", "contextId": context_id, "returnByValue": False,
+                        "objectGroup": group})
+                    obj = found.get("result") or {}
+                    object_id = obj.get("objectId") if obj.get("subtype") == "node" else None
+                if not object_id or not await self._select_same_box(cdp, object_id, node, True, False):
+                    raise RuntimeError("격리 world 노드가 승인 노드와 같은 자리가 아님")
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": _ISOLATED_MEANING_FN, "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    raise RuntimeError("격리 world 의미 판독 예외")
+                desc = await cdp.send("DOM.describeNode", {"objectId": object_id, "depth": 0})
+                ident = int((desc.get("node") or {}).get("backendNodeId") or 0)
+                if not ident:
+                    raise RuntimeError("격리 world 노드 식별 실패")
+                return (called.get("result") or {}).get("value"), ident
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001
+                    pass
+
+        out = await self._in_gate_world(cdp, frame_id, run)
+        if out is None:
+            raise RuntimeError("격리 world 를 만들지 못함")
+        value, ident = out
+        return value, (cdp, frame_id, ident, False)
+
+    async def _iso_meaning_now(self, pin: "PinnedTarget") -> Optional[str]:
+        """WS-85 (#163 B3): 실행 직전 — 고정 때의 격리 노드(backendNodeId)를 DOM.resolveNode 로 다시 잡아, 지금 승인 노드
+        상자와 같은지 보고 격리 world 실행 의미를 비교한다. 다르거나 못 하면 사유(결속 불가 = TOCTOU), 같으면 None."""
+        if pin.iso is None:
+            return None
+        cdp, frame_id, backend, before, oopif = pin.iso
+        group = f"ws85-check-{id(self)}"
+
+        async def run(context_id: int) -> Any:
+            try:
+                found = await cdp.send("DOM.resolveNode", {"backendNodeId": backend, "executionContextId": context_id,
+                                                            "objectGroup": group})
+                object_id = (found.get("object") or {}).get("objectId")
+                if not object_id or not await self._select_same_box(cdp, object_id, pin.node, True, oopif):
+                    raise RuntimeError("격리 world 노드가 승인 노드와 같은 자리가 아님")
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": _ISOLATED_MEANING_FN, "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    raise RuntimeError("격리 world 의미 판독 예외")
+                return (called.get("result") or {}).get("value")
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            now = await self._in_gate_world(cdp, frame_id, run)
+        except Exception as exc:  # noqa: BLE001
+            return f"승인한 노드의 목적지 확인 실패(격리 world): {type(exc).__name__}"
+        if not isinstance(now, dict):
+            return "승인한 노드의 목적지를 읽을 수 없음(격리 world)"
+        changed = [k for k in _MEANING_KEYS if str(now.get(k) or "") != before.get(k, "")]
+        if changed:
+            return "승인 때와 목적지·동작이 바뀜(" + ", ".join(changed) + ")"
+        return None
 
     async def _point_node(self, params: Dict[str, Any]) -> Tuple[Any, str]:
         """좌표의 hit-test 노드(ElementHandle, 최상위 문맥). 판정 불가 지점(다른 출처 iframe·closed shadow·요소
@@ -2116,7 +2236,8 @@ class ActionDispatcher:
         changed = [k for k in _MEANING_KEYS if str(now.get(k) or "") != pin.meaning.get(k, "")]
         if changed:
             return "승인 때와 목적지·동작이 바뀜(" + ", ".join(changed) + ")"
-        return None
+        # WS-85 (#163 B2): 페이지 world 의미가 같아도 격리 world 의미가 바뀌었거나 못 읽으면 불일치(OR).
+        return await self._iso_meaning_now(pin)
 
     async def _pin_mismatch(self, pin: PinnedTarget, locator: Any) -> Optional[str]:
         """지금 locator 가 가리키는 노드가 잡아 둔 그 노드가 아니면 사유, 같으면 None."""

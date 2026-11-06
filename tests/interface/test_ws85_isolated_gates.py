@@ -361,3 +361,48 @@ async def test_163_same_origin_frame_element_id_spoof_blocked(site):
     assert _blocked(r), (r.success, r.error_message)
     assert status == "대기"
 
+
+# ------------------------------------------------------------------ #163 승인 결속 의미(_MEANING_JS, B2·B3)
+
+_SWAP = ("window.swap=function(){const f=document.getElementById('f');"
+         "const old=Object.getOwnPropertyDescriptor(HTMLFormElement.prototype,'action').get.call(f);"
+         "f.setAttribute('action','/account/delete-all?confirm=1');"
+         "Object.defineProperty(HTMLFormElement.prototype,'action',{get(){return old},configurable:true});};")
+_MEAN_PAGE = (HEAD + f"<form id=f action='/account/delete' method=post {ON_SUBMIT}><input id=q aria-label='메모'>"
+              "<button id=b>계속</button></form>" + _script(_SWAP))
+
+
+async def _pinned(server, params):
+    got = await server._dispatcher.pin_target(params)  # noqa: SLF001
+    assert "pin" in got, got
+    return got["pin"]
+
+
+@requires_chromium
+@pytest.mark.parametrize("target", ["element_id", "selector", "point", "focus"])
+async def test_163_meaning_swap_after_pin_is_refused(site, target):
+    PAGES["/m"] = _MEAN_PAGE
+    async with BrowserMCPServer() as server:
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/m"})
+        obs = await _call(server, ActionType.OBSERVE_PAGE, {})
+        if target == "element_id":
+            params = {"element_id": _eid(obs, _by_name("계속")), "epoch": obs.snapshot_epoch}
+        elif target == "selector":
+            params = {"selector": "#b"}
+        elif target == "point":
+            box = await _page(server).locator("#b").bounding_box()
+            params = {"x": int(box["x"] + box["width"] / 2), "y": int(box["y"] + box["height"] / 2),
+                      "epoch": obs.snapshot_epoch}
+        else:
+            await _page(server).focus("#q")
+            params = {"key": "Enter"}
+        pin = await _pinned(server, params)
+        same = await server._dispatcher.pinned_target_check(pin, params)  # noqa: SLF001
+        await _page(server).evaluate("window.swap()")
+        # 전제: 페이지 world 의미 판독은 속는다(옛 목적지).
+        page_now = await pin.node.evaluate("(el) => (el.form || el.closest('form')).action")
+        swapped = await server._dispatcher.pinned_target_check(pin, params)  # noqa: SLF001
+        truth = await _truth(server, "document.getElementById('f').action")
+    assert same == {"fresh": True, "detail": ""}, same  # 과잉 0: 바뀌지 않았으면 그대로 통과
+    assert page_now.endswith("/account/delete") and truth.endswith("delete-all?confirm=1")
+    assert swapped["fresh"] is False and "action" in swapped["detail"], swapped
