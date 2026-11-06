@@ -980,7 +980,12 @@ class SignalsMixin:
             found, isolated = await asyncio.gather(
                 challenge_mod.detect_challenge(page, last_status=judge_status),
                 self._isolated_challenge(page, judge_status))
-            if isolated is not None and isolated.detected:
+            if isolated is not None and isolated.detected and not found.detected:
+                # 오류 문서(이동 실패)는 페이지 world 프로브가 돌지 않아 예전에도 판정이 없었다 — 그대로 둔다(바이트 동일).
+                unreachable = getattr(self._dispatcher, "top_document_unreachable", None)
+                if unreachable is None or not await unreachable():
+                    found = isolated
+            elif isolated is not None and isolated.detected:
                 found = isolated
             if found.detected:
                 challenge = {

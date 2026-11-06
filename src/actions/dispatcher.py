@@ -845,6 +845,10 @@ _ISOLATED_TARGET_FN = "function () { return (" + _TARGET_INFO_JS.strip() + ")(th
 _ISO_BOX_CANDIDATES = 8
 _ISO_COUNT_CAP = 50
 _ISO_ROOTS = 500
+#: 격리 world 판독이 만든 원격 객체 묶음 이름(판독 끝에 묶음째 놓는다 — 한 디스패처 안에서 판독은 겹치지 않는다).
+_ISO_GROUP_GATE = "ws85-gate"
+_ISO_GROUP_PIN = "ws85-pin"
+_ISO_GROUP_CHECK = "ws85-check"
 
 
 def _iso_candidates_expr(css: str, size: Any) -> str:
@@ -2126,7 +2130,7 @@ class ActionDispatcher:
             backend, frame_id = hit.get("backendNodeId"), str(hit.get("frameId") or "")
         else:
             backend, frame_id = None, ""
-        group = f"ws85-pin-{id(self)}"
+        group = _ISO_GROUP_PIN
 
         async def run(context_id: int) -> Any:
             try:
@@ -2169,7 +2173,7 @@ class ActionDispatcher:
         if pin.iso is None:
             return None
         cdp, frame_id, backend, before, oopif = pin.iso
-        group = f"ws85-check-{id(self)}"
+        group = _ISO_GROUP_CHECK
 
         async def run(context_id: int) -> Any:
             try:
@@ -2681,7 +2685,7 @@ class ActionDispatcher:
         if world is None:
             raise RuntimeError("격리 world 프레임을 정하지 못함")
         cdp, frame_id, oopif = world
-        group = f"ws85-gate-{id(self)}"
+        group = _ISO_GROUP_GATE
 
         async def run(context_id: int) -> Any:
             try:
@@ -2829,6 +2833,16 @@ class ActionDispatcher:
         from browser.document_commits import watch_document_commits
 
         return watch_document_commits(self._top_page())
+
+    async def top_document_unreachable(self) -> bool:
+        """WS-85 (#171): 최상위 문서가 브라우저 오류 문서(이동 실패 — CDP frame.unreachableUrl)인가. 못 읽으면 True(보수: 격리
+        판정을 더하지 않는다 — 오류 문서의 빈 본문을 차단 화면으로 새로 판정하지 않게)."""
+        try:
+            cdp = await self._gate_cdp_for(self._top_page())
+            frame = ((await cdp.send("Page.getFrameTree")).get("frameTree") or {}).get("frame") or {}
+        except Exception:  # noqa: BLE001
+            return True
+        return bool(frame.get("unreachableUrl"))
 
     async def isolated_top_evaluate(self, expression: str, expect_loader: Optional[str] = None) -> Any:
         """최상위 문서의 **격리 world** 에서 expression 을 평가해 값을 돌려준다 (WS-68 R1, B1).
