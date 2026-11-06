@@ -106,6 +106,7 @@ KEYS = {
     "worldName": (NOT_OUT, "security/manual_origin.py CDP Page.createIsolatedWorld 인자(WS-64 R2)"),
     # --- CONTROL: 도구 열거 어휘
     "layer": (CONTROL, "actions/covered_click.py data.covered_by.layer — COVER_LAYERS(WS-79)"),
+    "name_risk": (CONTROL, "perception/hidden_controls.py data.hidden_controls[].name_risk — 리터럴 \"high\" 하나(WS-85 #226)"),
     ("tag", "actions/covered_click.py"): (FREE, "WS-79 data.covered_by.tag — 페이지 태그 이름([a-z0-9-]≤32 로 거름, "
                                                "밖이면 unknown — 면제 없음)"),
     "nav_frame": (CONTROL, "actions/dispatcher.py _NavWatch — iframe 안 문서 이동(R6-B1)"),

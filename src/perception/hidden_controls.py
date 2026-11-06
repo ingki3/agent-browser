@@ -158,6 +158,10 @@ _SCAN_FN = r"""(obs, lim, nonce) => {
                bbox: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}};
     }
     if (name === '') { const k = row(p.label, inp); if (k >= 0) e.row = k; }
+    // WS-85 (#226): 숨긴 input 자신의 접근성 이름 원천(aria-label·title)과 라벨 이름 — 서버가 위험 범주만 비교한다(글자는
+    // 싣지 않음).
+    e.hn = String(inp.getAttribute('aria-label') || inp.getAttribute('title') || '').slice(0, 200);
+    e.ln = name.slice(0, 200);
     out.push(e);
   }
   globalThis[HC_PINS] = {n: nonce, p: pins};
@@ -228,6 +232,26 @@ def _bbox(raw: Any) -> Optional[Dict[str, int]]:
     return out
 
 
+#: WS-85 (#226, WS-86 리뷰 D2 a): 숨긴 control 의 aria-label·title 이 라벨보다 위험하면 항목에 고정 어휘 신호
+#: `name_risk: "high"`(값 하나, 페이지 글자 없음)를 싣는다.
+
+
+def _hidden_risky(hidden: Any, label: Any) -> bool:
+    """숨긴 이름의 위험(assess_risk)이 HIGH 이고 보이는 라벨 이름은 HIGH 가 아닌가 — 신호만(게이트 불변)."""
+    if not isinstance(hidden, str) or not hidden.strip():
+        return False
+    from contracts import ActionType
+    from security import ActionContext, RiskLevel
+    from security.hitl import assess_risk
+
+    def risk(name: str) -> Any:
+        return assess_risk(ActionContext(action=ActionType.CLICK, element_name=name)).risk
+
+    if risk(hidden) is not RiskLevel.HIGH:
+        return False
+    return risk(label if isinstance(label, str) else "") is not RiskLevel.HIGH
+
+
 def _parse(raw: Any, n_handles: int) -> Tuple[List[Dict[str, Any]], int]:
     """페이지 결과 검증 → (항목 원료, 전체 짝 수). 모양이 어긋난 항목은 버린다(표시 전용)."""
     if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
@@ -259,7 +283,8 @@ def _parse(raw: Any, n_handles: int) -> Tuple[List[Dict[str, Any]], int]:
         if not isinstance(pin, int) or isinstance(pin, bool) or pin < 0:
             continue  # 노드 핀 없는 항목은 노출하지 않는다(R1 B1 — 실행 때 대조할 수 없다)
         out.append({"i": i, "kind": e["kind"], "checked": e["checked"], "operable": e["operable"], "row": row,
-                    "group": group, "add": add if i < 0 else None, "pin": pin})
+                    "group": group, "add": add if i < 0 else None, "pin": pin,
+                    "hidden_risky": _hidden_risky(e.get("hn"), e.get("ln"))})
     total = raw.get("total")
     total = total if isinstance(total, int) and not isinstance(total, bool) else len(out)
     return out, max(total, len(out))
@@ -330,6 +355,8 @@ def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: 
             entry["group"] = p["group"]
         if new is not None:
             entry["added"] = True
+        if p.get("hidden_risky") is True:
+            entry["name_risk"] = "high"
         if _size(kept + [entry]) > HC_MAX_CHARS:
             continue
         kept.append(entry)
