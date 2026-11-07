@@ -376,7 +376,9 @@ def test_control_key_inventory_is_fixed():
                                     # WS-79: data.covered_by.layer(덮개 층 — actions.covered_click.COVER_LAYERS)
                                     "layer",
                                     # WS-85 (#226): data.hidden_controls[].name_risk(숨긴 이름 위험 신호 — "high" 하나)
-                                    "name_risk"}
+                                    "name_risk",
+                                    # WS-88 (#248): gate_basis Enter-on-field 판정 근거
+                                    "enter_target", "sensitive"}
     assert pu.CONTROL_ITEM_VOCABULARY == {("dialogs", "type"): {"alert", "beforeunload", "confirm", "prompt",
                                                                 "unknown"}}
     # R9: 목록 바로 아래 문자열 원소 경로 어휘(healing_attempts 복합 코드·signals 순수 코드 — test_ws51_r9_census 가 도출)

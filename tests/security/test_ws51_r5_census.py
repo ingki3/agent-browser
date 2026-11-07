@@ -155,6 +155,8 @@ REVIEWED = {
     ("op", "interface/server_schema.py",
      "{'enum': ['save', 'run', 'list', 'delete', 'remember_page', 'pages', 'forget_page']}"): "도구 스키마(값 아님, WS-61 op 추가)",
     ("risk", "interface/server_hitl.py", "decision.risk.value"): "RiskLevel",
+    # WS-88 gate_basis.sensitive — _enter_sensitive 반환(password·autocomplete·field_name, 빈 값이면 싣지 않음)
+    ("sensitive", "interface/server_hitl.py", "sensitive"): "server_hitl._enter_sensitive 반환 어휘",
     ("risk", "security/hitl.py", "risk"): "RiskLevel",
     ("sticky_reason", "interface/on_demand.py",
      "f\"{pending.get('domain')} 에서 창에서 해결한 뒤 headless 복귀 후 {pending.get('kind') or '차단'} 재감지 — 서버 수명 동안 창 유지\""): FREE,

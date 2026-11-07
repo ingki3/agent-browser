@@ -65,6 +65,201 @@ _ENTER_SUBMITS_INPUT_TYPES = frozenset({
 _BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 
 
+# -- WS-88 (#248): Enter-on-field 판정 — press_key Enter·type_text(press_enter)·type_text 개행이 같이 쓴다 ---------------
+
+#: B2: 민감 칸 autocomplete 토큰(cc-* 는 접두로 따로 본다).
+_ENTER_SENSITIVE_AUTOCOMPLETE = frozenset({"one-time-code", "current-password", "new-password"})
+#: B2: 이 경로 한정 민감 칸 이름 낱말(한글 — 부분 문자열, 정규화 뒤). 기존 HIGH/MEDIUM 키워드 표는 바꾸지 않는다.
+_ENTER_SENSITIVE_WORDS = ("카드번호", "카드 번호", "인증번호", "인증 번호", "비밀번호", "패스워드", "로그인", "보안코드",
+                          "보안 코드", "주민등록번호", "계좌번호", "계좌 번호", "일회용 비밀", "아이디")
+#: '아이디어' 는 아이디가 아니다.
+_ENTER_SENSITIVE_EXCEPT = ("아이디어",)
+#: B2: 영문 식별자·이름 토큰(class_tokens 로 나눈 낱말) — 한 낱말과 두 낱말 이음.
+_ENTER_SENSITIVE_TOKENS = frozenset({
+    "password", "passwd", "pwd", "pw", "passcode", "otp", "cvc", "cvv", "csc", "login", "signin", "logon",
+    "username", "userid", "cardnumber", "cardnum", "ccnum", "creditcard",
+})
+_ENTER_SENSITIVE_PAIRS = frozenset({
+    ("card", "number"), ("card", "no"), ("security", "code"), ("verification", "code"), ("sign", "in"),
+    ("log", "in"), ("one", "time"), ("user", "name"), ("user", "id"), ("credit", "card"),
+})
+#: 판정 보조 사실(키워드 매칭 안 함)과 제출 목적지 원천 — 기본 제출 버튼·항목 신호에서는 빼고 게이트가 따로 싣는다.
+_ENTER_SKIP_SOURCES = frozenset({"nav_link", "form_method", "role", "tab_context", "edit_context",
+                                 "form_action", "formaction"})
+#: GET 예외를 줄 수 있는 폼 컨트롤 수 상한(판독기 _ENTER_FACTS_JS 의 200 과 같다 — 넘으면 다 보지 못했다).
+_ENTER_CONTROLS_CAP = 200
+#: 칸에서 Enter 의 효과가 '그 칸 안'인 요소(제출 아님 — 이름·문맥 신호로 판정). 그 밖(body·div 등)은 기존 표 그대로.
+_ENTER_FIELD_ROLES = frozenset({"combobox", "searchbox", "textbox", "spinbutton"})
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _enter_words_hit(text: str) -> bool:
+    from security.hitl import class_tokens, normalize_gate_text
+
+    norm = normalize_gate_text(text)
+    if norm:
+        for word in _ENTER_SENSITIVE_WORDS:
+            idx = norm.find(word)
+            while idx != -1:
+                if not any(norm.startswith(ex, idx) for ex in _ENTER_SENSITIVE_EXCEPT):
+                    return True
+                idx = norm.find(word, idx + 1)
+    tokens = class_tokens(text)
+    if any(t in _ENTER_SENSITIVE_TOKENS for t in tokens):
+        return True
+    return any((a, b) in _ENTER_SENSITIVE_PAIRS for a, b in zip(tokens, tokens[1:]))
+
+
+def _enter_autocomplete_hit(value: Any) -> bool:
+    for token in str(value or "").lower().split():
+        if token.startswith("cc-") or token in _ENTER_SENSITIVE_AUTOCOMPLETE:
+            return True
+    return False
+
+
+def _enter_sensitive(info: Dict[str, Any]) -> str:
+    """B2: 대상 칸(또는 그 칸이 속한 폼의 컨트롤)이 민감 칸인가 — 근거('password'·'autocomplete'·'field_name') 또는 ''.
+
+    type=password, autocomplete(cc-*·one-time-code·current-password·new-password), 칸 이름 낱말(이 경로 한정 상수 — 접근성
+    이름·aria·title·placeholder 는 이름에, id·name·class 는 식별자 토큰으로). 폼 컨트롤은 type·autocomplete·name·id 만 본다.
+    """
+    enter = _as_dict(info.get("enter"))
+    if str(info.get("type") or "").lower() == "password":
+        return "password"
+    if _enter_autocomplete_hit(enter.get("autocomplete")):
+        return "autocomplete"
+    texts = [str(info.get("name") or "")]
+    for src, text in _signals_of(info):
+        if src in ("aria", "title", "id", "name_attr", "class", "testid"):
+            texts.append(text)
+    if any(_enter_words_hit(t) for t in texts if t):
+        return "field_name"
+    for ctl in _as_dict(enter.get("form")).get("controls") or ():
+        if not isinstance(ctl, dict):
+            continue
+        if str(ctl.get("type") or "").lower() == "password":
+            return "password"
+        if _enter_autocomplete_hit(ctl.get("autocomplete")):
+            return "autocomplete"
+        if _enter_words_hit(str(ctl.get("name_attr") or "")) or _enter_words_hit(str(ctl.get("id") or "")):
+            return "field_name"
+    return ""
+
+
+def _enter_plain_signals(signals: Any) -> tuple:
+    """판정 보조 사실·제출 목적지·보이는 글자(칸의 내용 — 사용자 입력)를 뺀 신호."""
+    return tuple(s for s in _signals_of({"signals": signals}) if s[0] not in _ENTER_SKIP_SOURCES and s[0] != "text")
+
+
+def _enter_get_form(info: Dict[str, Any]) -> Optional[tuple]:
+    """B1: '검색형 제출'(명시 GET) 예외 — 줄 수 있으면 (판정 신호, 근거 부가정보), 아니면 None(폼 제출 HIGH).
+
+    조건: 폼 method 속성이 명시적으로 'get', 기본 제출 버튼 formmethod 가 없거나 'get', 폼 안 iframe·frame·object·embed 0개,
+    컨트롤을 다 읽음(상한 이하). 신호: 제출 목적지(formaction > form action — 쿼리까지, form_method 신호 없음 = path_only 아님),
+    기본 제출 버튼 이름·신호, 모든 컨트롤의 name·id·고정 value(hidden 포함 — 한글 값은 문자열, 그 밖은 식별자 토큰).
+    """
+    enter = _as_dict(info.get("enter"))
+    form = enter.get("form")
+    if not isinstance(form, dict) or form.get("method_attr") != "get":
+        return None
+    if form.get("frames") != 0:
+        return None
+    controls = form.get("controls")
+    total = form.get("controls_total")
+    if not isinstance(controls, list) or not isinstance(total, int) or total > _ENTER_CONTROLS_CAP \
+            or len(controls) != total:
+        return None
+    submitter = form.get("submitter") if isinstance(form.get("submitter"), dict) else None
+    if submitter is not None and submitter.get("formmethod") not in (None, "get"):
+        return None
+    out: list = []
+    action = form.get("action_attr")
+    if submitter is not None and submitter.get("formaction") is not None:
+        action = submitter.get("formaction")
+    if action:
+        out.append(("form_action", str(action)))
+    if submitter is not None:
+        if submitter.get("name"):
+            out.append(("detail", str(submitter["name"])))
+        out.extend(_enter_plain_signals(submitter.get("signals")))
+    for ctl in controls:
+        if not isinstance(ctl, dict):
+            return None
+        for key, src in (("name_attr", "name_attr"), ("id", "id")):
+            if ctl.get(key):
+                out.append((src, str(ctl[key])))
+        value = ctl.get("value")
+        if value:
+            value = str(value)
+            out.append(("value" if any("\uac00" <= ch <= "\ud7a3" for ch in value) else "name_attr", value))
+    extra: Dict[str, Any] = {"enter_target": "form_get"}
+    origin, doc = str(form.get("action_origin") or ""), str(form.get("doc_origin") or "")
+    if origin and doc and origin != doc:
+        extra["enter_action_origin"] = origin  # NN8: 입력값이 다른 출처로 간다 — 목적지를 보인다
+    return tuple(out), extra
+
+
+def _enter_field_verdict(info: Dict[str, Any], get_ok: bool) -> tuple:
+    """WS-88 (#248 B3): 입력칸에서 Enter → (폼 제출, 대상 이름, 판정 불가 사유, 문맥 신호, 근거 부가정보).
+
+    한 함수를 press_key Enter·type_text(press_enter)·type_text 개행이 같이 쓴다. get_ok: 명시 GET 예외를 줄 수 있는가
+    (격리 world 판독이 있을 때만 — 낮춤은 격리 확인 필수, NN9). 규칙:
+    * 민감 칸(B2) → 항상 폼 제출(HIGH).
+    * 폼 안 암묵 제출 칸(_ENTER_SUBMITS_INPUT_TYPES, 버튼형 제외) → 폼 제출(HIGH). 명시 GET 예외(B1)면 제출 아님 —
+      칸·목적지·기본 버튼·컨트롤 신호로 키워드 판정.
+    * 버튼·링크·폼 안 select·알 수 없는 요소 → 기존 표(_focus_verdict) 그대로.
+    * 그 밖의 입력칸(폼 밖 input·textarea·contenteditable·combobox 등) → 제출 아님, 칸 이름·문맥 신호(+ activedescendant
+      항목 이름·신호, NN2)로 판정. 칸의 보이는 글자(입력 내용)는 보지 않는다.
+    """
+    if info.get("opaque"):
+        return False, "", "포커스가 다른 출처 프레임 안에 있음", (), {}
+    tag = str(info.get("tag") or "")
+    itype = str(info.get("type") or "")
+    in_form = bool(info.get("in_form"))
+    name = str(info.get("name") or "")
+    roles = {s[1].strip().lower() for s in _signals_of(info) if s[0] == "role"}
+    field = (tag == "TEXTAREA" or bool(info.get("editable")) or (tag == "INPUT" and itype not in _BUTTON_INPUT_TYPES)
+             or bool(roles & _ENTER_FIELD_ROLES))
+    sensitive = _enter_sensitive(info) if field else ""
+    if sensitive:
+        return True, "", "", (), {"enter_target": "sensitive_field", "sensitive": sensitive}
+    if in_form and tag == "INPUT" and itype in _ENTER_SUBMITS_INPUT_TYPES and itype not in _BUTTON_INPUT_TYPES:
+        got = _enter_get_form(info) if get_ok else None
+        if got is None:
+            return True, "", "", (), {}  # 폼 제출 — 근거는 기존 source=form_submit 그대로(봉투 불변)
+        signals, extra = got
+        return False, name, "", _enter_plain_signals(info.get("signals")) + signals, extra
+    base = _focus_verdict("enter", info)
+    if base[0] or base[1] or base[2] or not field:
+        return base + ({},)
+    signals = _enter_plain_signals(info.get("signals"))
+    enter = _as_dict(info.get("enter"))
+    option = enter.get("active_option") if isinstance(enter.get("active_option"), dict) else None
+    if option is not None:
+        if option.get("name"):
+            signals = signals + (("detail", str(option["name"])),)
+        signals = signals + _enter_plain_signals(option.get("signals"))
+    return False, name, "", signals, {"enter_target": "field" if in_form else "no_form"}
+
+
+def _secret_text(params: Dict[str, Any], store: Any) -> bool:
+    """B2: 입력값이 SecretStore 키 문구(SECRET_KEY_PATTERN)이고 그 키가 실제로 풀리는가 — 자격증명 + Enter = 로그인 제출.
+
+    저장소가 없으면 디스패처도 바꾸지 않으므로 비밀이 아니다. 저장소를 묻지 못하면(예외) 비밀로 본다(fail-closed)."""
+    from security.secrets import KEY_PATTERN
+
+    text = params.get("text")
+    if not isinstance(text, str) or not KEY_PATTERN.match(text) or store is None:
+        return False
+    try:
+        return bool(store.resolve(text).resolved)
+    except Exception:  # noqa: BLE001 — 의도된 fail-closed
+        return True
+
+
 def _gate_rank(action: ActionType, domain: str, name: str, submits_form: bool, unresolved: str,
                signals: tuple) -> tuple:
     """한 판정 결과의 위험 순위 (WS-67). 판정 불가 > 폼 제출 > 신호(키워드) > 없음.
@@ -284,6 +479,8 @@ class HitlMixin:
         if isinstance(target, ActionResult):
             return target
         element_name, selector, submits_form, unresolved, signals, basis_extra, report_basis = target
+        # WS-88 (#248 B4): 입력 전 판정의 위험 순위 — Enter 직전 재판정(_enter_recheck)이 이보다 높으면 Enter 를 보내지 않는다.
+        self._enter_gate_rank = _gate_rank(action, self._current_domain(), element_name, submits_form, unresolved, signals)
 
         gate_ctx = self._gate_context(action, target)
         decision = self._hitl.evaluate(gate_ctx)
@@ -333,13 +530,18 @@ class HitlMixin:
         if action is ActionType.PRESS_KEY and not key_kind(str(params.get("key", ""))):
             return
         if action is ActionType.TYPE_TEXT and not self._dispatcher._fence_binds(action, params):
-            # 줄바꿈 없는 입력(또는 press_enter — 판독 없이 폼 제출 HIGH)은 게이트가 페이지에서 판정한 것이 없다: 묶을 것이
-            # 없고 평범한 입력에 왕복을 더하지 않는다.
+            # 줄바꿈·press_enter 없는 입력은 게이트가 페이지에서 판정한 것이 없다: 묶을 것이 없고 평범한 입력에 왕복을 더하지
+            # 않는다. WS-88 (#248 B5): press_enter 는 게이트가 그 칸을 판정하므로 묶는다.
             return
+        self._enter_gate_rank = None
         try:
             await begin(self._gate_recheck)
         except Exception:  # noqa: BLE001 — 가짜 페이지·닫힌 탭: 묶음 없이
             self._gate_fence_end()
+            return
+        arm = getattr(self._dispatcher, "arm_enter_check", None)
+        if arm is not None and action is ActionType.TYPE_TEXT:
+            arm(self._enter_recheck)  # WS-88 (#248 B4): Enter 직전 같은 칸 재판정
 
     def _gate_fence_end(self) -> None:
         end = getattr(self._dispatcher, "end_gate_fence", None)
@@ -361,6 +563,16 @@ class HitlMixin:
         if isinstance(target, ActionResult):
             return False
         return bool(self._hitl.evaluate(self._gate_context(action, target)).allowed)
+
+    async def _enter_recheck(self, action: ActionType, params: Dict[str, Any]) -> bool:
+        """WS-88 (#248 B4): 입력 뒤 Enter 직전 같은 칸을 같은 판정(페이지·격리 world, 판정 노드를 다시 적음)으로 다시 본다. 위험
+        순위가 입력 전 게이트 판정 이하면 True — 올라갔으면 디스패처가 Enter 를 보내지 않는다(typed_without_enter)."""
+        stored = self.__dict__.get("_enter_gate_rank")
+        target = await self._gate_target(action, params)
+        if stored is None or isinstance(target, ActionResult):
+            return False
+        element_name, _selector, submits_form, unresolved, signals = target[:5]
+        return _gate_rank(action, self._current_domain(), element_name, submits_form, unresolved, signals) <= stored
 
     def _gate_context(self, action: ActionType, target: tuple) -> Any:
         """_gate_target 해석 결과 → 게이트 판정 입력(ActionContext)."""
@@ -388,7 +600,7 @@ class HitlMixin:
             if handle is not None:
                 element_name = handle.name
 
-        submits_form = bool(params.get("press_enter"))
+        submits_form = False
         unresolved = ""
         selector = params.get("selector", "") or ""
         dispatcher = self._dispatcher
@@ -433,12 +645,17 @@ class HitlMixin:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
             report_basis = True
-        elif action is ActionType.TYPE_TEXT and not submits_form:
-            submits_form, unresolved = await self._newline_submit_target(
-                params, element_id, submits_form, unresolved)
+        elif action is ActionType.TYPE_TEXT and self._enters(params):
+            # WS-88 (#248 B3): press_enter·개행 입력 = 그 칸에서 Enter — press_key Enter 와 같은 Enter-on-field 판정.
+            submits_form, name, unresolved, signals, basis_extra = await self._enter_field_target(params, element_id)
+            if name and " ".join(name.split()) != " ".join(element_name.split()):
+                signals = signals + (("detail", name),)  # 지금 읽은 이름도 판정에(관찰 이름은 element_name)
+            element_name = element_name or name
+            report_basis = bool(basis_extra.get("enter_action_origin"))  # NN8: 다른 출처 목적지는 통과해도 알린다
         elif action is ActionType.PRESS_KEY:
-            submits_form, name, unresolved, signals = await self._press_key_target(params)
+            submits_form, name, unresolved, signals, basis_extra = await self._press_key_target(params)
             element_name = name or element_name
+            report_basis = bool(basis_extra.get("enter_action_origin"))
         if action in (ActionType.CLICK, ActionType.SELECT_OPTION) and dispatcher is not None and not unresolved:
             if element_id:
                 signals = signals + await self._proxy_field_signals(action, params, "describe_proxy_for_gate",
@@ -506,31 +723,57 @@ class HitlMixin:
             out.append(("detail", str(params["value"])))
         return tuple(out)
 
-    async def _newline_submit_target(self, params: Dict[str, Any], element_id: Any, submits_form: bool,
-                                     unresolved: str) -> tuple:
-        """type_text 의 줄바꿈 입력이 폼 제출인지 대상 요소로 판정한다. 반환: (폼 제출, 판정 불가 사유)."""
-        dispatcher = self._dispatcher
+    @staticmethod
+    def _enters(params: Dict[str, Any]) -> bool:
         text = str(params.get("text") or "")
-        if "\n" in text or "\r" in text:
-            # 줄바꿈 입력은 한 줄 입력칸에서 Enter 와 같다(Playwright type 실측: 폼 제출).
-            if dispatcher is None:
-                return submits_form, "입력 대상을 읽을 수 없음"
-            info, iso = await self._page_and_isolated(dispatcher.describe_element(element_id),
-                                                      "isolated_element_info_for_gate", element_id)
-            self._note_gate_node(("element_id", str(element_id)), iso, info is not None)  # R1 (검증 B2·B3)
-            if info is None:
-                unresolved = "입력 대상을 읽을 수 없음"
-            elif info.get("tag") == "INPUT" and info.get("in_form"):
-                submits_form = True
-            elif iso is not None:
-                # WS-85 (#163 B1·B2): 격리 world 판독도 본다(페이지가 form getter 를 지워도 원본 소속 폼) — 폼 제출이면 높은 쪽.
-                # 판독할 수 있어야 하는데 실패했으면 판정 불가(승인 경로, 페이지 world 로 내려가지 않음).
-                iso_info = iso.get("info") if isinstance(iso, dict) else None
-                if not isinstance(iso_info, dict):
-                    unresolved = self.ISOLATED_UNRESOLVED
-                elif iso_info.get("tag") == "INPUT" and iso_info.get("in_form"):
-                    submits_form = True
-        return submits_form, unresolved
+        return bool(params.get("press_enter")) or "\n" in text or "\r" in text
+
+    def _enter_pick(self, action: ActionType, a: tuple, b: tuple) -> tuple:
+        """두 Enter 판정 중 위험 순위가 높은 쪽(같으면 a — 페이지 world 판정)."""
+        domain = self._current_domain()
+        if _gate_rank(action, domain, b[1], b[0], b[2], b[3]) > _gate_rank(action, domain, a[1], a[0], a[2], a[3]):
+            return b
+        return a
+
+    async def _enter_field_target(self, params: Dict[str, Any], element_id: Any) -> tuple:
+        """WS-88 (#248): type_text 의 press_enter·개행 입력 — 입력할 그 칸의 Enter-on-field 판정. 반환 (폼 제출, 이름, 판정 불가
+        사유, 문맥 신호, 근거 부가정보).
+
+        페이지 world(describe_element)·격리 world(isolated_element_info_for_gate(enter=True)) 판독을 병렬로 읽어 각각 판정하고 높은 쪽.
+        낮춤(명시 GET·폼 밖 칸)은 격리 판독이 있을 때만이다: press_enter 는 격리 판독이 없거나 실패하면(판독기 없음 포함) 기존
+        '폼 제출' HIGH(fail-closed). 개행만 있는 입력은 WS-85 규칙 그대로(판독기 없음 = 페이지 판정, 격리 실패 = 판정 불가).
+        입력값이 풀리는 SecretStore 키거나 이미 민감 칸으로 표시된 호출(_CONCEAL_KEY — Enter 직전 재판정)은 민감 칸(B2)."""
+        from actions.dispatcher import _CONCEAL_KEY
+
+        dispatcher = self._dispatcher
+        press = bool(params.get("press_enter"))
+        high: tuple = (True, "", "", (), {})
+        unread: tuple = high if press else (False, "", "입력 대상을 읽을 수 없음", (), {})
+        if dispatcher is None:
+            return unread
+        store = getattr(getattr(dispatcher, "ctx", None), "secrets", None)
+        if params.get(_CONCEAL_KEY) or _secret_text(params, store):
+            return True, "", "", (), {"enter_target": "sensitive_field", "sensitive": "secret_value"}
+        info, iso = await self._page_and_isolated(dispatcher.describe_element(element_id),
+                                                  "isolated_element_info_for_gate", element_id, True)
+        self._note_gate_node(("element_id", str(element_id)), iso, info is not None)  # WS-85 R1 (검증 B2·B3)
+        if not isinstance(info, dict):
+            return unread
+        iso_info = iso.get("info") if isinstance(iso, dict) else None
+        if iso is not None:
+            # WS-85 (#211 B1): 문맥 예외(탭·편집)는 격리 world 판독이 확인할 때만.
+            info = self._with_isolated_context(info, iso_info)
+        if isinstance(iso_info, dict):
+            return self._enter_pick(ActionType.TYPE_TEXT, _enter_field_verdict(info, True),
+                                    _enter_field_verdict(iso_info, True))
+        page_v = _enter_field_verdict(info, False)
+        if press:
+            return self._enter_pick(ActionType.TYPE_TEXT, page_v, high)
+        if iso is None:
+            return page_v  # 판독기 없음(가짜 디스패처) — 페이지 판정만(지금 동작)
+        if page_v[0] or page_v[2]:
+            return page_v
+        return False, "", self.ISOLATED_UNRESOLVED, (), {}
 
     async def _approval_or_pass(self, action: ActionType, params: Dict[str, Any], approval_id: Any,
                                 decision: Any, report_basis: bool, element_name: str,
@@ -651,24 +894,24 @@ class HitlMixin:
     async def _press_key_target(self, params: Dict[str, Any]) -> tuple:  # noqa: C901
         """press_key 가 폼 제출·버튼 활성화인지 실제 포커스 요소로 판정한다 (WS-30 항목 6, R1).
 
-        type_text(press_enter=True) 는 '폼 제출'로 막히는데 type_text 뒤 press_key("Enter") 는
-        같은 제출이 통과하던 불일치를 막는다. 반환: (submits_form, 대상 이름, 판정 불가 사유).
-
-        무엇이 제출하는지는 Chromium 실측 표(`_ENTER_SUBMITS_INPUT_TYPES` 등)를 따른다. 포커스는
-        최상위 Page 기준(키가 가는 곳)으로 읽는다 — `ActionDispatcher.focused_target`.
+        반환: (submits_form, 대상 이름, 판정 불가 사유, 문맥 신호, 근거 부가정보). 무엇이 제출하는지는 Chromium 실측 표
+        (`_ENTER_SUBMITS_INPUT_TYPES` 등)를 따른다. 포커스는 최상위 Page 기준(키가 가는 곳)으로 읽는다 —
+        `ActionDispatcher.focused_target`. WS-88 (#248 B3): Enter 는 type_text(press_enter)·개행과 같은 Enter-on-field 판정
+        (_enter_field_verdict) — 명시 GET 예외는 격리 world 판독이 있을 때만(NN9), 없으면 기존 표대로 폼 제출.
         """
         from actions.dispatcher import key_kind
 
         kind = key_kind(str(params.get("key", "")))
         if not kind:
-            return False, "", "", ()
+            return False, "", "", (), {}
         dispatcher = self._dispatcher
+        enter = kind == "enter"
         info = await dispatcher.focused_target() if dispatcher is not None else None
         if info is None:
             # Enter·Space 모두 요소를 누를 수 있다 — 대상을 모르면 판정 불가(fail-closed).
-            return False, "", "포커스 요소를 읽을 수 없음", ()
+            return False, "", "포커스 요소를 읽을 수 없음", (), {}
         if info.get("opaque"):
-            return False, "", "포커스가 다른 출처 프레임 안에 있음", ()
+            return False, "", "포커스가 다른 출처 프레임 안에 있음", (), {}
         # WS-67 (#141): 같은 포커스를 격리 world 에서도 읽어(페이지가 form getter 등을 지워도 원본)
         # 각각 위험 분류한 뒤 높은 쪽을 쓴다. 격리 판정이 없으면(실패·OOPIF) 기존 판정 그대로.
         reader = getattr(dispatcher, "isolated_focus_target", None)
@@ -676,14 +919,14 @@ class HitlMixin:
         if reader is not None:
             # WS-85 (#211 B1): 문맥 예외(탭·편집)는 격리 world 판독이 확인할 때만 — 페이지 world 의 것은 버린다.
             info = self._with_isolated_context(info, isolated)
-        verdict = _focus_verdict(kind, info)
+        if enter:
+            if isinstance(isolated, dict):
+                return self._enter_pick(ActionType.PRESS_KEY, _enter_field_verdict(info, True),
+                                        _enter_field_verdict(isolated, True))
+            return _enter_field_verdict(info, False)
+        verdict = _focus_verdict(kind, info) + ({},)
         if isinstance(isolated, dict):
-            other = _focus_verdict(kind, isolated)
-            domain = self._current_domain()
-            if (_gate_rank(ActionType.PRESS_KEY, domain, other[1], other[0], other[2], other[3])
-                    > _gate_rank(ActionType.PRESS_KEY, domain, verdict[1], verdict[0], verdict[2],
-                                 verdict[3])):
-                return other
+            return self._enter_pick(ActionType.PRESS_KEY, verdict, _focus_verdict(kind, isolated) + ({},))
         return verdict
 
     async def _point_target(self, params: Dict[str, Any]) -> tuple:
