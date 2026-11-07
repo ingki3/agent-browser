@@ -842,9 +842,13 @@ function () {
 _ISOLATED_TARGET_FN = "function () { return (" + _TARGET_INFO_JS.strip() + ")(this); }"
 #: WS-88 (#248): 입력칸에서 Enter 가 무엇을 하는가를 판정할 사실(게이트 server_hitl._enter_field_verdict 가 읽는다).
 #: 칸의 autocomplete, aria-activedescendant 항목(NN2 — combobox Enter 는 그 항목을 고른다), 소속 폼(el.form — form= 속성
-#: 연결 포함, NN6)의 **명시** method 속성(B1 — 속성 없음은 null), 기본 제출 버튼(form.elements 순서상 첫 submit)의
-#: formmethod·formaction·이름·신호, 폼 안 모든 컨트롤(hidden 포함)의 type·autocomplete·name·id·고정 value, 폼 안
-#: iframe·frame·object·embed 수, 제출 목적지 출처와 문서 출처(NN8). 컨트롤은 200개까지 — 넘으면 게이트가 GET 예외를 주지 않는다.
+#: 연결 포함, NN6)의 **명시** method 속성(B1 — 속성 없음은 null), 기본 제출 버튼의 formmethod·formaction·이름·신호, 폼 안
+#: 모든 컨트롤(hidden 포함)의 type·autocomplete·name·id·고정 value, 폼 안 iframe·frame·object·embed 수, 제출 목적지 출처와
+#: 문서 출처(NN8). 컨트롤은 200개까지 — 넘으면 게이트가 GET 예외를 주지 않는다.
+#: R1 (검증 B1): 기본 제출자는 HTML 규칙대로 — 폼 소유 제출 버튼(button[type=submit]·input submit·**input image**, form= 로
+#: 바깥에서 연결된 것 포함) 중 문서(트리) 순서 첫째. form.elements 는 image 를 빼므로 그것으로 찾지 않는다(_MEANING_JS 의
+#: defaultSubmitter 와 같은 규칙). 해석이 실패하면 submitter_undetermined=true — 게이트가 GET 예외를 주지 않는다(HIGH).
+#: concealed(R1 검증 B3): 이 칸이 격리 world 의 가림 표식 집합(_CONCEALED_SET — SecretStore 값·민감 입력을 친 칸)에 있는가.
 _ENTER_FACTS_JS = """
 function enterFacts(el) {
   const low = (v) => (v === null || v === undefined) ? null : String(v).trim().toLowerCase();
@@ -858,15 +862,33 @@ function enterFacts(el) {
     if (!opt) { try { opt = el.ownerDocument.getElementById(ad); } catch (e) { opt = null; } }
     if (opt) out.active_option = { name: String(accessibleName(opt) || '').slice(0, 200), signals: gateSignals(opt) };
   }
+  try { const cs = globalThis.__CONCEALED_SET__; out.concealed = !!(cs && typeof cs.has === 'function' && cs.has(el)); }
+  catch (e) { out.concealed = false; }
   const form = el.form || null;
   if (!form) return out;
   let els = [];
   try { els = Array.prototype.slice.call(form.elements || []); } catch (e) { els = []; }
+  const isSub = (c) => {
+    const t = (c.type || '').toLowerCase();
+    return (c.tagName === 'BUTTON' && t === 'submit') || (c.tagName === 'INPUT' && (t === 'submit' || t === 'image'));
+  };
   let submitter = null;
+  let undetermined = false;
+  try {
+    const root = form.getRootNode();
+    const owned = [];
+    const add = (list) => { for (const n of list) if (owned.indexOf(n) === -1 && isSub(n) && n.form === form) owned.push(n); };
+    add(form.querySelectorAll('button, input'));
+    add(root.querySelectorAll('button[form], input[form]'));
+    // 문서(트리) 순서 — 4 = DOCUMENT_POSITION_FOLLOWING.
+    owned.sort((a, b) => (a === b ? 0 : (a.compareDocumentPosition(b) & 4 ? -1 : 1)));
+    submitter = owned.length ? owned[0] : null;
+    // form.elements 에 없는 소유 제출자(input image)도 컨트롤로 판정한다(name·value 신호).
+    for (const n of owned) if (els.indexOf(n) === -1) els.push(n);
+  } catch (e) { undetermined = true; submitter = null; }
   const controls = [];
   for (const c of els) {
     const t = (c.type || '').toLowerCase();
-    if (!submitter && ((c.tagName === 'BUTTON' && t === 'submit') || (c.tagName === 'INPUT' && (t === 'submit' || t === 'image')))) submitter = c;
     if (controls.length < 200) {
       const item = { tag: c.tagName, type: t, name_attr: attr(c, 'name') || '', id: c.id || '', autocomplete: low(attr(c, 'autocomplete')) || '' };
       if (c.tagName === 'BUTTON' || STATIC_VALUE.indexOf(t) !== -1) item.value = String(c.value || '').slice(0, 300);
@@ -876,7 +898,8 @@ function enterFacts(el) {
   let frames = -1;
   try { frames = form.querySelectorAll('iframe, frame, object, embed').length; } catch (e) { frames = -1; }
   const f = { method_attr: form.hasAttribute('method') ? low(attr(form, 'method')) : null, action_attr: attr(form, 'action'),
-              controls: controls, controls_total: els.length, frames: frames, submitter: null, action_origin: '', doc_origin: '' };
+              controls: controls, controls_total: els.length, frames: frames, submitter: null,
+              submitter_undetermined: undetermined, action_origin: '', doc_origin: '' };
   if (submitter) {
     f.submitter = { tag: submitter.tagName, type: (submitter.type || '').toLowerCase(),
                     formmethod: submitter.hasAttribute('formmethod') ? low(attr(submitter, 'formmethod')) : null,
@@ -893,6 +916,11 @@ function enterFacts(el) {
   return out;
 }
 """
+
+#: R1 (검증 B3): 격리 world 전역의 가림 표식 집합 이름(WeakSet — 페이지 main world 에서는 보이지 않는다). 페이지 world 판독에서
+#: 같은 이름을 페이지가 만들어도 표식을 **더할** 뿐(높은 쪽 판정) 지울 수는 없다.
+_CONCEALED_SET = "__agentBrowserConcealed"
+_ENTER_FACTS_JS = _ENTER_FACTS_JS.replace("__CONCEALED_SET__", _CONCEALED_SET)
 
 #: WS-88: 게이트 판정 정보(_TARGET_INFO_JS) + Enter 사실(info.enter).
 _ENTER_INFO_JS = (
@@ -4523,6 +4551,27 @@ class ActionDispatcher:
         register_secret_values([text])
         params[_CONCEAL_KEY] = True
 
+    async def _mark_concealed_field(self) -> None:
+        """R1 (검증 B3): 가림 입력(SecretStore 값·민감 칸)을 친 뒤 키를 받는 노드(_FOCUS_NODE_JS)를 **격리 world** 가림 표식
+        집합(_CONCEALED_SET, WeakSet)에 넣는다 — 뒤의 press_key Enter 판정(enterFacts.concealed)이 type_text(press_enter)·개행의
+        _CONCEAL_KEY 판정과 같은 결론(민감 칸 HIGH)을 낸다. 노드 identity 라 페이지가 칸을 옮겨도 남고, 새 문서면 사라진다.
+        가림 입력에서만 부른다(평범한 입력 왕복 0). 못 하면 조용히 — 그때 press_key 는 기존 판정(사용자 결정 대기 #240)."""
+        expr = ("(() => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+                "if (!(n && typeof n === 'object' && n.tagName)) return false; "
+                "const g = globalThis; if (!g." + _CONCEALED_SET + ") g." + _CONCEALED_SET + " = new WeakSet(); "
+                "g." + _CONCEALED_SET + ".add(n); return true; })()")
+        try:
+            top = self._top_page()
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": expr, "contextId": context_id, "returnByValue": True})
+
+            await asyncio.wait_for(self._in_gate_world(cdp, "", run), 2.0)  # 문서 이동 중 멈춤 상한
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe(표식 없음 = 지금 판정)
+            return
+
     @staticmethod
     async def _target_node_key(target: Any, fixed: bool) -> Optional[str]:
         """R1 (검증 B1): 입력 대상 노드의 식별 열쇠(_NODE_KEY_JS). 못 읽으면 None(격리 OR 에 더하지 않는다)."""
@@ -5377,6 +5426,8 @@ class ActionDispatcher:
                     await target.type(text, timeout=5000)
                 sent()
             await self._mark_sensitive_input(handle, params, text, after_input=True, target=target, fixed=fixed)
+            if params.get(_CONCEAL_KEY):
+                await self._mark_concealed_field()  # R1 (검증 B3): 뒤 press_key Enter 도 이 칸을 민감 칸으로
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.

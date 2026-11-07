@@ -127,6 +127,10 @@ def _enter_sensitive(info: Dict[str, Any]) -> str:
     이름·aria·title·placeholder 는 이름에, id·name·class 는 식별자 토큰으로). 폼 컨트롤은 type·autocomplete·name·id 만 본다.
     """
     enter = _as_dict(info.get("enter"))
+    if enter.get("concealed") is True:
+        # R1 (검증 B3): 격리 world 가림 표식 — 이 칸에 SecretStore 값·민감 입력을 쳤다(press_key Enter 도 type_text 의
+        # _CONCEAL_KEY·SecretStore 키 판정과 같은 결론).
+        return "secret_value"
     if str(info.get("type") or "").lower() == "password":
         return "password"
     if _enter_autocomplete_hit(enter.get("autocomplete")):
@@ -167,6 +171,8 @@ def _enter_get_form(info: Dict[str, Any]) -> Optional[tuple]:
         return None
     if form.get("frames") != 0:
         return None
+    if form.get("submitter_undetermined") is not False:
+        return None  # R1 (검증 B1): 기본 제출자(HTML 규칙 — image·form= 바깥 포함)를 정하지 못함 = 폼 제출
     controls = form.get("controls")
     total = form.get("controls_total")
     if not isinstance(controls, list) or not isinstance(total, int) or total > _ENTER_CONTROLS_CAP \

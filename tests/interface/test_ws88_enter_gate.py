@@ -96,6 +96,8 @@ RISK: Dict[str, Tuple[str, str]] = {
                              "</form>"), "/order"),
 }
 SWAPPED = _page("교체됨", "<form method=post action=/order/pay><input id=t name=q aria-label='검색어'></form>")
+#: R1 (검증 B3): 폼 밖 평범한 두 칸 — SecretStore 값을 친 칸(t)과 평범한 칸(t2).
+SECRET_PAGE = _page("검색", "<input id=t name=keyword aria-label='검색어 입력'><input id=t2 aria-label='메모 입력'>")
 
 #: 정상군: (경로, 페이지, 효과 확인 방식 'mark'(#out) 또는 요청 경로 접두).
 NORMAL: Dict[str, Tuple[str, str]] = {
@@ -136,6 +138,7 @@ def site() -> Iterator[_Site]:
     state = _Site()
     pages: Dict[str, str] = {k: v[0] for k, v in {**RISK, **NORMAL, **KNOWN_HIGH}.items()}
     pages["/r_swapped"] = SWAPPED
+    pages["/x_secret"] = SECRET_PAGE
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self) -> None:
@@ -254,6 +257,144 @@ async def test_risk_census_zero_pass(site, mode):
     passed = [row for row in rows if row[1] == "PASS" or (len(row) > 3 and row[3])]
     print(json.dumps([[str(c) for c in row] for row in rows], ensure_ascii=False))
     assert passed == [], passed
+
+
+#: R1 (검증 B1): 기본 제출자 형제 — 명시 GET 폼(/results)이지만 **HTML 규칙상 기본 제출자**(폼 소유 제출 버튼 중 문서 순서
+#: 첫째 — button·input submit·input image, form= 로 바깥에서 연결된 것 포함)가 formmethod=post formaction=/pay 다.
+#: 세 경로 모두 승인 없이 POST /pay 가 나가면 안 된다(기준 9b9bbf0 은 전부 HIGH). form.elements 는 image 를 빼므로 그것으로
+#: 찾으면 image·바깥 image 형제가 새어 나갔다.
+_SUB_POST = "formmethod=post formaction=/pay"
+_SIB_FIELD = "<input id=t name=q aria-label='검색어'>"
+SUBMITTER_SIBLINGS: Dict[str, str] = {
+    "/sb_button": f"<form id=f method=get action=/results>{_SIB_FIELD}<button {_SUB_POST}>검색</button></form>",
+    "/sb_submit": f"<form id=f method=get action=/results>{_SIB_FIELD}<input type=submit {_SUB_POST} value='검색'></form>",
+    "/sb_image": f"<form id=f method=get action=/results>{_SIB_FIELD}<input type=image {_SUB_POST} alt='검색'></form>",
+    # image 가 앞, 평범한 button 이 뒤 — 기본 제출자는 image(문서 순서 첫째).
+    "/sb_image_first": (f"<form id=f method=get action=/results>{_SIB_FIELD}<input type=image {_SUB_POST} alt='검색'>"
+                        "<button>찾기</button></form>"),
+    "/sb_ext_button": f"<form id=f method=get action=/results>{_SIB_FIELD}</form><button form=f {_SUB_POST}>검색</button>",
+    "/sb_ext_image": (f"<form id=f method=get action=/results>{_SIB_FIELD}</form>"
+                      f"<input type=image form=f {_SUB_POST} alt='검색'>"),
+    # 바깥 제출자가 폼보다 **앞**(문서 순서 첫째) — 안쪽 평범한 버튼보다 우선.
+    "/sb_ext_before": (f"<input type=image form=f {_SUB_POST} alt='검색'>"
+                       f"<form id=f method=get action=/results>{_SIB_FIELD}<button>찾기</button></form>"),
+    # 비활성 첫 제출자: 암묵 제출 없음(뒤 버튼으로 넘어가지 않음) — 그 formmethod 를 그대로 반영(HIGH).
+    "/sb_disabled_first": (f"<form id=f method=get action=/results>{_SIB_FIELD}<button disabled {_SUB_POST}>검색</button>"
+                           "<button>찾기</button></form>"),
+}
+#: 대조(과차단 금지): 기본 제출자가 평범한 GET 이고 POST 형제는 그 **뒤** — 명시 GET 예외(검색형 제출) 그대로.
+SUBMITTER_GET_OK: Dict[str, str] = {
+    "/sb_button_then_image": (f"<form id=f method=get action=/results>{_SIB_FIELD}<button>찾기</button>"
+                              f"<input type=image {_SUB_POST} alt='검색'></form>"),
+    "/sb_none": f"<form id=f method=get action=/results>{_SIB_FIELD}</form>",
+}
+
+
+@pytest.fixture
+def sib_site() -> Iterator[_Site]:
+    state = _Site()
+    pages = {k: _page("검색", v, mark=False) for k, v in {**SUBMITTER_SIBLINGS, **SUBMITTER_GET_OK}.items()}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self) -> None:
+            state.requests.append((self.command, self.path))
+            path = self.path.split("?", 1)[0]
+            body = (b"User-agent: *\nAllow: /\n" if path == "/robots.txt"
+                    else pages.get(path, HEAD.format(t="결과") + "<h1>결과</h1>").encode("utf-8"))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            self._reply()
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._reply()
+
+        def log_message(self, *args):  # noqa: ANN002
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    state.base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        yield state
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+async def _sib_enter(server: BrowserMCPServer, site: _Site, path: str, mode: str) -> Tuple[Any, List[Tuple[str, str]]]:
+    import asyncio
+
+    nav = await _call(server, ActionType.NAVIGATE, {"url": site.base + path})
+    assert nav.success, nav.error_message
+    eid, epoch = await _target(server, "검색어")
+    start = len(site.requests)
+    if mode == "press_key":
+        typed = await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "abc"})
+        assert typed.success, (path, typed.error_message)
+        r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+    else:
+        r = await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch,
+                                                       "text": "abc\n" if mode == "newline" else "abc",
+                                                       "press_enter": mode == "type_enter"})
+    await asyncio.sleep(0.15)
+    return r, site.requests[start:]
+
+
+@requires_chromium
+@pytest.mark.parametrize("mode", ["type_enter", "press_key", "newline"])
+async def test_default_submitter_siblings_never_post_unapproved(sib_site, mode):
+    rows = []
+    async with BrowserMCPServer() as server:
+        for path in SUBMITTER_SIBLINGS:
+            r, reqs = await _sib_enter(server, sib_site, path, mode)
+            rows.append((path, r.error_code, [m for m, _p in reqs if m == "POST"]))
+    print(json.dumps([[str(c) for c in row] for row in rows], ensure_ascii=False))
+    leaked = [row for row in rows if row[2] or row[1] is not ErrorCode.HITL_UNATTENDED_BLOCKED]
+    assert leaked == [], leaked
+
+
+@requires_chromium
+@pytest.mark.parametrize("mode", ["type_enter", "press_key"])
+async def test_default_submitter_get_controls_still_pass(sib_site, mode):
+    async with BrowserMCPServer() as server:
+        for path in SUBMITTER_GET_OK:
+            r, reqs = await _sib_enter(server, sib_site, path, mode)
+            assert r.success, (path, r.error_code, r.error_message)
+            assert [m for m, p in reqs if p.startswith("/results?q=abc")] == ["GET"], (path, reqs)
+            assert not any(m == "POST" for m, _p in reqs), (path, reqs)
+
+
+@requires_chromium
+async def test_press_key_enter_after_secret_is_sensitive_like_type_text(site):
+    """R1 (검증 B3): SecretStore 키로 실제 값을 넣은 칸에서 press_key Enter 도 type_text(press_enter)·개행과 같은 민감 칸
+    판정(HIGH, sensitive=secret_value) — 칸 이름이 평범해도. 다른 평범한 칸으로 옮겨 친 Enter 는 그대로 통과(과차단 금지)."""
+    from security.secrets import SecretStore
+
+    async with BrowserMCPServer() as server:
+        server._dispatcher.ctx.secrets = SecretStore({"WS88_SYN_KEY": "SyntheticCedarValue"})  # noqa: SLF001 — 합성 값
+        await _call(server, ActionType.NAVIGATE, {"url": site.base + "/x_secret"})
+        eid, epoch = await _target(server, "검색어 입력")
+        a = await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "WS88_SYN_KEY",
+                                                       "press_enter": True})
+        eid, epoch = await _target(server, "검색어 입력")
+        typed = await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "WS88_SYN_KEY"})
+        b = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+        out_b = await server._page.text_content("#out")  # noqa: SLF001
+        eid2, epoch2 = await _target(server, "메모 입력")
+        await _call(server, ActionType.TYPE_TEXT, {"element_id": eid2, "epoch": epoch2, "text": "abc"})
+        c = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+    assert typed.success and typed.data.get("secret_resolved") is True, (typed.error_message, typed.data)
+    for r in (a, b):
+        assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, (r.action, r.error_code, r.error_message)
+        assert r.data["gate_basis"].get("sensitive") == "secret_value", (r.action, r.data.get("gate_basis"))
+    assert out_b == "대기"  # Enter 가 그 칸에 닿지 않았다
+    assert c.success, (c.error_code, c.error_message)
 
 
 @requires_chromium
@@ -403,7 +544,8 @@ def _field(**kw: Any) -> Dict[str, Any]:
 def _get_form(**kw: Any) -> Dict[str, Any]:
     form = {"method_attr": "get", "action_attr": "/search", "controls": [{"tag": "INPUT", "type": "text",
                                                                           "name_attr": "q", "id": "t"}],
-            "controls_total": 1, "frames": 0, "submitter": None, "action_origin": "http://a", "doc_origin": "http://a"}
+            "controls_total": 1, "frames": 0, "submitter": None, "submitter_undetermined": False,
+            "action_origin": "http://a", "doc_origin": "http://a"}
     form.update(kw)
     return form
 
@@ -444,6 +586,22 @@ def test_get_exception_rules():
                                       "name": "검색", "signals": []})):
         v = _enter_field_verdict(_field(in_form=True, enter={"form": form}), True)
         assert v[0] is True and "enter_target" not in v[4], form
+
+
+def test_get_exception_needs_determined_default_submitter():
+    """R1 (검증 B1): 기본 제출자를 정하지 못했거나(해석 실패·모호) 그 사실이 없으면 GET 예외 없음(HIGH)."""
+    for form in (_get_form(submitter_undetermined=True), {k: v for k, v in _get_form().items()
+                                                         if k != "submitter_undetermined"}):
+        v = _enter_field_verdict(_field(in_form=True, enter={"form": form}), True)
+        assert v[0] is True and "enter_target" not in v[4], form
+
+
+def test_concealed_field_mark_is_sensitive():
+    """R1 (검증 B3): 격리 world 가 가림 표식(SecretStore·민감 입력으로 친 칸)을 본 칸 — 세 경로 공통 민감 칸."""
+    assert _enter_sensitive(_field(enter={"concealed": True})) == "secret_value"
+    v = _enter_field_verdict(_field(name="검색어 입력", enter={"concealed": True}), True)
+    assert v[0] is True and v[4] == {"enter_target": "sensitive_field", "sensitive": "secret_value"}
+    assert _enter_sensitive(_field(enter={"concealed": False})) == ""
 
 
 def test_get_signals_include_hidden_and_query():

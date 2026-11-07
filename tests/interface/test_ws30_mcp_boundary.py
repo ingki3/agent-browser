@@ -51,6 +51,10 @@ def site():
             self.end_headers()
             self.wfile.write(data)
 
+        def do_POST(self):  # noqa: N802 — WS-88 R1 (검증 B2): 사전승인으로 연 POST 폼 제출이 실제로 닿는 곳
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.do_GET()
+
         def log_message(self, *args):  # noqa: ANN002
             pass
 
@@ -274,8 +278,10 @@ async def test_type_text_newline_is_form_submit(site):
 
 @requires_chromium
 async def test_press_key_enter_pre_approved_submits(site):
+    """사전승인(press_key:*)이 폼 제출 Enter 를 연다. WS-88 R1 (검증 B2): 승인이 실제로 필요한 POST 폼 — GET 검색 폼은 이제
+    승인 없이도 통과하므로 사전승인을 무효화해도 이 시험이 잡지 못했다."""
     async with BrowserMCPServer(pre_approved_actions=("press_key:*",)) as server:
-        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/post_form"})
         eid, epoch = await _element(server, "검색어")
         await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "노트북"})
         r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
