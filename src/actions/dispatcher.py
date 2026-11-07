@@ -4508,6 +4508,13 @@ class ActionDispatcher:
                     await self._reresolved_check(action, handle, params, node, first_doc)
                 # 대기(스크롤 포함) 전에도 관문 — 치유·재해석 사이 목록 문서로 바뀌었으면 그 문서에서 기다리지도 않는다.
                 await self._manual_guard(action, params)
+                if pin is None and self._live_fence() is not None and self._fence_binds(action, params):
+                    # WS-85 R2 (재검증 B3 형제): 목록이 있어도 _fenced_input 과 같은 묶음 — 문서 대조 후 이 노드가 게이트가
+                    # 판정한 노드가 아니면 다시 판정(허용 + 판정 노드가 이 노드일 때만). 다시 해석한 노드도 이 자리를 지난다.
+                    refused = await self._fence_refusal(action)
+                    if refused is not None:
+                        raise _TargetRefused(refused)
+                    await self._fence_bind_node(action, handle, params, node)
                 point = await self._wait_actionable(action, params, node, first_doc, deadline)
                 token = _BOUND_NODE.set(node)  # 민감 칸 판정도 입력할 그 노드로(is_sensitive_field)
                 try:
@@ -6161,8 +6168,9 @@ class ActionDispatcher:
             refused = await self._manual_site_refusal(action, params)  # 이동(hover) 뒤 누르기 직전 다시
             if refused is not None:
                 return refused
-        if pin is None and not self._manual_active():
-            # WS-85 R1 (검증 B2): 게이트 판정 뒤 문서가 바뀌었으면(이동 시작·loaderId) 누르지 않는다.
+        if pin is None:
+            # WS-85 R1 (검증 B2): 게이트 판정 뒤 문서가 바뀌었으면(이동 시작·loaderId) 누르지 않는다. R2: 목록이 있어도 같다
+            # (목록 사이트 거부는 위 재판정이 먼저).
             refused = await self._fence_refusal(action)
             if refused is not None:
                 return refused
@@ -6181,6 +6189,7 @@ class ActionDispatcher:
                 await page.mouse.down(button=button)
                 await self._manual_guard(action, params)
                 await page.mouse.up(button=button)
+                self._fence_disarm()  # R2: 목록 없을 때와 같이 묶음은 첫 입력 동작까지
             else:
                 await page.mouse.click(x, y, button=button)
                 self._fence_disarm()
