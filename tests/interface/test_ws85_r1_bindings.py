@@ -387,3 +387,22 @@ async def test_b2_same_document_pushstate_is_not_refused(fx, route):
         assert q == "hithere", q  # 한 줄 입력칸: 줄바꿈은 Enter(값에 남지 않음) — 앞뒤 조각 모두 그 칸에
     else:
         assert r.success, r.error_message
+
+
+@requires_chromium
+async def test_missing_target_isolated_read_does_not_wait_for_box(fx):
+    """관찰 뒤 사라진 대상의 격리 판독은 상자를 기다리지 않고 곧바로 missing(701f412 heal 회귀) — 묶음이 문서 교체를 막아도
+    게이트가 최대 2초 멈추는 지연 자체를 고정한다."""
+    import time
+
+    FX_PAGES["/m"] = _BENIGN
+    async with BrowserMCPServer(recipes=False) as server:
+        await _call(server, ActionType.NAVIGATE, {"url": fx + "/m"})
+        obs = await _call(server, ActionType.OBSERVE_PAGE, {})
+        eid = _eid(obs, lambda e: e.get("name") == "계속")
+        await _page(server).evaluate("document.getElementById('b').remove()")
+        t0 = time.perf_counter()
+        iso = await server._dispatcher.isolated_element_info_for_gate(eid)  # noqa: SLF001
+        took = time.perf_counter() - t0
+    assert iso == {"missing": True}, iso
+    assert took < 1.0, took

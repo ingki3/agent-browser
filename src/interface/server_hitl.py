@@ -332,6 +332,10 @@ class HitlMixin:
             return
         if action is ActionType.PRESS_KEY and not key_kind(str(params.get("key", ""))):
             return
+        if action is ActionType.TYPE_TEXT and not self._dispatcher._fence_binds(action, params):
+            # 줄바꿈 없는 입력(또는 press_enter — 판독 없이 폼 제출 HIGH)은 게이트가 페이지에서 판정한 것이 없다: 묶을 것이
+            # 없고 평범한 입력에 왕복을 더하지 않는다.
+            return
         try:
             await begin(self._gate_recheck)
         except Exception:  # noqa: BLE001 — 가짜 페이지·닫힌 탭: 묶음 없이
