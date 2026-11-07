@@ -1649,6 +1649,8 @@ class ActionDispatcher:
         self.last_key_sensitive: bool = False
         #: WS-78 T1 sticky: 앞 press_key 에서 민감으로 판정한 포커스 노드(JSHandle) — 같은 노드면 type 이 바뀌어도 민감.
         self._sticky_key_node: Any = None
+        #: WS-88 R2 (재검증 C1): 가림 표식(_CONCEALED_SET)을 한 번이라도 넣었는가 — 평범한 대체 입력의 해제 확인 왕복은 그때만.
+        self._concealed_marked: bool = False
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
         #: WS-83(B2·B3): 직전 dispatch 가 연 팝업 Page 들 — 서버가 egress 차단 귀속 후보(이 호출이 연 팝업)로 읽는다.
@@ -4560,6 +4562,7 @@ class ActionDispatcher:
                 "if (!(n && typeof n === 'object' && n.tagName)) return false; "
                 "const g = globalThis; if (!g." + _CONCEALED_SET + ") g." + _CONCEALED_SET + " = new WeakSet(); "
                 "g." + _CONCEALED_SET + ".add(n); return true; })()")
+        self._concealed_marked = True  # 평가가 실패해도 — 뒤 대체 입력의 해제 확인은 표식이 없으면 아무것도 하지 않는다
         try:
             top = self._top_page()
             cdp = await self._gate_cdp_for(top)
@@ -4570,6 +4573,36 @@ class ActionDispatcher:
 
             await asyncio.wait_for(self._in_gate_world(cdp, "", run), 2.0)  # 문서 이동 중 멈춤 상한
         except Exception:  # noqa: BLE001 — 의도된 fail-safe(표식 없음 = 지금 판정)
+            return
+
+    async def _unmark_concealed_field(self, target: Any, fixed: bool, text: str) -> None:
+        """WS-88 R2 (재검증 C1): 가림 표식은 '지금 그 칸에 비밀 값이 들어 있다' — 도구가 그 칸의 값을 **통째로 바꾸는** 평범한
+        입력(clear 후 입력, 성공)을 마쳤으면 표식을 지운다. 성공한 대체 입력 뒤에만 부르고(덧붙임·입력 실패는 부르지 않음),
+        격리 world 에서 키를 받는 노드가 표식된 노드이고, 입력한 그 노드(식별 열쇠)이며, 그 값이 친 글자와 **정확히 같을** 때만
+        지운다. 하나라도 아니거나 못 읽으면 유지(fail-closed — press_key Enter 는 민감 칸 HIGH). 페이지가 스스로 값을 지운
+        경우는 바꾸지 않는다(유지). 표식을 넣은 적이 없으면 왕복 0."""
+        if not self._concealed_marked:
+            return
+        key = await self._target_node_key(target, fixed)
+        if not key:
+            return
+        expr = ("(() => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+                "if (!(n && typeof n === 'object' && n.tagName)) return false; "
+                "const cs = globalThis." + _CONCEALED_SET + "; "
+                "if (!(cs && typeof cs.has === 'function' && cs.has(n))) return false; "
+                "if ((" + _NODE_KEY_JS.strip() + ")(n) !== " + json.dumps(key) + ") return false; "
+                "if (typeof n.value !== 'string' || n.value !== " + json.dumps(text) + ") return false; "
+                "cs.delete(n); return true; })()")
+        try:
+            top = self._top_page()
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": expr, "contextId": context_id, "returnByValue": True})
+
+            await asyncio.wait_for(self._in_gate_world(cdp, "", run), 2.0)
+        except Exception:  # noqa: BLE001 — 의도된 fail-closed(표식 유지 = 민감 칸 판정)
             return
 
     @staticmethod
@@ -5428,6 +5461,9 @@ class ActionDispatcher:
             await self._mark_sensitive_input(handle, params, text, after_input=True, target=target, fixed=fixed)
             if params.get(_CONCEAL_KEY):
                 await self._mark_concealed_field()  # R1 (검증 B3): 뒤 press_key Enter 도 이 칸을 민감 칸으로
+            elif params.get("clear_before", True):
+                # WS-88 R2 (재검증 C1): 성공한 평범한 대체 입력(clear 후 입력) — 그 칸의 가림 표식을 지운다(덧붙임은 유지).
+                await self._unmark_concealed_field(target, fixed, text)
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.

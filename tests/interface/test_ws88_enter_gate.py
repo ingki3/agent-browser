@@ -397,6 +397,89 @@ async def test_press_key_enter_after_secret_is_sensitive_like_type_text(site):
     assert c.success, (c.error_code, c.error_message)
 
 
+#: R2 (재검증 C1): 문서 단위 Enter 표시 — SPA 로 교체된 노드에도 효과를 본다(칸 리스너는 cloneNode 로 옮겨지지 않는다).
+_DOC_MARK_JS = ("() => { document.addEventListener('keydown', (e) => { if (e.key === 'Enter') "
+                "document.getElementById('out').textContent = 'enter:' + e.target.value; }); }")
+
+
+async def _secret_enter(server: BrowserMCPServer, name: str, text: str, **kw: Any) -> Tuple[Any, Any, Any]:
+    """칸(name)에 type_text(text, kw) 뒤 press_key Enter — (입력 결과, Enter 결과, #out)."""
+    await server._page.evaluate("() => { document.getElementById('out').textContent = '대기'; }")  # noqa: SLF001
+    eid, epoch = await _target(server, name)
+    typed = await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": text, **kw})
+    r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+    return typed, r, await server._page.text_content("#out")  # noqa: SLF001
+
+
+async def _secret_nav(server: BrowserMCPServer, site: _Site) -> None:
+    assert (await _call(server, ActionType.NAVIGATE, {"url": site.base + "/x_secret"})).success
+    await server._page.evaluate(_DOC_MARK_JS)  # noqa: SLF001
+
+
+def _blocked_secret(r: Any) -> bool:
+    return r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED and \
+        (r.data or {}).get("gate_basis", {}).get("sensitive") == "secret_value"
+
+
+@requires_chromium
+async def test_concealed_mark_cleared_by_plain_replacement_only(site):
+    """R2 (재검증 C1): 가림 표식은 '지금 그 칸에 비밀 값이 있다' — 같은 칸을 **통째로 바꾸는** 평범한 입력(clear 후 입력,
+    성공, 값 확인)이면 해제(기준처럼 허용·Enter 효과). 덧붙임(clear_before=false)·입력 실패·값 불일치는 유지(HIGH)."""
+    from security.secrets import SecretStore
+
+    async with BrowserMCPServer() as server:
+        server._dispatcher.ctx.secrets = SecretStore({"WS88_SYN_KEY": "SyntheticCedarValue"})  # noqa: SLF001 — 합성 값
+        await _secret_nav(server, site)
+        typed, pos, _ = await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        assert typed.data.get("secret_resolved") is True and _blocked_secret(pos), (pos.error_code, pos.data)
+        # c: 같은 칸 clear(빈 입력) 뒤 평범한 abc — 기준(9b9bbf0)처럼 허용, Enter 효과.
+        _, _, _ = await _secret_enter(server, "검색어 입력", "")
+        typed, c, out_c = await _secret_enter(server, "검색어 입력", "abc")
+        assert typed.success and c.success, (c.error_code, c.error_message, (c.data or {}).get("gate_basis"))
+        assert out_c == "enter:abc"
+        # c': 비밀 값 위에 곧바로 평범한 대체 입력(clear_before 기본) — 허용.
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        _, c2, out_c2 = await _secret_enter(server, "검색어 입력", "abc")
+        assert c2.success and out_c2 == "enter:abc", (c2.error_code, c2.error_message)
+        # 덧붙임: 비밀 입력 뒤 clear 없이 abc — 비밀이 칸에 남는다(HIGH).
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        # (덧붙임 type_text 자체는 기존 사후조건(기대값 = 친 글자)으로 실패 보고 — 기준과 같음. 글자는 칸에 들어갔다.)
+        _, app, out_app = await _secret_enter(server, "검색어 입력", "abc", clear_before=False)
+        assert _blocked_secret(app), (app.error_code, (app.data or {}).get("gate_basis"))
+        assert await server._page.input_value("#t") == "SyntheticCedarValueabc"  # noqa: SLF001 — 합성 값
+        assert out_app == "대기"
+        # 덧붙임 뒤 평범한 대체 입력은 다시 해제(표식 = 현재 값).
+        _, again, _ = await _secret_enter(server, "검색어 입력", "abc")
+        assert again.success, (again.error_code, again.error_message)
+        # 입력 실패: 비밀 입력 뒤 칸이 readonly — clear 가 실패하면 비밀이 남는다(HIGH).
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        await server._page.evaluate("() => { document.getElementById('t').readOnly = true; }")  # noqa: SLF001
+        typed, fail, out_fail = await _secret_enter(server, "검색어 입력", "abc")
+        assert not typed.success and _blocked_secret(fail), (typed.error_code, fail.error_code)
+        assert out_fail == "대기"
+        # 값 확인 불가(입력 결과가 친 값과 다름 — maxlength): 유지(HIGH).
+        await _secret_nav(server, site)
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        await server._page.evaluate("() => { document.getElementById('t').maxLength = 2; }")  # noqa: SLF001
+        _, short, _ = await _secret_enter(server, "검색어 입력", "abc")
+        assert _blocked_secret(short), (short.error_code, (short.data or {}).get("gate_basis"))
+        # a: 비밀 칸은 그대로, 다른 평범한 칸 Enter — 허용(다른 칸으로 번지지 않음).
+        await _secret_nav(server, site)
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        _, a, out_a = await _secret_enter(server, "메모 입력", "abc")
+        assert a.success and out_a == "enter:abc", (a.error_code, a.error_message)
+        # d: SPA 로 같은 칸 노드 교체 뒤 평범한 입력 — 허용.
+        await server._page.evaluate(  # noqa: SLF001
+            "() => { const t = document.getElementById('t'); t.replaceWith(t.cloneNode(true)); }")
+        _, d, out_d = await _secret_enter(server, "검색어 입력", "abc")
+        assert d.success and out_d == "enter:abc", (d.error_code, d.error_message)
+        # e: 비밀 입력 뒤 새 문서 — 평범한 입력 허용.
+        await _secret_enter(server, "검색어 입력", "WS88_SYN_KEY")
+        await _secret_nav(server, site)
+        _, e, out_e = await _secret_enter(server, "검색어 입력", "abc")
+        assert e.success and out_e == "enter:abc", (e.error_code, e.error_message)
+
+
 @requires_chromium
 async def test_mutation_during_input_refused_with_typed_without_enter(site):
     """B4: 입력 전 LOW(명시 GET) → 입력 중 POST·password 로 바뀜 → Enter 를 보내지 않고 거부(typed_without_enter)."""
