@@ -544,11 +544,16 @@ class ToolsMixin:
             # WS-56 R4(WS-56 R2 B4·R3 B6 를 이 구간으로 통일): 승인 증표·정책·elicitation 으로 연 호출과 일반 호출 모두
             # 재확인 → 실제 입력 → 효과 판정을 이 작업 공간 직렬화 구간 안에서 한다(서버 단위 별도 락 없음). 사람 응답
             # 대기(elicitation)만 구간 밖 — _out_of_band 가 잠시 놓았다가(_SerialPause) 응답 뒤 다시 잡고 재판정한다.
-            blocked = await self._check_hitl(action, params, approval_id=approval_id)
-            if blocked is not None:
-                await self._drop_approval_pin()
-                return blocked
-            return await self._run_gated_action(name, arguments, action, params)
+            # WS-85 R1 (검증 B2·B3): 게이트가 판정한 문서·노드를 실제 입력에 묶는다(판정 시작 때 문서를 잡는다).
+            await self._gate_fence_begin(action, params)
+            try:
+                blocked = await self._check_hitl(action, params, approval_id=approval_id)
+                if blocked is not None:
+                    await self._drop_approval_pin()
+                    return blocked
+                return await self._run_gated_action(name, arguments, action, params)
+            finally:
+                self._gate_fence_end()
 
     async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
                                         capture: Dict[str, Any]) -> Optional[ActionResult]:

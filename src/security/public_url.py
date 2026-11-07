@@ -736,6 +736,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                      "take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish",
                      "cookie_sites", "status", "done"}),  # handoff._OPS · cli status (done: WS-64)
     "risk": frozenset({"low", "medium", "high"}),  # security.hitl.RiskLevel
+    "name_risk": frozenset({"high"}),  # WS-85 (#226) data.hidden_controls[].name_risk(apply_block 리터럴)
     "presented_as": frozenset({"chrome"}),  # server_signals identity
     "sticky_reason": frozenset(),  # 자유 문장(on_demand — 도메인·사유 문장) — 늘 정제
     # server_handoff._control_wait + WS-64 직접 조작 인계 결과(security.manual_sites OUTCOMES). cancelled 는 쓰지 않는다 —

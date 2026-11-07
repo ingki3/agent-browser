@@ -35,6 +35,9 @@ RISKY: Dict[str, str] = {
     "trash_button": f"<button id=t type=button {_PRESS}>Trash</button>",
     "lone_block": f"<button id=t type=button {_PRESS}>차단</button>",
     "lone_empty": f"<button id=t type=button {_PRESS}>비우기</button>",
+    # WS-85 (#211 D1, 의도한 기대값 변경): 예전 BENIGN block_tab(탭 1개 tablist) — tablist 래핑 우회와 같은 모양이라 막는다.
+    "block_single_tab_list": f"<div role=tablist><button id=t type=button role=tab aria-controls=blocked "
+                             f"aria-selected=false {_PRESS}>차단</button></div><section id=blocked>차단한 사용자 보기</section>",
     "lone_empty_no_text_input": f"<label>수량<input type=number value=1></label>"
                                 f"<button id=t type=button {_PRESS}>비우기</button>",
 }
@@ -53,7 +56,9 @@ BENIGN: Dict[str, str] = {
     "clear_search": f"<label>검색<input id=q value=\"search words\"></label>"
                     f"<button id=t type=button {_PRESS}>비우기</button>",
     "clear_search_sibling": f"<div><input type=search><button id=t type=button {_PRESS}>비우기</button></div>",
-    "block_tab": f"<div role=tablist><button id=t type=button role=tab aria-controls=blocked aria-selected=false "
+    # WS-85 (#211 D1): 탭 문맥은 보이는 탭 2개 이상인 실제 탭 목록에서만 — 탭 1개 목록은 RISKY 의 block_single_tab_list.
+    "block_tab": f"<div role=tablist><button type=button role=tab aria-selected=true>전체</button>"
+                 f"<button id=t type=button role=tab aria-controls=blocked aria-selected=false "
                  f"{_PRESS}>차단</button></div><section id=blocked>차단한 사용자 보기</section>",
     "empty_cancel": f"<button id=t {_PRESS}>휴지통 비우기 취소</button>",
     "empty_guide": f"<button id=t {_PRESS}>휴지통 비우기 안내</button>",

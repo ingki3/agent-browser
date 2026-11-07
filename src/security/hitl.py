@@ -277,7 +277,7 @@ def _match_markup(source: str, text: str) -> Optional[str]:
     return _match_tokens(class_tokens(text))
 
 
-def match_signal(source: str, text: str, path_only: bool = False) -> Optional[str]:
+def match_signal(source: str, text: str, path_only: bool = False, guide_anywhere: bool = False) -> Optional[str]:
     """원천 종류에 맞는 규칙으로 고위험 키워드를 찾는다. 없으면 None.
 
     `path_only`: 폼 목적지(form_action·formaction)의 쿼리를 보지 않는다(GET 제출).
@@ -297,7 +297,7 @@ def match_signal(source: str, text: str, path_only: bool = False) -> Optional[st
     if hit is None and account_termination(source, text):
         return ACCOUNT_TERMINATION_KEYWORD
     if hit is None:
-        hit = irreversible_action(source, text)
+        hit = irreversible_action(source, text, guide_anywhere)
     if hit is None and source in PATH_SOURCES:
         hit = item_operation_destination(text, path_only=path_only)
     return hit
@@ -468,6 +468,11 @@ _IRR_COMPOUND_RE = re.compile(
 #: 우회됐고 '신고하기안내' 의 활용 어미 뒤 꼬리를 못 봤다), 안내 머리는 구 앞 어디든 본다(정규형 — 공백 없음).
 _IRR_KO_NEG_AFTER_RE = re.compile(r"해제|취소|안내|방법|설명|도움말|목록|설정|관리|내역|기준|정책|해지|가이드")
 _IRR_KO_INFO_BEFORE_RE = re.compile(r"도움말|안내|방법|가이드")
+#: WS-85 (#211, WS-86 리뷰 B2): 붙어 있을 때만 — 꼬리는 구 바로 뒤(사이에 어미·조사 하기·하는·기·을·를·의만), 머리 뒤에는 꼬리만.
+_IRR_KO_TAIL_ADJ_RE = re.compile(r"(?:하기|하는|기|을|를|의)?(?:" + _IRR_KO_NEG_AFTER_RE.pattern + r")")
+_IRR_KO_TAILS_RE = re.compile(r"(?:" + _IRR_KO_NEG_AFTER_RE.pattern + r")*")
+#: 영어 안내 머리와 구 사이에 올 수 있는 낱말('How to report spam' · 'Learn how to empty trash' · 'About …').
+_IRR_HEAD_GAP = frozenset({"to", "how", "about", "learn", "the", "a", "an"})
 #: B3: 이동·버림 동사의 활용형(옮기기·옮겨·옮김·보내기·보내·보냄·버리기·버려·버림·넣기·이동).
 _IRR_KO_MOVE = r"(?:이동|보내|보냄|버리|버려|버림|넣|옮기|옮겨|옮김)"
 _IRR_KO = (
@@ -499,7 +504,7 @@ def _irr_skip(tokens: List[str], start: int, allowed: frozenset, limit: int = 3)
     return j
 
 
-def _irreversible_tokens(tokens: List[str]) -> Optional[str]:
+def _irreversible_tokens(tokens: List[str], guide_anywhere: bool = False) -> Optional[str]:
     for i, tok in enumerate(tokens):
         if i > 0 and tokens[i - 1] in _IRR_NEG_BEFORE:
             continue
@@ -539,15 +544,32 @@ def _irreversible_tokens(tokens: List[str]) -> Optional[str]:
                 end, keyword = j + 1, BLOCK_KEYWORD
         if end is None:
             continue
-        # WS-76 R1 B2: 안내 꼬리는 뒤 어디든, 안내 머리는 앞 어디든.
-        if any(t in _IRR_NEG_AFTER for t in tokens[end:]) or any(t in _IRR_INFO_BEFORE for t in tokens[:i]):
+        if guide_anywhere:
+            # WS-76 R1 B2: 안내 꼬리는 뒤 어디든, 안내 머리는 앞 어디든 — WS-85 부터 도움말 목적지 링크에만(추가 LOW 사유).
+            if any(t in _IRR_NEG_AFTER for t in tokens[end:]) or any(t in _IRR_INFO_BEFORE for t in tokens[:i]):
+                continue
+            return keyword
+        # WS-85 (#211, WS-86 리뷰 B2): 안내·취소 꼬리는 구 **바로 뒤**, 안내 머리는 구 **바로 앞**(사이에 to·how·about 등만)이면서
+        # 구 뒤에 안내 꼬리 말고 다른 낱말이 없을 때만 — 'How to report spam now'·'Report spam and cancel …' 은 동작이다.
+        after = tokens[end:]
+        if after and after[0] in _IRR_NEG_AFTER:
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j] in _IRR_HEAD_GAP and tokens[j] not in _IRR_INFO_BEFORE:
+            j -= 1
+        if (j >= 0 and tokens[j] in _IRR_INFO_BEFORE
+                and all(t in _IRR_HEAD_GAP or t in _IRR_INFO_BEFORE for t in tokens[j:i])
+                and all(t in _IRR_NEG_AFTER for t in after)):
             continue
         return keyword
     return None
 
 
-def irreversible_action(source: str, text: str) -> Optional[str]:
-    """이 원천의 문자열이 되돌리기 어려운 메일·계정 조작(휴지통·비우기·스팸 신고·차단)을 말하면 근거 키워드."""
+def irreversible_action(source: str, text: str, guide_anywhere: bool = False) -> Optional[str]:
+    """이 원천의 문자열이 되돌리기 어려운 메일·계정 조작(휴지통·비우기·스팸 신고·차단)을 말하면 근거 키워드.
+
+    WS-85 (#211 B2): 안내·취소 낱말은 구와 **바로 붙어 있을 때만** 동작이 아니라고 본다. guide_anywhere(도움말 목적지 링크 —
+    assess_risk 가 정함)면 예전처럼 앞뒤 어디든(추가 LOW 사유)."""
     if not text or source in META_SOURCES:
         return None
     raw = str(text)
@@ -560,11 +582,11 @@ def irreversible_action(source: str, text: str) -> Optional[str]:
             return None
     if source == "class":
         for cls in raw.split():
-            hit = _irreversible_tokens(_acct_tokens(cls))
+            hit = _irreversible_tokens(_acct_tokens(cls), guide_anywhere)
             if hit:
                 return hit
         return None
-    hit = _irreversible_tokens(_acct_tokens(raw))
+    hit = _irreversible_tokens(_acct_tokens(raw), guide_anywhere)
     if hit or source in TOKEN_SOURCES:
         return hit
     norm = normalize_gate_text(raw)
@@ -577,7 +599,16 @@ def irreversible_action(source: str, text: str) -> Optional[str]:
                 return keyword
     for keyword, pattern in _IRR_KO:
         for m in pattern.finditer(compact):
-            if _IRR_KO_NEG_AFTER_RE.search(compact, m.end()) or _IRR_KO_INFO_BEFORE_RE.search(compact, 0, m.start()):
+            if guide_anywhere:
+                if _IRR_KO_NEG_AFTER_RE.search(compact, m.end()) or _IRR_KO_INFO_BEFORE_RE.search(compact, 0, m.start()):
+                    continue
+                return keyword
+            # WS-85 (#211 B2): 꼬리는 구 바로 뒤(하기·기·을/를 같은 어미·조사만 사이에), 머리는 구 바로 앞이면서 뒤에 꼬리만.
+            if _IRR_KO_TAIL_ADJ_RE.match(compact, m.end()):
+                continue
+            rest = compact[m.end():]
+            if (any(h.end() == m.start() for h in _IRR_KO_INFO_BEFORE_RE.finditer(compact, 0, m.start()))
+                    and (rest == "" or _IRR_KO_TAILS_RE.fullmatch(rest))):
                 continue
             return keyword
     return None
@@ -709,10 +740,11 @@ def _basis(ctx: ActionContext, keyword: Optional[str], source: Optional[str]) ->
 
 
 def _first_hit(
-    sources: Sequence[Tuple[str, str]], path_only: bool = False, exempt: Sequence[str] = ()
+    sources: Sequence[Tuple[str, str]], path_only: bool = False, exempt: Sequence[str] = (),
+    guide_anywhere: bool = False,
 ) -> Optional[Tuple[str, str]]:
     for source, text in sources:
-        hit = match_signal(source, text, path_only=path_only)
+        hit = match_signal(source, text, path_only=path_only, guide_anywhere=guide_anywhere)
         if hit:
             # WS-76 R1 B1: 탐색·편집 문맥이 확인된 단독 '차단'·'비우기' 는 이 원천에서 고위험이 아니다(다른 원천은 계속 본다).
             if exempt and lone_label(text) in exempt:
@@ -732,6 +764,19 @@ def _lone_context(ctx: ActionContext) -> Tuple[Tuple[str, ...], str]:
         elif src in ("tab_context", "edit_context") and str(text or "").strip():
             present.add(src)
     return tuple(word for word, src in _LONE_EXEMPT if src in present), role
+
+
+def _help_link(ctx: ActionContext) -> bool:
+    """대상이 도움말·안내 목적지로 가는 링크인가(WS-85 #211 B2 — 안내 낱말을 앞뒤 어디든 인정하는 추가 LOW 사유)."""
+    for src, text in ctx.signals:
+        if str(src) != "href":
+            continue
+        try:
+            path = unquote_plus(urlsplit(str(text or "")).path)
+        except ValueError:
+            return False
+        return bool(_IRR_INFO_PATH & set(class_tokens(path)))
+    return False
 
 
 def _lone_trash_action(ctx: ActionContext, role: str) -> Optional[str]:
@@ -786,7 +831,8 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
         ("name", ctx.element_name), ("selector", ctx.selector), ("detail", ctx.detail),
     ]
     exempt, role = _lone_context(ctx) if ctx.signals else ((), "")
-    found = _first_hit(own, exempt=exempt)
+    guide = _help_link(ctx)
+    found = _first_hit(own, exempt=exempt, guide_anywhere=guide)
     if found is None and ctx.submits_form:
         return RiskAssessment(RiskLevel.HIGH, "폼 제출 액션", _basis(ctx, None, "form_submit"))
     if found is None:
@@ -794,7 +840,7 @@ def assess_risk(ctx: ActionContext) -> RiskAssessment:
             str(src) == "form_method" and str(text or "").strip().lower() == "get"
             for src, text in ctx.signals
         )
-        found = _first_hit(_effective_signals(ctx), path_only=get_submit, exempt=exempt)
+        found = _first_hit(_effective_signals(ctx), path_only=get_submit, exempt=exempt, guide_anywhere=guide)
     if found is None and role:
         trash_source = _lone_trash_action(ctx, role)
         if trash_source:

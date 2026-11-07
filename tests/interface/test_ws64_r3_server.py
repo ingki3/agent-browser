@@ -247,17 +247,50 @@ async def test_typing_stops_when_fixed_node_document_swapped_to_unlisted(tmp_pat
             await srv.close()
 
 
-async def test_empty_list_keeps_locator_path(tmp_path):
-    """빈 목록은 기존 Locator 경로 그대로(회귀 대조): 대기 중 바뀐 목록 밖 문서의 같은 노드를 누른다."""
+async def test_empty_list_document_swap_refused_ws85_b2(tmp_path):
+    """WS-85 B2 의도된 변경 — 판정 뒤 문서가 바뀌면 거부. 이전 기대(빈 목록은 Locator 가 대기 중 바뀐 목록 밖 문서의 같은
+    노드를 눌렀다 — 회귀 대조)는 검증 B2(다른 문서 입력)였다: 이제 게이트가 판정한 문서가 아니면 누르지 않고 기존 TOCTOU +
+    재관찰(효과 0)."""
     with _Local() as local:
         srv = _server(tmp_path, local, listed=False)
         await srv.start()
         try:
             result, state = await _race(tmp_path, local, srv, "empty", ActionType.CLICK, None, {"selector": "#go"},
                                         "", dest_listed=False)
+            out = {"response": result.model_dump(mode="json"), "state": state}
+            assert result.success is False and result.error_code is ErrorCode.TOCTOU_MISMATCH, out
+            assert result.reobserve_required, out
+            assert state["ev"] == [] and local.effects("empty") == [], out
+        finally:
+            await srv.close()
+
+
+async def test_empty_list_same_document_wait_keeps_click(tmp_path):
+    """WS-85 B2 대조: 문서가 바뀌지 않으면 빈 목록·selector 경로는 그대로 — 비활성 대상이 대기 중 같은 문서에서 활성이 되면
+    누른다(효과 1, 신뢰 이벤트)."""
+    with _Local() as local:
+        srv = _server(tmp_path, local, listed=False)
+        await srv.start()
+        try:
+            page = srv._page
+            assert (await _call(srv, ActionType.NAVIGATE, url=local.url(False, "/wait?case=same"))).success
+            pending = asyncio.create_task(_act(srv, ActionType.CLICK, selector="#go"))
+            try:
+                await asyncio.sleep(0.6)
+                assert not pending.done(), (await pending).model_dump(mode="json")
+                assert local.effects("same") == []
+                await page.evaluate("document.getElementById('go').disabled=false;"
+                                    "document.getElementById('cover').remove()")
+                result = await asyncio.wait_for(pending, 15)
+            finally:
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            await asyncio.sleep(0.3)
+            ev = await page.evaluate("window.__ev")
             assert result.success, result.error_message
-            assert [e["kind"] for e in state["ev"]] == ["click"] and state["ev"][0]["trusted"]
-            assert len(local.effects("empty")) == 1
+            assert [e["kind"] for e in ev] == ["click"] and ev[0]["trusted"]
+            assert len(local.effects("same")) == 1
         finally:
             await srv.close()
 
