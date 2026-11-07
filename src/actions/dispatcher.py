@@ -1222,8 +1222,6 @@ _KEY_FIELD_JS = (
     "{s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
     "v: typeof n.value === 'string' ? n.value : ''} : null"
 )
-#: WS-85 (#218): 격리 world 에서 평가하는 포커스 노드 민감 판정 — _KEY_FIELD_JS 와 같은 기준(원본 type·value getter).
-_ISOLATED_KEY_FIELD_EXPR = "((n) => (" + _KEY_FIELD_JS + ")(n))((" + _FOCUS_NODE_JS.strip() + ")())"
 #: WS-78 R1 R3: 노드 식별 열쇠(같은 문서 안 자식 위치 경로 — open shadow·같은 출처 iframe 경계는 표지) — 핸들 없이
 #: 키 전·키 뒤 포커스가 같은 노드인가를 본다(일반 칸은 핸들·해제 왕복을 쓰지 않는다).
 _NODE_KEY_JS = """
@@ -1241,6 +1239,12 @@ _NODE_KEY_JS = """
   return p.join('.');
 }
 """
+#: WS-85 (#218): 격리 world 에서 평가하는 포커스 노드 민감 판정 — _KEY_FIELD_JS 와 같은 기준(원본 type·value getter).
+#: R1 (검증 B1): 그 노드의 식별 열쇠(k, _NODE_KEY_JS — 격리 world 원본 DOM 함수)도 — 입력한 그 노드일 때만 OR 에 더한다.
+_ISOLATED_KEY_FIELD_EXPR = (
+    "((n) => { const r = (" + _KEY_FIELD_JS + ")(n); if (r) { r.k = (" + _NODE_KEY_JS.strip() + ")(n); } return r; })(("
+    + _FOCUS_NODE_JS.strip() + ")())"
+)
 #: WS-78 R1 R3: 키 **전** 판정을 평가 한 번으로 — 포커스 노드(_FOCUS_NODE_JS)가 민감 칸인가(s)·앞 키의 sticky 노드인가
 #: (same)·식별 열쇠(k)·값(v, 민감일 때만). 노드가 아니면(opaque·none) null.
 _KEY_FOCUS_JS = (
@@ -4125,7 +4129,8 @@ class ActionDispatcher:
             return False
 
     async def _mark_sensitive_input(
-        self, handle: ElementHandle, params: Dict[str, Any], text: str, after_input: bool = False
+        self, handle: ElementHandle, params: Dict[str, Any], text: str, after_input: bool = False,
+        target: Any = None, fixed: bool = False,
     ) -> None:
         """입력 액션의 한 시점에서 민감 칸을 판정하고, 민감이면 친 값을 등록한다(WS-55 R2).
 
@@ -4139,15 +4144,31 @@ class ActionDispatcher:
             # WS-85 (#218, 리뷰 B4): 입력 직후 격리 world 의 activeElement(키가 실제로 간 곳)가 비밀번호 칸이면 OR — 페이지가
             # type getter 를 바꿔도 원본 type 을 본다. 결속이 필요 없는 판독이라 입력 직후에만 보고, 못 읽으면 지금 동작 그대로
             # (일반 입력을 비밀로 등록하는 과잉 가림 금지).
-            if not after_input:
+            # R1 (검증 B1): 그 activeElement 가 **입력한 그 노드**(target 의 식별 열쇠와 같음)일 때만 — 입력 완료 이벤트가
+            # 포커스를 다른 비밀번호 칸으로 옮겼다고 검색어를 비밀로 등록하지 않는다(다르거나 못 읽으면 기준 동작).
+            if not after_input or target is None:
                 return
-            focus = await self._isolated_focus_field()
+            focus, key = await asyncio.gather(self._isolated_focus_field(), self._target_node_key(target, fixed))
             if not (isinstance(focus, dict) and focus.get("s") is True):
+                return
+            if not (key and focus.get("k") == key):
                 return
         from security.secret_registry import register_secret_values
 
         register_secret_values([text])
         params[_CONCEAL_KEY] = True
+
+    @staticmethod
+    async def _target_node_key(target: Any, fixed: bool) -> Optional[str]:
+        """R1 (검증 B1): 입력 대상 노드의 식별 열쇠(_NODE_KEY_JS). 못 읽으면 None(격리 OR 에 더하지 않는다)."""
+        try:
+            if fixed:
+                key = await asyncio.wait_for(target.evaluate(_NODE_KEY_JS), _KEY_FIELD_TIMEOUT_S)
+            else:
+                key = await target.evaluate(_NODE_KEY_JS, timeout=int(_KEY_FIELD_TIMEOUT_S * 1000))
+        except Exception:  # noqa: BLE001
+            return None
+        return key if isinstance(key, str) and key else None
 
     @staticmethod
     async def _register_field_value(target: Any) -> None:
@@ -4918,7 +4939,7 @@ class ActionDispatcher:
             else:
                 await guard(action, params)
                 await target.type(text, timeout=5000)
-            await self._mark_sensitive_input(handle, params, text, after_input=True)
+            await self._mark_sensitive_input(handle, params, text, after_input=True, target=target, fixed=fixed)
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
@@ -5662,7 +5683,7 @@ class ActionDispatcher:
             self._nav_info = await watch.settle()
         if isinstance(node, _PlainKey):
             # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
-            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending))
+            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending, node.k))
             defer = KEY_AFTER_DEFER.get()
             if defer is not None:
                 defer.append(task)
@@ -5683,11 +5704,13 @@ class ActionDispatcher:
             return None
         return info if isinstance(info, dict) else None
 
-    async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None) -> None:
+    async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None, k: str = "") -> None:
         """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다.
 
-        WS-85 (#218): iso_pending = 키 직후 격리 world 판독({s, v}) — 페이지 판독이 일반이어도 격리 world 가 비밀번호 칸으로
-        보면 민감(OR, 값은 격리 world 의 원본 value). 못 읽으면 페이지 판독 그대로(민감 처리로 넘기지 않는다)."""
+        WS-85 (#218): iso_pending = 키 직후 격리 world 판독({s, v, k}) — 페이지 판독이 일반이어도 격리 world 가 비밀번호 칸으로
+        보면 민감(OR, 값은 격리 world 의 원본 value). 못 읽으면 페이지 판독 그대로(민감 처리로 넘기지 않는다).
+        R1 (검증 B1·한계 2): 격리 판독 노드가 키 전 그 노드(식별 열쇠 k)일 때만 — 키(Tab·입력 이벤트)가 포커스를 다른
+        비밀번호 칸으로 옮겼으면 더하지 않는다(기준 동작)."""
         try:
             info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
         except Exception:  # noqa: BLE001
@@ -5699,7 +5722,7 @@ class ActionDispatcher:
             except Exception:  # noqa: BLE001 — 격리 판독 실패 = 지금 판정 그대로
                 iso = None
         if not (isinstance(info, dict) and info.get("s")):
-            if not (isinstance(iso, dict) and iso.get("s") is True):
+            if not (isinstance(iso, dict) and iso.get("s") is True and k and iso.get("k") == k):
                 return
             info = {"s": True, "v": str(iso.get("v") or "")}
         self.last_key_sensitive = True
