@@ -4375,9 +4375,10 @@ class ActionDispatcher:
             # 포커스를 다른 비밀번호 칸으로 옮겼다고 검색어를 비밀로 등록하지 않는다(다르거나 못 읽으면 기준 동작).
             if not after_input or target is None:
                 return
-            focus, key = await asyncio.gather(self._isolated_focus_field(), self._target_node_key(target, fixed))
+            focus = await self._isolated_focus_field()
             if not (isinstance(focus, dict) and focus.get("s") is True):
                 return
+            key = await self._target_node_key(target, fixed)  # 격리 판독이 비밀번호 칸일 때만(평범한 입력 왕복 0)
             if not (key and focus.get("k") == key):
                 return
         from security.secret_registry import register_secret_values
