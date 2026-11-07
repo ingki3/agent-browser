@@ -318,6 +318,46 @@ class HitlMixin:
         return self._attach_oob_note(
             self._hitl_blocked_result(action, decision, element_name, ap, approval, rejected))
 
+    # -- WS-85 R1 (검증 B2·B3): 게이트 판정 문서·노드와 실제 입력의 묶음 ---------------------------------------
+
+    async def _gate_fence_begin(self, action: ActionType, params: Dict[str, Any]) -> None:
+        """이 호출의 게이트 판정 문서를 잡는다(디스패처 begin_gate_fence). 못 걸면 묶음 없이(지금 동작).
+
+        press_key 는 게이트가 포커스를 판정하는 키(Enter·Space — key_kind)만 — 글자 키는 판정하지 않으므로 묶을 것이 없고, 키 전
+        왕복을 늘리지 않는다(WS-78 R3)."""
+        from actions.dispatcher import GATE_FENCED_ACTIONS, key_kind
+
+        begin = getattr(self._dispatcher, "begin_gate_fence", None)
+        if begin is None or action not in GATE_FENCED_ACTIONS:
+            return
+        if action is ActionType.PRESS_KEY and not key_kind(str(params.get("key", ""))):
+            return
+        try:
+            await begin(self._gate_recheck)
+        except Exception:  # noqa: BLE001 — 가짜 페이지·닫힌 탭: 묶음 없이
+            self._gate_fence_end()
+
+    def _gate_fence_end(self) -> None:
+        end = getattr(self._dispatcher, "end_gate_fence", None)
+        if end is not None:
+            end()
+
+    def _note_gate_node(self, key: tuple, iso: Any, judged: bool) -> None:
+        """게이트가 격리 world 로 판정한 노드를 디스패처 묶음에 적는다 — 두 판독이 그 노드를 읽지 못했으면 None."""
+        note = getattr(self._dispatcher, "note_gate_node", None)
+        if note is None:
+            return
+        info_ok = judged and isinstance(iso, dict) and isinstance(iso.get("info"), dict)
+        note(key, iso.get("node") if info_ok else None)
+
+    async def _gate_recheck(self, action: ActionType, params: Dict[str, Any]) -> bool:
+        """실행 직전 입력 노드가 게이트가 판정한 노드가 아닐 때(판정 때 없음·같은 css 복제·치유) 그 대상을 같은 판정으로
+        다시 본다(페이지·격리 판독, 판정 노드를 다시 적음). 허용이면 True — 아니면 디스패처가 실행하지 않는다."""
+        target = await self._gate_target(action, params)
+        if isinstance(target, ActionResult):
+            return False
+        return bool(self._hitl.evaluate(self._gate_context(action, target)).allowed)
+
     def _gate_context(self, action: ActionType, target: tuple) -> Any:
         """_gate_target 해석 결과 → 게이트 판정 입력(ActionContext)."""
         from security import ActionContext
@@ -364,6 +404,9 @@ class HitlMixin:
                 if not unresolved and "info" in target:
                     _name, signals, unresolved = self._combine_isolated(element_name, target.get("info"), iso,
                                                                         keep_name=True)
+                # R1 (검증 B3): 두 판독이 모두 그 노드를 읽었을 때만 '판정한 노드' — 지금 DOM 에 없었으면(missing) 판정한
+                # 노드 없음으로 두어, 디스패처가 실제 입력 노드를 다시 판정하게 한다.
+                self._note_gate_node(("element_id", str(element_id)), iso, "info" in target)
         elif action is ActionType.CLICK and selector:
             # WS-30 추가 A: selector 문자열이 아니라 페이지에서 읽은 대상 이름으로 판정한다.
             # 0개·여러 개·읽기 실패면 판정 불가 → 고위험(fail-closed).
@@ -377,9 +420,11 @@ class HitlMixin:
                 ambiguous = self._ambiguous_low_risk(action, selector, target.get("ambiguous"))
                 if ambiguous is not None:
                     return ambiguous
+                iso = None
                 if not unresolved and "info" in target:
                     iso = await self._isolated_read("isolated_selector_info_for_gate", selector)
                     element_name, signals, unresolved = self._combine_isolated(element_name, target.get("info"), iso)
+                self._note_gate_node(("selector", str(selector)), iso, iso is not None)
         elif action is ActionType.CLICK and params.get("x") is not None:
             # WS-31: 좌표 클릭도 그 좌표가 누를 요소(상호작용 조상)의 이름·문맥으로 판정한다.
             element_name, signals, unresolved, basis_extra = await self._point_target(params)
@@ -468,6 +513,7 @@ class HitlMixin:
                 return submits_form, "입력 대상을 읽을 수 없음"
             info, iso = await self._page_and_isolated(dispatcher.describe_element(element_id),
                                                       "isolated_element_info_for_gate", element_id)
+            self._note_gate_node(("element_id", str(element_id)), iso, info is not None)  # R1 (검증 B2·B3)
             if info is None:
                 unresolved = "입력 대상을 읽을 수 없음"
             elif info.get("tag") == "INPUT" and info.get("in_form"):

@@ -1356,6 +1356,38 @@ class _CoveredRefused(Exception):
         self.covered_by = covered_by
 
 
+class _GateFence:
+    """WS-85 R1 (검증 B2·B3): 이 호출의 게이트가 판정한 문서·노드 — 실제 입력이 그 문서·그 노드에 가는가를 묶는다.
+
+    loaders: 게이트 시작 때 (최상위, 대상 프레임) loaderId. tripped: 그 뒤 최상위·대상 프레임의 문서 이동 요청을 봤으면 사유.
+    nodes: 게이트가 격리 world 로 판정한 노드 ((frameId, backendNodeId), 판정 못 했으면 None) — 키는 ('element_id', id)
+    또는 ('selector', css). recheck: 대상이 바뀌었을 때 새 대상을 다시 판정하는 서버 콜백(허용이면 True).
+    armed: 첫 입력 동작이 끝나면 꺼진다(그 뒤 재시도·사후 확인은 이 묶음 밖).
+    """
+
+    def __init__(self, top: Any, frames: Tuple[Any, ...], loaders: Any, recheck: Any) -> None:
+        self.top = top
+        self.frames = frames
+        self.loaders = loaders
+        self.recheck = recheck
+        self.tripped: Optional[str] = None
+        self.nodes: Dict[Tuple[str, str], Optional[Tuple[str, int]]] = {}
+        self.armed = True
+
+    def on_request(self, request: Any) -> None:
+        if self.tripped is not None:
+            return
+        try:
+            if request.is_navigation_request() and any(request.frame is f for f in self.frames):
+                self.tripped = "문서 이동이 시작됨"
+        except Exception:  # noqa: BLE001 — 서비스 워커 요청 등(프레임 없음): 문서 이동 아님
+            pass
+
+
+#: WS-85 R1: 게이트·실행 묶음을 거는 액션(검증 B2 경로 — 요소·selector·좌표 클릭, 개행 입력, 키).
+GATE_FENCED_ACTIONS = frozenset({ActionType.CLICK, ActionType.TYPE_TEXT, ActionType.PRESS_KEY})
+
+
 #: WS-79 NB2: 이 호출에서 가운데 대신 덮이지 않은 대상 점을 썼다면 data.click_point(성공 때만 싣는다).
 _CLICK_POINT: ContextVar[Optional[Dict[str, Any]]] = ContextVar("agent_browser_click_point", default=None)
 
@@ -2738,21 +2770,23 @@ class ActionDispatcher:
                 need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
             else:
                 need_box = await self.ctx.page.locator(css).count() != 1
-            info = await self._iso_on_target(css, locator, need_box, _ISOLATED_TARGET_FN)
+            info, ident = await self._iso_on_target(css, locator, need_box, _ISOLATED_TARGET_FN, want_backend=True)
         except Exception as exc:  # noqa: BLE001 — 판정 불가(부르는 쪽 규칙 B2)
             return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
-        return {"info": info} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
+        # R1 (검증 B3): 판정한 그 노드 (frameId, backendNodeId) — 실행 직전 입력 노드와 대조한다(_fence_bind_node).
+        return {"info": info, "node": (ident[1], ident[2])} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
 
     async def isolated_selector_info_for_gate(self, selector: str) -> Dict[str, Any]:
-        """WS-85 (#163): selector 클릭 대상(정확히 1개)의 판정 정보를 격리 world 에서 — {"info"} 또는 {"unresolved"}."""
+        """WS-85 (#163): selector 클릭 대상(정확히 1개)의 판정 정보를 격리 world 에서 — {"info", "node"} 또는 {"unresolved"}."""
         try:
             locator = self.ctx.page.locator(selector)
             if await locator.count() != 1:
                 return {"unresolved": "selector 대상이 1개가 아님"}
-            info = await self._iso_on_target(selector, locator.first, False, _ISOLATED_TARGET_FN)
+            info, ident = await self._iso_on_target(selector, locator.first, False, _ISOLATED_TARGET_FN,
+                                                    want_backend=True)
         except Exception as exc:  # noqa: BLE001
             return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
-        return {"info": info} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
+        return {"info": info, "node": (ident[1], ident[2])} if isinstance(info, dict) else {"unresolved": "격리 판독 실패"}
 
     async def isolated_point_target(self, x: int, y: int) -> Optional[Dict[str, Any]]:
         """좌표 클릭이 누를 요소를 **격리 world** 에서 판정한다 (WS-67). 반환: {"name", "info"} 또는 None.
@@ -2871,6 +2905,198 @@ class ActionDispatcher:
         if not isinstance(res, dict) or res.get("exceptionDetails"):
             raise RuntimeError("격리 world 평가 실패")
         return (res.get("result") or {}).get("value")
+
+    # -- WS-85 R1 (검증 B2·B3): 게이트가 판정한 문서·노드와 실제 입력을 묶는다 ---------------------------------
+
+    async def begin_gate_fence(self, recheck: Any) -> None:
+        """이 호출의 게이트 판정 시작 — 대상 문서(최상위·대상 프레임 loaderId)를 잡고 그 뒤 문서 이동 요청을 듣는다.
+
+        recheck(action, params) → 허용이면 True: 실행 직전 입력 노드가 게이트가 판정한 노드가 아니면(판정 때 없음·치유·
+        재해석) 그 새 대상을 다시 판정하는 서버 콜백. 못 걸면 예외(부르는 쪽은 묶음 없이 — 지금 동작).
+        """
+        self.end_gate_fence()
+        top = self._top_page()
+        frames = [top.main_frame]
+        if self.ctx.root_page is not None and self.ctx.page is not top.main_frame:
+            frames.append(self.ctx.page)
+        loaders = await self._fence_loaders()
+        fence = _GateFence(top, tuple(frames), loaders, recheck)
+        top.on("request", fence.on_request)
+        self._fence = fence
+
+    def end_gate_fence(self) -> None:
+        fence, self._fence = self.__dict__.get("_fence"), None
+        if fence is not None:
+            try:
+                fence.top.remove_listener("request", fence.on_request)
+            except Exception:  # noqa: BLE001 — 닫힌 탭: 무해
+                pass
+
+    def note_gate_node(self, key: Tuple[str, str], node: Any) -> None:
+        """게이트가 그 대상(key)을 격리 world 로 판정한 노드 (frameId, backendNodeId) — 판정 못 했으면 None."""
+        fence = self.__dict__.get("_fence")
+        if fence is not None:
+            ok = isinstance(node, (tuple, list)) and len(node) == 2 and node[1]
+            fence.nodes[key] = (str(node[0]), int(node[1])) if ok else None
+
+    def _live_fence(self) -> Optional[_GateFence]:
+        """입력 전 묶음 확인을 할 호출인가 — 승인 노드(pin) 호출은 그 결속(_pin_mismatch_for)이 맡는다."""
+        fence = self.__dict__.get("_fence")
+        if fence is None or not fence.armed or self._current_pin() is not None:
+            return None
+        return fence
+
+    def _fence_disarm(self) -> None:
+        fence = self.__dict__.get("_fence")
+        if fence is not None:
+            fence.armed = False
+
+    async def _fence_loaders(self) -> Tuple[Any, ...]:
+        top = self._top_page()
+        out: List[Any] = [(await self._frame_loader(await self._gate_cdp_for(top), ""))[1]]
+        if self.ctx.root_page is not None and self.ctx.page is not getattr(top, "main_frame", None):
+            world = await self._select_frame_world()
+            out.append(None if world is None else (await self._frame_loader(world[0], world[1]))[1])
+        return tuple(out)
+
+    def _fence_result(self, action: ActionType, why: str) -> ActionResult:
+        return self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=ErrorCode.TOCTOU_MISMATCH,
+            error_message=f"게이트가 판정한 대상과 실제 입력 대상이 달라 실행하지 않았습니다({why}). 다시 관찰하세요.",
+            reobserve_required=True,
+        )
+
+    async def _fence_refusal(self, action: ActionType) -> Optional[ActionResult]:
+        """게이트 판정 뒤 대상 문서가 바뀌었거나(loaderId) 이동이 시작됐으면 거부 결과, 아니면 None."""
+        fence = self._live_fence()
+        if fence is None:
+            return None
+        why = fence.tripped
+        if why is None:
+            try:
+                now: Any = await self._fence_loaders()
+            except Exception:  # noqa: BLE001 — 지금 문서를 못 읽음: 같은 문서라고 보지 않는다
+                now = None
+            if now != fence.loaders:
+                why = "문서가 바뀜"
+        return None if why is None else self._fence_result(action, why)
+
+    @staticmethod
+    def _fence_binds(action: ActionType, params: Dict[str, Any]) -> bool:
+        """게이트가 격리 world 로 노드를 판정하는 경로(요소·selector 클릭, 개행 입력) — 실행 노드를 그 노드에 묶는다."""
+        if action is ActionType.CLICK:
+            return bool(params.get("element_id") or params.get("selector"))
+        if action is ActionType.TYPE_TEXT:
+            text = str(params.get("text") or "")
+            return ("\n" in text or "\r" in text) and not params.get("press_enter")
+        return False
+
+    async def _fenced_input(self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]) -> None:
+        """묶음 입력: 해석한 노드(고정 핸들)가 게이트가 판정한 그 노드·그 문서일 때만 그 노드로 보낸다.
+
+        다른 노드(판정 때 없음·같은 css 복제·치유)면 그 노드를 다시 판정(recheck — 페이지·격리)해 허용이고 그 판정 노드가
+        이 노드일 때만. 문서가 바뀌었으면 거부(TOCTOU, 재관찰). 입력 전 노드가 떨어지면 다시 해석한다(_bound_input 과 같은
+        기한) — 다시 해석한 노드도 같은 확인을 거친다. Locator 는 대기 중 새 문서의 같은 css 노드로 넘어가므로 쓰지 않는다.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BOUND_DEADLINE_S
+        progress: Dict[str, bool] = {"sent": False}
+        last: Optional[BaseException] = None
+        while True:
+            remaining_ms = (deadline - loop.time()) * 1000
+            if remaining_ms <= 0:
+                raise TimeoutError(f"{int(_BOUND_DEADLINE_S * 1000)}ms 안에 입력 가능한 대상을 찾지 못했습니다: {last}")
+            node = await self._locator_for(handle).element_handle(timeout=max(1, int(remaining_ms)))
+            try:
+                refused = await self._fence_refusal(action)
+                if refused is not None:
+                    raise _TargetRefused(refused)
+                await self._fence_bind_node(action, handle, params, node)
+                await self._send_to_target(action, handle, params, node, fixed=True, progress=progress)
+                return
+            except (_ManualSiteRefused, _ProtectedSaveRefused, _FixedNodeGone, _TargetRefused, _CoveredRefused):
+                raise
+            except Exception as exc:  # noqa: BLE001 — 입력 전 노드가 떨어졌으면 다시 해석, 아니면 원래 실패 그대로
+                if progress["sent"] or await self._node_connected(node):
+                    raise
+                last = exc
+            finally:
+                self._dispose_later(node)
+
+    async def _fence_bind_node(self, action: ActionType, handle: ElementHandle, params: Dict[str, Any],
+                               node: Any) -> None:
+        """입력할 노드가 게이트가 판정한 노드인가. 아니면 그 대상을 다시 판정 — 허용 + 판정 노드가 이 노드면 통과,
+        아니면 _TargetRefused(TOCTOU, 재관찰)."""
+        fence = self._live_fence()
+        if fence is None:
+            return
+        element = bool(params.get("element_id"))
+        key = ("element_id", str(handle.element_id)) if element else ("selector", str(params.get("selector") or ""))
+        ident = await self._fence_ident(handle, params, node)
+        if ident is not None and fence.nodes.get(key) == ident:
+            return
+        again = {k: params[k] for k in ("element_id", "selector", "text", "press_enter") if k in params}
+        if element:
+            again["element_id"] = handle.element_id
+        try:
+            allowed = await fence.recheck(action, again) is True
+        except Exception:  # noqa: BLE001 — 다시 판정하지 못함: 실행하지 않는다
+            allowed = False
+        if allowed:
+            if ident is None:
+                ident = await self._fence_ident(handle, params, node)
+            if ident is not None and fence.nodes.get(key) == ident:
+                return
+        raise _TargetRefused(self._fence_result(
+            action, "바뀐 대상을 다시 판정한 결과 실행할 수 없음" if not allowed else "다시 판정한 노드가 입력할 노드가 아님"))
+
+    async def _fence_ident(self, handle: ElementHandle, params: Dict[str, Any], node: Any) -> Optional[Tuple[str, int]]:
+        """고정 노드(Playwright 핸들)와 같은 격리 world 노드의 (frameId, backendNodeId) — 게이트 판독과 같은 결속(css + 상자,
+        isolated_element_info_for_gate). css 가 하나뿐이어도 상자가 있으면 그 노드 상자와 같아야 한다. 못 정하면 None."""
+        element = bool(params.get("element_id"))
+        css = (getattr(handle, "css_path", "") or "") if element else str(params.get("selector") or "")
+        if not css:
+            return None
+        try:
+            world = await self._select_frame_world()
+            if world is None:
+                return None
+            cdp, frame_id, oopif = world
+            if element:
+                need_box = bool(getattr(handle, "is_shadow", False) and handle.name) \
+                    or await self.ctx.page.locator(css).count() != 1
+            else:
+                need_box = False
+            group = _ISO_GROUP_GATE
+
+            async def run(context_id: int) -> Optional[int]:
+                try:
+                    oid = await self._iso_bind(cdp, context_id, css, node, need_box, oopif, group)
+                    if not oid:
+                        return None
+                    if not need_box:
+                        try:
+                            same: Any = await self._select_same_box(cdp, oid, node, True, oopif)
+                        except Exception:  # noqa: BLE001 — 그 노드 상자 없음(렌더 안 됨): css 하나뿐 결속 그대로
+                            same = None
+                        if same is not True and await node.bounding_box() is not None:
+                            return None
+                    desc = await cdp.send("DOM.describeNode", {"objectId": oid, "depth": 0})
+                    backend = (desc.get("node") or {}).get("backendNodeId")
+                    return int(backend) if backend else None
+                finally:
+                    try:
+                        await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            backend = await self._in_gate_world(cdp, frame_id, run)
+        except Exception:  # noqa: BLE001 — 결속 불가
+            return None
+        return (str(frame_id), int(backend)) if backend else None
 
     @staticmethod
     async def _scroll_once(page: Any, delta: int) -> Tuple[bool, Optional[int]]:
@@ -3772,6 +3998,7 @@ class ActionDispatcher:
                 healed=healed_flag,
             )
         self._input_sent = True
+        self._fence_disarm()  # WS-85 R1: 게이트 묶음은 첫 입력 동작까지(그 뒤 사후 재시도는 이 묶음 밖)
         if watch is not None:
             self._nav_info = await watch.settle()
         return before, root_before, popups, _on_popup
@@ -4225,6 +4452,9 @@ class ActionDispatcher:
         # 다른 노드를 누를 수 있다. 그 노드가 떨어졌으면 Playwright 가 예외(발송 실패, 누르지 않음).
         if pin is not None:
             await self._send_to_target(action, handle, params, pin.node, fixed=True)
+        elif self._live_fence() is not None and self._fence_binds(action, params):
+            # WS-85 R1 (검증 B2·B3): 게이트가 판정한 그 노드·그 문서에만 — 다르면 다시 판정하거나 거부.
+            await self._fenced_input(action, handle, params)
         else:
             await self._send_to_target(action, handle, params, self._locator_for(handle), fixed=False)
 
@@ -4859,6 +5089,24 @@ class ActionDispatcher:
         except Exception as exc:  # noqa: BLE001 — 부가 정보
             logger.debug("숨긴 control 수집 실패: %s", type(exc).__name__)
 
+    @staticmethod
+    async def _type_fenced(action: ActionType, params: Dict[str, Any], target: Any, text: str, guard: Any) -> None:
+        """WS-85 R1: text 를 줄바꿈 앞뒤로 나눠 입력 — 조각 입력과 Enter 마다 바로 앞에서 관문(guard: 문서 확인 포함)."""
+        buf = ""
+        for ch in text:
+            if ch not in "\r\n":
+                buf += ch
+                continue
+            if buf:
+                await guard(action, params)
+                await target.type(buf, timeout=5000)
+                buf = ""
+            await guard(action, params)
+            await target.press("Enter", timeout=5000)
+        if buf:
+            await guard(action, params)
+            await target.type(buf, timeout=5000)
+
     async def _send_to_target(
         self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], target: Any, *, fixed: bool,
         bind: Any = None, progress: Optional[Dict[str, bool]] = None, point: Optional[Dict[str, float]] = None,
@@ -4878,6 +5126,12 @@ class ActionDispatcher:
         fk: Dict[str, Any] = {"force": True} if bind is not None else {}
 
         async def guard(act: ActionType, prm: Dict[str, Any]) -> None:
+            # WS-85 R1 (검증 B2): 게이트 판정 뒤 대상 문서가 바뀌었으면(이동 시작·loaderId) 보내지 않는다 — 목록 관문·결속보다
+            # 앞(관문과 입력 사이 왕복을 늘리지 않는다).
+            refused = await self._fence_refusal(act)
+            if refused is not None:
+                await self._manual_guard(act, prm)  # 목록 사이트로 바뀌었으면 그 거부(manual_site)가 우선
+                raise _TargetRefused(refused)
             await self._manual_guard(act, prm)
             if bind is not None:
                 await self._bind_or_gate(act, prm, target, bind)
@@ -4937,8 +5191,14 @@ class ActionDispatcher:
                     await guard(action, params)
                     await keyboard.type(ch)
             else:
-                await guard(action, params)
-                await target.type(text, timeout=5000)
+                if self._live_fence() is not None and ("\n" in text or "\r" in text):
+                    # WS-85 R1 (검증 B2): 줄바꿈(Enter = 폼 제출)마다 그 앞에서 문서 확인 — 글자 입력 중 문서가 바뀌면 새 문서의
+                    # 폼으로 Enter 를 보내지 않는다. Playwright type 의 '\n'·'\r' 은 Enter 한 번(같은 키)이다.
+                    await self._type_fenced(action, params, target, text, guard)
+                else:
+                    await guard(action, params)
+                    await target.type(text, timeout=5000)
+                sent()
             await self._mark_sensitive_input(handle, params, text, after_input=True, target=target, fixed=fixed)
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
@@ -5642,7 +5902,12 @@ class ActionDispatcher:
         if self.ctx.nav_settle:
             # 프레임 안이면 그 프레임 문서의 이동도 기다린다(R1 BLOCKING-5 와 같은 감시).
             watch = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
+        # WS-85 R1 (검증 B2): 게이트 판정 뒤 문서가 바뀌었으면 키를 보내지 않는다(목록 재판정보다 앞 — 그것이 키 직전).
+        # 목록 사이트로 바뀌었으면 그 거부(manual_site)가 우선한다.
+        fenced = await self._fence_refusal(action)
         refused = await self._manual_site_refusal(action, params)  # WS-64 R1 B1: 키 입력 직전 재판정
+        if refused is None:
+            refused = fenced
         if refused is not None:
             if watch is not None:
                 watch.close()
@@ -5666,6 +5931,7 @@ class ActionDispatcher:
                                f"{_bounded_echo(repr(raw_key), _KEY_ERROR_ECHO_CHARS)} -> "
                                f"{_bounded_echo(repr(key), _KEY_ERROR_ECHO_CHARS)})"),
             )
+        self._fence_disarm()
         data: Dict[str, Any] = {"key": key}
         # 키 뒤 곧바로 그 노드 값 읽기를 시작하고 이동 대기와 겹쳐 돌린다 — Enter 제출 직후의 평가는 새 문서가 올
         # 때까지 멈출 수 있어(실측) 기다리지 않고, 대기가 끝난 뒤 짧은 상한 안에서만 결과를 받는다.
@@ -5859,6 +6125,11 @@ class ActionDispatcher:
             refused = await self._manual_site_refusal(action, params)  # 이동(hover) 뒤 누르기 직전 다시
             if refused is not None:
                 return refused
+        if pin is None and not self._manual_active():
+            # WS-85 R1 (검증 B2): 게이트 판정 뒤 문서가 바뀌었으면(이동 시작·loaderId) 누르지 않는다.
+            refused = await self._fence_refusal(action)
+            if refused is not None:
+                return refused
         watch = _NavWatch(page) if self.ctx.nav_settle else None
         stray: Optional[str] = None
         try:
@@ -5876,6 +6147,7 @@ class ActionDispatcher:
                 await page.mouse.up(button=button)
             else:
                 await page.mouse.click(x, y, button=button)
+                self._fence_disarm()
         except _ManualSiteRefused as exc:
             if watch is not None:
                 watch.close()
