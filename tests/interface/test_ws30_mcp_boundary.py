@@ -29,6 +29,9 @@ PAGES: Dict[str, str] = {
 <form action="/results" method="get"><input id=q name=q aria-label="검색어"></form>
 <input id=loose aria-label="메모">
 <button id=nothing>아무것도</button>""",
+    # WS-88 (#248 B6): 명시 GET 검색 폼의 Enter 는 이제 '검색형 제출'로 통과한다 — 제출 차단 대조는 POST 폼으로.
+    "/post_form": """<!doctype html><meta charset=utf-8><title>주문 메모</title>
+<form action="/results" method="post"><input id=q name=q aria-label="검색어"></form>""",
     "/results": """<!doctype html><meta charset=utf-8><title>결과</title><h1>검색 결과</h1>""",
     "/pay": """<!doctype html><meta charset=utf-8><title>결제</title><p id=out>대기</p>
 <button id=pay class=btn onclick="document.getElementById('out').textContent='결제됨'">결제하기</button>
@@ -47,6 +50,10 @@ def site():
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def do_POST(self):  # noqa: N802 — WS-88 R1 (검증 B2): 사전승인으로 연 POST 폼 제출이 실제로 닿는 곳
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.do_GET()
 
         def log_message(self, *args):  # noqa: ANN002
             pass
@@ -216,9 +223,12 @@ def test_switch_frame_description_mentions_to_main_and_order():
 
 @requires_chromium
 async def test_enter_paths_same_verdict(site):
-    """type_text(press_enter) 와 type_text 뒤 press_key(Enter) 가 같은 판정(차단)."""
+    """type_text(press_enter) 와 type_text 뒤 press_key(Enter) 가 같은 판정(POST 폼 — 차단).
+
+    WS-88 (#248 B6, 의도 변경): 예전 fixture 는 GET 검색 폼(/form)이었다 — 그 폼은 이제 두 경로 모두 통과한다
+    (test_enter_paths_same_verdict_get_form)."""
     async with BrowserMCPServer() as server:
-        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/post_form"})
         eid, epoch = await _element(server, "검색어")
         a = await _call(server, ActionType.TYPE_TEXT,
                         {"element_id": eid, "epoch": epoch, "text": "노트북", "press_enter": True})
@@ -233,26 +243,45 @@ async def test_enter_paths_same_verdict(site):
         assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED, (r.action, r.error_message)
         assert "폼 제출" in (r.error_message or "")
     assert b.data["pre_approve_hint"] == "press_key:*"
-    assert url.endswith("/form"), f"차단됐는데 제출됨: {url}"
+    assert url.endswith("/post_form"), f"차단됐는데 제출됨: {url}"
+
+
+@requires_chromium
+async def test_enter_paths_same_verdict_get_form(site):
+    """WS-88 (#248 B3·B6): 명시 method=get 검색 폼 — type_text(press_enter)·press_key(Enter) 가 같은 판정(통과·이동)."""
+    async with BrowserMCPServer() as server:
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        eid, epoch = await _element(server, "검색어")
+        a = await _call(server, ActionType.TYPE_TEXT,
+                        {"element_id": eid, "epoch": epoch, "text": "노트북", "press_enter": True})
+        url_a = server._dispatcher.ctx.page.url  # noqa: SLF001
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        eid, epoch = await _element(server, "검색어")
+        await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "노트북"})
+        b = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})
+    assert a.success and b.success, (a.error_message, b.error_message)
+    assert "/results" in url_a and "/results" in b.current_url
 
 
 @requires_chromium
 async def test_type_text_newline_is_form_submit(site):
-    """text 안의 줄바꿈도 Enter 와 같다 — 입력칸(textarea 아님)이면 폼 제출로 본다."""
+    """text 안의 줄바꿈도 Enter 와 같다 — 입력칸(textarea 아님)이면 폼 제출로 본다(WS-88: POST 폼 — GET 은 검색형 제출)."""
     async with BrowserMCPServer() as server:
-        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/post_form"})
         eid, epoch = await _element(server, "검색어")
         r = await _call(server, ActionType.TYPE_TEXT,
                         {"element_id": eid, "epoch": epoch, "text": "노트북\n"})
         url = server._dispatcher.ctx.page.url  # noqa: SLF001
     assert r.error_code is ErrorCode.HITL_UNATTENDED_BLOCKED
-    assert url.endswith("/form")
+    assert url.endswith("/post_form")
 
 
 @requires_chromium
 async def test_press_key_enter_pre_approved_submits(site):
+    """사전승인(press_key:*)이 폼 제출 Enter 를 연다. WS-88 R1 (검증 B2): 승인이 실제로 필요한 POST 폼 — GET 검색 폼은 이제
+    승인 없이도 통과하므로 사전승인을 무효화해도 이 시험이 잡지 못했다."""
     async with BrowserMCPServer(pre_approved_actions=("press_key:*",)) as server:
-        await _call(server, ActionType.NAVIGATE, {"url": site + "/form"})
+        await _call(server, ActionType.NAVIGATE, {"url": site + "/post_form"})
         eid, epoch = await _element(server, "검색어")
         await _call(server, ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": "노트북"})
         r = await _call(server, ActionType.PRESS_KEY, {"key": "Enter"})

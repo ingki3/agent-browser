@@ -70,6 +70,11 @@ PRESERVED = (
     "_focus_verdict", "_gate_rank", "_isolated", "_point_verdict",
     # WS-68 잘림 안내 숫자(설정 상한·실효 예산, 최종 봉투 returned_chars)
     "_limit_text", "settle_returned_chars",
+    # WS-88 Enter-on-field 판정(민감 칸 표·명시 GET 예외·판정 함수·SecretStore 키 문구)
+    "_ENTER_CONTROLS_CAP", "_ENTER_FIELD_ROLES", "_ENTER_SENSITIVE_AUTOCOMPLETE", "_ENTER_SENSITIVE_EXCEPT",
+    "_ENTER_SENSITIVE_PAIRS", "_ENTER_SENSITIVE_TOKENS", "_ENTER_SENSITIVE_WORDS", "_ENTER_SKIP_SOURCES", "_as_dict",
+    "_enter_autocomplete_hit", "_enter_field_verdict", "_enter_get_form", "_enter_plain_signals", "_enter_sensitive",
+    "_enter_words_hit", "_secret_text",
 )
 
 

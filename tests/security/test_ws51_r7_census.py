@@ -116,6 +116,8 @@ KEYS = {
     "captured": (CONTROL, "actions/dispatcher.py 프레임 안 screenshot data.captured"),
     "handled": (CONTROL, "actions/dispatcher.py data.dialogs[].handled"),
     "coordinate_target": (CONTROL, "interface/server_hitl.py 좌표 대상 근거(gate_basis)"),
+    "enter_target": (CONTROL, "interface/server_hitl.py Enter-on-field 판정 근거(gate_basis, WS-88)"),
+    "sensitive": (CONTROL, "interface/server_hitl.py 민감 칸 근거(gate_basis.sensitive, WS-88)"),
     "blocked_by": (CONTROL, "interface/server_display.py 캡처 차단 data.blocked_by"),
     "code": (CONTROL, "security/egress.py data.egress.code·data.upstream.code"),
     "category": (CONTROL, "security/egress.py data.egress.category(CAT_*)"),

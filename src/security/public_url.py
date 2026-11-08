@@ -757,6 +757,9 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "resolved_from": frozenset({"current_frame", "root"}),  # actions.dispatcher switch_frame · server_schema 안내
     "coordinate_target": frozenset({"interactive", "non_interactive", "rejected_by_dispatcher",
                                     "unresolved"}),  # server_hitl 좌표 대상 근거
+    # WS-88 (#248) server_hitl Enter-on-field 판정 근거(gate_basis.enter_target·sensitive)
+    "enter_target": frozenset({"form_get", "no_form", "field", "sensitive_field"}),
+    "sensitive": frozenset({"password", "autocomplete", "field_name", "secret_value"}),
     "handled": frozenset({"accepted", "dismissed"}),  # actions.dispatcher data.dialogs[].handled
     "blocked_by": frozenset({"approval_code_displayed"}),  # server_display 캡처 차단
     "captured": frozenset({"root_page"}),  # actions.dispatcher 프레임 안 screenshot

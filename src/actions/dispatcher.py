@@ -794,8 +794,7 @@ function () {
 
 #: 키 입력을 실제로 받는 요소(document.activeElement) — iframe(같은 출처)·open shadow 를
 #: 따라 내려간다. 다른 출처 iframe 이면 opaque(판정 불가 → 게이트는 fail-closed).
-_FOCUS_INFO_JS = (
-    """
+_FOCUS_INFO_TEMPLATE = """
 () => {
   const info = __INFO__;
   let el = document.activeElement;
@@ -813,8 +812,8 @@ _FOCUS_INFO_JS = (
   if (!el) return { tag: '' };
   return info(el);
 }
-""".replace("__INFO__", _TARGET_INFO_JS.strip())
-)
+"""
+_FOCUS_INFO_JS = _FOCUS_INFO_TEMPLATE.replace("__INFO__", _TARGET_INFO_JS.strip())
 
 #: WS-67 (#141): 게이트 판정을 다시 하는 CDP 격리 world 이름. 격리 world 는 DOM 은 공유하고 JS
 #: 전역·prototype 은 원본이라, 페이지가 `HTMLInputElement.prototype.form`·`Element.prototype.closest`
@@ -841,6 +840,110 @@ function () {
 
 #: WS-85 (#163): 격리 world 에서 결속한 노드(this)의 게이트 판정 정보 — 페이지 world 와 같은 _TARGET_INFO_JS.
 _ISOLATED_TARGET_FN = "function () { return (" + _TARGET_INFO_JS.strip() + ")(this); }"
+#: WS-88 (#248): 입력칸에서 Enter 가 무엇을 하는가를 판정할 사실(게이트 server_hitl._enter_field_verdict 가 읽는다).
+#: 칸의 autocomplete, aria-activedescendant 항목(NN2 — combobox Enter 는 그 항목을 고른다), 소속 폼(el.form — form= 속성
+#: 연결 포함, NN6)의 **명시** method 속성(B1 — 속성 없음은 null), 기본 제출 버튼의 formmethod·formaction·이름·신호, 폼 안
+#: 모든 컨트롤(hidden 포함)의 type·autocomplete·name·id·고정 value, 폼 안 iframe·frame·object·embed 수, 제출 목적지 출처와
+#: 문서 출처(NN8). 컨트롤은 200개까지 — 넘으면 게이트가 GET 예외를 주지 않는다.
+#: R1 (검증 B1): 기본 제출자는 HTML 규칙대로 — 폼 소유 제출 버튼(button[type=submit]·input submit·**input image**, form= 로
+#: 바깥에서 연결된 것 포함) 중 문서(트리) 순서 첫째. form.elements 는 image 를 빼므로 그것으로 찾지 않는다(_MEANING_JS 의
+#: defaultSubmitter 와 같은 규칙). 해석이 실패하면 submitter_undetermined=true — 게이트가 GET 예외를 주지 않는다(HIGH).
+#: concealed(R1 검증 B3): 이 칸이 격리 world 의 가림 표식 집합(_CONCEALED_SET — SecretStore 값·민감 입력을 친 칸)에 있는가.
+_ENTER_FACTS_JS = """
+function enterFacts(el) {
+  const low = (v) => (v === null || v === undefined) ? null : String(v).trim().toLowerCase();
+  const attr = (n, a) => { try { return n.getAttribute(a); } catch (e) { return null; } };
+  const STATIC_VALUE = ['hidden', 'submit', 'button', 'reset', 'image', 'checkbox', 'radio'];
+  const out = { autocomplete: low(attr(el, 'autocomplete')) || '', active_option: null, form: null };
+  const ad = attr(el, 'aria-activedescendant');
+  if (ad) {
+    let opt = null;
+    try { const root = el.getRootNode ? el.getRootNode() : null; opt = (root && root.getElementById) ? root.getElementById(ad) : null; } catch (e) { opt = null; }
+    if (!opt) { try { opt = el.ownerDocument.getElementById(ad); } catch (e) { opt = null; } }
+    if (opt) out.active_option = { name: String(accessibleName(opt) || '').slice(0, 200), signals: gateSignals(opt) };
+  }
+  try { const cs = globalThis.__CONCEALED_SET__; out.concealed = !!(cs && typeof cs.has === 'function' && cs.has(el)); }
+  catch (e) { out.concealed = false; }
+  const form = el.form || null;
+  if (!form) return out;
+  let els = [];
+  try { els = Array.prototype.slice.call(form.elements || []); } catch (e) { els = []; }
+  const isSub = (c) => {
+    const t = (c.type || '').toLowerCase();
+    return (c.tagName === 'BUTTON' && t === 'submit') || (c.tagName === 'INPUT' && (t === 'submit' || t === 'image'));
+  };
+  let submitter = null;
+  let undetermined = false;
+  try {
+    const root = form.getRootNode();
+    const owned = [];
+    const add = (list) => { for (const n of list) if (owned.indexOf(n) === -1 && isSub(n) && n.form === form) owned.push(n); };
+    add(form.querySelectorAll('button, input'));
+    add(root.querySelectorAll('button[form], input[form]'));
+    // 문서(트리) 순서 — 4 = DOCUMENT_POSITION_FOLLOWING.
+    owned.sort((a, b) => (a === b ? 0 : (a.compareDocumentPosition(b) & 4 ? -1 : 1)));
+    submitter = owned.length ? owned[0] : null;
+    // form.elements 에 없는 소유 제출자(input image)도 컨트롤로 판정한다(name·value 신호).
+    for (const n of owned) if (els.indexOf(n) === -1) els.push(n);
+  } catch (e) { undetermined = true; submitter = null; }
+  const controls = [];
+  for (const c of els) {
+    const t = (c.type || '').toLowerCase();
+    if (controls.length < 200) {
+      const item = { tag: c.tagName, type: t, name_attr: attr(c, 'name') || '', id: c.id || '', autocomplete: low(attr(c, 'autocomplete')) || '' };
+      if (c.tagName === 'BUTTON' || STATIC_VALUE.indexOf(t) !== -1) item.value = String(c.value || '').slice(0, 300);
+      controls.push(item);
+    }
+  }
+  let frames = -1;
+  try { frames = form.querySelectorAll('iframe, frame, object, embed').length; } catch (e) { frames = -1; }
+  const f = { method_attr: form.hasAttribute('method') ? low(attr(form, 'method')) : null, action_attr: attr(form, 'action'),
+              controls: controls, controls_total: els.length, frames: frames, submitter: null,
+              submitter_undetermined: undetermined, action_origin: '', doc_origin: '' };
+  if (submitter) {
+    f.submitter = { tag: submitter.tagName, type: (submitter.type || '').toLowerCase(),
+                    formmethod: submitter.hasAttribute('formmethod') ? low(attr(submitter, 'formmethod')) : null,
+                    formaction: submitter.hasAttribute('formaction') ? attr(submitter, 'formaction') : null,
+                    name: String(accessibleName(submitter) || '').slice(0, 200), signals: gateSignals(submitter) };
+  }
+  try {
+    const d = el.ownerDocument;
+    const dest = (f.submitter && f.submitter.formaction !== null) ? f.submitter.formaction : (f.action_attr || '');
+    f.action_origin = new URL(dest, d.baseURI).origin;
+    f.doc_origin = new URL(d.URL).origin;
+  } catch (e) { /* 출처를 못 읽음: 표시 없음 */ }
+  out.form = f;
+  return out;
+}
+"""
+
+#: R1 (검증 B3): 격리 world 전역의 가림 표식 집합 이름(WeakSet — 페이지 main world 에서는 보이지 않는다). 페이지 world 판독에서
+#: 같은 이름을 페이지가 만들어도 표식을 **더할** 뿐(높은 쪽 판정) 지울 수는 없다.
+_CONCEALED_SET = "__agentBrowserConcealed"
+_ENTER_FACTS_JS = _ENTER_FACTS_JS.replace("__CONCEALED_SET__", _CONCEALED_SET)
+
+#: WS-88: 게이트 판정 정보(_TARGET_INFO_JS) + Enter 사실(info.enter).
+_ENTER_INFO_JS = (
+    """
+(el) => {
+  __ACCESSIBLE_NAME__
+  __GATE_SIGNALS__
+  __ENTER_FACTS__
+  const info = (__TARGET_INFO__)(el);
+  info.enter = enterFacts(el);
+  return info;
+}
+""".replace("__ACCESSIBLE_NAME__", ACCESSIBLE_NAME_JS.strip())
+    .replace("__GATE_SIGNALS__", _GATE_SIGNALS_JS.strip())
+    .replace("__ENTER_FACTS__", _ENTER_FACTS_JS.strip())
+    .replace("__TARGET_INFO__", _TARGET_INFO_JS.strip())
+)
+#: WS-88: 키를 받는 요소(_FOCUS_INFO_JS 와 같은 탐색)의 Enter 판정 정보 — 페이지 world·격리 world 식.
+_ENTER_FOCUS_INFO_JS = _FOCUS_INFO_TEMPLATE.replace("__INFO__", _ENTER_INFO_JS.strip())
+_ISOLATED_ENTER_FOCUS_EXPR = f"({_ENTER_FOCUS_INFO_JS.strip()})()"
+#: WS-88: 격리 world 에서 결속한 노드(this)의 Enter 판정 정보.
+_ISOLATED_ENTER_FN = "function () { return (" + _ENTER_INFO_JS.strip() + ")(this); }"
+
 #: WS-85 (#163 B3): 상자 일치로 고를 후보 상한·shadow root 탐색 상한(넘으면 결속 불가 — 판정 불가 규칙으로).
 _ISO_BOX_CANDIDATES = 8
 _ISO_COUNT_CAP = 50
@@ -1375,6 +1478,8 @@ class _GateFence:
         self.tripped: Optional[str] = None
         self.nodes: Dict[Tuple[str, str], Optional[Tuple[str, int]]] = {}
         self.armed = True
+        #: WS-88 (#248 B4): Enter 직전 같은 칸을 다시 판정하는 서버 콜백(action, params) → 위험이 게이트 판정 이하면 True.
+        self.enter_check: Any = None
 
     def on_request(self, request: Any) -> None:
         if self.tripped is not None:
@@ -1544,6 +1649,8 @@ class ActionDispatcher:
         self.last_key_sensitive: bool = False
         #: WS-78 T1 sticky: 앞 press_key 에서 민감으로 판정한 포커스 노드(JSHandle) — 같은 노드면 type 이 바뀌어도 민감.
         self._sticky_key_node: Any = None
+        #: WS-88 R2 (재검증 C1): 가림 표식(_CONCEALED_SET)을 한 번이라도 넣었는가 — 평범한 대체 입력의 해제 확인 왕복은 그때만.
+        self._concealed_marked: bool = False
         #: WS-26b: 이번 액션이 연 팝업 Page 들(click 경로가 채운다).
         self._opened_pages: List[Any] = []
         #: WS-83(B2·B3): 직전 dispatch 가 연 팝업 Page 들 — 서버가 egress 차단 귀속 후보(이 호출이 연 팝업)로 읽는다.
@@ -2027,12 +2134,12 @@ class ActionDispatcher:
         return {"name": str(info.get("name") or ""), "info": info}
 
     async def describe_element(self, element_id: str) -> Optional[Dict[str, Any]]:
-        """관찰로 받은 요소의 실제 DOM 정보(태그·폼 소속 등). 못 읽으면 None."""
+        """관찰로 받은 요소의 실제 DOM 정보(태그·폼 소속 등 — WS-88: Enter 판정 사실 info.enter 포함). 못 읽으면 None."""
         handle = self.ctx.engine.get_handle(element_id)
         if handle is None:
             return None
         try:
-            return await self._locator_for(handle).evaluate(_TARGET_INFO_JS)
+            return await self._locator_for(handle).evaluate(_ENTER_INFO_JS)
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 읽기 실패 = 대상 판정 불가(None) — 게이트가 판정 불가로 막는다(fail-closed).
             return None
@@ -2463,19 +2570,21 @@ class ActionDispatcher:
         Playwright 로 그 프레임 안에서 이어서 읽는다 — 포커스를 가진 문서 사슬(document.hasFocus)이
         한 줄로 확정될 때만. 확정 못 하면 opaque 를 그대로 돌려준다(게이트는 fail-closed).
         """
+        # WS-88 (#248): Enter 판정 사실(info.enter — 폼 method·기본 버튼·컨트롤·activedescendant)도 함께 읽는다.
+        expr = _ENTER_FOCUS_INFO_JS
         top = self._top_page()
         try:
-            info = await top.evaluate(_FOCUS_INFO_JS)
+            info = await top.evaluate(expr)
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
         if isinstance(info, dict) and info.get("opaque"):
-            deeper = await self._focus_in_focused_frame(top)
+            deeper = await self._focus_in_focused_frame(top, expr)
             if deeper is not None:
                 return deeper
         return info
 
-    async def _focus_in_focused_frame(self, top: Any) -> Optional[Dict[str, Any]]:
+    async def _focus_in_focused_frame(self, top: Any, expr: str) -> Optional[Dict[str, Any]]:
         """포커스를 가진 가장 깊은 프레임에서 activeElement 를 읽는다. 확정 못 하면 None."""
         try:
             frames = [f for f in top.frames if f is not top.main_frame]
@@ -2501,7 +2610,7 @@ class ActionDispatcher:
         if any(f not in chain for f in focused):
             return None
         try:
-            info = await deepest.evaluate(_FOCUS_INFO_JS)
+            info = await deepest.evaluate(expr)
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 포커스를 읽지 못하면 None — press_key 게이트가 판정 불가로 막는다(fail-closed).
             return None
@@ -2616,13 +2725,14 @@ class ActionDispatcher:
         None(격리 world 생성 실패·다른 출처 iframe(OOPIF) 안 포커스·예외)이면 게이트는 기존(페이지
         world) 판정만 쓴다 — 지금 동작 그대로. 페이지 world 판정과 각각 위험 분류해 높은 쪽을 쓴다.
         """
+        expr = _ISOLATED_ENTER_FOCUS_EXPR  # WS-88 (#248): Enter 판정 사실(info.enter)도 — focused_target 과 같은 식
         top = self._top_page()
         try:
             cdp = await self._gate_cdp_for(top)
 
             async def run(context_id: int) -> Any:
                 return await cdp.send("Runtime.evaluate", {
-                    "expression": _ISOLATED_FOCUS_EXPR, "contextId": context_id, "returnByValue": True})
+                    "expression": expr, "contextId": context_id, "returnByValue": True})
 
             res = await self._in_gate_world(cdp, "", run)
         except Exception:  # noqa: BLE001
@@ -2755,11 +2865,12 @@ class ActionDispatcher:
             raise RuntimeError("격리 world 를 만들지 못함")
         return out
 
-    async def isolated_element_info_for_gate(self, element_id: Any) -> Dict[str, Any]:
+    async def isolated_element_info_for_gate(self, element_id: Any, enter: bool = False) -> Dict[str, Any]:
         """WS-85 (#163): element_id 대상의 게이트 판정 정보(_TARGET_INFO_JS)를 **격리 world** 에서 읽는다.
 
         반환 {"info": …} 또는 {"unresolved": 사유}. 판독할 수 있어야 하는 대상(페이지 world 로는 읽힘)인데 실패하면 게이트가
         페이지 판정 < HIGH 일 때 승인 경로로 보낸다(리뷰 B2 — 페이지 world 로 내려가지 않는다)."""
+        function = _ISOLATED_ENTER_FN if enter else _ISOLATED_TARGET_FN  # WS-88: Enter-on-field 판정은 info.enter 도
         handle = self.ctx.engine.get_handle(element_id) if element_id else None
         css = getattr(handle, "css_path", "") or ""
         if handle is None or not css:
@@ -2774,7 +2885,7 @@ class ActionDispatcher:
                 need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
             else:
                 need_box = await self.ctx.page.locator(css).count() != 1
-            info, ident = await self._iso_on_target(css, locator, need_box, _ISOLATED_TARGET_FN, want_backend=True)
+            info, ident = await self._iso_on_target(css, locator, need_box, function, want_backend=True)
         except Exception as exc:  # noqa: BLE001 — 판정 불가(부르는 쪽 규칙 B2)
             return {"unresolved": f"격리 판독 실패: {type(exc).__name__}"}
         # R1 (검증 B3): 판정한 그 노드 (frameId, backendNodeId) — 실행 직전 입력 노드와 대조한다(_fence_bind_node).
@@ -2928,6 +3039,47 @@ class ActionDispatcher:
         top.on("request", fence.on_request)
         self._fence = fence
 
+    def arm_enter_check(self, check: Any) -> None:
+        """WS-88 (#248 B4): 이 호출의 묶음에 Enter 직전 재판정 콜백을 건다(묶음이 없으면 아무것도 하지 않음)."""
+        fence = self.__dict__.get("_fence")
+        if fence is not None:
+            fence.enter_check = check
+
+    async def _enter_recheck(self, action: ActionType, handle: ElementHandle, params: Dict[str, Any], node: Any) -> None:
+        """WS-88 (#248 B4·B5): 입력 뒤 Enter 직전 — 같은 고정 노드를 게이트가 다시 판정한다(페이지·격리 world). 위험이 입력 전
+        판정보다 올라갔거나, 다시 판정한 노드가 이 노드가 아니면 Enter 를 보내지 않는다(입력은 이미 됨 — typed_without_enter).
+        묶음이 없거나(가짜 페이지·승인 노드 호출) 콜백이 없으면 지금 동작 그대로."""
+        fence = self._live_fence()
+        if fence is None or fence.enter_check is None:
+            return
+        try:
+            ok = await fence.enter_check(action, params) is True
+        except Exception:  # noqa: BLE001 — 다시 판정하지 못함: Enter 를 보내지 않는다
+            ok = False
+        if not ok:
+            raise _TargetRefused(self._typed_without_enter(
+                action, ErrorCode.HITL_UNATTENDED_BLOCKED,
+                "입력 중 칸·폼이 바뀌어 Enter 직전 다시 판정한 위험이 입력 전보다 높습니다"))
+        key = ("element_id", str(handle.element_id)) if params.get("element_id") else \
+            ("selector", str(params.get("selector") or ""))
+        ident = await self._fence_ident(handle, params, node)
+        if ident is None or fence.nodes.get(key) != ident:
+            raise _TargetRefused(self._typed_without_enter(
+                action, ErrorCode.TOCTOU_MISMATCH, "Enter 직전 다시 판정한 칸이 입력한 칸이 아닙니다"))
+
+    def _typed_without_enter(self, action: ActionType, code: ErrorCode, why: str) -> ActionResult:
+        result = self._result(
+            success=False,
+            action=action,
+            retry_safe=True,
+            error_code=code,
+            error_message=(f"입력은 했지만 Enter 는 보내지 않았습니다({why}). 다시 관찰하세요 — 다시 Enter 하면 새 판정"
+                           "(필요하면 사람 승인)을 거칩니다."),
+            reobserve_required=True,
+        )
+        result.data["typed_without_enter"] = True
+        return result
+
     def end_gate_fence(self) -> None:
         fence, self._fence = self.__dict__.get("_fence"), None
         if fence is not None:
@@ -2990,12 +3142,13 @@ class ActionDispatcher:
 
     @staticmethod
     def _fence_binds(action: ActionType, params: Dict[str, Any]) -> bool:
-        """게이트가 격리 world 로 노드를 판정하는 경로(요소·selector 클릭, 개행 입력) — 실행 노드를 그 노드에 묶는다."""
+        """게이트가 격리 world 로 노드를 판정하는 경로(요소·selector 클릭, 개행·press_enter 입력) — 실행 노드를 그 노드에 묶는다."""
         if action is ActionType.CLICK:
             return bool(params.get("element_id") or params.get("selector"))
         if action is ActionType.TYPE_TEXT:
             text = str(params.get("text") or "")
-            return ("\n" in text or "\r" in text) and not params.get("press_enter")
+            # WS-88 (#248 B5): press_enter 도 — 게이트가 그 칸을 격리 world 로 판정한다(Enter-on-field).
+            return "\n" in text or "\r" in text or bool(params.get("press_enter"))
         return False
 
     async def _fenced_input(self, action: ActionType, handle: ElementHandle, params: Dict[str, Any]) -> None:
@@ -4400,6 +4553,58 @@ class ActionDispatcher:
         register_secret_values([text])
         params[_CONCEAL_KEY] = True
 
+    async def _mark_concealed_field(self) -> None:
+        """R1 (검증 B3): 가림 입력(SecretStore 값·민감 칸)을 친 뒤 키를 받는 노드(_FOCUS_NODE_JS)를 **격리 world** 가림 표식
+        집합(_CONCEALED_SET, WeakSet)에 넣는다 — 뒤의 press_key Enter 판정(enterFacts.concealed)이 type_text(press_enter)·개행의
+        _CONCEAL_KEY 판정과 같은 결론(민감 칸 HIGH)을 낸다. 노드 identity 라 페이지가 칸을 옮겨도 남고, 새 문서면 사라진다.
+        가림 입력에서만 부른다(평범한 입력 왕복 0). 못 하면 조용히 — 그때 press_key 는 기존 판정(사용자 결정 대기 #240)."""
+        expr = ("(() => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+                "if (!(n && typeof n === 'object' && n.tagName)) return false; "
+                "const g = globalThis; if (!g." + _CONCEALED_SET + ") g." + _CONCEALED_SET + " = new WeakSet(); "
+                "g." + _CONCEALED_SET + ".add(n); return true; })()")
+        self._concealed_marked = True  # 평가가 실패해도 — 뒤 대체 입력의 해제 확인은 표식이 없으면 아무것도 하지 않는다
+        try:
+            top = self._top_page()
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": expr, "contextId": context_id, "returnByValue": True})
+
+            await asyncio.wait_for(self._in_gate_world(cdp, "", run), 2.0)  # 문서 이동 중 멈춤 상한
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe(표식 없음 = 지금 판정)
+            return
+
+    async def _unmark_concealed_field(self, target: Any, fixed: bool, text: str) -> None:
+        """WS-88 R2 (재검증 C1): 가림 표식은 '지금 그 칸에 비밀 값이 들어 있다' — 도구가 그 칸의 값을 **통째로 바꾸는** 평범한
+        입력(clear 후 입력, 성공)을 마쳤으면 표식을 지운다. 성공한 대체 입력 뒤에만 부르고(덧붙임·입력 실패는 부르지 않음),
+        격리 world 에서 키를 받는 노드가 표식된 노드이고, 입력한 그 노드(식별 열쇠)이며, 그 값이 친 글자와 **정확히 같을** 때만
+        지운다. 하나라도 아니거나 못 읽으면 유지(fail-closed — press_key Enter 는 민감 칸 HIGH). 페이지가 스스로 값을 지운
+        경우는 바꾸지 않는다(유지). 표식을 넣은 적이 없으면 왕복 0."""
+        if not self._concealed_marked:
+            return
+        key = await self._target_node_key(target, fixed)
+        if not key:
+            return
+        expr = ("(() => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
+                "if (!(n && typeof n === 'object' && n.tagName)) return false; "
+                "const cs = globalThis." + _CONCEALED_SET + "; "
+                "if (!(cs && typeof cs.has === 'function' && cs.has(n))) return false; "
+                "if ((" + _NODE_KEY_JS.strip() + ")(n) !== " + json.dumps(key) + ") return false; "
+                "if (typeof n.value !== 'string' || n.value !== " + json.dumps(text) + ") return false; "
+                "cs.delete(n); return true; })()")
+        try:
+            top = self._top_page()
+            cdp = await self._gate_cdp_for(top)
+
+            async def run(context_id: int) -> Any:
+                return await cdp.send("Runtime.evaluate", {
+                    "expression": expr, "contextId": context_id, "returnByValue": True})
+
+            await asyncio.wait_for(self._in_gate_world(cdp, "", run), 2.0)
+        except Exception:  # noqa: BLE001 — 의도된 fail-closed(표식 유지 = 민감 칸 판정)
+            return
+
     @staticmethod
     async def _target_node_key(target: Any, fixed: bool) -> Optional[str]:
         """R1 (검증 B1): 입력 대상 노드의 식별 열쇠(_NODE_KEY_JS). 못 읽으면 None(격리 OR 에 더하지 않는다)."""
@@ -5133,8 +5338,10 @@ class ActionDispatcher:
             logger.debug("숨긴 control 수집 실패: %s", type(exc).__name__)
 
     @staticmethod
-    async def _type_fenced(action: ActionType, params: Dict[str, Any], target: Any, text: str, guard: Any) -> None:
-        """WS-85 R1: text 를 줄바꿈 앞뒤로 나눠 입력 — 조각 입력과 Enter 마다 바로 앞에서 관문(guard: 문서 확인 포함)."""
+    async def _type_fenced(action: ActionType, params: Dict[str, Any], target: Any, text: str, guard: Any,
+                           before_enter: Any = None) -> None:
+        """WS-85 R1: text 를 줄바꿈 앞뒤로 나눠 입력 — 조각 입력과 Enter 마다 바로 앞에서 관문(guard: 문서 확인 포함).
+        WS-88 (#248 B4): Enter 마다 그 앞에서 before_enter(같은 칸 재판정 — 관문보다 앞, 관문과 키 사이 await 없음)."""
         buf = ""
         for ch in text:
             if ch not in "\r\n":
@@ -5144,6 +5351,8 @@ class ActionDispatcher:
                 await guard(action, params)
                 await target.type(buf, timeout=5000)
                 buf = ""
+            if before_enter is not None:
+                await before_enter()
             await guard(action, params)
             await target.press("Enter", timeout=5000)
         if buf:
@@ -5182,6 +5391,11 @@ class ActionDispatcher:
         def sent() -> None:
             if progress is not None:
                 progress["sent"] = True
+
+        async def before_enter() -> None:
+            # WS-88 (#248 B4): 고정 노드(게이트 묶음)일 때만 — Enter 직전 같은 칸 재판정.
+            if fixed:
+                await self._enter_recheck(action, handle, params, target)
 
         if action is ActionType.CLICK:
             button = params.get("button", "left")
@@ -5231,23 +5445,31 @@ class ActionDispatcher:
                         # R3 B1: 앞 글자 사이 고정 노드가 떨어졌다(문서 교체) — 남은 글자를 새 문서의 포커스로 보내지 않는다.
                         # 관문보다 앞에 둔다(관문과 키 사이에는 await 를 두지 않는다 — R2 B1).
                         raise RuntimeError("Element is not attached to the DOM")
+                    if ch in "\r\n":
+                        await before_enter()  # WS-88 B4: 줄바꿈(Enter)도 그 앞에서 같은 칸 재판정
                     await guard(action, params)
                     await keyboard.type(ch)
             else:
                 if self._live_fence() is not None and ("\n" in text or "\r" in text):
                     # WS-85 R1 (검증 B2): 줄바꿈(Enter = 폼 제출)마다 그 앞에서 문서 확인 — 글자 입력 중 문서가 바뀌면 새 문서의
                     # 폼으로 Enter 를 보내지 않는다. Playwright type 의 '\n'·'\r' 은 Enter 한 번(같은 키)이다.
-                    await self._type_fenced(action, params, target, text, guard)
+                    await self._type_fenced(action, params, target, text, guard, before_enter)
                 else:
                     await guard(action, params)
                     await target.type(text, timeout=5000)
                 sent()
             await self._mark_sensitive_input(handle, params, text, after_input=True, target=target, fixed=fixed)
+            if params.get(_CONCEAL_KEY):
+                await self._mark_concealed_field()  # R1 (검증 B3): 뒤 press_key Enter 도 이 칸을 민감 칸으로
+            elif params.get("clear_before", True):
+                # WS-88 R2 (재검증 C1): 성공한 평범한 대체 입력(clear 후 입력) — 그 칸의 가림 표식을 지운다(덧붙임은 유지).
+                await self._unmark_concealed_field(target, fixed, text)
             if params.get(_CONCEAL_KEY) and not params.get("clear_before", True):
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
                 await self._register_field_value(target)
             if params.get("press_enter"):
+                await before_enter()  # WS-88 (#248 B4): 입력 뒤 Enter 직전 같은 칸 재판정(관문보다 앞)
                 await guard(action, params)
                 await target.press("Enter", timeout=5000)
 
