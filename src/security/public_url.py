@@ -736,6 +736,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
                      "take", "release", "approve", "deny", "show_code", "describe", "login", "login_finish",
                      "cookie_sites", "status", "done"}),  # handoff._OPS · cli status (done: WS-64)
     "risk": frozenset({"low", "medium", "high"}),  # security.hitl.RiskLevel
+    "name_risk": frozenset({"high"}),  # WS-85 (#226) data.hidden_controls[].name_risk(apply_block 리터럴)
     "presented_as": frozenset({"chrome"}),  # server_signals identity
     "sticky_reason": frozenset(),  # 자유 문장(on_demand — 도메인·사유 문장) — 늘 정제
     # server_handoff._control_wait + WS-64 직접 조작 인계 결과(security.manual_sites OUTCOMES). cancelled 는 쓰지 않는다 —
@@ -756,6 +757,9 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "resolved_from": frozenset({"current_frame", "root"}),  # actions.dispatcher switch_frame · server_schema 안내
     "coordinate_target": frozenset({"interactive", "non_interactive", "rejected_by_dispatcher",
                                     "unresolved"}),  # server_hitl 좌표 대상 근거
+    # WS-88 (#248) server_hitl Enter-on-field 판정 근거(gate_basis.enter_target·sensitive)
+    "enter_target": frozenset({"form_get", "no_form", "field", "sensitive_field"}),
+    "sensitive": frozenset({"password", "autocomplete", "field_name", "secret_value"}),
     "handled": frozenset({"accepted", "dismissed"}),  # actions.dispatcher data.dialogs[].handled
     "blocked_by": frozenset({"approval_code_displayed"}),  # server_display 캡처 차단
     "captured": frozenset({"root_page"}),  # actions.dispatcher 프레임 안 screenshot

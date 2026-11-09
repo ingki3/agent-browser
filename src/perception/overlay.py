@@ -106,6 +106,49 @@ _MEMBERS_JS = r"""
 """
 
 
+#: WS-87(#222, 리뷰 B1·U3): 요소 액션 직전 '열린 모달 밖 대상' 신호의 어휘(KINDS 중 모달 종류만 — covering 은 신호 아님).
+MODAL_KINDS = ("top_layer", "aria_modal")
+#: 그 신호의 고정 hint(페이지 글자 0). 거부가 아니라 알림 — 입력은 이미 보냈다.
+OUTSIDE_MODAL_HINT = ("열린 모달(대화상자) 밖의 대상에 입력했습니다 — 모달이 아직 열려 있으면 먼저 모달을 처리(확인·닫기)해야 "
+                      "하는지 확인하세요. 다시 관찰하면 모달 안 요소가 앞에 옵니다.")
+
+# 같은 감지(_DETECT_JS)를 돌리고, 모달 종류 레이어가 있을 때만 대상(css_path, 실행 노드와 같은 경로)이 어느 레이어 안에도 없는지 본다.
+# 감지가 남기는 격리 world 상태(__abOverlay — 클릭 뒤 overlay_opened 의 '직전 레이어')는 되돌려 놓는다(WS-82 동작 불변).
+# 대상을 못 찾으면 null(판독 실패 = 신호 생략).
+_OUTSIDE_JS = r"""
+(() => {
+  const PATH = __PATH__, W = window, KEY = '__abOverlay', __abOutside = true;
+  const had = Object.prototype.hasOwnProperty.call(W, KEY), saved = W[KEY];
+  try {
+    const r = __DETECT__;
+    const kinds = (r && r.kinds || []).filter(function (k) { return k === 'top_layer' || k === 'aria_modal'; });
+    if (!r || !r.on || !kinds.length) return {modal: false};
+    let e = null; try { e = document.querySelector(PATH); } catch (x) { e = null; }
+    if (!e) return null;
+    const layers = W[KEY] && Array.isArray(W[KEY].layers) ? W[KEY].layers : [];
+    const inside = layers.some(function (L) { return L === e || L.contains(e); });
+    return {modal: true, outside: !inside, kinds: kinds};
+  } finally {
+    if (had) W[KEY] = saved; else delete W[KEY];
+  }
+})()
+"""
+
+
+def outside_modal_expr(nonce: str, path: str) -> str:
+    # 감지 식을 먼저 끼우고 경로를 나중에(경로 글자가 자리표시자와 같아도 다시 치환되지 않게).
+    return _OUTSIDE_JS.replace("__DETECT__", detect_expr(nonce).strip()).replace(
+        "__PATH__", json.dumps(str(path or ""), ensure_ascii=False))
+
+
+def parse_outside_modal(raw: Any) -> Optional[Dict[str, List[str]]]:
+    """판독 → {"kinds": [...]}(모달 밖 대상) 또는 None(모달 없음·모달 안·모르는 모양 = 신호 없음). kinds 는 고정 어휘만."""
+    if not isinstance(raw, dict) or raw.get("modal") is not True or raw.get("outside") is not True:
+        return None
+    kinds = [k for k in MODAL_KINDS if k in (raw.get("kinds") or [])]
+    return {"kinds": kinds} if kinds else None
+
+
 def detect_expr(nonce: str) -> str:
     return (_DETECT_JS.replace("__NONCE__", json.dumps(nonce)).replace("__K__", str(COVER_MIN))
             .replace("__LIMIT__", str(SCAN_LIMIT)).replace("__SEL__", json.dumps(_CANDIDATES)))

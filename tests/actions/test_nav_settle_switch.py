@@ -97,13 +97,17 @@ async def test_off_enter_submit_does_not_wait(server):
         b, page, engine, d = await _open(pw, server + "/?d=400", nav_settle=False)
         await page.focus("#q")
         await page.keyboard.type("키보드")
+        t0 = time.perf_counter()
         r = await d.dispatch(ActionType.PRESS_KEY, {"key": "Enter"})
         url_at_return = page.url
+        returned_ms = (time.perf_counter() - t0) * 1000
         # 호출자 책임: 스스로 기다리면 새 문서가 뜬다.
         await page.wait_for_url("**/result**", timeout=5000)
+        nav_ms = (time.perf_counter() - t0) * 1000  # 새 문서 도착(이 시각 이전) — 실패 시 원인 구분용(WS-89 NN5)
         await b.close()
     assert r.success, r.error_message
-    assert "/result" not in url_at_return, url_at_return
+    assert "/result" not in url_at_return, (
+        f"{url_at_return} returned_ms={returned_ms:.0f} latency_ms={r.data.get('latency_ms')} nav_seen_ms={nav_ms:.0f}")
     assert "/result" not in r.current_url
     assert not any(k in r.data for k in _NAV_KEYS), r.data
 

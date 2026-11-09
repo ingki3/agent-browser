@@ -39,9 +39,11 @@ from ws29_helpers import code_from_banner
 GOLDEN = Path(__file__).parent / "golden" / "ws48_characterization.json"
 UPDATE = os.environ.get("WS48_UPDATE_GOLDEN") == "1"
 
+#: WS-88 (#248 B6): 폼은 method=post — 명시 GET 검색 폼의 Enter 는 이제 '검색형 제출'로 통과해 /next 로 옮겨 가므로,
+#: type_enter_blocked·press_enter_blocked(와 그 뒤 표본) 차단 봉투를 그대로 두려고 POST 로 바꿨다(골든 diff 0).
 HOME = """<!doctype html><meta charset=utf-8><title>WS48 홈</title>
 <h1>특성화 홈</h1>
-<form id=f action=/next method=get><input aria-label='검색어' name=q id=q>
+<form id=f action=/next method=post><input aria-label='검색어' name=q id=q>
 <button type=submit>검색</button></form>
 <button id=pay onclick="document.getElementById('out').textContent='결제됨'">결제하기</button>
 <p id=out>대기</p>
