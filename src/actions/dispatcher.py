@@ -1367,6 +1367,13 @@ _KEY_FOCUS_AFTER_JS = (
 )
 #: WS-78 T1: 포커스 노드 판정·키 뒤 값 읽기의 상한(초) — 문서 이동 중이면 평가가 이동 끝까지 멈출 수 있다(실측).
 _KEY_FIELD_TIMEOUT_S = 0.3
+
+
+def _key_read_budget(deadline: Optional[float]) -> float:
+    """WS-89(#244): 키 뒤 판독의 남은 대기(초) — 공유 마감(time.monotonic)까지, 없으면 상한 그대로. 지났으면 0."""
+    if deadline is None:
+        return _KEY_FIELD_TIMEOUT_S
+    return max(0.0, deadline - time.monotonic())
 #: WS-78 R1 R3: 서버가 미리 시작한 키 전 판정을 쓰는 최대 경과(초) — 그보다 오래면(승인 대기 등) 버리고 다시 판정한다.
 _KEY_PREFETCH_MAX_AGE_S = 0.25
 #: WS-78 R1 R3: 서버가 일반 칸의 키 뒤 확인을 기존 차단 판정(detect_challenge)과 겹쳐 돌릴 때 주는 자리(목록) —
@@ -1644,6 +1651,9 @@ class ActionDispatcher:
         self._healing_successes = 0
         #: 이번 dispatch 에서 문서 이동을 기다린 기록(WS-25). dispatch 마다 비운다.
         self._nav_info: Dict[str, Any] = {}
+        #: WS-89(#244): press_key 키 뒤 판독(페이지·격리·오버레이)이 함께 쓰는 마감(time.monotonic) — 이동 대기 뒤에 잡고
+        #: 오버레이 감지가 쓰면 비운다. dispatch 마다 비운다(앞 액션의 마감이 뒤 액션 예산을 줄이지 않게).
+        self._post_key_deadline: Optional[float] = None
         #: WS-78 T1(#142): 마지막 press_key 가 민감 칸(키 전·키 뒤 password)으로 갔는가 — 레시피 기록이 그 단계를
         #: 비밀로 끊는 데 쓴다(press_key 마다 다시 정한다).
         self.last_key_sensitive: bool = False
@@ -3349,6 +3359,7 @@ class ActionDispatcher:
             result.data["secret_resolved"] = False
             return result
         self._nav_info = {}
+        self._post_key_deadline = None
         self._opened_pages = []
         self.last_opened_pages = []
         self._related_navs = []
@@ -3421,8 +3432,12 @@ class ActionDispatcher:
             # WS-82(#158): 같은 감지기(격리 world)로 이 액션 뒤 페이지 안 모달·레이어가 새로 열렸는지 — JS 대화상자
             # (dialog_opened·data.dialogs)와 다른 키. 종류 어휘만(페이지 글자 0). 못 읽거나 새로 열린 것이 없으면 키 없음.
             # 문서 이동이 보였으면(대기 중·커밋·중단) 보지 않고, 판독은 짧은 상한 안에서만(이동 대기를 늘리지 않게).
+            # WS-89(#244): press_key 면 키 뒤 판독과 같은 마감 안에서만(남은 시간이 없으면 보지 않는다).
+            deadline, self._post_key_deadline = self._post_key_deadline, None
+            budget = (_OVERLAY_SIGNAL_TIMEOUT_S if deadline is None
+                      else min(_OVERLAY_SIGNAL_TIMEOUT_S, deadline - time.monotonic()))
             try:
-                det = await asyncio.wait_for(self._overlay_detect(), _OVERLAY_SIGNAL_TIMEOUT_S)
+                det = await asyncio.wait_for(self._overlay_detect(), budget) if budget > 0 else None
             except asyncio.TimeoutError:
                 det = None
             if det is not None and det["opened"]:
@@ -6114,16 +6129,17 @@ class ActionDispatcher:
         return info if isinstance(info, dict) else None
 
     async def _key_field_after(self, node: Any, sensitive: bool, before: str, data: Dict[str, Any],
-                               pending: Any = None) -> None:
+                               pending: Any = None, deadline: Optional[float] = None) -> None:
         """WS-78 T1 B2~B4: 키 **뒤** 그 노드의 값을 읽어, 키 전·키 뒤 어느 쪽이든 민감이면(sticky·OR) 칸 전체 값을
         자격증명 등급으로 등록한다. 누적 값을 매번 통째로 등록하고 앞서 등록한 접두는 그대로 둔다(B3, 지우는 API 없음).
         민감인데 키 뒤 값을 못 읽으면(상한 안에 못 읽음 포함) 키 전 값만 등록하고 data 에 고정 신호(B4, 값 없음).
         일반 칸은 아무것도 붙이지 않는다. pending: 키 직후 시작해 둔 읽기(이동 대기와 겹쳐 돈다).
+        deadline: WS-89 키 뒤 판독 공유 마감(없으면 지금부터 상한).
         """
         if pending is None:
             pending = asyncio.ensure_future(self._key_field_read(node))
         try:
-            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
+            info = await asyncio.wait_for(pending, _key_read_budget(deadline))
         except Exception:  # noqa: BLE001 — Enter 제출 직후 평가가 새 문서 도착까지 멈추는 경우(실측) 등
             info = None
         after: Optional[str] = None
@@ -6212,16 +6228,20 @@ class ActionDispatcher:
         # (G마켓 0.7~0.9초). 떠나는 중인 페이지를 관찰하지 않게 기다린다.
         if watch is not None:
             self._nav_info = await watch.settle()
+        # WS-89(#244): 키 뒤 판독(페이지·격리·오버레이) 공유 마감 — 이동 대기 **뒤**에 잡는다(키 시각에 잡으면 nav_settle
+        # 무이동의 감지 창이 오버레이 예산을 먹는다, WS-82). 판독이 멈춰도 키 뒤 대기는 합쳐 이 상한 하나.
+        deadline = time.monotonic() + _KEY_FIELD_TIMEOUT_S
+        self._post_key_deadline = deadline
         if isinstance(node, _PlainKey):
             # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
-            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending, node.k))
+            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending, node.k, deadline))
             defer = KEY_AFTER_DEFER.get()
             if defer is not None:
                 defer.append(task)
             else:
                 await task
         elif node is not None:
-            await self._key_field_after(node, sensitive, before, data, pending)
+            await self._key_field_after(node, sensitive, before, data, pending, deadline)
         return self._result(
             success=True, action=action, retry_safe=False, data=data
         )
@@ -6235,23 +6255,30 @@ class ActionDispatcher:
             return None
         return info if isinstance(info, dict) else None
 
-    async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None, k: str = "") -> None:
+    async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None, k: str = "",
+                               deadline: Optional[float] = None) -> None:
         """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다.
 
         WS-85 (#218): iso_pending = 키 직후 격리 world 판독({s, v, k}) — 페이지 판독이 일반이어도 격리 world 가 비밀번호 칸으로
         보면 민감(OR, 값은 격리 world 의 원본 value). 못 읽으면 페이지 판독 그대로(민감 처리로 넘기지 않는다).
         R1 (검증 B1·한계 2): 격리 판독 노드가 키 전 그 노드(식별 열쇠 k)일 때만 — 키(Tab·입력 이벤트)가 포커스를 다른
-        비밀번호 칸으로 옮겼으면 더하지 않는다(기준 동작)."""
-        try:
-            info = await asyncio.wait_for(pending, _KEY_FIELD_TIMEOUT_S)
-        except Exception:  # noqa: BLE001
-            info = None
-        iso = None
-        if iso_pending is not None:
-            try:
-                iso = await asyncio.wait_for(iso_pending, _KEY_FIELD_TIMEOUT_S)
-            except Exception:  # noqa: BLE001 — 격리 판독 실패 = 지금 판정 그대로
-                iso = None
+        비밀번호 칸으로 옮겼으면 더하지 않는다(기준 동작).
+        WS-89 (#244): 두 판독은 함께 기다린다 — 공유 마감(deadline, 없으면 지금부터 상한) 하나. 마감 안에 못 끝낸 판독은
+        취소하고 판독 없음(실패도 같음) — 마감 뒤 도착한 격리 판독은 쓰지 않는다(docs/security.md WS-85 한계)."""
+        futs = [f for f in (pending, iso_pending) if f is not None]
+        done: Any = set()
+        if futs:
+            done, rest = await asyncio.wait(futs, timeout=_key_read_budget(deadline))
+            for f in rest:
+                f.cancel()
+
+        def _read(f: Any) -> Any:
+            # 못 끝냄·취소·실패 = 판독 없음(지금 판정 그대로)
+            if f is None or f not in done or f.cancelled() or f.exception() is not None:
+                return None
+            return f.result()
+
+        info, iso = _read(pending), _read(iso_pending)
         if not (isinstance(info, dict) and info.get("s")):
             if not (isinstance(iso, dict) and iso.get("s") is True and k and iso.get("k") == k):
                 return
