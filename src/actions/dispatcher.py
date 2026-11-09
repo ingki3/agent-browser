@@ -152,6 +152,22 @@ class RelatedNav:
         self.done = False
 
 
+#: WS-92 (#247): navigate 다중 커밋 부분 성공의 커밋 수 상한 — 넘으면 클라이언트 리다이렉트 고리로 보고 기존 실패.
+_NAV_MAX_DOCUMENTS = 3
+
+
+def _multi_commit_settled(documents: Any, before_read: Any, url: Any) -> bool:
+    """navigate 2단계 시간 초과에서 문서가 2..3회 커밋된 경우를 부분 성공으로 올려도 되는가 (WS-92, #247).
+
+    클라이언트 이동(스크립트·meta refresh·같은 주소 reload)은 커밋이 2회 이상이다. (1) 커밋 수가 2.._NAV_MAX_DOCUMENTS
+    (4회 이상 = 고리), (2) readyState 판독 전후 커밋 수가 같고(판독 값이 지금 문서의 것 — DCL 직후 parser-blocked 둘째
+    문서·판독 중 커밋 차단), (3) 지금 주 프레임 주소가 http(s)(about:·data:·blob: 제외)일 때만. 마지막 await 뒤 동기로
+    부른다. readyState·오류 문서 판정은 호출부의 기존 확인이 그대로 한다.
+    """
+    return (isinstance(documents, int) and 2 <= documents <= _NAV_MAX_DOCUMENTS and documents == before_read
+            and str(url or "").startswith(("http://", "https://")))
+
+
 def _is_error_document(url: Any) -> bool:
     """주 프레임이 브라우저 오류 문서(이동 실패 화면, chrome-error://chromewebdata/)인가 (WS-69 R1)."""
     return str(url or "").startswith("chrome-error://")
@@ -5952,11 +5968,13 @@ class ActionDispatcher:
                     except Exception as exc:  # noqa: BLE001
                         return self._navigate_failure(action, exc)
                 if timed_out is not None:
+                    seen_before_read = commits["count"]  # WS-92: 판독 중 커밋 여부를 가리려고 판독 전 값을 둔다
                     ready = await self._bounded_ready_state(page, read_deadline, loop)
                     # ── 마지막 await 뒤: 아래는 모두 동기 판정(그 사이 문서가 바뀔 수 없다) ──
                     if _is_error_document(page.url):
                         return self._error_document_failure(action, page.url, failed_navs)
-                    if commits["count"] != 1:
+                    documents = commits["count"]
+                    if documents != 1 and not _multi_commit_settled(documents, seen_before_read, page.url):
                         # 이동 중 문서가 두 번 이상 커밋됐다(또는 셀 수 없었다) — 1단계 DCL 이 지금 문서의 것이라는
                         # 증명이 없으니 부분 성공으로 올리지 않는다(기준 동작과 같은 실패).
                         from actions.nav_failure import DOCUMENT_CHANGED_HINT as _DOCUMENT_CHANGED_HINT
@@ -5969,6 +5987,8 @@ class ActionDispatcher:
                     from actions.nav_failure import LOAD_STATE_TIMED_OUT_HINT
 
                     data["load_state"] = {"requested": requested, "reached": "domcontentloaded", "timed_out": True}
+                    if documents != 1:
+                        data["load_state"]["documents"] = documents  # WS-92: 정수만(고정 형식) — 주소 원문 없음
                     data["hint"] = LOAD_STATE_TIMED_OUT_HINT.format(requested=requested)
                 elif _is_error_document(page.url):  # 2단계 완료 — 그 await 뒤 동기 확인
                     return self._error_document_failure(action, page.url, failed_navs)
