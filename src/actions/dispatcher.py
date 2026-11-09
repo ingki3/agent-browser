@@ -950,6 +950,35 @@ _ISO_COUNT_CAP = 50
 _ISO_ROOTS = 500
 #: 격리 world 판독이 만든 원격 객체 묶음 이름(판독 끝에 묶음째 놓는다 — 한 디스패처 안에서 판독은 겹치지 않는다).
 _ISO_GROUP_GATE = "ws85-gate"
+#: WS-90 (#245 B1·B2·B4): 효과 없는 click 의 목적 판정 — 격리 world 에서 클릭한 노드(this)에 결속해 부른다.
+#: focus: 지금 포커스(open shadow 를 따라감)가 this 자신, 또는 this 가 role combobox·textbox·searchbox 일 때 그 자손이고
+#: 편집 가능(text 류 input·textarea·contenteditable, disabled·readonly·aria-readonly·aria-disabled·inert(조상 포함) 아님).
+#: 포커스 '변화'는 보지 않는다(자동 포커스 칸). aria-controls·aria-activedescendant 연결은 보지 않는다.
+#: selected: this 가 role tab·option 이고 aria-selected="true"(aria-current 는 보지 않는다).
+_CLICK_PURPOSE_FN = """function () {
+  const TEXT = ['text', 'search', 'email', 'url', 'tel', 'number', 'password'];
+  const blocked = (el) => {
+    for (let n = el; n && n.nodeType === 1;) {
+      if (n.inert || n.getAttribute('aria-disabled') === 'true' || n.getAttribute('aria-readonly') === 'true') return true;
+      const p = n.parentNode;
+      n = p && p.nodeType === 11 ? p.host : n.parentElement;
+    }
+    return false;
+  };
+  const editable = (el) => {
+    if (!el || el.nodeType !== 1 || blocked(el)) return false;
+    if (el.tagName === 'INPUT') return TEXT.includes(el.type) && !el.disabled && !el.readOnly;
+    if (el.tagName === 'TEXTAREA') return !el.disabled && !el.readOnly;
+    return el.isContentEditable === true;
+  };
+  const role = (this.getAttribute('role') || '').trim().toLowerCase();
+  if (!this.isConnected || blocked(this)) return {focus: false, selected: false};
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const mine = a === this || (['combobox', 'textbox', 'searchbox'].includes(role) && !!a && this.contains(a));
+  return {focus: mine && editable(a),
+          selected: ['tab', 'option'].includes(role) && this.getAttribute('aria-selected') === 'true'};
+}"""
 _ISO_GROUP_PIN = "ws85-pin"
 _ISO_GROUP_CHECK = "ws85-check"
 
@@ -4312,6 +4341,33 @@ class ActionDispatcher:
         )
         return post
 
+    async def _click_purpose_signals(self, handle: ElementHandle) -> List[str]:
+        """WS-90 (#245 B4): 효과 없는 click 의 목적 신호 — 격리 world, 클릭한 노드 결속(_iso_on_target).
+
+        판독 실패·결속 불가·다른 출처 iframe·이 액션 중 문서 이동(커밋) = [] (기준 실패 그대로)."""
+        css = getattr(handle, "css_path", "") or ""
+        if not css or self._nav_info.get("nav_committed"):
+            return []
+        try:
+            world = await self._select_frame_world()
+            if world is None or world[2]:
+                return []
+            locator = self._locator_for(handle)
+            if getattr(handle, "is_shadow", False) and handle.name:
+                need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
+            else:
+                need_box = await self.ctx.page.locator(css).count() != 1
+            info = await self._iso_on_target(css, locator, need_box, _CLICK_PURPOSE_FN)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 판독 불가 = 기준 실패 그대로
+            return []
+        if not isinstance(info, dict):
+            return []
+        if info.get("focus") is True:
+            return ["focus_target"]
+        if info.get("selected") is True:
+            return ["target_selected"]
+        return []
+
     async def _retry_unsatisfied(
         self,
         action: ActionType,
@@ -4324,6 +4380,21 @@ class ActionDispatcher:
         """사후조건 미충족(Silent Failure): 부작용 액션은 중단, 멱등 액션만 1회 재시도(WS-48 분해)."""
         # 사후조건 미충족 (Silent Failure)
         post_retry_safe = is_retry_safe(action, FailurePhase.POST_DISPATCH)
+        if not post_retry_safe and action is ActionType.CLICK:
+            # WS-90 (#245): 효과는 없지만 목적(편집 칸 포커스·탭/옵션 선택 상태)이 클릭한 그 노드에서 확인되면 성공.
+            # 신호는 효과가 아니다(레시피 기대 신호에서 거른다 — recipes.recorder.signal_kinds).
+            purpose = await self._click_purpose_signals(handle)
+            if purpose:
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=False,
+                    healed=healed_flag,
+                    data=_with_click_point({
+                        "signals": list(post.signals) + purpose,
+                        "element_id": handle.element_id,
+                    }),
+                )
         if not post_retry_safe:
             # 이중 제출/결제 방지를 위해 재시도하지 않는다.
             return self._result(

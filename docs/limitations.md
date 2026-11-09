@@ -6,6 +6,8 @@
 
 **액션 뒤 이동 대기는 문서 요청만 봅니다** — SPA의 `pushState` 라우팅(문서 요청 없음)과, 액션 뒤 200ms가 지나서 시작되는 이동(예: 400ms 뒤 JS로 `location` 변경)은 기다리지 않습니다. 이때는 기존 사후조건 검증과 루프의 관찰 재시도가 맡습니다. 연결 실패가 Chromium 오류 문서(`chrome-error://`)로 커밋되면 새 문서로 보아 `nav_committed=true`로 남습니다.
 
+**클릭 목적 신호는 페이지 자기 서술을 믿습니다** — `target_selected`(WS-90)는 클릭한 노드 자신의 `aria-selected="true"` 를 봅니다. 페이지가 클릭한 탭에 거짓으로 `aria-selected="true"` 를 두면(화면에는 다른 탭이 선택) 무효 클릭도 성공입니다. 선택 상태를 클래스로만 표시하는 탭은 이 신호를 받지 못해 기존처럼 `E_TIMEOUT` 입니다.
+
 **Tier-2 시각 폴백은 옵트인입니다** — 텍스트 셀렉터가 2회 연속 실패하면(아이콘 버튼, 난독화 라벨, Canvas UI) 스크린샷에 태그를 얹어 비전 모델에게 묻는 폴백이 있습니다. `serve --som-vision`으로 켭니다. 끄면 `take_screenshot(annotate_som=True)`는 이전처럼 `E_FEATURE_NOT_IMPLEMENTED`를 반환합니다(레거시 클라이언트 보호).
 
 ```bash

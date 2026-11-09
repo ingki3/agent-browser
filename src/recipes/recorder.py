@@ -28,12 +28,17 @@ DROP_ARGS = frozenset({"element_id", "epoch", "expected_role", "expected_name", 
                        "target_element_id", "trigger_element_id"})
 
 
+#: 사후 확인 신호 중 효과가 아닌 종류 — 도달(focus_moved)·목적 확인(WS-90 focus_target·target_selected). 기대 신호에 넣지
+#: 않는다: 기록 때 포커스만 확인된 단계가 재생 때 효과(추천 목록 열림 등)를 내도 '종류가 다름'으로 멈추지 않게(리뷰 B3).
+NON_EFFECT_KINDS = frozenset({"focus_moved", "focus_target", "target_selected"})
+
+
 def signal_kinds(signals: Any) -> List[str]:
-    """사후 확인 신호 문자열 → 종류(':' 앞). 도달 신호(focus_moved)는 뺀다."""
+    """사후 확인 신호 문자열 → 종류(':' 앞). 효과가 아닌 종류(NON_EFFECT_KINDS)는 뺀다."""
     out = set()
     for s in signals or []:
         kind = str(s).split(":", 1)[0].strip()
-        if kind and kind != "focus_moved":
+        if kind and kind not in NON_EFFECT_KINDS:
             out.add(kind)
     return sorted(out)
 

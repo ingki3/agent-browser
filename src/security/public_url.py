@@ -799,8 +799,8 @@ CONTROL_LIST_VOCABULARY: Dict[str, FrozenSet[str]] = {
     "healing_attempts": frozenset(
         set(_HEAL_STRATEGIES) | {f"{s}({o})" for s in _HEAL_STRATEGIES for o in _HEAL_OUTCOMES}),
     # verify_post_condition 고정 신호 + dispatcher "navigation_started"·"tab_closed"(WS-83) + _top_effect_signals f"top:{s}"
-    # + _dialog_signals f"dialog_opened:{type}"(dialogs[].type 어휘)
-    "signals": frozenset(_VERIFY_SIGNAL_CODES | {"navigation_started", "tab_closed"}
+    # + _dialog_signals f"dialog_opened:{type}"(dialogs[].type 어휘) + _click_purpose_signals(WS-90 — 효과 아님, 목적 확인)
+    "signals": frozenset(_VERIFY_SIGNAL_CODES | {"navigation_started", "tab_closed", "focus_target", "target_selected"}
                          | {f"top:{c}" for c in _VERIFY_SIGNAL_CODES}
                          | {f"dialog_opened:{t}" for t in _DIALOG_TYPES}),
 }
