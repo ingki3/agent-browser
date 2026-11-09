@@ -63,6 +63,7 @@ from actions.healing import (
     is_retry_safe,
 )
 from actions.verification import (
+    PageStateSnapshot,
     PostConditionResult,
     StalenessReason,
     capture_state,
@@ -382,6 +383,63 @@ class _NavWatch:
                 pass
         self._handlers = []
         self.active = False
+
+
+class _EnterWatch(_NavWatch):
+    """WS-91 F2·B3 (#253): nav_settle=False Enter 뒤 메인 프레임 문서 요청을 듣는다 — 관문 뒤 동기 구간에 붙인다(왕복 0).
+
+    기다리지 않는다: 요청 시작(started)·응답(responded, 3xx 제외)·요청 실패(failed, 커밋 뒤여도 남김)·커밋(committed)을
+    동기로 적고, 판독은 공유 마감(deadline = Enter 뒤 _KEY_FIELD_TIMEOUT_S) 안에서만 그 기록을 본다. 응답 상태 400 이상
+    (egress 의 연결 실패 502 포함)도 실패로 본다 — 기준(nav_settle=False 는 이동이면 늘 실패)에서 성공으로 바뀌는 것은
+    마감 안 오류 신호가 없는 이동뿐이다."""
+
+    def __init__(self, page: Any) -> None:
+        self.failed = False
+        self.responded = False
+        self.deadline: Optional[float] = None
+        super().__init__(page)
+
+    def _on_response(self, response: Any) -> None:
+        super()._on_response(response)
+        try:
+            status = int(response.status)
+            if response.request is self._current and not 300 <= status < 400:
+                self.responded = True
+                if status >= 400:
+                    self.failed = True  # B3: 오류 응답(차단 프록시 502 포함) — 기준 실패 계열 그대로
+        except Exception:  # noqa: BLE001 — 응답 객체를 못 읽음: 기록하지 않는다
+            return
+
+    def _on_failed(self, request: Any) -> None:
+        # 메인 프레임 문서 요청이면 그것이 지금 요청이 아니어도(오류 문서 이동이 요청을 대체) 실패로 남긴다 — 다음 이동이
+        # 앞 요청을 끊은 ERR_ABORTED 만 뺀다(차단 route.abort('blockedbyclient') 는 실패).
+        if request is self._current or self._is_main_nav(request):
+            try:
+                text = str(request.failure or "")
+            except Exception:  # noqa: BLE001
+                text = ""
+            if "ERR_ABORTED" not in text:
+                self.failed = True
+                self._changed.set()
+        super()._on_failed(request)
+
+    def remaining(self) -> float:
+        return 0.0 if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+
+    def document(self) -> str:
+        return "navigated" if self.committed else ("navigating" if self.started else "same")
+
+    async def outcome(self) -> None:
+        """요청 응답·실패를 마감 안에서만 기다린다(이미 있으면 바로)."""
+        while not (self.failed or self.responded):
+            left = self.remaining()
+            if left <= 0:
+                return
+            self._changed.clear()
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=left)
+            except asyncio.TimeoutError:
+                return
 
 
 #: 페이지를 옮길 수 있는 요소 액션(WS-25). type_text 는 press_enter 일 때만 —
@@ -1396,6 +1454,21 @@ _ISOLATED_KEY_FIELD_EXPR = (
     "((n) => { const r = (" + _KEY_FIELD_JS + ")(n); if (r) { r.k = (" + _NODE_KEY_JS.strip() + ")(n); } return r; })(("
     + _FOCUS_NODE_JS.strip() + ")())"
 )
+#: WS-91 (#246): Enter 뒤 그 칸의 연결 목록 상태 판독(노드 n) — {c 연결됨, v 값, ex aria-expanded, linked 연결 대상 수,
+#: shown 연결 대상이 보임, opts 연결 대상 안 보이는 role=option 수(≤50)}. 연결은 aria-controls·aria-owns 의 id 대상만 —
+#: 연결 없는 문서의 listbox 는 다른 칸 것일 수 있어 세지 않는다.
+_ENTER_STATE_JS = (
+    "(n) => { const ids = ((n.getAttribute('aria-controls') || '') + ' ' + (n.getAttribute('aria-owns') || ''))"
+    ".split(/\\s+/).filter(Boolean); const doc = n.ownerDocument; const linked = []; "
+    "for (const id of ids) { const e = doc && doc.getElementById(id); if (e && linked.indexOf(e) < 0) linked.push(e); } "
+    "const vis = (e) => { try { if (!e.getClientRects().length) return false; const st = getComputedStyle(e); "
+    "return st.visibility !== 'hidden' && st.display !== 'none'; } catch (x) { return false; } }; "
+    "let shown = false, opts = 0; "
+    "for (const e of linked) { if (vis(e)) shown = true; const os = e.matches('[role=option]') ? [e] : []; "
+    "for (const o of e.querySelectorAll('[role=option]')) os.push(o); for (const o of os) { if (opts < 50 && vis(o)) opts++; } } "
+    "return {c: n.isConnected === true, v: typeof n.value === 'string' ? n.value : null, "
+    "ex: n.getAttribute('aria-expanded'), linked: linked.length, shown: shown, opts: opts}; }"
+)
 #: WS-78 R1 R3: 키 **전** 판정을 평가 한 번으로 — 포커스 노드(_FOCUS_NODE_JS)가 민감 칸인가(s)·앞 키의 sticky 노드인가
 #: (same)·식별 열쇠(k)·값(v, 민감일 때만). 노드가 아니면(opaque·none) null.
 _KEY_FOCUS_JS = (
@@ -1404,14 +1477,16 @@ _KEY_FOCUS_JS = (
     "const s = n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password'; "
     "const same = !!sticky && n === sticky; "
     "return {s: s, same: same, k: (" + _NODE_KEY_JS.strip() + ")(n), "
-    "v: (s || same) && typeof n.value === 'string' ? n.value : ''}; }"
+    "v: (s || same) && typeof n.value === 'string' ? n.value : '', "
+    "pv: !(s || same) && typeof n.value === 'string' ? n.value : null}; }"
 )
 #: WS-78 R1 R3: 일반 칸 키 **뒤** 확인 — 지금 포커스 노드가 키 전 그 노드(식별 열쇠 k)일 때만 {s, v}, 아니면 null.
 _KEY_FOCUS_AFTER_JS = (
     "(k) => { const n = (" + _FOCUS_NODE_JS.strip() + ")(); "
     "if (!(n && typeof n === 'object' && n.tagName) || (" + _NODE_KEY_JS.strip() + ")(n) !== k) return null; "
+    "const r = (" + _ENTER_STATE_JS + ")(n); "
     "return {s: n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password', "
-    "v: typeof n.value === 'string' ? n.value : ''}; }"
+    "v: typeof n.value === 'string' ? n.value : '', c: r.c, ex: r.ex, linked: r.linked, shown: r.shown, opts: r.opts}; }"
 )
 #: WS-78 T1: 포커스 노드 판정·키 뒤 값 읽기의 상한(초) — 문서 이동 중이면 평가가 이동 끝까지 멈출 수 있다(실측).
 _KEY_FIELD_TIMEOUT_S = 0.3
@@ -1422,6 +1497,75 @@ def _key_read_budget(deadline: Optional[float]) -> float:
     if deadline is None:
         return _KEY_FIELD_TIMEOUT_S
     return max(0.0, deadline - time.monotonic())
+
+
+#: WS-91: 격리 world 에서 고정 노드(this)에 — 민감 칸(password·가림 표식)이면 {s: true} 만(값을 읽지 않는다).
+_ENTER_READ_FN = (
+    "function () { const n = this; const cs = globalThis." + _CONCEALED_SET + "; "
+    "if ((n.tagName === 'INPUT' && (n.type || '').toLowerCase() === 'password') || "
+    "(cs && typeof cs.has === 'function' && cs.has(n))) return {s: true}; "
+    "const r = (" + _ENTER_STATE_JS + ")(n); r.s = false; return r; }"
+)
+#: WS-91 (#246): data.after_enter 의 항목 수 상한.
+_AFTER_ENTER_OPTIONS_MAX = 50
+
+
+def after_enter_view(before: Optional[str], read: Any, document: str,
+                     css_found: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+    """WS-91 (#246): Enter 뒤 그 칸 상태 — 고정 어휘·숫자만(값 원문 없음, 'changed' 도 바뀐 값을 싣지 않는다).
+
+    before = Enter 직전 그 칸 값(내부 비교용), read = Enter 뒤 그 고정 노드 판독(_ENTER_STATE_JS 모양, 못 읽음 None),
+    document = same|navigating|navigated, css_found = 고정 노드가 끊겼을 때 같은 css 로 다른 노드가 보이는가(replaced 와
+    gone 구분용 — 칸 판정 자체는 고정 노드 isConnected 로만). 민감 칸(read.s)이면 None(통째 생략).
+    listbox: 연결(aria-controls·owns) 대상이 있으면 보이고 aria-expanded≠false 면 open(options = 그 안 보이는 option 수),
+    아니면 closed. 연결이 없으면 aria-expanded 만으로 true=open(항목 수는 세지 않아 0)·false=closed, 그 속성도 없으면 none.
+    """
+    if isinstance(read, dict) and read.get("s") is True:
+        return None
+    view: Dict[str, Any] = {"value": "unknown", "field": "unknown", "listbox": "none", "options": 0,
+                            "document": document if document in ("same", "navigating", "navigated") else "same"}
+    if view["document"] == "navigated":
+        view["field"] = "gone"
+        return view
+    if view["document"] != "same" or not isinstance(read, dict):
+        return view
+    if read.get("c") is not True:
+        view["field"] = "replaced" if css_found else ("gone" if css_found is False else "unknown")
+        return view
+    view["field"] = "same_node"
+    value = read.get("v")
+    if isinstance(value, str) and isinstance(before, str):
+        view["value"] = "kept" if value == before else ("cleared" if value == "" else "changed")
+    expanded = read.get("ex")
+    linked = read.get("linked")
+    opts = read.get("opts")
+    count = opts if isinstance(opts, int) and not isinstance(opts, bool) else 0
+    count = max(0, min(_AFTER_ENTER_OPTIONS_MAX, count))
+    if isinstance(linked, int) and not isinstance(linked, bool) and linked > 0:
+        if read.get("shown") is True and expanded != "false":
+            view["listbox"], view["options"] = "open", count
+        else:
+            view["listbox"] = "closed"
+    elif expanded == "true":
+        view["listbox"] = "open"
+    elif expanded == "false":
+        view["listbox"] = "closed"
+    return view
+
+
+class _EnterNavigated(Exception):
+    """WS-91 F2: nav_settle=False Enter 뒤 메인 프레임 문서 요청을 봤고 실패는 보이지 않음 — 기존 navigation_started 결과로."""
+
+
+def _done_value(fut: Any) -> Any:
+    """끝난 판독의 값(못 끝냄·취소·실패 = None). 예외는 거둔다(미회수 경고 방지)."""
+    if fut is None or not fut.done() or fut.cancelled():
+        return None
+    if fut.exception() is not None:
+        return None
+    return fut.result()
+
+
 #: WS-78 R1 R3: 서버가 미리 시작한 키 전 판정을 쓰는 최대 경과(초) — 그보다 오래면(승인 대기 등) 버리고 다시 판정한다.
 _KEY_PREFETCH_MAX_AGE_S = 0.25
 #: WS-78 R1 R3: 서버가 일반 칸의 키 뒤 확인을 기존 차단 판정(detect_challenge)과 겹쳐 돌릴 때 주는 자리(목록) —
@@ -1440,6 +1584,8 @@ class _PlainKey:
     """WS-78 R1 R3: 키 전 일반 칸 — 핸들 대신 식별 열쇠만(키 뒤 같은 노드인가를 열쇠로 본다)."""
 
     k: str
+    #: WS-91 (#246): 키 전 그 칸 값(Enter 뒤 kept/cleared/changed 비교용, 결과에 싣지 않는다). 못 읽음 None.
+    v: Optional[str] = None
 
 
 class _NoNode:
@@ -1702,6 +1848,15 @@ class ActionDispatcher:
         #: WS-89(#244): press_key 키 뒤 판독(페이지·격리·오버레이)이 함께 쓰는 마감(time.monotonic) — 이동 대기 뒤에 잡고
         #: 오버레이 감지가 쓰면 비운다. dispatch 마다 비운다(앞 액션의 마감이 뒤 액션 예산을 줄이지 않게).
         self._post_key_deadline: Optional[float] = None
+        #: WS-91 (#253 F2·F3): nav_settle=False Enter 뒤 판독(디스패처 사후 판독·서버 차단 판정)이 함께 쓰는 마감
+        #: (time.monotonic, Enter 뒤 _KEY_FIELD_TIMEOUT_S). dispatch 마다 비운다 — nav_settle=True 에서는 만들지 않는다.
+        self.last_input_deadline: Optional[float] = None
+        #: WS-91: 그 Enter 뒤 메인 프레임 문서 요청 리스너(_EnterWatch) — dispatch 끝에 뗀다.
+        self._enter_watch: Optional[_EnterWatch] = None
+        #: WS-91 (#246): Enter 를 보낸 그 고정 노드의 정체·Enter 직전 값(내부 비교용)·params — after_enter 판독용.
+        self._enter_node: Optional[Dict[str, Any]] = None
+        #: WS-91 (#246): 이 액션의 data.after_enter(고정 어휘) — press_key 를 서버가 미뤄 확인하면 서버가 붙인다.
+        self.last_after_enter: Optional[Dict[str, Any]] = None
         #: WS-78 T1(#142): 마지막 press_key 가 민감 칸(키 전·키 뒤 password)으로 갔는가 — 레시피 기록이 그 단계를
         #: 비밀로 끊는 데 쓴다(press_key 마다 다시 정한다).
         self.last_key_sensitive: bool = False
@@ -3413,6 +3568,7 @@ class ActionDispatcher:
             return result
         self._nav_info = {}
         self._post_key_deadline = None
+        self._enter_reset()
         self._opened_pages = []
         self.last_opened_pages = []
         self._related_navs = []
@@ -3495,6 +3651,11 @@ class ActionDispatcher:
                 det = None
             if det is not None and det["opened"]:
                 result.data.setdefault("overlay_opened", {"kinds": list(det["kinds"])})
+        self._enter_close()
+        after_enter = self.take_after_enter()
+        if after_enter is not None and not result.data.get("typed_without_enter"):
+            # WS-91 (#246): Enter 뒤 그 칸 상태(고정 어휘·숫자만) — 성공·실패 결과 모두. 민감 칸이면 만들지 않았다.
+            result.data.setdefault("after_enter", dict(after_enter))
         result.data.setdefault(
             "latency_ms", round((time.perf_counter() - started) * 1000, 2)
         )
@@ -4277,11 +4438,11 @@ class ActionDispatcher:
         """[3] 사후 상태 읽기·늦은 효과 유예·팝업 반영(WS-48 분해). 반환: (후 상태, 최상위 후 상태) 또는 결과."""
         # --- [3] 사후조건 검증 ------------------------------------------------
         try:
-            after = await self._capture_state(self.ctx.page, handle)
-        except Exception:  # noqa: BLE001
-            if not self._nav_info:
+            after = await self._post_capture(action, handle)
+        except Exception as exc:  # noqa: BLE001
+            if not (isinstance(exc, _EnterNavigated) or self._nav_info):
                 raise
-            # 상한을 넘겨 진행했는데 그 사이 문서가 바뀌는 중 — 이동 자체가 효과다.
+            # 상한을 넘겨 진행했는데 그 사이 문서가 바뀌는 중 — 이동 자체가 효과다(WS-91 F2: Enter 뒤 문서 요청을 봄).
             self._off_popup(_on_popup)
             return self._result(
                 success=True,
@@ -4378,6 +4539,15 @@ class ActionDispatcher:
         css = getattr(handle, "css_path", "") or ""
         if not css or str(getattr(handle, "role", "") or "").lower() not in _CLICK_PURPOSE_ROLES:
             return None
+        return await self._capture_node_ident(handle, target, fixed)
+
+    async def _capture_node_ident(self, handle: ElementHandle, target: Any,
+                                  fixed: bool) -> Optional[Tuple[Any, str, int, str]]:
+        """입력할 그 노드의 (CDP 세션, frameId, backendNodeId, loaderId) — _capture_clicked_node 의 결속 부분(WS-91 이 Enter
+        뒤 판독에도 재사용). 다른 출처 iframe·결속 불가면 None."""
+        css = getattr(handle, "css_path", "") or ""
+        if not css:
+            return None
         try:
             world = await self._select_frame_world()
             if world is None or world[2]:
@@ -4406,6 +4576,185 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001 — 의도된 fail-safe: 정체를 못 잡음 = 목적 판정 없음(기준 실패 그대로)
             return None
         return (cdp, frame_id, backend, str(loader)) if backend and loader else None
+
+    # -- WS-91 (#253·#246): Enter 꼬리 ------------------------------------------------
+
+    def _enter_reset(self) -> None:
+        """dispatch 입구: 앞 액션의 Enter 마감·리스너·노드·after_enter 를 비운다."""
+        self._enter_close()
+        self.last_input_deadline = None
+        self._enter_node = None
+        self._key_enter = None
+        self.last_after_enter = None
+
+    def take_after_enter(self) -> Optional[Dict[str, Any]]:
+        """#246: 이 액션의 after_enter. press_key 는 판독은 키 뒤 마감 안 그대로, 문서 상태만 지금 리스너 기록으로 다시 본다
+        (판독이 문서 요청보다 먼저 끝나도 붙이는 시점까지 본 요청은 반영)."""
+        src = self.__dict__.get("_key_enter")
+        if src is not None:
+            node, info, document, watch = src
+            if watch is not None:
+                document = watch.document()
+            self.last_after_enter = after_enter_view(node.v, info, document)
+        return self.__dict__.get("last_after_enter")
+
+    def _enter_close(self) -> None:
+        watch, self._enter_watch = self.__dict__.get("_enter_watch"), None
+        if watch is not None:
+            watch.close()
+
+    def _enter_arm(self) -> None:
+        """F2: Enter 직전(관문 뒤 동기 구간 — await 없음) 메인 프레임 문서 요청 리스너. nav_settle=False 에서만 부른다."""
+        if self.__dict__.get("_enter_watch") is None:
+            watch = _EnterWatch(self._top_page())
+            self._enter_watch = watch if watch.active else None
+
+    def _enter_sent(self) -> None:
+        """F2: Enter 를 보낸 직후 — 공유 마감(디스패처 사후 판독·서버 차단 판정)을 Enter 뒤부터 잡는다."""
+        deadline = time.monotonic() + _KEY_FIELD_TIMEOUT_S
+        self.last_input_deadline = deadline
+        watch = self.__dict__.get("_enter_watch")
+        if watch is not None:
+            watch.deadline = deadline
+
+    async def _press_enter(self, target: Any) -> None:
+        """type_text 의 Enter(press_enter·개행). F1: nav_settle=False 면 Playwright 의 '이동 시작까지 대기'(noWaitAfter)를
+        끈다 — 새 문서 커밋까지 막혀(~415ms) '이동을 기다리지 않음'(WS-28)이 깨졌다. nav_settle=True 는 그대로(바이트 동일).
+        관문(guard) 바로 뒤에 부른다 — 리스너는 동기라 관문과 키 사이에 await 가 늘지 않는다(WS-64)."""
+        if self.ctx.nav_settle:
+            await target.press("Enter", timeout=5000)
+            return
+        self._enter_arm()
+        await target.press("Enter", timeout=5000, no_wait_after=True)
+        self._enter_sent()
+
+    async def _enter_node_note(self, handle: ElementHandle, params: Dict[str, Any], target: Any, fixed: bool) -> None:
+        """#246: Enter 직전(관문보다 앞) — 그 고정 노드의 정체와 지금 값(내부 비교용)을 잡는다. 민감 칸이면 잡지 않는다."""
+        self._enter_node = None
+        if params.get(_CONCEAL_KEY):
+            return
+        try:
+            ident = await asyncio.wait_for(self._capture_node_ident(handle, target, fixed), _KEY_FIELD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 결속 불가: 칸 판정 unknown
+            ident = None
+        read = await self._enter_node_read(ident) if ident is not None else None
+        if isinstance(read, dict) and read.get("s") is True:
+            return
+        before = read.get("v") if isinstance(read, dict) else None
+        self._enter_node = {"ident": ident, "before": before, "params": params}
+
+    async def _enter_node_read(self, ident: Any) -> Optional[Dict[str, Any]]:
+        """#246: 격리 world 에서 그 고정 노드(backendNodeId, 그 문서 loaderId)만 판독 — css 재조회 없음. 못 읽으면 None."""
+        if ident is None:
+            return None
+        cdp, frame_id, backend, loader = ident
+        group = _ISO_GROUP_GATE
+
+        async def run(context_id: int) -> Any:
+            try:
+                found = await cdp.send("DOM.resolveNode", {"backendNodeId": backend, "executionContextId": context_id,
+                                                            "objectGroup": group})
+                object_id = (found.get("object") or {}).get("objectId")
+                if not object_id:
+                    raise RuntimeError("Enter 한 노드를 격리 world 에서 잡지 못함")
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": _ENTER_READ_FN, "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    raise RuntimeError("격리 world 판독 예외")
+                return (called.get("result") or {}).get("value")
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                    pass
+
+        try:
+            info = await self._in_gate_world(cdp, frame_id, run, expect_loader=loader)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 판독 불가 = unknown
+            return None
+        return info if isinstance(info, dict) else None
+
+    def _enter_view(self, read: Any, document: str, after: Any = None) -> None:
+        """#246: after_enter 를 정한다(민감 칸·노드 없음이면 만들지 않음). 칸 판정은 고정 노드 isConnected — 끊겼을 때만
+        사후 상태(css)로 replaced/gone 을 가른다."""
+        enter = self.__dict__.get("_enter_node")
+        if enter is None or enter["params"].get(_CONCEAL_KEY):
+            return
+        css_found = None if after is None else bool(getattr(after, "element_signature", ""))
+        self.last_after_enter = after_enter_view(enter["before"], read, document, css_found)
+
+    async def _post_capture(self, action: ActionType, handle: ElementHandle) -> Any:
+        """[3] 사후 상태 읽기. type_text Enter 면 #246 판독을 함께(gather) — nav_settle=False 는 공유 마감 안에서만(F2).
+
+        F2: 마감 안에 메인 문서 요청을 봤으면(판독 시작 때 이미 봤으면 판독 생략) 그 요청의 응답·실패를 마감 안에서만
+        보고, 실패가 보였거나(B3) 커밋된 최상위가 오류 문서면 빈 상태(기준 실패 계열 E_TIMEOUT 그대로), 아니면 기존
+        navigation_started 결과(_EnterNavigated). 요청이 없는데 판독이 마감을 넘기면 기준대로 끝까지 기다린다."""
+        enter = self.__dict__.get("_enter_node") if action is ActionType.TYPE_TEXT else None
+        watch = self.__dict__.get("_enter_watch") if action is ActionType.TYPE_TEXT else None
+        if watch is not None and watch.deadline is None:
+            watch = None  # Enter 를 보내지 못함
+        if enter is None and watch is None:
+            return await self._capture_state(self.ctx.page, handle)
+        ident = enter["ident"] if enter is not None else None
+        if watch is None:
+            # nav_settle=True — 이동 대기는 이미 끝났다(_nav_info). 판독은 같은 문서일 때만, 짧은 상한 안.
+            info = self._nav_info
+            document = ("navigated" if info.get("nav_committed") else
+                        "navigating" if info.get("nav_timed_out") else "same")
+            if document != "same" or ident is None:
+                after = await self._capture_state(self.ctx.page, handle)
+                self._enter_view(None, document, after)
+                return after
+            rd = asyncio.ensure_future(asyncio.wait_for(self._enter_node_read(ident), _KEY_FIELD_TIMEOUT_S))
+            try:
+                after = await self._capture_state(self.ctx.page, handle)
+            except BaseException:
+                rd.cancel()
+                raise
+            try:
+                read = await rd
+            except Exception:  # noqa: BLE001 — 판독 상한·실패 = unknown
+                read = None
+            self._enter_view(read, "same", after)
+            return after
+        cap = None if watch.started else asyncio.ensure_future(self._capture_state(self.ctx.page, handle))
+        rd = None if watch.started or ident is None else asyncio.ensure_future(self._enter_node_read(ident))
+        futs = [f for f in (cap, rd) if f is not None]
+        if futs:
+            await asyncio.wait(futs, timeout=watch.remaining())
+        read = _done_value(rd)
+        if watch.started:
+            return await self._enter_nav_outcome(watch, futs)
+        if rd is not None and not rd.done():
+            rd.cancel()
+        assert cap is not None
+        try:
+            after = await cap  # 마감 안에 끝났으면 바로 — 이동 요청 없이 늦으면 기준대로 기다린다
+        except Exception:
+            if watch.started:
+                return await self._enter_nav_outcome(watch, [])
+            raise
+        self._enter_view(read, "same", after)
+        return after
+
+    async def _enter_nav_outcome(self, watch: _EnterWatch, futs: List[Any]) -> Any:
+        for f in futs:
+            if not f.done():
+                f.cancel()
+            else:
+                _done_value(f)  # 결과·예외를 거둔다(미회수 경고 방지)
+        await watch.outcome()
+        self._enter_view(None, watch.document())
+        if watch.failed:
+            return PageStateSnapshot(url="", dom_node_count=0)  # B3: 요청 실패 — 기준 실패 계열(기대값 != 실제 None)
+        if watch.committed:
+            try:
+                unreachable = await asyncio.wait_for(self.top_document_unreachable(), max(0.001, watch.remaining()))
+            except Exception:  # noqa: BLE001 — 못 읽음: 보수(top_document_unreachable 와 같은 결론)
+                unreachable = True
+            if unreachable:
+                return PageStateSnapshot(url="", dom_node_count=0)
+        raise _EnterNavigated()
 
     async def _click_purpose_signals(self, handle: ElementHandle) -> List[str]:
         """WS-90 (#245 B4): 효과 없는 click 의 목적 신호 — 격리 world, **실제로 클릭한 그 노드**에서만(R1 검증 B1).
@@ -5507,9 +5856,10 @@ class ActionDispatcher:
 
     @staticmethod
     async def _type_fenced(action: ActionType, params: Dict[str, Any], target: Any, text: str, guard: Any,
-                           before_enter: Any = None) -> None:
+                           before_enter: Any = None, press_enter: Any = None) -> None:
         """WS-85 R1: text 를 줄바꿈 앞뒤로 나눠 입력 — 조각 입력과 Enter 마다 바로 앞에서 관문(guard: 문서 확인 포함).
-        WS-88 (#248 B4): Enter 마다 그 앞에서 before_enter(같은 칸 재판정 — 관문보다 앞, 관문과 키 사이 await 없음)."""
+        WS-88 (#248 B4): Enter 마다 그 앞에서 before_enter(같은 칸 재판정 — 관문보다 앞, 관문과 키 사이 await 없음).
+        WS-91 F1: press_enter(target) 가 있으면 Enter 를 그것으로(nav_settle=False 면 no_wait_after)."""
         buf = ""
         for ch in text:
             if ch not in "\r\n":
@@ -5522,7 +5872,10 @@ class ActionDispatcher:
             if before_enter is not None:
                 await before_enter()
             await guard(action, params)
-            await target.press("Enter", timeout=5000)
+            if press_enter is not None:
+                await press_enter(target)
+            else:
+                await target.press("Enter", timeout=5000)
         if buf:
             await guard(action, params)
             await target.type(buf, timeout=5000)
@@ -5624,7 +5977,7 @@ class ActionDispatcher:
                 if self._live_fence() is not None and ("\n" in text or "\r" in text):
                     # WS-85 R1 (검증 B2): 줄바꿈(Enter = 폼 제출)마다 그 앞에서 문서 확인 — 글자 입력 중 문서가 바뀌면 새 문서의
                     # 폼으로 Enter 를 보내지 않는다. Playwright type 의 '\n'·'\r' 은 Enter 한 번(같은 키)이다.
-                    await self._type_fenced(action, params, target, text, guard, before_enter)
+                    await self._type_fenced(action, params, target, text, guard, before_enter, self._press_enter)
                 else:
                     await guard(action, params)
                     await target.type(text, timeout=5000)
@@ -5640,9 +5993,11 @@ class ActionDispatcher:
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
                 await self._register_field_value(target)
             if params.get("press_enter"):
+                # WS-91 (#246): Enter 를 보낼 그 노드의 정체·지금 값 — 관문보다 앞(관문과 키 사이 await 를 늘리지 않는다).
+                await self._enter_node_note(handle, params, target, fixed)
                 await before_enter()  # WS-88 (#248 B4): 입력 뒤 Enter 직전 같은 칸 재판정(관문보다 앞)
                 await guard(action, params)
-                await target.press("Enter", timeout=5000)
+                await self._press_enter(target)  # WS-91 F1·F2: nav_settle=False 면 no_wait_after + 동기 리스너
 
         elif action is ActionType.SELECT_OPTION:
             # WS-80: Playwright 의 value-or-label 첫 일치 대신 한 번 해석한다(정확한 value → 정규화 라벨 1개). 해석은 관문
@@ -6258,7 +6613,8 @@ class ActionDispatcher:
             return None, False, ""
         if not (info.get("s") or info.get("same")):
             # WS-85 (#218): 격리 world 판독은 키 **뒤**(_key_plain_after, 리뷰 B4 '입력 직후') — 키 전 왕복을 늘리지 않는다.
-            return _PlainKey(str(info.get("k") or "")), False, ""
+            pv = info.get("pv")
+            return _PlainKey(str(info.get("k") or ""), pv if isinstance(pv, str) else None), False, ""
         node = await top.evaluate_handle(_FOCUS_NODE_JS)
         if node.as_element() is None:
             self._dispose_later(node)
@@ -6355,7 +6711,10 @@ class ActionDispatcher:
             if node is not None and not isinstance(node, _PlainKey):
                 self._dispose_later(node)
             return refused
+        enter_tail = key == "Enter" and not self.ctx.nav_settle
         try:
+            if enter_tail:
+                self._enter_arm()  # WS-91 (#246): Enter 뒤 문서 요청 기록(동기 — 판정과 키 사이 await 없음)
             await top.keyboard.press(key)
         except Exception as exc:  # noqa: BLE001
             if watch is not None:
@@ -6392,9 +6751,21 @@ class ActionDispatcher:
         # 무이동의 감지 창이 오버레이 예산을 먹는다, WS-82). 판독이 멈춰도 키 뒤 대기는 합쳐 이 상한 하나.
         deadline = time.monotonic() + _KEY_FIELD_TIMEOUT_S
         self._post_key_deadline = deadline
+        if enter_tail:
+            # WS-91 F3 (#244 서버 경로): 서버 차단 판정도 이 마감 안에서만(nav_settle=False Enter).
+            self.last_input_deadline = deadline
+            watch = self.__dict__.get("_enter_watch")
+            if watch is not None:
+                watch.deadline = deadline
         if isinstance(node, _PlainKey):
             # WS-78 R1 R3: 일반 칸 키 뒤 확인(OR) — 서버가 자리를 주면 기존 차단 판정과 겹쳐 돌게 맡긴다(추가 대기 없음).
-            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending, node.k, deadline))
+            enter = None
+            if key == "Enter":
+                # WS-91 (#246): Enter 뒤 상태 — 문서 상태는 지금(nav_settle=True 의 이동 대기 결과)·리스너(False)로.
+                nav = self._nav_info
+                enter = (node, "navigated" if nav.get("nav_committed") else
+                         "navigating" if nav.get("nav_timed_out") else "same", self.__dict__.get("_enter_watch"))
+            task = asyncio.ensure_future(self._key_plain_after(top, pending, iso_pending, node.k, deadline, enter))
             defer = KEY_AFTER_DEFER.get()
             if defer is not None:
                 defer.append(task)
@@ -6416,7 +6787,7 @@ class ActionDispatcher:
         return info if isinstance(info, dict) else None
 
     async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None, k: str = "",
-                               deadline: Optional[float] = None) -> None:
+                               deadline: Optional[float] = None, enter: Any = None) -> None:
         """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다.
 
         WS-85 (#218): iso_pending = 키 직후 격리 world 판독({s, v, k}) — 페이지 판독이 일반이어도 격리 world 가 비밀번호 칸으로
@@ -6424,7 +6795,8 @@ class ActionDispatcher:
         R1 (검증 B1·한계 2): 격리 판독 노드가 키 전 그 노드(식별 열쇠 k)일 때만 — 키(Tab·입력 이벤트)가 포커스를 다른
         비밀번호 칸으로 옮겼으면 더하지 않는다(기준 동작).
         WS-89 (#244): 두 판독은 함께 기다린다 — 공유 마감(deadline, 없으면 지금부터 상한) 하나. 마감 안에 못 끝낸 판독은
-        취소하고 판독 없음(실패도 같음) — 마감 뒤 도착한 격리 판독은 쓰지 않는다(docs/security.md WS-85 한계)."""
+        취소하고 판독 없음(실패도 같음) — 마감 뒤 도착한 격리 판독은 쓰지 않는다(docs/security.md WS-85 한계).
+        WS-91 (#246): enter(Enter 키의 키 전 칸)가 있으면 같은 판독으로 after_enter 를 정한다(새 왕복 없음) — 민감이면 없음."""
         futs = [f for f in (pending, iso_pending) if f is not None]
         done: Any = set()
         if futs:
@@ -6439,6 +6811,10 @@ class ActionDispatcher:
             return f.result()
 
         info, iso = _read(pending), _read(iso_pending)
+        if enter is not None and not (isinstance(iso, dict) and iso.get("s") is True) \
+                and not self.__dict__.get("_concealed_marked"):
+            self._key_enter = (enter[0], info if isinstance(info, dict) else None, enter[1], enter[2])
+            self.take_after_enter()
         if not (isinstance(info, dict) and info.get("s")):
             if not (isinstance(iso, dict) and iso.get("s") is True and k and iso.get("k") == k):
                 return

@@ -55,6 +55,8 @@ ATTRS = {
     ("handoff_id", "handoff_id"): (FREE, "interface/server_manual.py mh-+hex8 — 면제하지 않음(모양이 바뀌지 않음)"),
     ("manual_sites", "texts()"): (FREE, "interface/server_tools.py control_status — 사람이 넣은 사이트 문자열"),
     ("site", "text"): (NOT_OUT, "security/manual_sites.py 목록 파일 행(사람 CLI)"),
+    # WS-91 (#246) data.after_enter.document — _EnterWatch.document() 고정 어휘(same|navigating|navigated), 면제 않음
+    ("document", "document()"): (FREE, "actions/dispatcher.py _EnterWatch.document — after_enter.document 고정 어휘(가림 받음)"),
     # --- CONTROL
     ("type", "type"): (CONTROL, "actions/dispatcher.py _on_dialog — Playwright Dialog.type → data.dialogs[].type (R7-B1)"),
     ("vendor", "vendor"): (CONTROL, "interface/server_signals.py data.challenge.vendor — browser.challenge 벤더 어휘(R8)"),

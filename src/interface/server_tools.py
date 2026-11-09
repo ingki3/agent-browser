@@ -679,6 +679,11 @@ class ToolsMixin:
         key_after: List[Any] = []
         defer_token = KEY_AFTER_DEFER.set(key_after) if action is ActionType.PRESS_KEY else None
         try:
+            # WS-91: 앞 호출의 Enter 마감이 이번 호출의 차단 판정을 자르지 않게(디스패치가 일어나지 않는 출구 포함).
+            self._dispatcher.last_input_deadline = None
+        except Exception:  # noqa: BLE001 — 가짜 디스패처
+            pass
+        try:
             result, remembered = await self._dispatch_with_approval(action, params, used, heal_off=via is not None)
         finally:
             if defer_token is not None:
@@ -747,6 +752,12 @@ class ToolsMixin:
         if key_after:
             pending, key_after[:] = list(key_after), []
             await asyncio.gather(*pending)
+        if action is ActionType.PRESS_KEY:
+            take = getattr(self._dispatcher, "take_after_enter", None)
+            after_enter = take() if callable(take) else None
+            if isinstance(after_enter, dict) and "after_enter" not in result.data:
+                # WS-91 (#246): 미룬 키 뒤 확인(press_key Enter)이 정한 Enter 뒤 상태 — 고정 어휘·숫자만.
+                result.data["after_enter"] = dict(after_enter)
         self._attach_remembered_identity(remembered, result)
         if action is ActionType.NAVIGATE and "document" not in result.data:
             retried = await self._retry_headless_navigation(name, arguments, params, result)

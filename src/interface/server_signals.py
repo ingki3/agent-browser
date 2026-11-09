@@ -977,9 +977,21 @@ class SignalsMixin:
 
             # WS-85 (#171, 리뷰 B1·NB2): 같은 프로브를 격리 world 에서도(페이지가 innerText·title getter 를 바꿔도 원본)
             # 평가해 격리 결과를 먼저, 없으면 페이지 결과(OR). 격리 판독 실패는 지금처럼 페이지 결과만(challenge.py·loop 불변).
-            found, isolated = await asyncio.gather(
+            both = asyncio.gather(
                 challenge_mod.detect_challenge(page, last_status=judge_status),
                 self._isolated_challenge(page, judge_status))
+            # WS-91 F3 (#253·#244): nav_settle=False Enter 뒤면 디스패처 사후 판독과 같은 마감 안에서만 — 시간 초과는 기존
+            # 판정 실패와 같은 challenge=None. 마감이 없으면(다른 행동·nav_settle=True) 기존 그대로.
+            deadline = getattr(self._dispatcher, "last_input_deadline", None)
+            if not isinstance(deadline, float):
+                found, isolated = await both
+            else:
+                import time
+
+                try:
+                    found, isolated = await asyncio.wait_for(both, max(0.0, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    found, isolated = challenge_mod.NO_CHALLENGE, None
             if isolated is not None and isolated.detected and not found.detected:
                 # 오류 문서(이동 실패)는 페이지 world 프로브가 돌지 않아 예전에도 판정이 없었다 — 그대로 둔다(바이트 동일).
                 unreachable = getattr(self._dispatcher, "top_document_unreachable", None)

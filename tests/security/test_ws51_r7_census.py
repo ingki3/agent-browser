@@ -175,7 +175,12 @@ KEYS = {
     ("kind", "browser/site_session.py"): (NOT_OUT, "로그인 추적 이벤트 종류(tracer 파일 — interface 가 쓰지 않음)"),
     ("server_id", "browser/serve_profile.py"): (NOT_OUT, "프로필 잠금 파일 내용"),
     ("verdict", "actions/dispatcher.py"): (NOT_OUT, "WS-81 R1 _hidden_state 내부 판정(moved — 노드 핀 대조 불가) — 응답에 "
-                                                    "싣지 않음"),
+                                                    "싣지 않음"),    # WS-91 (#246) data.after_enter — 고정 어휘(actions.dispatcher.after_enter_view)지만 면제(CONTROL) 어휘에 넣지 않는다:
+    # 값은 4~7자 영단어라 비밀로 등록되지 않고(secret_registry._eligible), 가림을 그대로 받는다(보수).
+    ("value", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.value kept|cleared|changed|unknown(값 원문 아님)"),
+    ("field", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.field same_node|replaced|gone|unknown"),
+    ("listbox", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.listbox open|closed|none"),
+    ("document", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.document same|navigating|navigated"),
 }
 
 
