@@ -966,6 +966,38 @@ _ISO_COUNT_CAP = 50
 _ISO_ROOTS = 500
 #: 격리 world 판독이 만든 원격 객체 묶음 이름(판독 끝에 묶음째 놓는다 — 한 디스패처 안에서 판독은 겹치지 않는다).
 _ISO_GROUP_GATE = "ws85-gate"
+#: WS-90 (#245 B1·B2·B4): 효과 없는 click 의 목적 판정 — 격리 world 에서 클릭한 노드(this)에 결속해 부른다.
+#: focus: 지금 포커스(open shadow 를 따라감)가 this 자신, 또는 this 가 role combobox·textbox·searchbox 일 때 그 자손이고
+#: 편집 가능(text 류 input·textarea·contenteditable, disabled·readonly·aria-readonly·aria-disabled·inert(조상 포함) 아님).
+#: 포커스 '변화'는 보지 않는다(자동 포커스 칸). aria-controls·aria-activedescendant 연결은 보지 않는다.
+#: selected: this 가 role tab·option 이고 aria-selected="true"(aria-current 는 보지 않는다).
+_CLICK_PURPOSE_FN = """function () {
+  const TEXT = ['text', 'search', 'email', 'url', 'tel', 'number', 'password'];
+  const blocked = (el) => {
+    for (let n = el; n && n.nodeType === 1;) {
+      if (n.inert || n.getAttribute('aria-disabled') === 'true' || n.getAttribute('aria-readonly') === 'true') return true;
+      const p = n.parentNode;
+      n = p && p.nodeType === 11 ? p.host : n.parentElement;
+    }
+    return false;
+  };
+  const editable = (el) => {
+    if (!el || el.nodeType !== 1 || blocked(el)) return false;
+    if (el.tagName === 'INPUT') return TEXT.includes(el.type) && !el.disabled && !el.readOnly;
+    if (el.tagName === 'TEXTAREA') return !el.disabled && !el.readOnly;
+    return el.isContentEditable === true;
+  };
+  const role = (this.getAttribute('role') || '').trim().toLowerCase();
+  if (!this.isConnected || blocked(this)) return {focus: false, selected: false};
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  const mine = a === this || (['combobox', 'textbox', 'searchbox'].includes(role) && !!a && this.contains(a));
+  return {focus: mine && editable(a),
+          selected: ['tab', 'option'].includes(role) && this.getAttribute('aria-selected') === 'true'};
+}"""
+#: WS-90: 목적 판정을 시도할 관찰 role — 편집 칸(contenteditable 은 generic)·tab·option, selector 대상('' — role 모름).
+#: 그 밖(button·link …)은 판독 없이 기준 실패 그대로(실패 경로 비용 0 — 이동 직전 클릭의 옛 문서 판정 시간 유지).
+_CLICK_PURPOSE_ROLES = frozenset({"", "combobox", "textbox", "searchbox", "spinbutton", "generic", "tab", "option"})
 _ISO_GROUP_PIN = "ws85-pin"
 _ISO_GROUP_CHECK = "ws85-check"
 
@@ -1692,6 +1724,9 @@ class ActionDispatcher:
         self.last_relation_only: Optional[str] = None
         #: WS-83(B4): 이번 dispatch 에서 요소 입력을 실제로 보냈는가(보낸 뒤 대상 탭이 닫히면 그 닫힘이 효과다).
         self._input_sent = False
+        #: WS-90 R1: 이번 발송이 누른 노드 (CDP 세션, frameId, backendNodeId, loaderId) / 게이트 묶음이 대조한 (노드, 정체).
+        self._clicked_node: Optional[Tuple[Any, str, int, str]] = None
+        self._fence_bound: Optional[Tuple[Any, Tuple[str, int]]] = None
         #: WS-87: 이번 dispatch 에서 입력 직전 판정한 '열린 모달 밖 대상'(data.outside_modal) — 없으면 None.
         self._outside_modal_info: Optional[Dict[str, List[str]]] = None
         #: WS-30 4(c): 이번 dispatch 중 뜬 네이티브 다이얼로그 기록(dispatch 마다 비운다).
@@ -3220,6 +3255,7 @@ class ActionDispatcher:
         key = ("element_id", str(handle.element_id)) if element else ("selector", str(params.get("selector") or ""))
         ident = await self._fence_ident(handle, params, node)
         if ident is not None and fence.nodes.get(key) == ident:
+            self._fence_bound = (node, ident)  # WS-90 R1: 입력할 그 노드의 정체 — 클릭 목적 판정이 재사용
             return
         again = {k: params[k] for k in ("element_id", "selector", "text", "press_enter") if k in params}
         if element:
@@ -3232,6 +3268,7 @@ class ActionDispatcher:
             if ident is None:
                 ident = await self._fence_ident(handle, params, node)
             if ident is not None and fence.nodes.get(key) == ident:
+                self._fence_bound = (node, ident)
                 return
         raise _TargetRefused(self._fence_result(
             action, "바뀐 대상을 다시 판정한 결과 실행할 수 없음" if not allowed else "다시 판정한 노드가 입력할 노드가 아님"))
@@ -4111,6 +4148,8 @@ class ActionDispatcher:
         """[2] 이벤트 발송(WS-48 분해). 반환: (전 상태, 최상위 전 상태, 팝업 목록, 팝업 리스너) 또는 실패 결과."""
         # --- [2] 이벤트 발송 -------------------------------------------------
         _CLICK_POINT.set(None)
+        self._clicked_node = None  # WS-90 R1: 이 발송이 실제로 누른 노드의 정체(클릭 직전에 잡는다)
+        self._fence_bound = None
         before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
@@ -4328,6 +4367,89 @@ class ActionDispatcher:
         )
         return post
 
+    async def _capture_clicked_node(self, handle: ElementHandle, params: Dict[str, Any], target: Any,
+                                    fixed: bool) -> Optional[Tuple[Any, str, int, str]]:
+        """WS-90 R1 (검증 B1): 이 click 이 누를 노드의 (CDP 세션, frameId, backendNodeId, loaderId) — 입력 직전에.
+
+        이미 고정한 노드가 있으면 그 정체를 재사용(새 왕복 없음): 게이트 묶음이 대조한 노드(_fence_bound — 누를 그
+        ElementHandle 과 같은 객체), 승인 노드(pin.iso). 아니면 누를 대상(Locator 면 지금 css 단일 후보, 고정 핸들이면
+        css + 상자 일치)과 결속한 격리 world 노드. 목적 판정 대상 role 이 아니거나·다른 출처 iframe·결속 불가면 None
+        (판정 없음 = 기준 실패 그대로)."""
+        css = getattr(handle, "css_path", "") or ""
+        if not css or str(getattr(handle, "role", "") or "").lower() not in _CLICK_PURPOSE_ROLES:
+            return None
+        try:
+            world = await self._select_frame_world()
+            if world is None or world[2]:
+                return None
+            cdp, frame_id, _ = world
+            backend: Optional[int] = None
+            bound = self.__dict__.get("_fence_bound")
+            pin = self._current_pin()
+            if fixed and bound is not None and bound[0] is target and bound[1][0] == frame_id:
+                backend = int(bound[1][1])
+            elif fixed and pin is not None and pin.node is target and pin.iso is not None \
+                    and pin.iso[0] is cdp and pin.iso[1] == frame_id and not pin.iso[4]:
+                backend = int(pin.iso[2])
+            else:
+                if not fixed and await target.count() == 0:
+                    return None  # 지금 없음 — 상자 결속이 최대 2초 기다리지 않게
+                # 고정 핸들은 css 하나뿐이어도 그 핸들 상자와 같아야 한다(css 후보가 그 노드라는 증거).
+                need_box = fixed or bool(getattr(handle, "is_shadow", False) and handle.name) \
+                    or await self.ctx.page.locator(css).count() != 1
+                _, ident = await self._iso_on_target(css, target, need_box, "function () { return 1; }",
+                                                     want_backend=True)
+                if ident[0] is not cdp or ident[1] != frame_id or ident[3]:
+                    return None
+                backend = int(ident[2])
+            _, loader = await self._frame_loader(cdp, frame_id)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 정체를 못 잡음 = 목적 판정 없음(기준 실패 그대로)
+            return None
+        return (cdp, frame_id, backend, str(loader)) if backend and loader else None
+
+    async def _click_purpose_signals(self, handle: ElementHandle) -> List[str]:
+        """WS-90 (#245 B4): 효과 없는 click 의 목적 신호 — 격리 world, **실제로 클릭한 그 노드**에서만(R1 검증 B1).
+
+        클릭 직전에 잡은 노드 정체(_capture_clicked_node: backendNodeId·loaderId)를 DOM.resolveNode 로 격리 world 에 다시
+        잡아 판정한다 — css 재조회 후보(클릭 때 교체된 같은 selector 의 새 노드)를 쓰지 않는다. 그 노드가 끊김·문서 바뀜
+        (loaderId)·정체 없음·판독 실패·다른 출처 iframe·이 액션 중 문서 이동(커밋) = [] (기준 실패 그대로)."""
+        clicked = self.__dict__.get("_clicked_node")
+        if clicked is None or self._nav_info.get("nav_committed") \
+                or str(getattr(handle, "role", "") or "").lower() not in _CLICK_PURPOSE_ROLES:
+            return []
+        cdp, frame_id, backend, loader = clicked
+        group = _ISO_GROUP_GATE
+
+        async def run(context_id: int) -> Any:
+            try:
+                found = await cdp.send("DOM.resolveNode", {"backendNodeId": backend, "executionContextId": context_id,
+                                                            "objectGroup": group})
+                object_id = (found.get("object") or {}).get("objectId")
+                if not object_id:
+                    raise RuntimeError("클릭한 노드를 격리 world 에서 잡지 못함")
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": _CLICK_PURPOSE_FN, "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    raise RuntimeError("격리 world 판독 예외")
+                return (called.get("result") or {}).get("value")
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                    pass
+
+        try:
+            info = await self._in_gate_world(cdp, frame_id, run, expect_loader=loader)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 판독 불가·문서 바뀜 = 기준 실패 그대로
+            return []
+        if not isinstance(info, dict):
+            return []
+        if info.get("focus") is True:
+            return ["focus_target"]
+        if info.get("selected") is True:
+            return ["target_selected"]
+        return []
+
     async def _retry_unsatisfied(
         self,
         action: ActionType,
@@ -4340,6 +4462,21 @@ class ActionDispatcher:
         """사후조건 미충족(Silent Failure): 부작용 액션은 중단, 멱등 액션만 1회 재시도(WS-48 분해)."""
         # 사후조건 미충족 (Silent Failure)
         post_retry_safe = is_retry_safe(action, FailurePhase.POST_DISPATCH)
+        if not post_retry_safe and action is ActionType.CLICK:
+            # WS-90 (#245): 효과는 없지만 목적(편집 칸 포커스·탭/옵션 선택 상태)이 클릭한 그 노드에서 확인되면 성공.
+            # 신호는 효과가 아니다(레시피 기대 신호에서 거른다 — recipes.recorder.signal_kinds).
+            purpose = await self._click_purpose_signals(handle)
+            if purpose:
+                return self._result(
+                    success=True,
+                    action=action,
+                    retry_safe=False,
+                    healed=healed_flag,
+                    data=_with_click_point({
+                        "signals": list(post.signals) + purpose,
+                        "element_id": handle.element_id,
+                    }),
+                )
         if not post_retry_safe:
             # 이중 제출/결제 방지를 위해 재시도하지 않는다.
             return self._result(
@@ -5436,6 +5573,9 @@ class ActionDispatcher:
             state = await self._hidden_state(handle, target, fixed) if self._is_hidden_label(handle) else None
             if isinstance(state, dict) and state.get("verdict") == "moved":
                 raise self._hidden_moved(action)
+            # WS-90 R1 (검증 B1): 누를 그 노드의 정체(backendNodeId)·문서(loaderId)를 입력 직전에 잡는다 — 목적 판정은 그
+            # 노드에서만(클릭 때 같은 selector 의 새 노드로 바뀌어도 그 새 노드를 읽지 않는다). 관문 앞(관문과 입력 사이 무 await).
+            self._clicked_node = await self._capture_clicked_node(handle, params, target, fixed)
             await self._pointer_call(action, params, target, guard, fk, point,
                                      lambda **kw: target.click(button=button, **kw))
             sent()

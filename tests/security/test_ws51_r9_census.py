@@ -54,6 +54,8 @@ CONTAINERS = {
     ("<return:_dialog_signals>", "actions/dispatcher.py"): (SIGNALS, "dialog_opened:{type} → data.signals"),
     ("<return:_top_effect_signals>", "actions/dispatcher.py"): (SIGNALS, "top:{신호} → data.signals"),
     ("<return:_related_signals>", "actions/dispatcher.py"): (SIGNALS, "WS-83 tab_navigated: tab-N → data.signals"),
+    ("<return:_click_purpose_signals>", "actions/dispatcher.py"): (SIGNALS, "WS-90 focus_target·target_selected "
+                                                                           "→ data.signals(효과 아님, 목적 확인)"),
     ("__all__", None): (NOT_OUT, "모듈 재수출 목록"),
     ("<expr>", "actions/pdf_document.py"): (NOT_OUT, "_rss_bytes — /bin/ps argv"),
     ("<expr>", "interface/handoff.py"): (NOT_OUT, "_process_start_time — ps argv"),
@@ -168,6 +170,9 @@ def test_census_finds_r8_b1_b2(records):
     assert ("signals", "text_changed", "actions/verification.py") in got
     assert ("signals", "element_attr_changed", "actions/verification.py") in got
     assert ("signals", "navigation_started", "actions/dispatcher.py") in got
+    # WS-90 (리뷰 B5): 효과 아님 목적 신호 생산자도 본다(헬퍼 반환값 — 조사 빈틈이었다)
+    assert ("<return:_click_purpose_signals>", "focus_target", "actions/dispatcher.py") in got
+    assert ("<return:_click_purpose_signals>", "target_selected", "actions/dispatcher.py") in got
     assert len(records) >= 200  # 빈 조사 통과 방지(실측 257 자리)
 
 
