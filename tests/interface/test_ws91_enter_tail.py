@@ -402,6 +402,8 @@ async def test_after_enter_absent_for_sensitive_fields(site, probe, caplog):
             # 디스패처 직접(게이트 없음) — Enter 를 실제로 보낸다
             outs.append(await d.dispatch(ActionType.TYPE_TEXT, {"element_id": eid, "epoch": epoch, "text": text,
                                                               "press_enter": True}))
+        listed = await s.call_server_tool("browser_recipe", {"op": "list"})
+    assert secret not in json.dumps(listed, ensure_ascii=False)  # 레시피에도 원문 없음
     assert probe.enter, "Enter 를 보낸 경로가 없음"
     for r in outs:
         assert "after_enter" not in r.data, r.data
