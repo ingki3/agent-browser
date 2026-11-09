@@ -979,6 +979,9 @@ _CLICK_PURPOSE_FN = """function () {
   return {focus: mine && editable(a),
           selected: ['tab', 'option'].includes(role) && this.getAttribute('aria-selected') === 'true'};
 }"""
+#: WS-90: 목적 판정을 시도할 관찰 role — 편집 칸(contenteditable 은 generic)·tab·option, selector 대상('' — role 모름).
+#: 그 밖(button·link …)은 판독 없이 기준 실패 그대로(실패 경로 비용 0 — 이동 직전 클릭의 옛 문서 판정 시간 유지).
+_CLICK_PURPOSE_ROLES = frozenset({"", "combobox", "textbox", "searchbox", "spinbutton", "generic", "tab", "option"})
 _ISO_GROUP_PIN = "ws85-pin"
 _ISO_GROUP_CHECK = "ws85-check"
 
@@ -4346,13 +4349,17 @@ class ActionDispatcher:
 
         판독 실패·결속 불가·다른 출처 iframe·이 액션 중 문서 이동(커밋) = [] (기준 실패 그대로)."""
         css = getattr(handle, "css_path", "") or ""
-        if not css or self._nav_info.get("nav_committed"):
+        if not css or self._nav_info.get("nav_committed") \
+                or str(getattr(handle, "role", "") or "").lower() not in _CLICK_PURPOSE_ROLES:
             return []
         try:
             world = await self._select_frame_world()
             if world is None or world[2]:
                 return []
             locator = self._locator_for(handle)
+            # 지금 DOM 에 없으면(클릭 뒤 문서가 바뀌는 중) 판독하지 않는다 — 상자 결속이 최대 2초 기다린다(실패 경로 지연).
+            if await locator.count() == 0:
+                return []
             if getattr(handle, "is_shadow", False) and handle.name:
                 need_box = True  # role+name 로케이터 — css 로 지목하지 않는다
             else:

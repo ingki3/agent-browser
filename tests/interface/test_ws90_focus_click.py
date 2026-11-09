@@ -72,6 +72,7 @@ PAGES: Dict[str, str] = {
                     "this.attachShadow({mode:'open'}).innerHTML='<input aria-label=\"그림자칸\">'}})"),
     "/textarea": _doc('<label>메모<textarea></textarea></label>'),
     "/ce": _doc('<div contenteditable="true" role="textbox" aria-label="본문"></div>'),
+    "/ce_plain": _doc('<div contenteditable="true" aria-label="편집영역" style="min-height:20px"></div>'),
     "/searchbox": _doc('<input type=search aria-label="검색">'),
     "/option_selected": _doc('<ul role="listbox" aria-label="정렬"><li role="option" tabindex=0 aria-selected="true">'
                              '추천순</li><li role="option" tabindex=0 aria-selected="false">거리순</li></ul>'),
@@ -210,6 +211,7 @@ async def test_focus_and_selected_successes_across_paths(site):
         ("/shadow", "textbox", "그림자", "", "focus_target"),
         ("/textarea", "textbox", "", "", "focus_target"),
         ("/ce", "textbox", "본문", "", "focus_target"),
+        ("/ce_plain", "generic", "편집영역", "", "focus_target"),
         ("/searchbox", "searchbox", "검색", "", "focus_target"),
         ("/option_selected", "option", "추천순", "", "target_selected"),
         ("/tab_aria_only", "tab", "나", "", "target_selected"),
