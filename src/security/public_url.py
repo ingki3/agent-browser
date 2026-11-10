@@ -808,6 +808,36 @@ CONTROL_LIST_VOCABULARY: Dict[str, FrozenSet[str]] = {
 CONTROL_PATTERNS: Dict[str, "re.Pattern[str]"] = {
     "reason": re.compile(r"http_\d{3}"),  # actions.pdf_document f"http_{status_code}"
 }
+#: WS-91 R1 B3 (#246): data.after_enter 의 칸별 고정 어휘(actions.dispatcher.after_enter_view — 같음은
+#: tests/security/test_ws51_r7_census.py 가 생산자 리터럴에서 도출해 고정). 이 dict 경로(어느 깊이든 `after_enter` 키 바로
+#: 아래)에서만 쓰는 경로 어휘라 같은 칸 이름(value·field·document)의 다른 위치는 면제하지 않는다. 공개 봉투에서 어휘 밖
+#: 값·모르는 칸은 fail-closed: 문자열 칸은 'unknown', options 는 0~상한 정수가 아니면 0, 모르는 칸은 뺀다(페이지 글자 0).
+AFTER_ENTER_VOCABULARY: Dict[str, FrozenSet[str]] = {
+    "value": frozenset({"kept", "cleared", "changed", "unknown"}),
+    "field": frozenset({"same_node", "replaced", "gone", "unknown"}),
+    "listbox": frozenset({"open", "closed", "none"}),
+    "document": frozenset({"same", "navigating", "navigated"}),
+}
+#: data.after_enter.options 상한(actions.dispatcher._AFTER_ENTER_OPTIONS_MAX 와 같음 — 시험이 고정).
+AFTER_ENTER_OPTIONS_MAX = 50
+_AFTER_ENTER_ORDER = ("value", "field", "listbox", "options", "document")  # after_enter_view 의 칸 순서
+
+
+def _after_enter_cell(key: str, value: Any) -> Any:
+    if key == "options":
+        ok = isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= AFTER_ENTER_OPTIONS_MAX
+        return value if ok else 0
+    return value if isinstance(value, str) and value in AFTER_ENTER_VOCABULARY[key] else "unknown"
+
+
+def public_after_enter(view: Any) -> Dict[str, Any]:
+    """WS-91 R1 B3: data.after_enter 공개 사본 — 고정 어휘 값은 텍스트 가림을 타지 않고(주소에서 같은 낱말이 비밀로 등록돼도
+    그대로), 어휘 밖이면 그 칸만 'unknown'(options 는 0) — fail-closed. 모르는 칸은 뺀다. dict 가 아니면 모든 칸 unknown."""
+    if not isinstance(view, dict):
+        return {k: _after_enter_cell(k, None) for k in _AFTER_ENTER_ORDER}
+    return {k: _after_enter_cell(k, v) for k, v in view.items() if k in _AFTER_ENTER_ORDER}
+
+
 #: 값이 도구 열거 어휘인 제어 키(호환 이름 — 판정은 CONTROL_VOCABULARY).
 CONTROL_ENUM_KEYS: FrozenSet[str] = frozenset(CONTROL_VOCABULARY)
 #: 값이 도구가 찍은 시각(ISO 8601)인 제어 키.
@@ -890,6 +920,8 @@ def _payload(obj: Any, path: Optional[Tuple[Any, ...]], depth: int,
             sub = path + (k,) if path is not None and len(path) < _MAX_CONTENT_PATH else None
             if sub is not None and sub in paths:
                 out[k] = _content_subtree(sub, v)  # 페이지 내용 — 아는 비밀 값만 가린다(WS-75), 없으면 공유
+            elif k == "after_enter":
+                out[k] = public_after_enter(v)  # WS-91 R1 B3: 고정 어휘 경로 — 가림 대신 어휘 밖이면 unknown
             else:
                 out[_payload_key(k)] = _payload(v, sub, depth + 1, paths, _is_url_key(k), k,
                                                 item_of if isinstance(v, str) else

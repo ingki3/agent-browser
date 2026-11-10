@@ -388,27 +388,25 @@ class _NavWatch:
 class _EnterWatch(_NavWatch):
     """WS-91 F2·B3 (#253): nav_settle=False Enter 뒤 메인 프레임 문서 요청을 듣는다 — 관문 뒤 동기 구간에 붙인다(왕복 0).
 
-    기다리지 않는다: 요청 시작(started)·응답(responded, 3xx 제외)·요청 실패(failed, 커밋 뒤여도 남김)·커밋(committed)을
-    동기로 적고, 판독은 공유 마감(deadline = Enter 뒤 _KEY_FIELD_TIMEOUT_S) 안에서만 그 기록을 본다. 응답 상태 400 이상
-    (egress 의 연결 실패 502 포함)도 실패로 본다 — 기준(nav_settle=False 는 이동이면 늘 실패)에서 성공으로 바뀌는 것은
-    마감 안 오류 신호가 없는 이동뿐이다."""
+    기다리지 않는다: 요청 시작(started)·요청 실패(failed, 커밋 뒤여도 남김)·커밋(committed)을 동기로 적고, 판독은 공유
+    마감(deadline = Enter 뒤 _KEY_FIELD_TIMEOUT_S) 안에서만 그 기록을 본다. 응답 상태 숫자는 판정에 쓰지 않는다(R1 B1 —
+    404·500 결과 문서에 같은 칸·값이 있으면 기준처럼 성공): 마감 안에 커밋된 문서는 그 문서를 읽어 기준과 같은 판정을
+    한다. 리스너는 call_tool 반환 직전까지 남아(R1 B2) 서버 꼬리 중 오류 이동도 반환 직전 동기 확인(final_failed)이 본다."""
 
     def __init__(self, page: Any) -> None:
         self.failed = False
-        self.responded = False
         self.deadline: Optional[float] = None
         super().__init__(page)
 
-    def _on_response(self, response: Any) -> None:
-        super()._on_response(response)
+    def final_failed(self) -> bool:
+        """R1 B2: 반환 직전 동기 확인 — 그 Enter 뒤 메인 프레임 문서 요청의 실패(ERR_ABORTED 제외)를 봤거나, 문서 요청을
+        본 뒤 지금 주 프레임이 브라우저 오류 문서(chrome-error)인가. 왕복 0(기록·Page.url 만)."""
+        if self.failed:
+            return True
         try:
-            status = int(response.status)
-            if response.request is self._current and not 300 <= status < 400:
-                self.responded = True
-                if status >= 400:
-                    self.failed = True  # B3: 오류 응답(차단 프록시 502 포함) — 기준 실패 계열 그대로
-        except Exception:  # noqa: BLE001 — 응답 객체를 못 읽음: 기록하지 않는다
-            return
+            return self.started and _is_error_document(self.page.url)
+        except Exception:  # noqa: BLE001 — 닫힌 페이지·가짜 페이지: 보지 못함(지금 판정 그대로)
+            return False
 
     def _on_failed(self, request: Any) -> None:
         # 메인 프레임 문서 요청이면 그것이 지금 요청이 아니어도(오류 문서 이동이 요청을 대체) 실패로 남긴다 — 다음 이동이
@@ -430,8 +428,8 @@ class _EnterWatch(_NavWatch):
         return "navigated" if self.committed else ("navigating" if self.started else "same")
 
     async def outcome(self) -> None:
-        """요청 응답·실패를 마감 안에서만 기다린다(이미 있으면 바로)."""
-        while not (self.failed or self.responded):
+        """요청 실패·새 문서 커밋·문서 없음(204·다운로드·중단)을 마감 안에서만 기다린다(이미 있으면 바로)."""
+        while not (self.failed or self.committed or self.aborted):
             left = self.remaining()
             if left <= 0:
                 return
@@ -1450,9 +1448,11 @@ _NODE_KEY_JS = """
 """
 #: WS-85 (#218): 격리 world 에서 평가하는 포커스 노드 민감 판정 — _KEY_FIELD_JS 와 같은 기준(원본 type·value getter).
 #: R1 (검증 B1): 그 노드의 식별 열쇠(k, _NODE_KEY_JS — 격리 world 원본 DOM 함수)도 — 입력한 그 노드일 때만 OR 에 더한다.
+#: WS-91 R1 B4: 그 노드가 격리 world 가림 표식 집합(_CONCEALED_SET — SecretStore 값·민감 입력을 친 칸)에 있는가(cm).
 _ISOLATED_KEY_FIELD_EXPR = (
-    "((n) => { const r = (" + _KEY_FIELD_JS + ")(n); if (r) { r.k = (" + _NODE_KEY_JS.strip() + ")(n); } return r; })(("
-    + _FOCUS_NODE_JS.strip() + ")())"
+    "((n) => { const r = (" + _KEY_FIELD_JS + ")(n); if (r) { r.k = (" + _NODE_KEY_JS.strip() + ")(n); "
+    "const cs = globalThis." + _CONCEALED_SET + "; r.cm = !!(cs && typeof cs.has === 'function' && cs.has(n)); } "
+    "return r; })((" + _FOCUS_NODE_JS.strip() + ")())"
 )
 #: WS-91 (#246): Enter 뒤 그 칸의 연결 목록 상태 판독(노드 n) — {c 연결됨, v 값, ex aria-expanded, linked 연결 대상 수,
 #: shown 연결 대상이 보임, opts 연결 대상 안 보이는 role=option 수(≤50)}. 연결은 aria-controls·aria-owns 의 id 대상만 —
@@ -1851,8 +1851,11 @@ class ActionDispatcher:
         #: WS-91 (#253 F2·F3): nav_settle=False Enter 뒤 판독(디스패처 사후 판독·서버 차단 판정)이 함께 쓰는 마감
         #: (time.monotonic, Enter 뒤 _KEY_FIELD_TIMEOUT_S). dispatch 마다 비운다 — nav_settle=True 에서는 만들지 않는다.
         self.last_input_deadline: Optional[float] = None
-        #: WS-91: 그 Enter 뒤 메인 프레임 문서 요청 리스너(_EnterWatch) — dispatch 끝에 뗀다.
+        #: WS-91: 그 Enter 뒤 메인 프레임 문서 요청 리스너(_EnterWatch) — R1 B2: call_tool 반환 직전 확인(enter_tail_final)·다음
+        #: dispatch 입구가 뗀다.
         self._enter_watch: Optional[_EnterWatch] = None
+        #: R1 B2: 그 type_text 의 (기대값, 가림 여부) — 반환 직전 확인이 기준 실패 문구를 만든다.
+        self._enter_expect: Optional[Tuple[Any, bool]] = None
         #: WS-91 (#246): Enter 를 보낸 그 고정 노드의 정체·Enter 직전 값(내부 비교용)·params — after_enter 판독용.
         self._enter_node: Optional[Dict[str, Any]] = None
         #: WS-91 (#246): 이 액션의 data.after_enter(고정 어휘) — press_key 를 서버가 미뤄 확인하면 서버가 붙인다.
@@ -3651,7 +3654,8 @@ class ActionDispatcher:
                 det = None
             if det is not None and det["opened"]:
                 result.data.setdefault("overlay_opened", {"kinds": list(det["kinds"])})
-        self._enter_close()
+        # R1 B2: Enter 리스너는 여기서 떼지 않는다 — call_tool 반환 직전 동기 확인(enter_tail_final)이 서버 꼬리 중의
+        # 오류 이동까지 보고 뗀다(서버 없이 부르면 다음 dispatch 입구 _enter_reset 이 뗀다).
         after_enter = self.take_after_enter()
         if after_enter is not None and not result.data.get("typed_without_enter"):
             # WS-91 (#246): Enter 뒤 그 칸 상태(고정 어휘·숫자만) — 성공·실패 결과 모두. 민감 칸이면 만들지 않았다.
@@ -4586,6 +4590,43 @@ class ActionDispatcher:
         self._enter_node = None
         self._key_enter = None
         self.last_after_enter = None
+        self._enter_expect = None
+
+    def enter_tail_final(self, result: ActionResult) -> ActionResult:
+        """R1 B2 (#253): call_tool 반환 직전 **동기** 확인(왕복 0) — nav_settle=False type_text Enter 뒤 그 리스너가 메인 프레임
+        문서 요청 실패(ERR_ABORTED 제외)를 봤거나 지금 주 프레임이 오류 문서(chrome-error)면, 성공 결과를 기준 실패 계열
+        (E_TIMEOUT·기존 '사후조건 미충족(기대값 … != 실제 None)' 문구·재관찰)로 바꾼다. 서버가 붙인 신호(차단·상태 등)는 그대로
+        두고 효과 신호(signals·element_id)만 뺀다. after_enter 가 있었으면 지금 문서 상태로 다시 정한다. 확인 뒤 리스너를 뗀다.
+        press_key 는 기준이 성공(키를 보냄)이라 판정을 바꾸지 않는다(after_enter.document 만 지금 기록 — take_after_enter).
+        마감·반환 뒤의 실패는 모른다(문서화된 한계)."""
+        watch = self.__dict__.get("_enter_watch")
+        expect, self._enter_expect = self.__dict__.get("_enter_expect"), None
+        try:
+            if (watch is None or expect is None or not result.success or result.action is not ActionType.TYPE_TEXT
+                    or watch.deadline is None or not watch.final_failed()):
+                return result
+            text, conceal = expect
+            empty = PageStateSnapshot(url="", dom_node_count=0)
+            post = verify_post_condition(empty, empty, expected_value=text, conceal_value=conceal)
+            data = {k: v for k, v in result.data.items() if k not in ("signals", "element_id")}
+            if "after_enter" in data:
+                data["after_enter"] = after_enter_view(None, None, watch.document())
+            failed = self._result(
+                success=False,
+                action=result.action,
+                retry_safe=False,
+                error_code=ErrorCode.TIMEOUT,
+                error_message=(
+                    f"사후조건 미충족({post.detail}). "
+                    f"{result.action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
+                ),
+                reobserve_required=True,
+                healed=result.healed,
+            )
+            failed.data = data
+            return failed
+        finally:
+            self._enter_close()
 
     def take_after_enter(self) -> Optional[Dict[str, Any]]:
         """#246: 이 액션의 after_enter. press_key 는 판독은 키 뒤 마감 안 그대로, 문서 상태만 지금 리스너 기록으로 다시 본다
@@ -4724,7 +4765,7 @@ class ActionDispatcher:
             await asyncio.wait(futs, timeout=watch.remaining())
         read = _done_value(rd)
         if watch.started:
-            return await self._enter_nav_outcome(watch, futs)
+            return await self._enter_nav_outcome(watch, futs, handle)
         if rd is not None and not rd.done():
             rd.cancel()
         assert cap is not None
@@ -4732,12 +4773,12 @@ class ActionDispatcher:
             after = await cap  # 마감 안에 끝났으면 바로 — 이동 요청 없이 늦으면 기준대로 기다린다
         except Exception:
             if watch.started:
-                return await self._enter_nav_outcome(watch, [])
+                return await self._enter_nav_outcome(watch, [], handle)
             raise
         self._enter_view(read, "same", after)
         return after
 
-    async def _enter_nav_outcome(self, watch: _EnterWatch, futs: List[Any]) -> Any:
+    async def _enter_nav_outcome(self, watch: _EnterWatch, futs: List[Any], handle: ElementHandle) -> Any:
         for f in futs:
             if not f.done():
                 f.cancel()
@@ -4745,8 +4786,8 @@ class ActionDispatcher:
                 _done_value(f)  # 결과·예외를 거둔다(미회수 경고 방지)
         await watch.outcome()
         self._enter_view(None, watch.document())
-        if watch.failed:
-            return PageStateSnapshot(url="", dom_node_count=0)  # B3: 요청 실패 — 기준 실패 계열(기대값 != 실제 None)
+        if watch.final_failed():
+            return PageStateSnapshot(url="", dom_node_count=0)  # B3: 요청 실패·오류 문서 — 기준 실패 계열(기대값 != 실제 None)
         if watch.committed:
             try:
                 unreachable = await asyncio.wait_for(self.top_document_unreachable(), max(0.001, watch.remaining()))
@@ -4754,6 +4795,13 @@ class ActionDispatcher:
                 unreachable = True
             if unreachable:
                 return PageStateSnapshot(url="", dom_node_count=0)
+        if (watch.committed or watch.aborted) and watch.remaining() > 0:
+            # R1 B1: 마감 안에 문서가 정해졌다(새 문서 커밋·문서 없음) — 응답 상태 숫자가 아니라 지금 그 문서를 읽어 기준과
+            # 같은 판정(같은 칸·값이 있으면 성공, 없으면 기대값 != 실제). 마감 안에 못 읽으면 이동 결과(알 수 없음)로.
+            try:
+                return await asyncio.wait_for(self._capture_state(self.ctx.page, handle), watch.remaining())
+            except Exception:  # noqa: BLE001 — 마감 초과·문서 교체 중 판독 실패: 이동 결과(navigation_started)
+                pass
         raise _EnterNavigated()
 
     async def _click_purpose_signals(self, handle: ElementHandle) -> List[str]:
@@ -5992,6 +6040,8 @@ class ActionDispatcher:
                 # WS-78 NB1: 덧붙이기(clear_before=false)면 칸 전체 값(기존 값 + 친 글자)도 등록한다 — 인자 text 만
                 # 등록하면 칸에 남은 앞부분과 이어진 완성값이 가려지지 않는다.
                 await self._register_field_value(target)
+            # R1 B2: 반환 직전 확인(enter_tail_final)이 기준 실패 문구를 만들 기대값·가림 여부(사후조건 판정과 같은 params).
+            self._enter_expect = (params.get("text"), bool(params.get(_CONCEAL_KEY)))
             if params.get("press_enter"):
                 # WS-91 (#246): Enter 를 보낼 그 노드의 정체·지금 값 — 관문보다 앞(관문과 키 사이 await 를 늘리지 않는다).
                 await self._enter_node_note(handle, params, target, fixed)
@@ -6786,6 +6836,16 @@ class ActionDispatcher:
             return None
         return info if isinstance(info, dict) else None
 
+    def _enter_key_sensitive(self, iso: Any, k: str) -> bool:
+        """WS-91 R1 B4: press_key Enter 의 after_enter 생략 판정 — 세션 단위가 아니라 **그 노드**: 격리 판독이 비밀번호 칸(s)이거나
+        가림 표식(cm — SecretStore 값·민감 입력을 친 칸, WS-88 노드+문서 결속)이면 민감. 가림 표식을 넣은 적이 있는데 키 뒤
+        격리 판독이 키 전 그 노드(k)의 '표식 없음'을 보이지 못하면(판독 실패·다른 노드) 보수로 민감(fail-closed)."""
+        if isinstance(iso, dict) and (iso.get("s") is True or iso.get("cm") is True):
+            return True
+        if not self.__dict__.get("_concealed_marked"):
+            return False
+        return not (isinstance(iso, dict) and bool(k) and iso.get("k") == k and iso.get("cm") is False)
+
     async def _key_plain_after(self, top: Any, pending: Any, iso_pending: Any = None, k: str = "",
                                deadline: Optional[float] = None, enter: Any = None) -> None:
         """WS-78 R1 R3: 키 전 일반 칸이 키 뒤 민감이 됐으면(OR) 그 값을 등록하고 다음 키의 sticky 노드로 둔다.
@@ -6811,8 +6871,7 @@ class ActionDispatcher:
             return f.result()
 
         info, iso = _read(pending), _read(iso_pending)
-        if enter is not None and not (isinstance(iso, dict) and iso.get("s") is True) \
-                and not self.__dict__.get("_concealed_marked"):
+        if enter is not None and not self._enter_key_sensitive(iso, k):
             self._key_enter = (enter[0], info if isinstance(info, dict) else None, enter[1], enter[2])
             self.take_after_enter()
         if not (isinstance(info, dict) and info.get("s")):

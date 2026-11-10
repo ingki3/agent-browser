@@ -32,6 +32,8 @@ from ws51_r7_census import Record, literal_census, literal_records  # noqa: E402
 
 R = "[REDACTED]"
 CONTROL, FREE, NOT_OUT = "CONTROL", "FREE", "NOT_OUT"
+#: WS-91 R1: dict 경로 어휘(`after_enter` 아래 칸) — CONTROL 처럼 키 통째 면제가 아니라 그 경로에서만 어휘 그대로.
+AFTER_ENTER = "AFTER_ENTER"
 
 
 def _pu():
@@ -175,12 +177,14 @@ KEYS = {
     ("kind", "browser/site_session.py"): (NOT_OUT, "로그인 추적 이벤트 종류(tracer 파일 — interface 가 쓰지 않음)"),
     ("server_id", "browser/serve_profile.py"): (NOT_OUT, "프로필 잠금 파일 내용"),
     ("verdict", "actions/dispatcher.py"): (NOT_OUT, "WS-81 R1 _hidden_state 내부 판정(moved — 노드 핀 대조 불가) — 응답에 "
-                                                    "싣지 않음"),    # WS-91 (#246) data.after_enter — 고정 어휘(actions.dispatcher.after_enter_view)지만 면제(CONTROL) 어휘에 넣지 않는다:
-    # 값은 4~7자 영단어라 비밀로 등록되지 않고(secret_registry._eligible), 가림을 그대로 받는다(보수).
-    ("value", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.value kept|cleared|changed|unknown(값 원문 아님)"),
-    ("field", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.field same_node|replaced|gone|unknown"),
-    ("listbox", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.listbox open|closed|none"),
-    ("document", "actions/dispatcher.py"): (FREE, "WS-91 after_enter.document same|navigating|navigated"),
+                                                    "싣지 않음"),
+    # WS-91 R1 (검증 B3·FREE 미탐): data.after_enter — 경로 어휘(public_url.AFTER_ENTER_VOCABULARY, `after_enter` dict 아래만).
+    # FREE 로 두면 등록 값(주소 `?token=same_node`)에 가려졌고 새 어휘 이탈(rogue 값)을 이 census 가 못 잡았다 — 생산자
+    # (after_enter_view) 리터럴 집합이 그 어휘와 **정확히** 같아야 한다(test_after_enter_literals_exact_vocabulary).
+    ("value", "actions/dispatcher.py"): (AFTER_ENTER, "WS-91 after_enter.value kept|cleared|changed|unknown(값 원문 아님)"),
+    ("field", "actions/dispatcher.py"): (AFTER_ENTER, "WS-91 after_enter.field same_node|replaced|gone|unknown"),
+    ("listbox", "actions/dispatcher.py"): (AFTER_ENTER, "WS-91 after_enter.listbox open|closed|none"),
+    ("document", "actions/dispatcher.py"): (AFTER_ENTER, "WS-91 after_enter.document same|navigating|navigated"),
 }
 
 
@@ -386,3 +390,58 @@ def test_hitl_gate_basis_source_survives(fresh_registry):
         _force_register(v)
     out = _wire({"gate_basis": dict(a.basis), "other": {"gate_basis": dict(b.basis)}})
     assert out["gate_basis"]["source"] == "unresolved" and out["other"]["gate_basis"]["source"] == "form_submit"
+
+
+# ------------------------------------------------------------------ WS-91 R1: data.after_enter 경로 어휘(검증 B3·FREE 미탐)
+
+def _after_enter_span():
+    """생산자 after_enter_view 의 줄 범위(AST — 소비자 표를 읽지 않는다)."""
+    src = Path(__file__).resolve().parents[2] / "src" / "actions" / "dispatcher.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "after_enter_view")
+    return fn.lineno, fn.end_lineno
+
+
+def test_after_enter_literals_exact_vocabulary(records):
+    """after_enter 칸(value·field·listbox·document)의 생산 리터럴은 모두 after_enter_view 안에 있고, 칸별 집합이 공개 경로 어휘
+    (public_url.AFTER_ENTER_VOCABULARY)와 **정확히** 같다 — 생산자가 어휘 밖 값(예: rogue_vocab)을 내면 RED(사보타주 고정)."""
+    pu = _pu()
+    rows = [r for r in records if not _skip(r) and r.table is None and _classify(r)[0] == AFTER_ENTER]
+    lo, hi = _after_enter_span()
+    assert rows and all(r.file == "actions/dispatcher.py" and lo <= r.line <= hi for r in rows), \
+        sorted({(r.key, r.value, r.line) for r in rows if not lo <= r.line <= hi})
+    got: dict = {}
+    for r in rows:
+        got.setdefault(r.key, set()).add(r.value)
+    assert got == {k: set(v) for k, v in pu.AFTER_ENTER_VOCABULARY.items()}, got
+    from actions import dispatcher
+
+    assert dispatcher._AFTER_ENTER_OPTIONS_MAX == pu.AFTER_ENTER_OPTIONS_MAX
+
+
+def _after_enter_samples():
+    pu = _pu()
+    return sorted((k, v) for k, vs in pu.AFTER_ENTER_VOCABULARY.items() for v in vs)
+
+
+@pytest.mark.parametrize("key,value", _after_enter_samples(), ids=lambda x: x)
+def test_after_enter_value_survives_real_url_registration(fresh_registry, key, value):
+    """검증 B3 재현: 실제 주소 관측(`?token=<어휘 값>`)으로 등록돼도 wire 의 after_enter 칸은 그 값 그대로(가림·이탈 없음),
+    같은 값이 자유 문장 칸에 있으면 가린다(경로 어휘 — 칸 이름 통째 면제 아님)."""
+    sr.register_url("http://127.0.0.1/multi?token=" + value)
+    view = {"value": "kept", "field": "same_node", "listbox": "none", "options": 0, "document": "same", key: value}
+    out = _wire({"after_enter": dict(view), "note": f"about {value} here", "nested": {key: value}})
+    assert out["after_enter"] == view, out
+    if public_text_masks(value):
+        assert value not in out["note"]
+        assert out["nested"][key] == R  # 다른 위치의 같은 칸 이름은 면제하지 않는다
+
+
+def test_after_enter_out_of_vocabulary_fails_closed(fresh_registry):
+    """어휘 밖 값·모르는 칸·잘못된 숫자 → 그 칸 unknown(options 0)·칸 제외 — 페이지 글자 0."""
+    out = _wire({"after_enter": {"value": "SynthPageWord", "field": "rogue_vocab", "listbox": "open",
+                                 "options": 999, "document": "same", "extra": "SynthPageWord"}})
+    assert out["after_enter"] == {"value": "unknown", "field": "unknown", "listbox": "open", "options": 0,
+                                  "document": "same"}
+    assert _wire({"after_enter": "SynthPageWord"})["after_enter"] == {
+        "value": "unknown", "field": "unknown", "listbox": "unknown", "options": 0, "document": "unknown"}
