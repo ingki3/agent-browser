@@ -192,20 +192,26 @@ async def test_b2_error_navigation_in_server_tail_is_base_failure(srv, probe, mo
 @requires_chromium
 @pytest.mark.parametrize("kind", ["closed", "loop", "invalid", "proxy502"])
 async def test_b2_error_navigation_real_20_runs_no_success(srv, probe, kind):
-    """실제 경로(주입 없음) 각 20회: 기준 성공 0 → 대상 성공 0, 반환 때 chrome-error 이면 늘 기준 실패 문구."""
+    """실제 경로(주입 없음) 각 20회: 반환 때 chrome-error 인데 성공이면 안 된다(B2).
+
+    오류 요청·커밋이 반환 뒤에 오면(문서화된 '마감·반환 뒤는 모름' 한계) 성공일 수 있다 — 그때는 반환 때
+    문서는 오류 문서가 아니다. 성공 0 을 단정하면
+    그 한계 때문에 흔들린다(검증 ws91-r1 NB: proxy502 1/20). 반환 때 오류 문서였던 성공(B2 원 결함)은 여기서 실패한다."""
     successes: List[Tuple[int, Dict[str, Any]]] = []
     async with BrowserMCPServer(nav_settle=False, recipes=False, **_kw(kind)) as s:
         for i in range(20):
             r = await _submit(s, srv.base + f"/form/{kind}")
+            at_return = s._page.url  # noqa: SLF001
             if r.success:
-                successes.append((i, {"url": s._page.url, "data": r.data}))  # noqa: SLF001
+                assert not at_return.startswith("chrome-error://"), (i, at_return, r.data)
+                successes.append((i, {"url": at_return, "data": r.data}))
             else:
                 assert r.error_code in (ErrorCode.TIMEOUT, ErrorCode.PAGE_CRASHED), (r.error_code, r.error_message)
                 if kind != "proxy502":
                     assert "egress" not in r.data, r.data  # 기준과 같다(대상 호스트가 호출 주소 후보에 없음)
                 else:
                     assert r.data.get("egress", {}).get("code") == "connect_failed", r.data  # 기준과 같은 차단 신호
-    assert successes == [], successes
+    assert len(successes) < 20, successes  # 전부 '반환 뒤'로 미뤄지면 이 시험이 판정 경로를 못 잰 것
 
 
 @requires_chromium
