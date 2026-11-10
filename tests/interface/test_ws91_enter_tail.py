@@ -261,6 +261,17 @@ async def _press_enter(s: BrowserMCPServer, p: _Probe, url: str, name: str) -> T
     return r, time.perf_counter() - p.t_enter
 
 
+async def _settle_pending(s: BrowserMCPServer) -> None:
+    """준비 호출(nav_settle=False Enter 제출)이 남긴 400ms 늦은 결과 이동이 끝날 때까지 — 다음 navigate 가
+    그 이동과 겹쳐 'interrupted by another navigation' 으로 실패하지 않게(CI 느린 러너에서 실측). 제품 판정 무관."""
+    page = s._page  # noqa: SLF001
+    try:
+        await page.wait_for_url("**/result**", timeout=5000)
+        await page.wait_for_load_state("load", timeout=5000)
+    except Exception:  # noqa: BLE001 — 이동이 없던 준비 호출(press_key 무이동 등)은 그대로 진행
+        pass
+
+
 def _why(r: Any, el: float) -> str:
     return f"{el:.3f}s code={r.error_code} msg={r.error_message} latency_ms={r.data.get('latency_ms')} data={r.data}"
 
@@ -273,6 +284,7 @@ async def test_type_enter_get_form_nav_settle_off_success_fast(site, probe):
     """기준: E_TIMEOUT('기대값 != 실제 None')·Enter→반환 ~425ms. 대상: 성공(navigation_started)·≤0.35s(call_tool 경계)."""
     async with BrowserMCPServer(nav_settle=False) as s:
         await _type_enter(s, probe, site.base + "/a", "검색어")  # 준비 비용 제외
+        await _settle_pending(s)
         r, el = await _type_enter(s, probe, site.base + "/a", "검색어")
     assert r.success, _why(r, el)
     assert "navigation_started" in r.data.get("signals", []) and r.reobserve_required, _why(r, el)
@@ -287,6 +299,7 @@ async def test_type_enter_nav_settle_off_hangs_bounded(site, probe, hang):
     """F1(press 이동 대기 흉내)·F2(사후 판독 멈춤)·F3(서버 차단 판정 두 판독 멈춤) — 어느 하나가 5s 멈춰도 ≤0.35s."""
     async with BrowserMCPServer(nav_settle=False) as s:
         await _type_enter(s, probe, site.base + "/a", "검색어")
+        await _settle_pending(s)
         if hang == "imitate":
             probe.imitate = True
         else:
@@ -302,6 +315,7 @@ async def test_press_key_enter_server_path_bounded(site, probe, hang):
     """#244 서버 경로: press_key Enter nav_settle=False — 서버 차단 판정도 키 뒤 마감 안(기준 p50 418.6ms·멈춤 5s)."""
     async with BrowserMCPServer(nav_settle=False) as s:
         await _press_enter(s, probe, site.base + "/a", "검색어")
+        await _settle_pending(s)
         if hang != "none":
             probe.hang[hang] = True
         r, el = await _press_enter(s, probe, site.base + "/a", "검색어")
