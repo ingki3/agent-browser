@@ -155,18 +155,24 @@ async def test_post_dcl_error_document_fails_with_long_timeout(server, wait_unti
     assert r.data["nav_failure"]["net_error"] == "ERR_UNSAFE_PORT"
 
 
-# -- 2. DCL 뒤 다른 정상 문서로 바뀜 — 보수적으로 실패 -----------------------------------------
+# -- 2. DCL 뒤 다른 정상 문서로 바뀜 — WS-92 (#247) 의도된 시험 변경 ------------------------------------
+# 기준(WS-69 R1·R2)은 이 경우를 보수 실패로 고정했다(test_post_dcl_other_document_is_conservative_failure). WS-92 는
+# 커밋 2..3회 + 판독 전후 커밋 불변 + 최종 http(s) + readyState interactive 이상이면 #170 과 같은 부분 성공으로 바꾼다
+# (실사용: 같은 주소 404 문서의 자기 reload 가 14.5s 실패였다). 그래서 지우지 않고 대체 시험으로 바꾼다. 나머지 대체
+# 시험(404 reload·3홉 상한·고리 실패·판독 중 커밋 실패)은 tests/interface/test_ws92_client_redirect.py, DCL 직후
+# parser-blocked 둘째 문서 실패는 test_ws69_r2_commit_count.py::test_dcl_immediate_hop_never_partial_success_unhooked 유지.
 
 
 @pytest.mark.parametrize("path,wait_until", [("/to-poll", "networkidle"), ("/to-img", "load")])
-async def test_post_dcl_other_document_is_conservative_failure(server, path, wait_until):
+async def test_post_dcl_other_document_is_partial_success_with_documents(server, path, wait_until):
     r, final = await _run(server + path, wait_until, timeout_ms=1200)
     assert not final.startswith("chrome-error://") and final != server + path
-    assert r.success is False, r.data
-    assert r.error_code is ErrorCode.NAVIGATE_TIMEOUT
-    assert "load_state" not in r.data
-    assert r.data["nav_failure"] == {"kind": "timeout"}
-    assert "이동 중 다른 문서로 바뀜" in r.data["hint"]
+    assert r.success is True, (r.error_code, r.data)
+    assert r.data["url"] == final
+    assert r.data["load_state"] == {"requested": wait_until, "reached": "domcontentloaded", "timed_out": True,
+                                    "documents": 2}
+    assert "nav_failure" not in r.data
+    assert "문서는 열렸" in r.data["hint"]
 
 
 # -- 3. 같은 문서 유지 — 부분 성공 그대로 ---------------------------------------------------------

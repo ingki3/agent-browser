@@ -32,6 +32,22 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 **선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
 
+## Enter 뒤 상태 신호 (`data.after_enter`, WS-91 #246)
+
+`type_text(press_enter=true)` 와 `press_key("Enter")` 결과에 Enter 를 받은 그 칸의 상태가 고정 어휘·숫자로 붙습니다 — 성공·실패 결과 모두(예: 값이 비워져 사후조건 실패인 `E_TIMEOUT` 에도). 칸 값·자동완성 글자는 싣지 않습니다(`changed` 도 바뀐 값 없음, 입력값 표기는 기존 `value_applied` 규칙 그대로). 민감 칸(비밀번호·SecretStore 값을 넣은 칸·가림 표식 칸)이면 키 자체가 없습니다 — `press_key` 는 Enter 를 받은 **그 노드**로 판정합니다(다른 칸에 비밀을 친 뒤 일반 칸 Enter 는 있음, 판독 실패면 보수로 없음). 값은 고정 어휘라 주소 등에서 같은 낱말이 비밀로 등록돼도 가려지지 않고, 어휘 밖 값은 응답에서 `unknown`(options 는 0)입니다(R1). Enter 를 보내지 않은 결과(`typed_without_enter`)에도 없습니다.
+
+| 키 | 값 | 뜻 |
+| :--- | :--- | :--- |
+| `value` | `kept` · `cleared` · `changed` · `unknown` | Enter 직전 값 그대로 · 빈 값 · 다른 값 · 못 읽음(칸이 같은 노드가 아니거나 문서 이동 중) |
+| `field` | `same_node` · `replaced` · `gone` · `unknown` | Enter 를 받은 **그 노드**가 아직 문서에 붙어 있음 · 끊겼고 같은 css 에 다른 노드가 있음(SPA 재렌더) · 끊겼고 없음(문서가 바뀜 포함) · 못 읽음. css 재조회로 '같은 칸'이라 하지 않습니다 |
+| `listbox` | `open` · `closed` · `none` | 그 칸이 `aria-controls`·`aria-owns` 로 가리키는 목록이 보이고 `aria-expanded` 가 `false` 가 아님 · 그 목록이 안 보이거나 `aria-expanded=false` · 연결도 `aria-expanded` 도 없음. 연결이 없으면 `aria-expanded` 만 봅니다(`true`=open, `false`=closed) — 문서의 다른 listbox 는 다른 칸 것일 수 있어 세지 않습니다 |
+| `options` | 0~50 정수 | 연결된 목록 안 보이는 `role=option` 수(연결 없으면 0) |
+| `document` | `same` · `navigating` · `navigated` | 문서 요청 없음 · 메인 문서 요청이 시작됨 · 새 문서가 커밋됨 |
+
+**0.3초 안 상태입니다.** `nav_settle=false` 는 Enter 뒤 판독 마감(0.3초) 안, `nav_settle=true` 는 이동 대기 뒤 판독 상한(0.3초) 안에서 본 상태입니다. 실제 지도 사이트처럼 검색 결과 목록이 0.5~1.5초 늦게 뜨는 화면은 `listbox: closed`·`value: kept`·`document: same`(Enter 가 아무것도 확정하지 않음)으로 보이고, 늦게 뜬 결과 목록은 다음 관찰로 확인하십시오. `press_key` 는 키 뒤 판독이 끝난 때까지 본 문서 요청만 반영합니다(판독이 요청보다 먼저 끝나면 `same`).
+
+**nav_settle=false 의 Enter 제출(WS-91 #253).** Enter 는 Playwright 의 '이동 시작까지 대기'를 끄고 보내며, 그 뒤 사후 판독·서버 차단 판정(`data.challenge`)은 Enter 뒤 0.3초 마감 하나를 함께 씁니다(이전에는 새 문서 커밋까지 막혀 약 0.42초 뒤 새 문서를 읽고 거짓 `E_TIMEOUT`). 판정은 응답 상태 숫자가 아니라 **최종 문서 상태**입니다(R1): 마감 안에 메인 문서 요청의 실패(`requestfailed`, `ERR_ABORTED` 제외 — egress 차단 포함)나 오류 문서(chrome-error) 커밋이 보이면 예전 실패(`E_TIMEOUT`, 같은 문구)이고, 마감 안에 새 문서가 커밋됐으면(404·500·502 결과 문서도) 그 문서를 읽어 기준과 같은 판정을 합니다(같은 칸·값이 있으면 성공, 없으면 `기대값 … != 실제 None`). 문서 요청만 보이고 마감까지 커밋이 없으면 기존 `navigation_started` 성공(`reobserve_required`)입니다. 문서 요청 리스너는 `call_tool` 반환 직전까지 남아, 서버 꼬리(차단 판정 등) 중에 그 이동이 실패·오류 문서로 끝났으면 반환 직전 동기 확인이 같은 실패로 바꿉니다(egress 판정은 기존 그대로). `press_key` 는 기준처럼 판정을 바꾸지 않습니다(`after_enter.document` 만 그때 기록). 한계: 마감 뒤에 커밋된 일반(오류 아님) 문서와 반환 뒤에 오는 실패는 이 결과가 알 수 없습니다(`press_key` 의 `nav_settle=false` 와 같음 — 다음 관찰로 확인). 마감을 넘긴 차단 판정은 판정 실패와 같은 `challenge: null` 입니다.
+
 ## 프롬프트 주입 신호 (`data.injection_suspected`)
 
 웹 페이지에 "이전 지시를 무시하고 …" 같은 문구가 있으면 그 문구가 부르는 에이전트를 조종할 수 있습니다(간접 프롬프트 주입). 액션 툴 19종의 결과(실패·HITL 차단 결과 포함)에 실린 **웹에서 온 텍스트** — 관찰 요소 이름·`value`·페이지 제목·`data.page_data`의 JSON-LD 요약, `extract` 텍스트·속성, `data.dialogs` 문구, 스크린샷 SoM 태그 이름, 프레임 목록의 `selector_hint`, HITL 차단의 대상 이름(`gate_basis`·`dialog`·`error_message`) — 를 결정론적 패턴(15종)으로 검사해, 의심되면 `data`에 신호를 붙입니다.
