@@ -39,6 +39,7 @@ from ws51_r8_census import AttrRecord, attr_records  # noqa: E402
 R = "[REDACTED]"
 CONTROL, ID, URL, FREE, PAGE, STRUCT, NOT_STR, NOT_OUT = (
     "CONTROL", "ID", "URL", "FREE", "PAGE", "STRUCT", "NOT_STR", "NOT_OUT")
+AFTER_ENTER = "AFTER_ENTER"  # WS-91 R1: data.after_enter 경로 어휘(public_url.AFTER_ENTER_VOCABULARY)
 
 
 def _pu():
@@ -55,6 +56,9 @@ ATTRS = {
     ("handoff_id", "handoff_id"): (FREE, "interface/server_manual.py mh-+hex8 — 면제하지 않음(모양이 바뀌지 않음)"),
     ("manual_sites", "texts()"): (FREE, "interface/server_tools.py control_status — 사람이 넣은 사이트 문자열"),
     ("site", "text"): (NOT_OUT, "security/manual_sites.py 목록 파일 행(사람 CLI)"),
+    # WS-91 R1 (검증 FREE 미탐) data.after_enter.document — _EnterWatch.document() 고정 어휘, 경로 어휘(AFTER_ENTER_VOCABULARY)와
+    # 정확히 같음은 test_after_enter_document_producer_exact 가 고정(FREE 면 어휘 이탈을 놓쳤다)
+    ("document", "document()"): (AFTER_ENTER, "actions/dispatcher.py _EnterWatch.document — after_enter.document 경로 어휘"),
     # --- CONTROL
     ("type", "type"): (CONTROL, "actions/dispatcher.py _on_dialog — Playwright Dialog.type → data.dialogs[].type (R7-B1)"),
     ("vendor", "vendor"): (CONTROL, "interface/server_signals.py data.challenge.vendor — browser.challenge 벤더 어휘(R8)"),
@@ -400,3 +404,17 @@ def test_healing_attempts_survive(fresh_registry, monkeypatch):
     out = _wire({"healing_attempts": vals, "note": " ".join(vals)})
     assert out["healing_attempts"] == vals
     assert R in out["note"] and not any(v in out["note"] for v in vals)
+
+
+
+def test_after_enter_document_producer_exact(records):
+    """WS-91 R1: after_enter.document 를 옮기는 자리는 _EnterWatch.document() 뿐이고, 그 반환 리터럴 집합이 경로 어휘와 정확히
+    같다(AST — 생산자가 어휘 밖 값을 내면 RED)."""
+    rows = [r for r in records if _classify(r)[0] == AFTER_ENTER]
+    assert rows and {(r.key, r.attr, r.file) for r in rows} == {("document", "document()", "actions/dispatcher.py")}
+    src = Path(__file__).resolve().parents[2] / "src" / "actions" / "dispatcher.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_EnterWatch")
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "document")
+    lits = {n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert lits == set(_pu().AFTER_ENTER_VOCABULARY["document"]), lits
