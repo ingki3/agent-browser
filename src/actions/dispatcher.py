@@ -78,6 +78,10 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 #: navigate 추가 판독(readyState)이 쓸 수 있는 timeout_ms 너머 유예(WS-69 R2) — 반환 ≤ timeout_ms + 100ms.
 _NAV_READ_GRACE_S = 0.05
+#: WS-93 (#271-2, 사용자 결정 A): 계약 기본 timeout_ms(NavigateInput 15000)의 networkidle 은 load 뒤 최대 3초만 더 기다린다.
+#: 서버가 기본값을 채우므로(model_dump) '명시'는 기본값과 다른 값으로만 구분된다(리뷰 B3) — 그 값은 기준 그대로.
+_NAV_IDLE_CAP_MS = 3000.0
+_NAV_IDLE_CAP_DEFAULT_TIMEOUT_MS = 15000
 
 #: 요소를 대상으로 하지 않는 액션 (staleness 검증 대상 아님)
 _ELEMENTLESS_ACTIONS = frozenset(
@@ -6367,7 +6371,18 @@ class ActionDispatcher:
                     return self._navigate_failure(action, PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded."))
                 else:
                     try:
-                        await page.wait_for_load_state(requested, timeout=remaining)
+                        if requested == "networkidle" and timeout_ms == _NAV_IDLE_CAP_DEFAULT_TIMEOUT_MS:
+                            # WS-93: load 까지는 남은 예산, 그 뒤 networkidle 은 min(남은 예산, 3초). 못 닿으면 아래 기존
+                            # 부분 성공 그대로(reached 는 'domcontentloaded' — 어휘·hint 불변, 리뷰 B2 a).
+                            await page.wait_for_load_state("load", timeout=remaining)
+                            left = timeout_ms - (_monotonic() - started) * 1000
+                            if left < 1:
+                                # timeout=0 은 무한 대기 — 부르지 않고 2단계 시간 초과로 본다(NN3).
+                                timed_out = PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded.")
+                            else:
+                                await page.wait_for_load_state("networkidle", timeout=min(left, _NAV_IDLE_CAP_MS))
+                        else:
+                            await page.wait_for_load_state(requested, timeout=remaining)
                     except PlaywrightTimeoutError as exc:
                         timed_out = exc  # 이것만 부분 성공 후보(N2) — 닫힘 등은 아래 기존 분류
                     except Exception as exc:  # noqa: BLE001
