@@ -75,6 +75,8 @@ PRESERVED = (
     "_ENTER_SENSITIVE_PAIRS", "_ENTER_SENSITIVE_TOKENS", "_ENTER_SENSITIVE_WORDS", "_ENTER_SKIP_SOURCES", "_as_dict",
     "_enter_autocomplete_hit", "_enter_field_verdict", "_enter_get_form", "_enter_plain_signals", "_enter_sensitive",
     "_enter_words_hit", "_secret_text",
+    # WS-94 extract_all 열린 레이어 우선 잘림 안내
+    "_TRUNC_HINT_EXTRACT_LAYER",
 )
 
 
