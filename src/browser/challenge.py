@@ -105,7 +105,17 @@ _BLOCKED_PHRASES = (
 #: Cloudflare·Akamai 는 앞단(CDN) 화면이라 어느 사이트 도메인에서나 나오므로 목록에 없다(도메인 무관).
 SITE_VENDOR_DOMAINS = {
     "naver": ("naver.com",),
+    "bing": ("bing.com",),
 }
+
+#: WS-93 (#270) 두 줄이 **함께** 있어야 캡차인 사이트 고유 화면: ((줄1, 줄2), 벤더, 이유) — 소문자 비교.
+#: 한 줄만으로는 결제·가입 화면('One last step')에도 나오므로 둘 다 요구하고, 본문 ≤ SHORT_BODY_CHARS 이며 페이지
+#: 주소가 그 벤더 도메인일 때만 판정한다(다른 도메인의 인용·미러는 NONE). 이 규칙만 공백(NBSP·줄바꿈)을 정규화한다.
+_BING_REASON = "Bing 과제 화면(계속하려면 과제 해결 요구)"
+_PAIR_CAPTCHA_PHRASES = (
+    (("마지막 한 단계", "계속하려면 아래 과제 해결"), "bing", _BING_REASON),
+    (("one last step", "please solve the challenge below to continue"), "bing", _BING_REASON),
+)
 
 
 def vendor_domain_matches(vendor: str, url: Optional[str]) -> bool:
@@ -139,6 +149,11 @@ def classify(title: str, text: str, length: int, widget: str,
     for phrase, vendor, reason in _CAPTCHA_PHRASES:
         if phrase in hay:
             return Challenge(ChallengeKind.CAPTCHA, reason, _vendor_for(vendor, url))
+    if length <= SHORT_BODY_CHARS:
+        flat = " ".join(hay.split())  # NBSP·줄바꿈 정규화(이 규칙만)
+        for pair, vendor, reason in _PAIR_CAPTCHA_PHRASES:
+            if all(p in flat for p in pair) and vendor_domain_matches(vendor, url):
+                return Challenge(ChallengeKind.CAPTCHA, reason, vendor)
     for phrase, vendor, reason in _BLOCKED_PHRASES:
         if phrase in hay:
             return Challenge(ChallengeKind.BLOCKED, reason, _vendor_for(vendor, url))

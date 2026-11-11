@@ -783,7 +783,7 @@ CONTROL_VOCABULARY: Dict[str, FrozenSet[str]] = {
     # WS-79 actions.covered_click data.covered_by.layer(COVER_LAYERS)
     "layer": frozenset({"fixed", "sticky", "modal", "frame", "other"}),
     # R8 — 속성 전달값 census(tests/security/test_ws51_r8_census.py)로 드러난 키.
-    "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai"}),  # browser.challenge
+    "vendor": frozenset({"generic", "hcaptcha", "cloudflare", "recaptcha", "naver", "akamai", "bing"}),  # browser.challenge
     # healing_attempts 는 R9 부터 목록 경로 어휘(CONTROL_LIST_VOCABULARY — 복합 코드는 낱말 모양이 아니다)
 }
 #: 목록 안 dict 의 키 경로로 정해진 제어 값: (목록 키, 항목 키) → 어휘(R8 — 다른 위치의 같은 키 이름은 면제하지 않는다).
