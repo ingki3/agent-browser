@@ -11,6 +11,7 @@
 
 판정 원칙(login_flow 의 캡차 판정과 같다):
 * 보이는 텍스트·제목·**보이는** 알려진 요소만 본다. 입력값·쿠키는 읽지 않는다.
+  예외(WS-93 R1): Bing 검색 입력칸(q) 값 하나만 읽는다 — 검색어에서 온 문장을 과제 판정에서 빼는 데만 쓴다.
 * 숨은 캡차 요소는 캡차가 아니다(네이버 로그인 화면의 숨은 input#ncaptchaSplit).
 * 긴 정상 페이지(본문 > LONG_PAGE_CHARS)에 단어만 섞인 경우는 NONE — 기사·문서에
   "Access Denied" 같은 말이 나올 수 있다.
@@ -18,10 +19,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 #: 이보다 긴 본문에서는 문구 일치만으로 차단/캡차로 보지 않는다.
 LONG_PAGE_CHARS = 3000
@@ -52,7 +54,7 @@ class Challenge:
 
 NO_CHALLENGE = Challenge()
 
-#: 보이는 요소만 센다. 값·쿠키는 읽지 않는다(텍스트·제목·요소 존재만).
+#: 보이는 요소만 센다. 값·쿠키는 읽지 않는다(텍스트·제목·요소 존재만 — 예외: Bing 검색칸 값, WS-93 R1).
 _PROBE_JS = r"""
 () => {
   const vis = el => {
@@ -78,8 +80,12 @@ _PROBE_JS = r"""
     break;
   }
   const body = document.body ? (document.body.innerText || '') : '';
+  // WS-93 R1: 두 쌍 규칙의 제외 판정에만 — Bing 결과 항목 존재와 검색 입력칸(q) 값(검색어)만 읽는다.
+  const serp = !!document.querySelector('#b_results .b_algo, .b_algo');
+  const qbox = document.querySelector('#sb_form_q, input[name=q], textarea[name=q]');
+  const query = qbox ? String(qbox.value || '').slice(0, 500) : '';
   return {title: document.title || '', text: body.slice(0, 4000), len: body.length, widget,
-          url: location.href};
+          url: location.href, serp, query};
 }
 """
 
@@ -105,7 +111,17 @@ _BLOCKED_PHRASES = (
 #: Cloudflare·Akamai 는 앞단(CDN) 화면이라 어느 사이트 도메인에서나 나오므로 목록에 없다(도메인 무관).
 SITE_VENDOR_DOMAINS = {
     "naver": ("naver.com",),
+    "bing": ("bing.com",),
 }
+
+#: WS-93 (#270) 두 줄이 **함께** 있어야 캡차인 사이트 고유 화면: ((줄1, 줄2), 벤더, 이유) — 소문자 비교.
+#: 한 줄만으로는 결제·가입 화면('One last step')에도 나오므로 둘 다 요구하고, 본문 ≤ SHORT_BODY_CHARS 이며 페이지
+#: 주소가 그 벤더 도메인일 때만 판정한다(다른 도메인의 인용·미러는 NONE). 이 규칙만 공백(NBSP·줄바꿈)을 정규화한다.
+_BING_REASON = "Bing 과제 화면(계속하려면 과제 해결 요구)"
+_PAIR_CAPTCHA_PHRASES = (
+    (("마지막 한 단계", "계속하려면 아래 과제 해결"), "bing", _BING_REASON),
+    (("one last step", "please solve the challenge below to continue"), "bing", _BING_REASON),
+)
 
 
 def vendor_domain_matches(vendor: str, url: Optional[str]) -> bool:
@@ -124,11 +140,42 @@ def _vendor_for(vendor: str, url: Optional[str]) -> str:
     return vendor if vendor_domain_matches(vendor, url) else "generic"
 
 
+def _flat(s: str) -> str:
+    return " ".join(s.lower().split())
+
+
+#: WS-93 R1: 짝이 맞는 따옴표 안 인용 구간(두 쌍 규칙에서만 뺀다). 짝이 안 맞으면 빼지 않는다.
+_QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|‘[^’]*’|「[^」]*」|'[^']*'")
+
+
+def _pair_source_free(flat_title: str, flat_text: str, pair: tuple, url: Optional[str], query: str) -> bool:
+    """WS-93 R1: 두 문장이 검색어·인용에서 온 것을 뺀 **보이는 본문**에 둘 다 남는가.
+
+    출처(URL q·검색 입력칸 값·제목) 중 문장을 담은 것이 있으면 제목을 빼고 본문에서 그 출처 문자열을 지운 뒤 다시 본다.
+    짝 맞는 따옴표 안 인용 구간도 뺀다(실제 과제 본문에는 따옴표가 없다).
+    """
+    try:
+        qs = parse_qs(urlparse(url or "").query).get("q", [])
+    except ValueError:
+        qs = []
+    sources = [_flat(s) for s in (*qs, query)] + [flat_title]
+    hay = f"{flat_title} {flat_text}"
+    if any(p in s for s in sources if s for p in pair):
+        hay = flat_text
+        for s in sorted({s for s in sources if s and any(p in s for p in pair)}, key=len, reverse=True):
+            hay = hay.replace(s, " ")
+    hay = _QUOTED.sub(" ", hay)
+    return all(p in hay for p in pair)
+
+
 def classify(title: str, text: str, length: int, widget: str,
-             last_status: Optional[int] = None, *, url: Optional[str] = None) -> Challenge:
+             last_status: Optional[int] = None, *, url: Optional[str] = None,
+             serp: Optional[bool] = None, query: Optional[str] = None) -> Challenge:
     """프로브 결과를 판정한다(순수 함수 — 브라우저 없이 시험 가능).
 
     url 은 페이지 주소 — 사이트 고유 문구의 vendor 는 주소가 그 사이트일 때만 채운다(WS-30b).
+    serp·query 는 두 쌍 규칙(WS-93)에만 쓴다(R1): serp=True(Bing 결과 항목 있음)면 그 규칙을 건너뛰고, query(검색 입력칸
+    값)·URL q·제목에서 온 문장은 뺀 본문으로 판정한다. 판독 실패(None)는 텍스트 규칙만.
     """
     if widget:
         vendor = "generic" if widget == "generic" else widget
@@ -139,6 +186,12 @@ def classify(title: str, text: str, length: int, widget: str,
     for phrase, vendor, reason in _CAPTCHA_PHRASES:
         if phrase in hay:
             return Challenge(ChallengeKind.CAPTCHA, reason, _vendor_for(vendor, url))
+    if length <= SHORT_BODY_CHARS and serp is not True:
+        flat = " ".join(hay.split())  # NBSP·줄바꿈 정규화(이 규칙만)
+        for pair, vendor, reason in _PAIR_CAPTCHA_PHRASES:
+            if (all(p in flat for p in pair) and vendor_domain_matches(vendor, url)
+                    and _pair_source_free(_flat(title), _flat(text), pair, url, query or "")):
+                return Challenge(ChallengeKind.CAPTCHA, reason, vendor)
     for phrase, vendor, reason in _BLOCKED_PHRASES:
         if phrase in hay:
             return Challenge(ChallengeKind.BLOCKED, reason, _vendor_for(vendor, url))
@@ -148,6 +201,12 @@ def classify(title: str, text: str, length: int, widget: str,
         return Challenge(ChallengeKind.BLOCKED,
                          f"HTTP {last_status} + 짧은 본문({length}자)", "generic")
     return NO_CHALLENGE
+
+
+def _serp_fields(s: dict) -> dict:
+    """WS-93 R1: 프로브의 결과 구조·검색칸 값. 모양이 틀리면 None(판독 실패 = 두 쌍 텍스트 규칙만, 엄격판도 거부하지 않음)."""
+    serp, query = s.get("serp"), s.get("query")
+    return {"serp": serp if isinstance(serp, bool) else None, "query": query if isinstance(query, str) else None}
 
 
 #: WS-68 R1 (#140 B1): 격리 world 에서 그대로 평가할 엄격 판정 식 — 같은 프로브(_PROBE_JS)를 즉시 호출한다.
@@ -179,7 +238,7 @@ async def detect_challenge_strict(page: Any, *, last_status: Optional[int] = Non
             or not isinstance(length, int) or isinstance(length, bool) or length < 0):
         return None
     return classify(title, text, length, widget, last_status,
-                    url=str(s.get("url") or getattr(page, "url", "") or ""))
+                    url=str(s.get("url") or getattr(page, "url", "") or ""), **_serp_fields(s))
 
 
 async def detect_challenge(page: Any, *, last_status: Optional[int] = None) -> Challenge:
@@ -197,4 +256,5 @@ async def detect_challenge(page: Any, *, last_status: Optional[int] = None) -> C
         str(s.get("widget") or ""),
         last_status,
         url=str(s.get("url") or getattr(page, "url", "") or ""),
+        **_serp_fields(s),
     )
