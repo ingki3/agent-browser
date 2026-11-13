@@ -5888,6 +5888,17 @@ class ActionDispatcher:
                 store.pop(e.element_id, None)  # 같은 관찰의 그 핸들만(다른 핸들로 바뀌었으면 건드리지 않는다)
         self.__dict__["_layer_extra"] = kept
 
+    def _release_previous_layer_extras(self) -> None:
+        """WS-95a R1: 새 관찰(엔진 등록 직후)에서 이전 관찰의 추가 레이어 구성원 핸들을 해제 — 엔진이 같은 id 를 새 핸들로
+        다시 매겼으면(이번 관찰의 요소) 건드리지 않고, 이전 관찰의 그 핸들 객체가 남아 있을 때만 지운다."""
+        held = self.__dict__.get("_layer_handles") or {}
+        store = getattr(self.ctx.engine, "_handles", None)
+        if not held or not isinstance(store, dict):
+            return
+        for eid, h in held.items():
+            if h is not None and store.get(eid) is h:
+                store.pop(eid, None)
+
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
     def _hidden_label_entry(self, handle: Any) -> Optional[Tuple[Any, Any]]:
@@ -6349,6 +6360,9 @@ class ActionDispatcher:
 
         overlay_data: Optional[Dict[str, Any]] = None
         # WS-95a(#275): 관찰마다 새로 — 열린 레이어의 반환 안 된 구성원(extras)·레이어 구성원 id(묶음 우선순위).
+        # R1(검증 B1): 이전 관찰의 extras 는 이 관찰 응답에 실리지 않는 한 해제 — 엔진이 방금 다시 매긴 id 는 새 핸들이라
+        # 같은 객체(이전 관찰의 그 핸들)만 지운다. 누를 수 있는 id = 가장 최근 관찰 응답에 실린 id.
+        self._release_previous_layer_extras()
         self.__dict__["_layer_extra"] = []
         self.__dict__["_layer_handles"] = {}
         self.__dict__["_layer_ids"] = None

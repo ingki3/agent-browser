@@ -354,3 +354,87 @@ async def test_hidden_control_ids_do_not_collide_with_layer_ids(site):
     for g in _groups(r):
         for m in g["members"]:
             assert names[m["id"]] is not None and names[m["id"]].startswith(m["name"]), (m, names[m["id"]])
+
+
+# ---------------------------------------------------------------- R1(검증 B1): 재관찰 뒤 응답 밖 옛 추가 id 수명
+
+_COUNT_DAY_CLICKS = ("() => {window.dayClicks=0;document.addEventListener('click',e=>{"
+                     "if(e.target.closest&&e.target.closest('#cal ul.day a'))window.dayClicks++;},true);}")
+_CLOSE = {
+    "hide": "() => {document.querySelector('#cal').style.display='none';}",
+    "remove": "() => {window._cal=document.querySelector('#cal');window._cal.remove();}",
+}
+_REOPEN = {
+    "hide": "() => {document.querySelector('#cal').style.display='';}",
+    "remove": "() => {document.body.appendChild(window._cal);}",
+}
+
+
+def _shown_ids(r: ActionResult) -> Set[str]:
+    return {e["element_id"] for e in _elements(r)} | _member_ids(r)
+
+
+@requires_chromium
+@pytest.mark.parametrize("mode", ["hide", "remove"])
+async def test_closed_reobserve_old_extra_refused_after_reshow(site, mode):
+    """달력 닫힘(숨김·제거) → 기본 재관찰 → 다시 표시: 새 응답에 없는 옛 추가 id 는 등록 해제 — 누르면 기준과 같이
+    E_TOCTOU_MISMATCH·효과 0. 다시 표시한 뒤 새 관찰의 추가 id 는 정상으로 눌린다."""
+
+    async def flow(server, r):
+        eid = _dec_day(r, "25")
+        assert eid not in {e["element_id"] for e in _elements(r)}
+        page = server._dispatcher.ctx.page
+        await page.evaluate(_COUNT_DAY_CLICKS)
+        await page.evaluate(_CLOSE[mode])
+        closed = await server.call_tool(OBSERVE, {})
+        assert closed.success, closed.error_message
+        out = {"in_closed": eid in _shown_ids(closed), "registered": eid in _registered(server)}
+        await page.evaluate(_REOPEN[mode])
+        old = await server.call_tool(CLICK, {"element_id": eid, "epoch": r.snapshot_epoch})
+        out.update(old=old, effects=await page.evaluate("window.dayClicks"),
+                   shown=await page.inner_text("#cal .foot .d"))
+        fresh = await server.call_tool(OBSERVE, {})
+        new_eid = _dec_day(fresh, "25")
+        assert new_eid not in {e["element_id"] for e in _elements(fresh)}
+        out["new"] = await server.call_tool(CLICK, {"element_id": new_eid, "epoch": fresh.snapshot_epoch})
+        out["new_shown"] = await page.inner_text("#cal .foot .d")
+        return out
+
+    _r, out = await _run(f"{site}/hana_p", then=flow)
+    assert out["in_closed"] is False
+    assert out["registered"] is False, "옛 추가 id 가 새 응답 밖에서 살아 있다"
+    old = out["old"]
+    assert old.success is False and old.error_code is ErrorCode.TOCTOU_MISMATCH, (old.error_code, old.error_message)
+    assert out["effects"] == 0 and out["shown"] == "2026.11.13(금)", (out["effects"], out["shown"])
+    new = out["new"]
+    assert new.success, (new.error_code, new.error_message)
+    assert out["new_shown"] == "2026년 12월 25", out["new_shown"]
+
+
+@requires_chromium
+async def test_consecutive_observe_only_second_extras_valid(site):
+    """레이어를 연 채 두 번 관찰(사이에 레이어 밖 링크가 줄어 후보 수가 준다): 두 번째 응답의 추가 id 만 유효 — 첫 응답에만
+    있던 추가 id(두 번째 관찰이 다시 매기지 않는 큰 번호)는 등록 해제·누르면 거부·효과 0."""
+
+    async def flow(server, r):
+        page = server._dispatcher.ctx.page
+        await page.evaluate(_COUNT_DAY_CLICKS)
+        await page.evaluate("() => {document.querySelectorAll('nav').forEach(n=>n.remove());}")
+        second = await server.call_tool(OBSERVE, {})
+        assert second.success, second.error_message
+        first_only = _member_ids(r) - {e["element_id"] for e in _elements(r)} - _shown_ids(second)
+        regs = _registered(server)
+        stale = sorted(first_only, key=lambda x: int(x[2:]))
+        res = await server.call_tool(CLICK, {"element_id": stale[0], "epoch": r.snapshot_epoch}) if stale else None
+        effects = await page.evaluate("window.dayClicks")
+        extra2 = sorted(_member_ids(second) - {e["element_id"] for e in _elements(second)}, key=lambda x: int(x[2:]))
+        ok = await server.call_tool(CLICK, {"element_id": extra2[-1], "epoch": second.snapshot_epoch}) if extra2 else None
+        return second, first_only, regs, res, effects, ok, await page.evaluate("window.dayClicks") - effects
+
+    r, (second, first_only, regs, res, effects, ok, ok_effects) = await _run(f"{site}/hana_p", then=flow)
+    assert first_only, "조건: 첫 응답에만 있던 추가 id 가 있어야 수명을 잰다"
+    assert not regs & first_only, sorted(regs & first_only)
+    assert res.success is False and res.error_code is ErrorCode.TOCTOU_MISMATCH, (res.error_code, res.error_message)
+    assert effects == 0
+    assert ok is not None, "조건: 두 번째 응답에도 elements 밖 추가 id 가 있어야 한다"
+    assert ok.success and ok_effects == 1, (ok.error_code, ok.error_message, ok_effects)
