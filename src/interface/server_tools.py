@@ -11,9 +11,9 @@ from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
 from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
-from interface.server_common import _wait_timeout
+from interface.server_common import _wait_timeout, undeclared_args_message
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
-                                      action_from_tool)
+                                      action_from_tool, declared_args, undeclared_keys)
 from interface.server_envelope import cap_result_size, settle_returned_chars
 from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
@@ -79,6 +79,11 @@ class ToolsMixin:
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
+        extra = undeclared_keys(name, args)
+        if extra:
+            # WS-95b(#278): 서버 도구도 액션 도구와 같은 규칙·같은 문장(도구 본문을 실행하지 않는다).
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": undeclared_args_message(extra, declared_args(name) or ())}
         if name == RECIPE_TOOL:
             # WS-57 R2(B1): 레시피 재생은 이 작업 공간의 액션 여러 개 — 단계 사이에 같은 작업 공간의 다른 호출이 끼지 않게
             # 재생 전체를 직렬화 구간으로(안쪽 call_tool 은 같은 흐름이라 다시 잡지 않는다).
@@ -509,6 +514,7 @@ class ToolsMixin:
         params: Dict[str, Any] = dict(arguments or {})
         # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
         approval_id = params.pop("approval_id", None)
+        raw_keys = list(params)  # WS-95b: 선언 밖 검사는 서버 경계 키를 뗀 원래 키로, 계약 검증 **뒤**에
         refused = await self._refuse_before_validation(action, params, capture)
         if refused is not None:
             return refused
@@ -516,6 +522,12 @@ class ToolsMixin:
         if isinstance(checked, ActionResult):
             return checked
         params = checked
+        extra = undeclared_keys(name, raw_keys)
+        if extra:
+            # WS-95b(#278): 계약 모델은 모르는 키를 조용히 버린다 — 오타·옛 이름(scroll amount 등)이 기본값으로 실행되지
+            # 않게 실행 전에 거부한다(고정 문장 + 허용 키, 이름 반향은 ^[a-z_]{1,32}$ 만).
+            return self._error_result(action, ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                                      undeclared_args_message(extra, declared_args(name) or ()))
 
         # WS-57 R2(B1): 같은 작업 공간의 게이트·디스패치는 한 번에 하나 — 디스패처가 호출 임시 상태(_dialogs·_nav_info·
         # _opened_pages·_top_attribution)를 인스턴스에 두고 dispatch 입구에서 초기화하므로, 겹치면 남의 alert·이동이 내

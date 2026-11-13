@@ -6,7 +6,8 @@ WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름�
 from __future__ import annotations
 
 import os
-from typing import Any
+import re
+from typing import Any, Iterable, Sequence
 
 from interface.handoff import WAIT_DEFAULT_S, WAIT_MAX_S
 
@@ -17,6 +18,24 @@ def _wait_timeout(raw: Any) -> float:
     except (TypeError, ValueError):
         value = WAIT_DEFAULT_S
     return max(0.0, min(WAIT_MAX_S, value))
+
+
+#: WS-95b(#278): 선언 밖 인자 거부 문구에 이름을 그대로 보여 줄 키 모양 — 그 밖(주입 문구·긴 이름·대문자·비ASCII)은 개수만.
+_ECHO_KEY = re.compile(r"[a-z_]{1,32}")
+
+
+def undeclared_args_message(extra: Iterable[Any], allowed: Sequence[str]) -> str:
+    """선언되지 않은 인자 거부의 고정 문장(액션 도구·서버 도구·browser_batch 공용, WS-95b)."""
+    keys = list(extra)
+    shown = sorted(k for k in keys if isinstance(k, str) and _ECHO_KEY.fullmatch(k))
+    hidden = len(keys) - len(shown)
+    from recipes.store import clean_text
+
+    text = f"선언되지 않은 인자 {len(keys)}개: [{', '.join(shown)}]"
+    if hidden:
+        text += f" ({hidden}개 이름 생략)"
+    text += f" — 허용: [{', '.join(allowed)}]. 실행하지 않았습니다 — 선언된 인자만으로 다시 호출하세요."
+    return clean_text(text, 600)
 
 
 def _iso(ts: float) -> str:

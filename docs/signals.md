@@ -35,6 +35,8 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 **선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
 
+**선언 밖 인자(WS-95b #278).** 도구 스키마에 없는 인자는 신호 없이 실행하지 않고 `E_FEATURE_NOT_IMPLEMENTED`(`retry_safe=true`, 고정 문장 + 허용 키 목록, 이름은 `^[a-z_]{1,32}$` 모양만 반향)로 거부합니다 — `data` 는 비어 있고 새 응답 키는 없습니다. 상세: [mcp-integration.md](mcp-integration.md#관찰--액션-흐름).
+
 ## Enter 뒤 상태 신호 (`data.after_enter`, WS-91 #246)
 
 `type_text(press_enter=true)` 와 `press_key("Enter")` 결과에 Enter 를 받은 그 칸의 상태가 고정 어휘·숫자로 붙습니다 — 성공·실패 결과 모두(예: 값이 비워져 사후조건 실패인 `E_TIMEOUT` 에도). 칸 값·자동완성 글자는 싣지 않습니다(`changed` 도 바뀐 값 없음, 입력값 표기는 기존 `value_applied` 규칙 그대로). 민감 칸(비밀번호·SecretStore 값을 넣은 칸·가림 표식 칸)이면 키 자체가 없습니다 — `press_key` 는 Enter 를 받은 **그 노드**로 판정합니다(다른 칸에 비밀을 친 뒤 일반 칸 Enter 는 있음, 판독 실패면 보수로 없음). 값은 고정 어휘라 주소 등에서 같은 낱말이 비밀로 등록돼도 가려지지 않고, 어휘 밖 값은 응답에서 `unknown`(options 는 0)입니다(R1). Enter 를 보내지 않은 결과(`typed_without_enter`)에도 없습니다.
