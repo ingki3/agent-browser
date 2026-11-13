@@ -436,6 +436,17 @@ class ToolsMixin:
             # WS-81: 요소를 자른 뒤 elements 밖 element_id(라벨·행 링크)를 가리키는 항목이 남지 않게 — 지웠으면 길이 다시.
             if hc.drop_orphans(result.data, hc.element_ids(result.data)):
                 settle_returned_chars(result)
+        if action is ActionType.OBSERVE_PAGE and result.success and isinstance(result.data, dict):
+            release = getattr(self._dispatcher, "release_layer_extras", None)
+            if release is not None:
+                from perception.repeated import repeated_ids
+
+                # WS-95a(#275, 리뷰 B2): 크기 맞춤 뒤 응답 묶음에 남지 않은 레이어 추가 구성원 id 는 등록 해제 — 보이지 않는
+                # 살아 있는 id 0(다시 맞추면 더 해제만 한다).
+                obs = result.data.get("observation")
+                els = obs.get("elements") if isinstance(obs, dict) else None
+                shown = {e.get("element_id") for e in els if isinstance(e, dict)} if isinstance(els, list) else set()
+                release(shown | repeated_ids(result.data.get("repeated")))
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
                attach_injection_signal: Any, window: Any, layers: Optional[List[bool]] = None) -> None:

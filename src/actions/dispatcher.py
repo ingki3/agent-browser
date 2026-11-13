@@ -5815,6 +5815,8 @@ class ActionDispatcher:
             logger.debug("오버레이 구성원 판독 실패: %s", type(exc).__name__)
         if full:
             await repeated_v1160.annotate_repeated(page, engine, els)
+            if members is not None:
+                self.__dict__["_layer_ids"] = self._layer_scope(els, members, list(range(len(els))))[1]
             if members is None or not any(members):
                 return observed, None
             order = ov.plan_full(len(els), members)
@@ -5825,14 +5827,20 @@ class ActionDispatcher:
         base = els[:n]
         await repeated_v1160.annotate_repeated(page, engine, base)
         final_idx, _pushed = ov.plan_top_n(len(els), members, top_n) if members is not None else (list(range(n)), [])
-        keep = {els[i].element_id for i in final_idx}
+        # WS-95a(#275): 반환 안 된 레이어 구성원(extras)은 반복 묶음 입력용으로 핸들을 남긴다 — 응답 묶음에 안 실리면
+        # 관찰 끝(release_layer_extras)에서 해제한다.
+        extras, layer_ids = self._layer_scope(els, members, final_idx) if members is not None else ([], None)
+        self.__dict__["_layer_extra"] = extras
+        self.__dict__["_layer_ids"] = layer_ids
+        keep = {els[i].element_id for i in final_idx} | {e.element_id for e in extras}
         store = getattr(engine, "_handles", None)
         if isinstance(store, dict):
             for e in els:
                 if e.element_id not in keep:
                     store.pop(e.element_id, None)
+            self.__dict__["_layer_handles"] = {e.element_id: store.get(e.element_id) for e in extras}
         added = [els[i] for i in final_idx if i >= n]
-        if not added:
+        if not added and not extras:
             return with_elements(base), None
         final = [els[i] for i in final_idx]
         saved = {}
@@ -5841,13 +5849,44 @@ class ActionDispatcher:
             if h is not None:
                 saved[e.element_id] = (h.group_path, h.group_heading)
         added_ids = {e.element_id for e in added}
-        await repeated_v1160.annotate_repeated(page, engine, final)
+        # 2차 고정(호출 수 2 유지): 최종 목록 + extras — extras 도 v1160 고정을 받고, base 핸들은 1차 결과로 원복.
+        await repeated_v1160.annotate_repeated(page, engine, final + extras)
         for eid, (path, pin) in saved.items():
             if eid not in added_ids:
                 h = engine.get_handle(eid)
                 if h is not None:
                     h.group_path, h.group_heading = path, pin
+        if not added:
+            return with_elements(base), None
         return with_elements(final), {"kinds": overlay["kinds"], "promoted": len(added)}
+
+    def _layer_scope(self, els: List[Any], members: List[bool],
+                     final_idx: List[int]) -> Tuple[List[Any], Optional[frozenset]]:
+        """WS-95a(#275): (반환 안 된 레이어 구성원 — 엔진 순위 순, 레이어 구성원 id 집합 또는 None).
+
+        구성원이 없으면 ([], None) — 반복 묶음 입력·우선순위가 기준 그대로(바이트 동일)."""
+        if not any(members):
+            return [], None
+        fset = set(final_idx)
+        extras = [els[i] for i in range(len(els)) if members[i] and i not in fset]
+        return extras, frozenset(els[i].element_id for i in range(len(els)) if members[i])
+
+    def release_layer_extras(self, keep: Any) -> None:
+        """WS-95a: 마지막 관찰의 추가 레이어 구성원 중 keep(응답에 실린 id)에 없는 것을 등록 해제(보이지 않는 살아 있는 id 0).
+
+        크기 맞춤이 묶음을 더 뺄 때마다 다시 불린다 — 해제만 하므로(되살리지 않음) 여러 번 불려도 안전."""
+        extras = self.__dict__.get("_layer_extra") or []
+        if not extras:
+            return
+        store = getattr(self.ctx.engine, "_handles", None)
+        held = self.__dict__.get("_layer_handles") or {}
+        kept = []
+        for e in extras:
+            if e.element_id in keep:
+                kept.append(e)
+            elif isinstance(store, dict) and store.get(e.element_id) is held.get(e.element_id):
+                store.pop(e.element_id, None)  # 같은 관찰의 그 핸들만(다른 핸들로 바뀌었으면 건드리지 않는다)
+        self.__dict__["_layer_extra"] = kept
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
@@ -6306,9 +6345,13 @@ class ActionDispatcher:
         # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
         # 관찰 정보 전용이라 핸들을 건드리지 않는다.
         from perception import repeated_v1160
-        from perception.repeated import annotate_repeated
+        from perception.repeated import annotate_repeated, repeated_ids
 
         overlay_data: Optional[Dict[str, Any]] = None
+        # WS-95a(#275): 관찰마다 새로 — 열린 레이어의 반환 안 된 구성원(extras)·레이어 구성원 id(묶음 우선순위).
+        self.__dict__["_layer_extra"] = []
+        self.__dict__["_layer_handles"] = {}
+        self.__dict__["_layer_ids"] = None
         if overlay is None:
             await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         else:
@@ -6317,7 +6360,13 @@ class ActionDispatcher:
         data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         if overlay_data is not None:
             data["overlay"] = overlay_data
-        repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
+        # WS-95a: 반복 묶음 입력 = 반환 elements + 반환 안 된 레이어 구성원(elements 는 그대로). 묶음에 안 든 extras 는 해제.
+        extras = list(self.__dict__.get("_layer_extra") or [])
+        layer_ids = self.__dict__.get("_layer_ids")
+        repeated = await annotate_repeated(page, self.ctx.engine, list(observed.elements) + extras,
+                                           **({"layer_ids": layer_ids} if layer_ids else {}))
+        if extras:
+            self.release_layer_extras({e.element_id for e in observed.elements} | repeated_ids(repeated))
         await self._record_panel_heads(repeated, page)
         if repeated is not None:
             data["repeated"] = repeated
