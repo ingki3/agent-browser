@@ -145,7 +145,9 @@ async def test_v1160_pins_engine_original_order_first_then_added_only(monkeypatc
     off_ids = [e["element_id"] for e in off.data["observation"]["elements"]]
     assert calls == [off_ids], calls
     assert len(on_calls) == 2 and on_calls[0] == off_ids, on_calls
-    assert on_calls[1] == [e["element_id"] for e in on.data["observation"]["elements"]]
+    # WS-95a(#275): 2차 = 최종 목록 + 반환 안 된 레이어 구성원(같은 호출에 합쳐 호출 수 2 유지) — 앞은 최종 목록 그대로.
+    final_ids = [e["element_id"] for e in on.data["observation"]["elements"]]
+    assert on_calls[1][:len(final_ids)] == final_ids
 
 
 # ------------------------------------------------------------------ 적대: 오탐 0 + 꺼진 쪽 바이트 동일

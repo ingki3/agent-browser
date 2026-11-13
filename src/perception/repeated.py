@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import unicodedata
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Set
 
 logger = logging.getLogger(__name__)
 
@@ -623,10 +623,12 @@ def _block_chars(groups: Sequence[Dict[str, Any]]) -> int:
     return len(json.dumps(list(groups), ensure_ascii=False, separators=(",", ":")))
 
 
-async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> Optional[Dict[str, Any]]:
+async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any], *,
+                            layer_ids: Optional[Collection[str]] = None) -> Optional[Dict[str, Any]]:
     """관찰 결과의 대상(핸들)으로 쌍둥이 묶음을 계산해 data.repeated 블록을 만든다(없으면 None).
 
     핸들을 바꾸지 않는다(R12 — 고정은 perception.repeated_v1160). 페이지 계산이 실패하면 None — 관찰은 그대로 성공한다(부가 정보).
+    layer_ids(WS-95a): 열린 레이어 구성원 id — 주면 구성원이 모두 레이어 안인 세트를 크기 예산에서 먼저 둔다(None 이면 기준 순서).
     """
     targets: List[Dict[str, Any]] = []
     handles: List[Any] = []
@@ -652,7 +654,7 @@ async def annotate_repeated(page: Any, engine: Any, elements: Sequence[Any]) -> 
     sets = raw.get("sets") if isinstance(raw, dict) else None
     if not isinstance(sets, list) or not sets:
         return None
-    block = _build_block(sets, handles)
+    block = _build_block(sets, handles, layer_ids)
     if block is not None:
         heads = panel_heads(sets, handles)
         if heads:
@@ -791,7 +793,27 @@ def _distinct_headings(groups: Sequence[Dict[str, Any]]) -> bool:
     return bool(heads) and all(isinstance(h, str) and h for h in heads) and len(set(heads)) == len(heads)
 
 
-def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]]:
+def repeated_ids(block: Any) -> Set[str]:
+    """반복 묶음 블록에 실린 구성원 id 전부(블록이 없거나 모양이 어긋나면 빈 집합)."""
+    out: Set[str] = set()
+    groups = block.get("groups") if isinstance(block, dict) else None
+    for g in groups if isinstance(groups, list) else []:
+        for m in (g.get("members") if isinstance(g, dict) else None) or []:
+            if isinstance(m, dict) and isinstance(m.get("id"), str):
+                out.add(m["id"])
+    return out
+
+
+def _in_layer(built: Dict[str, Any], layer_ids: Optional[Collection[str]]) -> bool:
+    """WS-95a(리뷰 B4): 세트의 공개 구성원이 모두 열린 레이어 안인가(레이어가 없으면 False — 기준 순서)."""
+    if not layer_ids:
+        return False
+    ids = repeated_ids(built)
+    return bool(ids) and ids <= set(layer_ids)
+
+
+def _build_block(sets: List[Any], handles: List[Any],
+                 layer_ids: Optional[Collection[str]] = None) -> Optional[Dict[str, Any]]:
     built: List[Dict[str, Any]] = []
     for s in sets:
         groups = s.get("groups") if isinstance(s, dict) else None
@@ -810,7 +832,10 @@ def _build_block(sets: List[Any], handles: List[Any]) -> Optional[Dict[str, Any]
     compact = _block_chars([g for b in built for g in b["groups"]]) > REPEATED_MAX_CHARS
     # WS-74(#190) F2: 실제로 보일 묶음들이 서로 다른 표제를 가진 세트(두 달 달력·상품 행 — 묶음을 고를 근거) 먼저,
     # 그 다음 큰 세트·앞 순위. 표시 전용 — 고정(repeated_v1160)·실행 직전 확인·batch 판정은 이 순서를 쓰지 않는다.
-    built.sort(key=lambda b: (not _distinct_headings(b["compact_groups"] if compact else b["groups"]),
+    # WS-95a(리뷰 B4): 열린 레이어(달력) 세트를 그보다도 먼저 — 표제가 null 이어도 레이어 밖 큰 세트에 밀려 빠지지 않게
+    # (fit_repeated 는 뒤부터 빼므로 마지막까지 남는다). 레이어가 없으면 이 축은 모두 같아 기준 순서 그대로.
+    built.sort(key=lambda b: (not _in_layer(b, layer_ids),
+                              not _distinct_headings(b["compact_groups"] if compact else b["groups"]),
                               -b["count"], b["best"]))
     kept: List[Dict[str, Any]] = []
     omitted = 0
