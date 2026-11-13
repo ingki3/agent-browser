@@ -1646,6 +1646,8 @@ class _NodeDetached(Exception):
 _OVERLAY_SIGNAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.PRESS_KEY})
 #: 그 판독의 상한(초) — 넘으면 신호 없음(액션 결과는 그대로).
 _OVERLAY_SIGNAL_TIMEOUT_S = 0.25
+#: WS-94(#272): extract_all 격리 판독(항목·렌더 여부·오버레이 소속 한 번) 상한(초) — 넘으면 기준 호출 그대로.
+_EXTRACT_VIEW_TIMEOUT_S = 1.0
 #: WS-87(#222, 리뷰 B1): 실행 직전 '열린 모달 밖 대상' 신호(data.outside_modal)를 보는 요소 액션 — 신호만, 누름은 그대로.
 _OUTSIDE_MODAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.HOVER, ActionType.CHECK_BOX, ActionType.SELECT_OPTION})
 
@@ -7341,6 +7343,32 @@ class ActionDispatcher:
             data={"condition": condition},
         )
 
+    async def _extract_view(self, selector: str, attrs: List[str]) -> Optional[Tuple[List[Dict[str, Any]], List[bool],
+                                                                                    List[bool]]]:
+        """WS-94: extract_all 항목·렌더 여부·오버레이 소속(격리 world 한 번, `actions.extract_visible`). 못 읽으면 None."""
+        import secrets
+
+        from actions import extract_visible as ev
+
+        try:
+            raw = await asyncio.wait_for(self._doc_isolated_eval(ev.extract_all_expr(secrets.token_hex(8), selector,
+                                                                                     attrs)),
+                                         _EXTRACT_VIEW_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — 못 읽으면 기준 호출 그대로(selector 오류·못 찾음 판정도 거기서)
+            logger.debug("extract_all 격리 판독 실패: %s", type(exc).__name__)
+            return None
+        return ev.parse_rows(raw)
+
+    def take_extract_layers(self, items: Any) -> Optional[List[bool]]:
+        """WS-94(B3): 직전 extract_all 의 항목별 오버레이 소속(1회 소비). 그 결과의 항목 목록과 같을 때만(아니면 None)."""
+        held, self._extract_layers = getattr(self, "_extract_layers", None), None
+        if held is None or not isinstance(items, list):
+            return None
+        ref, layer = held
+        if len(ref) != len(items) or (ref is not items and ref != items):
+            return None
+        return list(layer)
+
     async def _extract(self, params: Dict[str, Any]) -> ActionResult:
         page = self.ctx.page
         # 필수 인자 누락은 KeyError 예외가 아니라 명확한 실패로 보고한다.
@@ -7359,6 +7387,20 @@ class ActionDispatcher:
             )
         attributes: Sequence[str] = params.get("attributes", [])
         extract_all = params.get("extract_all", False)
+        self._extract_layers = None
+        if extract_all:
+            # WS-94(#272): 렌더되지 않는 항목 제외 + 열린 오버레이 소속(격리 world 한 번). 못 읽으면 아래 기준 호출 그대로.
+            view = await self._extract_view(selector, list(attributes))
+            if view is not None:
+                from actions.extract_visible import keep_rendered
+
+                items, layer, omitted = keep_rendered(*view)
+                if any(layer):
+                    self._extract_layers = (items, layer)
+                data: Dict[str, Any] = {"items": items}
+                if omitted:
+                    data["hidden_omitted"] = omitted
+                return self._result(success=True, action=ActionType.EXTRACT, retry_safe=True, data=data)
 
         try:
             payload = await page.evaluate(

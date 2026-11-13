@@ -14,7 +14,7 @@ from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
 from interface.server_common import _wait_timeout
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
                                       action_from_tool)
-from interface.server_envelope import cap_result_size, settle_returned_chars
+from interface.server_envelope import _TRUNC_HINT_EXTRACT_LAYER, cap_result_size, envelope_json, settle_returned_chars
 from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
@@ -303,13 +303,15 @@ class ToolsMixin:
             # WS-75 ③~⑤: 내용 경로(관찰 요소·요약·반복 묶음·extract 항목)를 지금 레지스트리로 **한 번** 가린 사본으로 바꾼 뒤
             # 크기 맞춤(④)을 그 사본 위에서 한다 — 글자 자르기는 늘 가린 글자를 자른다(B1), 반복 직렬화는 다시 훑지 않는다(B2).
             # 사본을 만든 뒤 version 이 바뀌면(새 값 등록) **자르기 전 원본에서** ③부터 다시(NB-h).
+            # WS-94(#272, B3): extract_all 항목의 열린 레이어 소속(디스패처 속성, 응답 키 아님) — 크기 맞춤의 재배치에만 쓴다.
+            layers = self._extract_layers_of(action, result)
             original = result.data
             version = secret_registry.version()
             for _ in range(self._MASK_ATTEMPTS):
                 version = secret_registry.version()
                 result.data = content_view(original)
                 with content_masked(version):
-                    self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+                    self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal, layers=layers)
                 if secret_registry.version() == version:
                     break
             with content_masked(version):
@@ -322,20 +324,20 @@ class ToolsMixin:
                 version = secret_registry.version()
                 result.data = content_view(original)
                 with content_masked(version):
-                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
                 if secret_registry.version() != version:
                     # 끝까지 흔들림(fail-closed — 누출보다 생략): 내용 칸의 페이지 글자를 고정 문구로 바꾼 원본에서 자른다.
                     from security.public_url import content_withheld
 
                     result.data = content_withheld(original)
-                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             if sink is not None and "reserve" in sink:
                 # WS-78 R1 R2: 묶음 응답 크기 맞춤용 — 관찰을 다시 실행하지 않고 **이 원본**(자르기 전)에서 더 작은
                 # 예산으로 다시 맞춘다(가림 → 크기 맞춤 순서·WS-74 요약 재구성·WS-68 max_chars/limit 경로 그대로).
                 sink["refit"] = self._batch_refitter(result, original, action, max_chars + int(sink.get("reserve") or 0),
-                                                     scan_chars)
+                                                     scan_chars, layers=layers)
             return result
         finally:
             try:
@@ -347,9 +349,39 @@ class ToolsMixin:
                 if capture:
                     self._captures_inflight -= 1
 
+    def _extract_layers_of(self, action: Any, result: ActionResult) -> Optional[List[bool]]:
+        """WS-94(B3): 이 extract 결과 항목의 열린 레이어 소속(디스패처가 1회 넘김, 항목 목록이 같을 때만). 그 외 None."""
+        if action is not ActionType.EXTRACT:
+            return None
+        take = getattr(self._dispatcher, "take_extract_layers", None)
+        if not callable(take):
+            return None
+        marks = take(result.data.get("items") if isinstance(result.data, dict) else None)
+        return marks if result.success else None
+
+    def _layers_first(self, result: ActionResult, layers: List[bool], max_chars: int, scan_chars: int,
+                      attach_injection_signal: Any) -> Optional[str]:
+        """WS-94(B3): 봉투(주입 신호 포함)가 상한을 넘을 때만 열린 레이어 안 항목을 앞으로 — 가린 사본 위 새 목록(원본 불변).
+        주입 신호 **앞**에서 하므로 신호의 where 번호는 옮긴 뒤 항목을 가리킨다. 옮겼으면 그때 쓸 hint, 아니면 None."""
+        from actions.extract_visible import layer_first_order
+
+        items = result.data.get("items") if isinstance(result.data, dict) else None
+        if not result.success or not isinstance(items, list) or len(items) != len(layers):
+            return None
+        order = layer_first_order(layers)
+        if order is None:
+            return None
+        if len(envelope_json(result)) <= max_chars:
+            probe = result.model_copy(update={"data": dict(result.data)})
+            attach_injection_signal(probe, max_scan_chars=scan_chars)
+            if len(envelope_json(probe)) <= max_chars:
+                return None
+        result.data["items"] = [items[i] for i in order]
+        return _TRUNC_HINT_EXTRACT_LAYER
+
     def _fit_result(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
-                    attach_injection_signal: Any) -> None:
-        """크기 맞춤(WS-75 ④ — 가린 사본 위에서): saved_pages → 반복 묶음 → 주입 신호 → 항목 경계 자르기."""
+                    attach_injection_signal: Any, layers: Optional[List[bool]] = None) -> None:
+        """크기 맞춤(WS-75 ④ — 가린 사본 위에서): saved_pages → 반복 묶음 → (WS-94 레이어 먼저) → 주입 신호 → 항목 경계 자르기."""
         if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
             from recipes.saved_pages import fit_saved_pages
 
@@ -381,10 +413,17 @@ class ToolsMixin:
                          finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
                          limit=self.max_result_chars)
 
+        layer_hint = None
+        if action is ActionType.EXTRACT and layers:
+            # WS-94(#272): 열린 레이어(모달·달력) 안 항목을 먼저 — 넘을 때만, 주입 신호 앞(where 번호 = 옮긴 뒤 항목).
+            layer_hint = self._layers_first(result, layers, max_chars, scan_chars, attach_injection_signal)
         attach_injection_signal(result, max_scan_chars=scan_chars)
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
-        cap_result_size(result, max_chars, limit=self.max_result_chars)
+        if layer_hint is not None:
+            cap_result_size(result, max_chars, limit=self.max_result_chars, extract_hint=layer_hint)
+        else:
+            cap_result_size(result, max_chars, limit=self.max_result_chars)
         if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
             from perception.select_options import drop_orphans, element_ids
 
@@ -399,15 +438,15 @@ class ToolsMixin:
                 settle_returned_chars(result)
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
-               attach_injection_signal: Any, window: Any) -> None:
+               attach_injection_signal: Any, window: Any, layers: Optional[List[bool]] = None) -> None:
         """R4 S1 마지막 재시도: 원본에서 새로 만든 사본을 크기 맞춤하고, 이미 소비한 창 보고를 옮겨 싣고 길이를 맞춘다."""
-        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal, layers=layers)
         if window is not None and isinstance(result.data, dict):
             result.data["window"] = window
         settle_returned_chars(result)
 
     def _batch_refitter(self, result: ActionResult, original: Any, action: Any, base_chars: int,
-                        scan_chars: int) -> Any:
+                        scan_chars: int, layers: Optional[List[bool]] = None) -> Any:
         """WS-78 R1 R2: 묶음 응답 관찰을 **다시 실행하지 않고** 같은 원본(자르기 전 data)에서 더 작은 예산으로 다시 맞추는
         함수 refit(reserve) -> ActionResult. 첫 맞춤과 같은 순서(가린 사본 → 크기 맞춤, version 이 흔들리면 원본에서 다시,
         끝까지 흔들리면 내용 생략)이고, 이미 소비한 창 보고(data.window)는 옮겨 싣는다. 결과 객체는 바꾸지 않는다."""
@@ -424,11 +463,11 @@ class ToolsMixin:
                 version = secret_registry.version()
                 trial.data = content_view(original)
                 with content_masked(version):
-                    self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
                 if secret_registry.version() == version:
                     return trial
             trial.data = content_withheld(original)
-            self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+            self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
             return trial
 
         return refit
