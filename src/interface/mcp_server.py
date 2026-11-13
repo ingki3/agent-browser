@@ -94,6 +94,7 @@ from interface.server_envelope import (  # noqa: E402,F401
     ENVELOPE_RULE,
     MIN_MAX_RESULT_CHARS,
     _TRUNC_HINT_EXTRACT,
+    _TRUNC_HINT_EXTRACT_LAYER,
     _TRUNC_HINT_OBSERVE,
     _TRUNC_HINT_TEXT,
     _compact_observation,
