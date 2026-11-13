@@ -35,6 +35,8 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 **선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
 
+**선언 밖 인자(WS-95b #278).** 도구 스키마에 없는 인자는 신호 없이 실행하지 않고 `E_FEATURE_NOT_IMPLEMENTED`(액션 도구는 `retry_safe=true`, 고정 문장 + 허용 키 목록, 이름은 `^[a-z_]{1,32}$` 모양만 최대 5개 반향)로 거부합니다 — 브라우저 시작·탭·창 전환 같은 준비보다 먼저이고, `data` 는 비어 있고 새 응답 키는 없습니다(서버 도구 응답에는 `retry_safe` 가 없습니다). 상세: [mcp-integration.md](mcp-integration.md#관찰--액션-흐름).
+
 ## extract_all — 렌더되지 않는 항목 제외·열린 레이어 먼저 (`data.hidden_omitted`, WS-94 #272)
 
 **렌더되지 않는 항목 제외.** `extract(extract_all=true)` 는 일치한 요소 중 렌더되지 않는 것 — `checkVisibility()` 가 거짓(자신·조상 `display:none`, `hidden` 속성·비활성 탭 패널, 닫힌 `<details>` 내용, `content-visibility:hidden`)이거나 `visibility` 가 visible 이 아니면서 보이는 글자(innerText)가 빈 것 — 을 빼고, 뺀 개수를 정수 `data.hidden_omitted` 로 알립니다(0 이면 키 없음). `display:contents` 그릇은 부모, `<option>`·`<optgroup>` 은 소속 `<select>` 기준입니다. 일치 전부가 렌더되지 않는 선택(`meta`·`script`·`input[type=hidden]`·접힌 메뉴만 고른 selector)은 예전과 같은 결과입니다(닫힌 `<select>` 의 `option` 은 렌더된 것으로 봅니다). **숨은 값(hidden input 값·접힌 메뉴 링크 등)은 그것만 고르는 selector 나 단일 `extract`(`extract_all` 없이 — 바뀌지 않음)로 읽으십시오.** `data.truncated.total_items` 는 뺀 뒤 개수입니다. 숨은 요소 글자에 실린 주입 문구는 항목과 함께 빠지므로 `injection_suspected` 신호도 함께 없습니다.
