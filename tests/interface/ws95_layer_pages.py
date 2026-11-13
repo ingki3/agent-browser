@@ -17,6 +17,14 @@ STYLE = (
     ".month{display:inline-block;width:330px;vertical-align:top} .week span{display:inline-block;width:44px} "
     "ul.day{list-style:none;padding:0;margin:0} ul.day li{display:inline-block;width:44px;height:40px} "
     ".heads .tit{display:inline-block;width:300px}"
+    # 플랫폼 글꼴과 무관한 배치: 점수 입력(상자 면적·세로 위치)이 글꼴 폭·높이에 따라 달라 CI(Linux)와 macOS 의
+    # Top-N 이 갈렸다(날짜 링크 7x17 vs 8x16). 링크·버튼·글자 줄을 고정 크기 상자로 둔다.
+    " body{line-height:20px} a,button{display:inline-block;box-sizing:border-box;width:100px;height:20px;padding:0;"
+    "overflow:hidden;white-space:nowrap;vertical-align:top;font:14px/20px sans-serif} "
+    "nav ul{margin:0;padding:0} nav li{width:120px;height:20px;vertical-align:top} "
+    "#search button{width:150px;height:30px} ul.day a{width:30px;height:30px} #cal .prev,#cal .next{width:60px;height:24px} "
+    ".tit{height:20px;margin:0;overflow:hidden;white-space:nowrap} .week{height:20px;overflow:hidden} "
+    ".foot span,.foot button{display:inline-block;width:220px;height:20px;overflow:hidden;white-space:nowrap}"
 )
 
 NAV = "<nav><ul>" + "".join(f'<li><a href="#m{i}">메뉴 항목 {i}</a></li>' for i in range(1, 31)) + "</ul></nav>"

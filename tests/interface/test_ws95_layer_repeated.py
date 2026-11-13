@@ -51,7 +51,7 @@ def site():
 
 
 def _baseline(monkeypatch) -> None:
-    """기준 동작: 레이어 범위(추가 구성원·묶음 우선)를 끈다 — 기준 바이트·7·3 재현의 출처."""
+    """기준 동작: 레이어 범위(추가 구성원·묶음 우선)를 끈다 — 기준 바이트·부분 달(두 달 전부 아님) 재현의 출처."""
     from actions.dispatcher import ActionDispatcher
 
     def none(self, els, members, final_idx):  # noqa: ANN001
@@ -131,11 +131,20 @@ async def _run(url: str, then=None, **kw):
 @requires_chromium
 @pytest.mark.parametrize("shape", P.SHAPES)
 async def test_baseline_reproduces_partial_months(site, shape, monkeypatch):
-    """재현 고정(RED 근거): 기준(레이어 범위 끔)은 elements 안 날짜만 묶어 두 달이 7·3 칸."""
+    """재현 고정(RED 근거): 기준(레이어 범위 끔)은 elements(top-N) 안 날짜만 묶음 입력이라 두 달 전부(30·31)가 아니다.
+
+    실사용은 7·3 칸, 고정 크기 fixture 는 묶음 없음 — 정확한 칸 수는 Top-N 동점 경계에 달려 단정하지 않는다(CI Linux 와
+    macOS 가 갈렸던 원인). 단정하는 성질: 레이어 날짜는 elements 에 일부 보이지만 묶음 날짜 합 < 61, 12월 25일 없음.
+    """
     _baseline(monkeypatch)
     r, _ = await _run(f"{site}/hana_{shape}")
     assert r.data.get("overlay", {}).get("kinds") == ["covering"], r.data.get("overlay")
-    assert _day_counts(r) == [7, 3], _day_counts(r)
+    shown_days = [e for e in _elements(r) if (e.get("name") or "").isdigit()]
+    assert shown_days, "조건: 레이어 날짜가 elements 에 일부라도 보여야 기준 동작을 잰다"
+    counts = _day_counts(r)
+    assert counts != [30, 31] and sum(counts) < 61, counts
+    assert not any(m["name"] == "25" for g in _groups(r) for m in g["members"] if len(g["members"]) == 31), counts
+    print(f"\nWS95-BASE hana_{shape} day_counts={counts} shown_days={len(shown_days)}")
 
 
 @requires_chromium
@@ -211,9 +220,14 @@ async def test_sephead_extra_id_same_as_returned_day(site):
         return res.success, res.error_code
 
     def returned_day(r):
+        # 반환된(elements 안) 날짜 id — 어느 달이든(두 표제 모두 '다음'으로 바뀐다). Top-N 에 어느 달 날짜가 드는지는
+        # 동점 경계라 달을 고정하지 않는다(CI 에서 12월 날짜가 하나도 안 들어 StopIteration).
         elems = {e["element_id"] for e in _elements(r)}
-        dec = next(g for g in _groups(r) if len(g["members"]) == 31)
-        return next(m["id"] for m in dec["members"] if m["id"] in elems)
+        months = [g for g in _groups(r) if len(g["members"]) in (30, 31)]
+        assert len(months) == 2, _day_counts(r)
+        ids = [m["id"] for g in months for m in g["members"] if m["id"] in elems]
+        assert ids, "조건: 레이어 날짜가 elements 에 하나 이상 반환돼야 비교한다"
+        return ids[0]
 
     _r, extra = await _run(f"{site}/hana_sephead", then=lambda s, r: flow(s, r, lambda x: _dec_day(x, "25")))
     _r, returned = await _run(f"{site}/hana_sephead", then=lambda s, r: flow(s, r, returned_day))
