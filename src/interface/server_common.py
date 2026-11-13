@@ -22,6 +22,7 @@ def _wait_timeout(raw: Any) -> float:
 
 #: WS-95b(#278): 선언 밖 인자 거부 문구에 이름을 그대로 보여 줄 키 모양 — 그 밖(주입 문구·긴 이름·대문자·비ASCII)은 개수만.
 _ECHO_KEY = re.compile(r"[a-z_]{1,32}")
+_ECHO_MAX = 5
 
 
 def undeclared_args_message(extra: Iterable[Any], allowed: Sequence[str]) -> str:
@@ -31,7 +32,9 @@ def undeclared_args_message(extra: Iterable[Any], allowed: Sequence[str]) -> str
     hidden = len(keys) - len(shown)
     from recipes.store import clean_text
 
-    text = f"선언되지 않은 인자 {len(keys)}개: [{', '.join(shown)}]"
+    # R1(검증 NB2): 반향 이름은 최대 _ECHO_MAX 개 + '외 N개' — 600자 절단이 뒤의 허용 키 목록을 자르지 않게.
+    listed = ", ".join(shown[:_ECHO_MAX]) + (f" 외 {len(shown) - _ECHO_MAX}개" if len(shown) > _ECHO_MAX else "")
+    text = f"선언되지 않은 인자 {len(keys)}개: [{listed}]"
     if hidden:
         text += f" ({hidden}개 이름 생략)"
     text += f" — 허용: [{', '.join(allowed)}]. 실행하지 않았습니다 — 선언된 인자만으로 다시 호출하세요."

@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 # WS-48: 책임별 모듈로 옮긴 이름 — 기존 `from interface.mcp_server import X` 를 그대로 지원한다.
 from interface.server_common import (  # noqa: E402,F401
     _ECHO_KEY,
+    _ECHO_MAX,
     _iso,
     _stderr_line,
     _wait_timeout,

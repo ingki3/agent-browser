@@ -231,26 +231,32 @@ class ToolsMixin:
         from interface.on_demand import SWITCH_WAIT_S
 
         capture: Dict[str, Any] = {}
-        if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
-            early = self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
-                                       ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
-            self._note_saved_pages(action_from_tool(name), arguments, early)
-            return early
-        if self._window is not None:
-            # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
-            blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
-            if blocked is not None:
-                self._note_saved_pages(action_from_tool(name), arguments, blocked)
-                return blocked
-            # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
-            # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
-            await self._manual_pre_switch(action_from_tool(name), arguments)
+        # WS-95b R1(검증 B1): 선언 밖 키 거부는 부작용 없는 순수 검증으로 **준비 앞**에 — 브라우저 시작·작업 공간 탭·
+        # on-demand 창 관문/전환·직접 조작 사이트 미리 창(sticky·기존 문서 재이동)이 일어나기 전에 돌려준다.
+        refused_early = await self._undeclared_refusal(name, arguments, capture)
+        if refused_early is None:
+            if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
+                early = self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                           ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
+                self._note_saved_pages(action_from_tool(name), arguments, early)
+                return early
+            if self._window is not None:
+                # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
+                blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
+                if blocked is not None:
+                    self._note_saved_pages(action_from_tool(name), arguments, blocked)
+                    return blocked
+                # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
+                # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
+                await self._manual_pre_switch(action_from_tool(name), arguments)
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
         navigation_scope = AsyncExitStack()
         navigation_token = self._navigation_scope.set(navigation_scope)
         try:
-            if self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
+            if refused_early is not None:
+                result = refused_early
+            elif self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
                 result = await self._call_wait_tool(name, arguments, capture)
             else:
                 result = await self._call_tool(name, arguments, capture)
@@ -514,7 +520,6 @@ class ToolsMixin:
         params: Dict[str, Any] = dict(arguments or {})
         # WS-29: 승인 증표 id 는 계약 밖 인자 — 계약 입력 검증 전에 떼어 낸다.
         approval_id = params.pop("approval_id", None)
-        raw_keys = list(params)  # WS-95b: 선언 밖 검사는 서버 경계 키를 뗀 원래 키로, 계약 검증 **뒤**에
         refused = await self._refuse_before_validation(action, params, capture)
         if refused is not None:
             return refused
@@ -522,12 +527,6 @@ class ToolsMixin:
         if isinstance(checked, ActionResult):
             return checked
         params = checked
-        extra = undeclared_keys(name, raw_keys)
-        if extra:
-            # WS-95b(#278): 계약 모델은 모르는 키를 조용히 버린다 — 오타·옛 이름(scroll amount 등)이 기본값으로 실행되지
-            # 않게 실행 전에 거부한다(고정 문장 + 허용 키, 이름 반향은 ^[a-z_]{1,32}$ 만).
-            return self._error_result(action, ErrorCode.FEATURE_NOT_IMPLEMENTED,
-                                      undeclared_args_message(extra, declared_args(name) or ()))
 
         # WS-57 R2(B1): 같은 작업 공간의 게이트·디스패치는 한 번에 하나 — 디스패처가 호출 임시 상태(_dialogs·_nav_info·
         # _opened_pages·_top_attribution)를 인스턴스에 두고 dispatch 입구에서 초기화하므로, 겹치면 남의 alert·이동이 내
@@ -566,6 +565,33 @@ class ToolsMixin:
                 return await self._run_gated_action(name, arguments, action, params)
             finally:
                 self._gate_fence_end()
+
+    async def _undeclared_refusal(self, name: str, arguments: Dict[str, Any],
+                                  capture: Dict[str, Any]) -> Optional[ActionResult]:
+        """WS-95b(#278) 선언 밖 키 거부 — 준비 부작용 없는 검증(브라우저 시작·작업 공간 탭·창 관문/전환·이동 없음).
+
+        계약 모델은 모르는 키를 조용히 버린다 — 오타·옛 이름(scroll amount 등)이 기본값으로 실행되지 않게 거부한다(고정
+        문장 + 허용 키, 이름 반향은 ^[a-z_]{1,32}$ 만). 서버 경계 키(approval_id·to_main·workspace)는 선언 키로 친다.
+        R1(검증 B1): 선언 밖 키가 있으면 기존 순서 그대로 — 조작권(사람)·확인 코드 캡처 거부 > 계약 입력 검증 오류(ws39
+        '입력 검증 실패') > 선언 밖 거부 — 를 준비 **앞**에서 끝낸다(인계 통로 폴링은 이미 열린 통로일 때만, 브라우저를
+        띄우지 않는다). 선언 밖 키가 없으면 None — 모든 검사는 기존 자리(_call_tool)에서 그대로 한다.
+        """
+        action = action_from_tool(name)
+        if action is None:
+            return None
+        params: Dict[str, Any] = dict(arguments or {})
+        params.pop("approval_id", None)
+        extra = undeclared_keys(name, list(params))
+        if not extra:
+            return None
+        refused = await self._refuse_before_validation(action, params, capture)
+        if refused is not None:
+            return refused
+        checked = self._validated_params(action, params)
+        if isinstance(checked, ActionResult):
+            return checked
+        return self._error_result(action, ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                                  undeclared_args_message(extra, declared_args(name) or ()))
 
     async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
                                         capture: Dict[str, Any]) -> Optional[ActionResult]:

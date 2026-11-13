@@ -76,7 +76,7 @@ PRESERVED = (
     "_enter_autocomplete_hit", "_enter_field_verdict", "_enter_get_form", "_enter_plain_signals", "_enter_sensitive",
     "_enter_words_hit", "_secret_text",
     # WS-95b 선언 밖 인자 거부(허용 키·고정 문장)
-    "_ACTION_BOUNDARY_KEYS", "_ECHO_KEY", "declared_args", "undeclared_args_message", "undeclared_keys",
+    "_ACTION_BOUNDARY_KEYS", "_ECHO_KEY", "_ECHO_MAX", "declared_args", "undeclared_args_message", "undeclared_keys",
 )
 
 

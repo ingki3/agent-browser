@@ -35,7 +35,7 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 **선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
 
-**선언 밖 인자(WS-95b #278).** 도구 스키마에 없는 인자는 신호 없이 실행하지 않고 `E_FEATURE_NOT_IMPLEMENTED`(`retry_safe=true`, 고정 문장 + 허용 키 목록, 이름은 `^[a-z_]{1,32}$` 모양만 반향)로 거부합니다 — `data` 는 비어 있고 새 응답 키는 없습니다. 상세: [mcp-integration.md](mcp-integration.md#관찰--액션-흐름).
+**선언 밖 인자(WS-95b #278).** 도구 스키마에 없는 인자는 신호 없이 실행하지 않고 `E_FEATURE_NOT_IMPLEMENTED`(액션 도구는 `retry_safe=true`, 고정 문장 + 허용 키 목록, 이름은 `^[a-z_]{1,32}$` 모양만 최대 5개 반향)로 거부합니다 — 브라우저 시작·탭·창 전환 같은 준비보다 먼저이고, `data` 는 비어 있고 새 응답 키는 없습니다(서버 도구 응답에는 `retry_safe` 가 없습니다). 상세: [mcp-integration.md](mcp-integration.md#관찰--액션-흐름).
 
 ## Enter 뒤 상태 신호 (`data.after_enter`, WS-91 #246)
 
