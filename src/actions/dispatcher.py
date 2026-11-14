@@ -78,6 +78,10 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 #: navigate 추가 판독(readyState)이 쓸 수 있는 timeout_ms 너머 유예(WS-69 R2) — 반환 ≤ timeout_ms + 100ms.
 _NAV_READ_GRACE_S = 0.05
+#: WS-93 (#271-2, 사용자 결정 A): 계약 기본 timeout_ms(NavigateInput 15000)의 networkidle 은 load 뒤 최대 3초만 더 기다린다.
+#: 서버가 기본값을 채우므로(model_dump) '명시'는 기본값과 다른 값으로만 구분된다(리뷰 B3) — 그 값은 기준 그대로.
+_NAV_IDLE_CAP_MS = 3000.0
+_NAV_IDLE_CAP_DEFAULT_TIMEOUT_MS = 15000
 
 #: 요소를 대상으로 하지 않는 액션 (staleness 검증 대상 아님)
 _ELEMENTLESS_ACTIONS = frozenset(
@@ -1642,6 +1646,8 @@ class _NodeDetached(Exception):
 _OVERLAY_SIGNAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.PRESS_KEY})
 #: 그 판독의 상한(초) — 넘으면 신호 없음(액션 결과는 그대로).
 _OVERLAY_SIGNAL_TIMEOUT_S = 0.25
+#: WS-94(#272): extract_all 격리 판독(항목·렌더 여부·오버레이 소속 한 번) 상한(초) — 넘으면 기준 호출 그대로.
+_EXTRACT_VIEW_TIMEOUT_S = 1.0
 #: WS-87(#222, 리뷰 B1): 실행 직전 '열린 모달 밖 대상' 신호(data.outside_modal)를 보는 요소 액션 — 신호만, 누름은 그대로.
 _OUTSIDE_MODAL_ACTIONS = frozenset({ActionType.CLICK, ActionType.HOVER, ActionType.CHECK_BOX, ActionType.SELECT_OPTION})
 
@@ -5809,6 +5815,8 @@ class ActionDispatcher:
             logger.debug("오버레이 구성원 판독 실패: %s", type(exc).__name__)
         if full:
             await repeated_v1160.annotate_repeated(page, engine, els)
+            if members is not None:
+                self.__dict__["_layer_ids"] = self._layer_scope(els, members, list(range(len(els))))[1]
             if members is None or not any(members):
                 return observed, None
             order = ov.plan_full(len(els), members)
@@ -5819,14 +5827,20 @@ class ActionDispatcher:
         base = els[:n]
         await repeated_v1160.annotate_repeated(page, engine, base)
         final_idx, _pushed = ov.plan_top_n(len(els), members, top_n) if members is not None else (list(range(n)), [])
-        keep = {els[i].element_id for i in final_idx}
+        # WS-95a(#275): 반환 안 된 레이어 구성원(extras)은 반복 묶음 입력용으로 핸들을 남긴다 — 응답 묶음에 안 실리면
+        # 관찰 끝(release_layer_extras)에서 해제한다.
+        extras, layer_ids = self._layer_scope(els, members, final_idx) if members is not None else ([], None)
+        self.__dict__["_layer_extra"] = extras
+        self.__dict__["_layer_ids"] = layer_ids
+        keep = {els[i].element_id for i in final_idx} | {e.element_id for e in extras}
         store = getattr(engine, "_handles", None)
         if isinstance(store, dict):
             for e in els:
                 if e.element_id not in keep:
                     store.pop(e.element_id, None)
+            self.__dict__["_layer_handles"] = {e.element_id: store.get(e.element_id) for e in extras}
         added = [els[i] for i in final_idx if i >= n]
-        if not added:
+        if not added and not extras:
             return with_elements(base), None
         final = [els[i] for i in final_idx]
         saved = {}
@@ -5835,13 +5849,55 @@ class ActionDispatcher:
             if h is not None:
                 saved[e.element_id] = (h.group_path, h.group_heading)
         added_ids = {e.element_id for e in added}
-        await repeated_v1160.annotate_repeated(page, engine, final)
+        # 2차 고정(호출 수 2 유지): 최종 목록 + extras — extras 도 v1160 고정을 받고, base 핸들은 1차 결과로 원복.
+        await repeated_v1160.annotate_repeated(page, engine, final + extras)
         for eid, (path, pin) in saved.items():
             if eid not in added_ids:
                 h = engine.get_handle(eid)
                 if h is not None:
                     h.group_path, h.group_heading = path, pin
+        if not added:
+            return with_elements(base), None
         return with_elements(final), {"kinds": overlay["kinds"], "promoted": len(added)}
+
+    def _layer_scope(self, els: List[Any], members: List[bool],
+                     final_idx: List[int]) -> Tuple[List[Any], Optional[frozenset]]:
+        """WS-95a(#275): (반환 안 된 레이어 구성원 — 엔진 순위 순, 레이어 구성원 id 집합 또는 None).
+
+        구성원이 없으면 ([], None) — 반복 묶음 입력·우선순위가 기준 그대로(바이트 동일)."""
+        if not any(members):
+            return [], None
+        fset = set(final_idx)
+        extras = [els[i] for i in range(len(els)) if members[i] and i not in fset]
+        return extras, frozenset(els[i].element_id for i in range(len(els)) if members[i])
+
+    def release_layer_extras(self, keep: Any) -> None:
+        """WS-95a: 마지막 관찰의 추가 레이어 구성원 중 keep(응답에 실린 id)에 없는 것을 등록 해제(보이지 않는 살아 있는 id 0).
+
+        크기 맞춤이 묶음을 더 뺄 때마다 다시 불린다 — 해제만 하므로(되살리지 않음) 여러 번 불려도 안전."""
+        extras = self.__dict__.get("_layer_extra") or []
+        if not extras:
+            return
+        store = getattr(self.ctx.engine, "_handles", None)
+        held = self.__dict__.get("_layer_handles") or {}
+        kept = []
+        for e in extras:
+            if e.element_id in keep:
+                kept.append(e)
+            elif isinstance(store, dict) and store.get(e.element_id) is held.get(e.element_id):
+                store.pop(e.element_id, None)  # 같은 관찰의 그 핸들만(다른 핸들로 바뀌었으면 건드리지 않는다)
+        self.__dict__["_layer_extra"] = kept
+
+    def _release_previous_layer_extras(self) -> None:
+        """WS-95a R1: 새 관찰(엔진 등록 직후)에서 이전 관찰의 추가 레이어 구성원 핸들을 해제 — 엔진이 같은 id 를 새 핸들로
+        다시 매겼으면(이번 관찰의 요소) 건드리지 않고, 이전 관찰의 그 핸들 객체가 남아 있을 때만 지운다."""
+        held = self.__dict__.get("_layer_handles") or {}
+        store = getattr(self.ctx.engine, "_handles", None)
+        if not held or not isinstance(store, dict):
+            return
+        for eid, h in held.items():
+            if h is not None and store.get(eid) is h:
+                store.pop(eid, None)
 
     # -- WS-81 (#207): 숨긴 체크박스·라디오 ----------------------------------------------------
 
@@ -6300,9 +6356,16 @@ class ActionDispatcher:
         # R12: 핸들 고정(group_path·group_heading)은 v1.16.0 원문만 쓴다(표시 블록은 버림). data.repeated 는 R4~R6 형성 —
         # 관찰 정보 전용이라 핸들을 건드리지 않는다.
         from perception import repeated_v1160
-        from perception.repeated import annotate_repeated
+        from perception.repeated import annotate_repeated, repeated_ids
 
         overlay_data: Optional[Dict[str, Any]] = None
+        # WS-95a(#275): 관찰마다 새로 — 열린 레이어의 반환 안 된 구성원(extras)·레이어 구성원 id(묶음 우선순위).
+        # R1(검증 B1): 이전 관찰의 extras 는 이 관찰 응답에 실리지 않는 한 해제 — 엔진이 방금 다시 매긴 id 는 새 핸들이라
+        # 같은 객체(이전 관찰의 그 핸들)만 지운다. 누를 수 있는 id = 가장 최근 관찰 응답에 실린 id.
+        self._release_previous_layer_extras()
+        self.__dict__["_layer_extra"] = []
+        self.__dict__["_layer_handles"] = {}
+        self.__dict__["_layer_ids"] = None
         if overlay is None:
             await repeated_v1160.annotate_repeated(page, self.ctx.engine, observed.elements)
         else:
@@ -6311,7 +6374,13 @@ class ActionDispatcher:
         data: Dict[str, Any] = {"observation": observed.model_dump(mode="json")}
         if overlay_data is not None:
             data["overlay"] = overlay_data
-        repeated = await annotate_repeated(page, self.ctx.engine, observed.elements)
+        # WS-95a: 반복 묶음 입력 = 반환 elements + 반환 안 된 레이어 구성원(elements 는 그대로). 묶음에 안 든 extras 는 해제.
+        extras = list(self.__dict__.get("_layer_extra") or [])
+        layer_ids = self.__dict__.get("_layer_ids")
+        repeated = await annotate_repeated(page, self.ctx.engine, list(observed.elements) + extras,
+                                           **({"layer_ids": layer_ids} if layer_ids else {}))
+        if extras:
+            self.release_layer_extras({e.element_id for e in observed.elements} | repeated_ids(repeated))
         await self._record_panel_heads(repeated, page)
         if repeated is not None:
             data["repeated"] = repeated
@@ -6367,7 +6436,18 @@ class ActionDispatcher:
                     return self._navigate_failure(action, PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded."))
                 else:
                     try:
-                        await page.wait_for_load_state(requested, timeout=remaining)
+                        if requested == "networkidle" and timeout_ms == _NAV_IDLE_CAP_DEFAULT_TIMEOUT_MS:
+                            # WS-93: load 까지는 남은 예산, 그 뒤 networkidle 은 min(남은 예산, 3초). 못 닿으면 아래 기존
+                            # 부분 성공 그대로(reached 는 'domcontentloaded' — 어휘·hint 불변, 리뷰 B2 a).
+                            await page.wait_for_load_state("load", timeout=remaining)
+                            left = timeout_ms - (_monotonic() - started) * 1000
+                            if left < 1:
+                                # timeout=0 은 무한 대기 — 부르지 않고 2단계 시간 초과로 본다(NN3).
+                                timed_out = PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded.")
+                            else:
+                                await page.wait_for_load_state("networkidle", timeout=min(left, _NAV_IDLE_CAP_MS))
+                        else:
+                            await page.wait_for_load_state(requested, timeout=remaining)
                     except PlaywrightTimeoutError as exc:
                         timed_out = exc  # 이것만 부분 성공 후보(N2) — 닫힘 등은 아래 기존 분류
                     except Exception as exc:  # noqa: BLE001
@@ -7326,6 +7406,32 @@ class ActionDispatcher:
             data={"condition": condition},
         )
 
+    async def _extract_view(self, selector: str, attrs: List[str]) -> Optional[Tuple[List[Dict[str, Any]], List[bool],
+                                                                                    List[bool]]]:
+        """WS-94: extract_all 항목·렌더 여부·오버레이 소속(격리 world 한 번, `actions.extract_visible`). 못 읽으면 None."""
+        import secrets
+
+        from actions import extract_visible as ev
+
+        try:
+            raw = await asyncio.wait_for(self._doc_isolated_eval(ev.extract_all_expr(secrets.token_hex(8), selector,
+                                                                                     attrs)),
+                                         _EXTRACT_VIEW_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — 못 읽으면 기준 호출 그대로(selector 오류·못 찾음 판정도 거기서)
+            logger.debug("extract_all 격리 판독 실패: %s", type(exc).__name__)
+            return None
+        return ev.parse_rows(raw)
+
+    def take_extract_layers(self, items: Any) -> Optional[List[bool]]:
+        """WS-94(B3): 직전 extract_all 의 항목별 오버레이 소속(1회 소비). 그 결과의 항목 목록과 같을 때만(아니면 None)."""
+        held, self._extract_layers = getattr(self, "_extract_layers", None), None
+        if held is None or not isinstance(items, list):
+            return None
+        ref, layer = held
+        if len(ref) != len(items) or (ref is not items and ref != items):
+            return None
+        return list(layer)
+
     async def _extract(self, params: Dict[str, Any]) -> ActionResult:
         page = self.ctx.page
         # 필수 인자 누락은 KeyError 예외가 아니라 명확한 실패로 보고한다.
@@ -7344,6 +7450,20 @@ class ActionDispatcher:
             )
         attributes: Sequence[str] = params.get("attributes", [])
         extract_all = params.get("extract_all", False)
+        self._extract_layers = None
+        if extract_all:
+            # WS-94(#272): 렌더되지 않는 항목 제외 + 열린 오버레이 소속(격리 world 한 번). 못 읽으면 아래 기준 호출 그대로.
+            view = await self._extract_view(selector, list(attributes))
+            if view is not None:
+                from actions.extract_visible import keep_rendered
+
+                items, layer, omitted = keep_rendered(*view)
+                if any(layer):
+                    self._extract_layers = (items, layer)
+                data: Dict[str, Any] = {"items": items}
+                if omitted:
+                    data["hidden_omitted"] = omitted
+                return self._result(success=True, action=ActionType.EXTRACT, retry_safe=True, data=data)
 
         try:
             payload = await page.evaluate(

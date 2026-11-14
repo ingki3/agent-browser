@@ -5,7 +5,7 @@ WS-48: interface/mcp_server.py 에서 동작 무변경으로 옮겼다. 이름�
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from contracts import ACTION_INPUT_MAP, ActionType
 
@@ -271,6 +271,32 @@ def build_server_tools(recipes: bool = True) -> List[Dict[str, Any]]:
 def build_listed_tools(recipes: bool = True) -> List[Dict[str, Any]]:
     """MCP tools/list 전체 = 액션 툴 19종 + 서버 도구."""
     return build_all_tools() + build_server_tools(recipes)
+
+
+#: WS-95b(#278): 액션 도구가 계약 밖에서 받는 서버 경계 키 — approval_id(WS-29, 모든 액션)·to_main(WS-30, switch_frame).
+#: workspace(WS-57)는 call_tool 입구에서 먼저 떼므로 여기 없다.
+_ACTION_BOUNDARY_KEYS: Dict[ActionType, Tuple[str, ...]] = {ActionType.SWITCH_FRAME: ("to_main",)}
+
+
+def declared_args(name: str) -> Optional[Tuple[str, ...]]:
+    """도구가 받는 인자 이름(선언 순서). 액션 = 계약 모델 필드 + 서버 경계 키, 서버 도구 = 스키마 properties. 모르는 도구 None."""
+    action = action_from_tool(name)
+    if action is not None:
+        model = ACTION_INPUT_MAP.get(action)
+        fields = tuple(model.model_fields) if model is not None else ()
+        return fields + _ACTION_BOUNDARY_KEYS.get(action, ()) + ("approval_id",)
+    spec = SERVER_TOOLS.get(name)
+    if spec is None:
+        return None
+    return tuple(spec["inputSchema"].get("properties", {}))
+
+
+def undeclared_keys(name: str, keys: Any) -> List[Any]:
+    """WS-95b: 이 도구에 선언되지 않은 인자 키(입력 순서). 모르는 도구는 빈 목록(알 수 없는 툴 거부는 따로)."""
+    allowed = declared_args(name)
+    if allowed is None:
+        return []
+    return [k for k in keys if k not in allowed]
 
 
 _DESCRIPTIONS: Dict[ActionType, str] = {

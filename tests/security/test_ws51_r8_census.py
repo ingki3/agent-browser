@@ -245,6 +245,7 @@ def _vendors():
 
     js = set(re.findall(r"'(hcaptcha|cloudflare|recaptcha|generic)'", challenge._PROBE_JS))
     phrases = {v for _, v, _ in challenge._CAPTCHA_PHRASES + challenge._BLOCKED_PHRASES}
+    phrases |= {v for _, v, _ in challenge._PAIR_CAPTCHA_PHRASES}  # WS-93: 두 줄 공존 표(bing)
     lits = {v for v in re.findall(r'"([a-z]+)"', Path(challenge.__file__).read_text(encoding="utf-8"))
             if v in ("generic", "akamai")}
     assert js == {"hcaptcha", "cloudflare", "recaptcha", "generic"} and lits == {"generic", "akamai"}
@@ -388,7 +389,9 @@ def test_challenge_classify_vendors_real_producer(fresh_registry, monkeypatch):
     produced = {classify("t", "", 10, w).vendor for w in ("hcaptcha", "cloudflare", "recaptcha", "generic")}
     produced.add(classify("t", "Access Denied reference #1", 30, "").vendor)
     produced.add(classify("t", "x", 10, "", 403).vendor)
-    assert produced == {"hcaptcha", "cloudflare", "recaptcha", "generic", "akamai"}
+    produced.add(classify("t", "One last step\nPlease solve the challenge below to continue", 60, "",
+                          url="https://www.bing.com/search?q=x").vendor)  # WS-93
+    assert produced == {"hcaptcha", "cloudflare", "recaptcha", "generic", "akamai", "bing"}
     for v in produced:
         _register(v, monkeypatch)
     out = _wire({"challenges": [{"vendor": v} for v in sorted(produced)]})

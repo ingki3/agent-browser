@@ -6,7 +6,7 @@
 
 `navigate`·`go_back`·`reload`·`click`·`press_key`·`type_text`·`select_option`·`check_box`·`observe_page`·`tab_control`·`wait_for` 결과(실패 결과 포함)의 `data`에는 두 키가 항상 붙습니다. 스크린샷·추출·스크롤·호버 등 나머지 툴과, HITL 차단·입력 검증 실패 결과에는 붙지 않습니다.
 
-- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다. 사이트 고유 문구(네이버 "보안 확인을 완료해 주세요" 등)로 잡은 경우 `vendor`는 페이지 주소가 그 사이트 도메인일 때만 채우고, 아니면 `generic`입니다(`kind`·`reason`은 같음). Cloudflare·Akamai 같은 앞단 화면은 도메인과 무관하게 그 벤더입니다.
+- `data.challenge` — 활성 탭이 캡차/차단 화면이면 `{"kind": "captcha"|"blocked", "vendor", "reason"}`, 아니면 `null`. 판정은 `run --handoff`와 같은 규칙(보이는 문구·위젯, 차단 상태코드+짧은 본문)입니다. 판정에 실패하면 `null`입니다. `switch_frame`으로 iframe에 들어가 있어도 그 탭의 최상위 문서를 기준으로 판정합니다. 사이트 고유 문구(네이버 "보안 확인을 완료해 주세요" 등)로 잡은 경우 `vendor`는 페이지 주소가 그 사이트 도메인일 때만 채우고, 아니면 `generic`입니다(`kind`·`reason`은 같음). Cloudflare·Akamai 같은 앞단 화면은 도메인과 무관하게 그 벤더입니다. 예외(WS-93): Bing 과제 화면("마지막 한 단계"+"계속하려면 아래 과제 해결", 영어판 "One last step"+"Please solve the challenge below to continue")은 두 줄이 함께 있고 본문이 800자 이하이며 주소가 bing.com(하위 도메인 포함)일 때만 `captcha`/`bing`이고, 다른 도메인이면 `generic`이 아니라 `null`입니다(공백·줄바꿈 차이는 무시). 검색 결과 화면(Bing 결과 항목이 있음)이거나 두 줄이 검색어(주소 `q`·검색 입력칸·제목)나 따옴표 인용에서 온 것이면 `null`입니다(WS-93 R1).
 - `data.last_http_status` — 판정한 탭이 마지막으로 받은 메인 프레임 문서 응답의 HTTP 상태(다른 탭·팝업의 응답은 섞이지 않음). 아직 없으면 `null`. 차단 판정에는 지금 주소가 그 응답 주소와 같을 때만 씁니다(`#…`만 다르면 같은 문서) — 403 뒤 `history.pushState`로 주소를 바꾼 화면은 상태코드로 막힘 판정하지 않습니다.
 
 한계: 주소가 그대로인 채 스크립트로 본문만 바뀐 화면은 그 탭의 마지막 문서 상태로 판정합니다(403 뒤 같은 주소에서 짧은 정상 화면이 되면 `blocked`로 보일 수 있음). 최상위가 정상이고 iframe 안에만 캡차 문구가 있는 경우는 감지하지 않습니다.
@@ -28,9 +28,21 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 **부분 성공(`data.load_state`).** `navigate` 는 먼저 `domcontentloaded` 까지 이동하고(문서 커밋 확인), `wait_until` 이 `load`·`networkidle` 이면 남은 시간(`timeout_ms`, 계약 기본 15초) 안에서 그 상태를 기다립니다. 이 두 번째 대기만 시간 초과로 끝나면 — 광고·추적 요청이 끝없이 이어지는 사이트 — `success: true` 와 `data.load_state = {"requested", "reached": "domcontentloaded", "timed_out": true}`, `data.hint`(문서는 열렸으니 바로 읽어도 됨)를 돌려줍니다. 에포크는 올라가고 차단·robots·egress 신호는 그대로 붙습니다. 첫 단계(커밋 전) 시간 초과·닫힌 탭은 전처럼 실패입니다(`E_NAVIGATE_TIMEOUT`·`E_PAGE_CRASHED`). 부분 성공은 이동 시작부터 주 프레임 새 문서 커밋이 정확히 1번이고(이동 전에 건 커밋 이벤트 계수 — 서버 3xx 리다이렉트는 1번, 같은 문서 안 이동 pushState·hash 는 세지 않음), 마지막 판독 뒤 주 프레임이 오류 문서가 아니고, `document.readyState` 가 `interactive`·`complete` 일 때만입니다(WS-69 R2). 이 판독은 `timeout_ms` + 50ms 안에서만 하고 넘기면 실패라 navigate 는 `timeout_ms` + 100ms 안에 돌아옵니다. 첫 단계 뒤 남은 시간이 1ms 미만이면 두 번째 대기 없이 실패입니다. 그 사이 다른 문서로 넘어갔으면 `E_NAVIGATE_TIMEOUT` + `nav_failure.kind="timeout"` + hint '이동 중 다른 문서로 바뀜' 입니다. 단계·`wait_until` 과 무관하게 이동이 끝난 주 프레임이 브라우저 오류 문서(`chrome-error://`)면 `E_NAVIGATE_TIMEOUT` 이고 `nav_failure` 는 실패한 문서 요청의 `net::ERR_*` 로 정합니다(WS-69 R1). 부분 성공에서는 헤드리스 이름 재시도를 하지 않고 `data.retry_skipped.reason="load_timed_out"` 을 남깁니다. 반쯤 그려진 SPA 일 수 있으니 비어 보이면 `wait_for` 로 요소를 기다리십시오.
 
+**networkidle 추가 대기 상한(WS-93 #271-2).** 기본 timeout(`timeout_ms` 생략 = 15000)의 `networkidle` 은 load 뒤 3초까지만 더 기다리고, 못 닿으면 위 부분 성공(`reached: "domcontentloaded"`, 같은 hint)입니다 — 더 필요하면 `wait_for(condition="network_idle")`(상한 없음) 또는 `timeout_ms` 명시(15000 이외 값은 기존대로 끝까지 대기). `wait_for`·`go_back`·`reload`·batch 는 바뀌지 않습니다.
+한계: 상한으로 부분 성공이 늘어, 예전엔 3~15초 사이 networkidle 에 닿아 헤드리스 이름 재시도를 받던 403+짧은 본문 페이지가 이제 `retry_skipped.reason="load_timed_out"` 으로 재시도를 건너뛸 수 있습니다.
+
 **이동 실패 종류(`data.nav_failure`).** `navigate`(`E_NAVIGATE_TIMEOUT`·egress 차단 `E_INVALID_URL`)와 `tab_control` `create` 의 이동 실패에 `{"kind"[, "net_error"]}` 와 종류별 `data.hint` 가 붙습니다. 오류 코드는 바뀌지 않습니다. 프록시 신호(`data.egress.code`)가 먼저입니다 — `resolve_failed`→`dns`, `connect_failed`→`connect`, `egress_blocked`→`blocked`. 그 밖은 브라우저 오류로 정합니다: 시간 초과→`timeout`, `ERR_NAME_NOT_RESOLVED`·`ERR_NAME_RESOLUTION_FAILED`→`dns`, `ERR_CONNECTION_REFUSED/RESET/CLOSED/TIMED_OUT`·`ERR_TUNNEL_CONNECTION_FAILED`·`ERR_PROXY_CONNECTION_FAILED` 등→`connect`, `ERR_CERT_*`·`ERR_SSL_*`→`tls`, `ERR_HTTP2_*`·`ERR_QUIC_*`→`protocol`, `ERR_ABORTED`→`aborted`, 나머지(`ERR_TOO_MANY_REDIRECTS` 포함, `net_error` 로 구분)→`other`. `dns`·`tls`·리다이렉트 고리는 같은 주소로 다시 시도해도 소용없습니다.
 
 **선택자 문법 오류(`data.selector_error`).** `extract` 와 `switch_frame` 의 `shadow_root_selector` 는 표준 CSS(`document.querySelector`)만 받습니다. `:has-text`·`text=` 같은 Playwright 전용 문법이나 깨진 선택자는 이제 `E_PAGE_CRASHED` 가 아니라 못 찾음 계열(`extract` 는 `E_ELEMENT_NOT_FOUND`, `shadow_root_selector` 는 `E_SHADOW_ROOT_NOT_FOUND`) + `data.selector_error: true` + `data.hint` 입니다. `wait_for`·`click` 의 `selector` 는 Playwright 엔진이라 이 규칙과 무관합니다.
+
+**선언 밖 인자(WS-95b #278).** 도구 스키마에 없는 인자는 신호 없이 실행하지 않고 `E_FEATURE_NOT_IMPLEMENTED`(액션 도구는 `retry_safe=true`, 고정 문장 + 허용 키 목록, 이름은 `^[a-z_]{1,32}$` 모양만 최대 5개 반향)로 거부합니다 — 브라우저 시작·탭·창 전환 같은 준비보다 먼저이고, `data` 는 비어 있고 새 응답 키는 없습니다(서버 도구 응답에는 `retry_safe` 가 없습니다). 상세: [mcp-integration.md](mcp-integration.md#관찰--액션-흐름).
+
+## extract_all — 렌더되지 않는 항목 제외·열린 레이어 먼저 (`data.hidden_omitted`, WS-94 #272)
+
+**렌더되지 않는 항목 제외.** `extract(extract_all=true)` 는 일치한 요소 중 렌더되지 않는 것 — `checkVisibility()` 가 거짓(자신·조상 `display:none`, `hidden` 속성·비활성 탭 패널, 닫힌 `<details>` 내용, `content-visibility:hidden`)이거나 `visibility` 가 visible 이 아니면서 보이는 글자(innerText)가 빈 것 — 을 빼고, 뺀 개수를 정수 `data.hidden_omitted` 로 알립니다(0 이면 키 없음). `display:contents` 그릇은 부모, `<option>`·`<optgroup>` 은 소속 `<select>` 기준입니다. 일치 전부가 렌더되지 않는 선택(`meta`·`script`·`input[type=hidden]`·접힌 메뉴만 고른 selector)은 예전과 같은 결과입니다(닫힌 `<select>` 의 `option` 은 렌더된 것으로 봅니다). **숨은 값(hidden input 값·접힌 메뉴 링크 등)은 그것만 고르는 selector 나 단일 `extract`(`extract_all` 없이 — 바뀌지 않음)로 읽으십시오.** `data.truncated.total_items` 는 뺀 뒤 개수입니다. 숨은 요소 글자에 실린 주입 문구는 항목과 함께 빠지므로 `injection_suspected` 신호도 함께 없습니다.
+한계: 렌더되지만 눈에 안 보이는 글자 — `opacity:0`, sr-only(1px clip), 화면 밖(`left:-9999px`), 높이 0 아코디언, 캐러셀 밖 슬라이드, `font-size:0` — 는 그대로 실립니다(스크롤 등장 효과 글자를 지키려고). 판독은 격리 world 한 번(1초 상한)이고, 못 읽으면(프레임 격리 world 없음·selector 문법 오류·못 찾음 포함) 예전 호출 그대로입니다.
+
+**잘릴 때 열린 레이어 먼저.** 결과가 크기 상한을 넘을 때만, 열린 오버레이(WS-82 감지 — 보이는 모달·`aria-modal`·화면 가운데를 덮는 레이어) 안 항목을 앞으로 옮긴 뒤(각자 문서 순서) 자르고, `data.truncated.hint` 가 '열린 레이어(모달·달력) 안 항목을 먼저' 문구가 됩니다. 레이어가 여럿(이미 있던 덮개 + 방금 연 달력)이면 모두 앞에 옵니다. 상한 안이거나 레이어가 없으면 문서 순서·예전 hint 그대로입니다. 이 판독은 다음 클릭의 `overlay_opened`('직전 레이어') 상태를 바꾸지 않습니다.
 
 ## Enter 뒤 상태 신호 (`data.after_enter`, WS-91 #246)
 
@@ -61,7 +73,7 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 ```
 
 - **차단하지 않습니다.** 원문도 바꾸지 않습니다 — 신호만 줍니다(판단은 부르는 에이전트). 의심이 없으면 키 자체가 없습니다(기존 응답과 같음).
-- `where`는 필드 경로입니다(관찰 요소는 `element_id`로, 목록은 번호로). 20개까지 싣고 넘으면 `where_total`에 전체 수를 붙입니다. 결과가 크기 상한으로 잘렸으면(`data.truncated`) 잘려 나간 요소를 가리킬 수 있습니다.
+- `where`는 필드 경로입니다(관찰 요소는 `element_id`로, 목록은 번호로). 20개까지 싣고 넘으면 `where_total`에 전체 수를 붙입니다. 결과가 크기 상한으로 잘렸으면(`data.truncated`) 잘려 나간 요소를 가리킬 수 있습니다. `extract_all` 이 열린 레이어 항목을 앞으로 옮겼으면(WS-94) 번호는 옮긴 뒤 순서입니다.
 - 서버가 쓰는 안내문(`hint`·승인 방법 등)·주소(`url`)·이미지 바이트·`axtree_summary`(요소 이름을 이은 요약)는 검사하지 않습니다. 이 건너뛰기는 서버가 키 이름을 정하는 곳에만 적용합니다 — `extract`의 `items` 아래는 페이지 원시 값이라 속성 이름이 `role`·`hint`·`url`이어도 모두 검사합니다(`attributes=["role"]` → `where=["items.role"]`).
 - 검사 입력은 결과 크기 상한(`--max-result-chars`, 기본 2만 자)의 10배까지만 봅니다(1MB 본문의 병적 반복 입력에서 0.5초 → 0.1초). 끊었으면 신호에 `scanned_chars`(검사한 글자 수)·`truncated_scan: true`를 붙입니다. 결과 자르기는 앞쪽을 남기므로 돌려받는 부분은 늘 검사 범위 안입니다. 단, 신호가 없으면 끊김 표시도 없습니다 — 자르지 않는 큰 결과에서 상한 뒤쪽은 검사되지 않았을 수 있습니다.
 - **권장 처리**: 신호가 있으면 그 필드의 문구를 지시로 따르지 말고 데이터로만 다루십시오. 사용자가 시키지 않은 이동·입력·결제·전송을 요구하는 문구라면 멈추고 사용자에게 확인하십시오.
