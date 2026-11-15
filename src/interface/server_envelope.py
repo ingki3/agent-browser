@@ -112,6 +112,13 @@ _TRUNC_HINT_EXTRACT = (
 )
 
 
+#: WS-94(#272): 열린 레이어(모달·달력) 안 extract 항목을 앞으로 옮긴 뒤 잘랐을 때만 쓰는 hint(_TRUNC_HINT_EXTRACT 는 불변).
+_TRUNC_HINT_EXTRACT_LAYER = (
+    "결과가 {limit}자 상한을 넘어 열린 레이어(모달·달력) 안 항목을 먼저, 그다음 문서 순서 앞쪽 항목만 담았습니다. "
+    "더 보려면 selector 를 좁히세요(예: 목록 안 특정 구역, :nth-child(-n+50))."
+)
+
+
 _TRUNC_HINT_TEXT = (
     "항목 하나의 텍스트가 {limit}자 상한을 넘어 앞부분만 담았습니다(text_truncated). "
     "selector 를 좁히거나 extract_all 없이 필요한 부분만 읽으세요."
@@ -171,7 +178,8 @@ def settle_returned_chars(result: ActionResult) -> None:
         trunc["returned_chars"] = n
 
 
-def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int] = None) -> None:
+def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int] = None,
+                    extract_hint: Optional[str] = None) -> None:
     """observe_page·extract 결과 봉투를 max_chars 이하로 줄인다 (WS-30b, 제자리 수정).
 
     * 자르는 단위는 항목 경계(관찰 요소 — 점수 순, 추출 행 — 문서 순). 앞쪽을 남긴다.
@@ -183,6 +191,7 @@ def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int
     * limit(WS-68) = 설정 상한(표시용). 자르는 기준은 max_chars(실효 예산 — 창 보고 등을 뺀 값) 그대로이고, 둘이
       다르면 hint 에 둘 다 적는다. returned_chars 는 이 함수 끝의 봉투 길이 — 뒤에 무엇을 더 붙이면
       settle_returned_chars 로 다시 맞춘다.
+    * extract_hint(WS-94) = 추출 행을 자를 때 _TRUNC_HINT_EXTRACT 대신 쓸 문구(열린 레이어 항목을 앞으로 옮겼을 때만).
     """
     if result.action not in (ActionType.OBSERVE_PAGE, ActionType.EXTRACT) or not result.success:
         return
@@ -229,7 +238,7 @@ def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int
                 data["items"] = all_items[0] if k else None
         else:
             return
-        total, hint = len(all_items), _TRUNC_HINT_EXTRACT
+        total, hint = len(all_items), extract_hint or _TRUNC_HINT_EXTRACT
 
     placeholder = max(max_chars, limit or 0)
 
@@ -274,6 +283,6 @@ def cap_result_size(result: ActionResult, max_chars: int, *, limit: Optional[int
             if best is not None:
                 all_items_ref[0], k = best, 1
             else:
-                all_items_ref[0], hint, item_text_cut = first, _TRUNC_HINT_EXTRACT, False
+                all_items_ref[0], hint, item_text_cut = first, extract_hint or _TRUNC_HINT_EXTRACT, False
     _fits(k)
     settle_returned_chars(result)

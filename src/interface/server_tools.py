@@ -11,10 +11,10 @@ from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
 from contracts import ACTION_INPUT_MAP, ActionResult, ActionType, ErrorCode
-from interface.server_common import _wait_timeout
+from interface.server_common import _wait_timeout, undeclared_args_message
 from interface.server_schema import (CHALLENGE_CHECK_ACTIONS, RECIPE_TOOL, SERVER_TOOLS, TOOL_PREFIX, YOUTUBE_TOOL,
-                                      action_from_tool)
-from interface.server_envelope import cap_result_size, settle_returned_chars
+                                      action_from_tool, declared_args, undeclared_keys)
+from interface.server_envelope import _TRUNC_HINT_EXTRACT_LAYER, cap_result_size, envelope_json, settle_returned_chars
 from interface.server_workspace import WorkspaceNameError, pop_workspace_arg
 
 logger = logging.getLogger("interface.mcp_server")
@@ -79,6 +79,11 @@ class ToolsMixin:
         if name not in SERVER_TOOLS:
             return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
                     "error_message": f"알 수 없는 툴: {name}"}
+        extra = undeclared_keys(name, args)
+        if extra:
+            # WS-95b(#278): 서버 도구도 액션 도구와 같은 규칙·같은 문장(도구 본문을 실행하지 않는다).
+            return {"success": False, "error_code": ErrorCode.FEATURE_NOT_IMPLEMENTED.value,
+                    "error_message": undeclared_args_message(extra, declared_args(name) or ())}
         if name == RECIPE_TOOL:
             # WS-57 R2(B1): 레시피 재생은 이 작업 공간의 액션 여러 개 — 단계 사이에 같은 작업 공간의 다른 호출이 끼지 않게
             # 재생 전체를 직렬화 구간으로(안쪽 call_tool 은 같은 흐름이라 다시 잡지 않는다).
@@ -226,26 +231,32 @@ class ToolsMixin:
         from interface.on_demand import SWITCH_WAIT_S
 
         capture: Dict[str, Any] = {}
-        if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
-            early = self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
-                                       ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
-            self._note_saved_pages(action_from_tool(name), arguments, early)
-            return early
-        if self._window is not None:
-            # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
-            blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
-            if blocked is not None:
-                self._note_saved_pages(action_from_tool(name), arguments, blocked)
-                return blocked
-            # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
-            # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
-            await self._manual_pre_switch(action_from_tool(name), arguments)
+        # WS-95b R1(검증 B1): 선언 밖 키 거부는 부작용 없는 순수 검증으로 **준비 앞**에 — 브라우저 시작·작업 공간 탭·
+        # on-demand 창 관문/전환·직접 조작 사이트 미리 창(sticky·기존 문서 재이동)이 일어나기 전에 돌려준다.
+        refused_early = await self._undeclared_refusal(name, arguments, capture)
+        if refused_early is None:
+            if self._window is None and not await self._await_gate(SWITCH_WAIT_S):
+                early = self._error_result(action_from_tool(name) or ActionType.OBSERVE_PAGE,
+                                           ErrorCode.TIMEOUT, "로그인 창을 준비 중입니다; 잠시 뒤 다시 호출하세요.")
+                self._note_saved_pages(action_from_tool(name), arguments, early)
+                return early
+            if self._window is not None:
+                # WS-34: 창 전환과 겹치지 않게 — 전환 중이면 기다리고, 실패 상태면 headless 로 다시 연다.
+                blocked = await self._on_demand_enter(action_from_tool(name) or ActionType.OBSERVE_PAGE)
+                if blocked is not None:
+                    self._note_saved_pages(action_from_tool(name), arguments, blocked)
+                    return blocked
+                # WS-64 R2-2: 목록 사이트로 가는 이동(navigate·새 탭)은 실행 전에 창을 미리 연다(sticky). 진행 중 호출로
+                # 등록하기 전이어야 한다(전환은 진행 중 호출이 끝나길 기다린다).
+                await self._manual_pre_switch(action_from_tool(name), arguments)
         # 관문 검사와 등록 사이에 await 없음 — 전환은 등록된 호출이 끝나길 기다린다(_drain_calls).
         self._inflight += 1
         navigation_scope = AsyncExitStack()
         navigation_token = self._navigation_scope.set(navigation_scope)
         try:
-            if self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
+            if refused_early is not None:
+                result = refused_early
+            elif self._window is not None and action_from_tool(name) is ActionType.WAIT_FOR:
                 result = await self._call_wait_tool(name, arguments, capture)
             else:
                 result = await self._call_tool(name, arguments, capture)
@@ -303,13 +314,15 @@ class ToolsMixin:
             # WS-75 ③~⑤: 내용 경로(관찰 요소·요약·반복 묶음·extract 항목)를 지금 레지스트리로 **한 번** 가린 사본으로 바꾼 뒤
             # 크기 맞춤(④)을 그 사본 위에서 한다 — 글자 자르기는 늘 가린 글자를 자른다(B1), 반복 직렬화는 다시 훑지 않는다(B2).
             # 사본을 만든 뒤 version 이 바뀌면(새 값 등록) **자르기 전 원본에서** ③부터 다시(NB-h).
+            # WS-94(#272, B3): extract_all 항목의 열린 레이어 소속(디스패처 속성, 응답 키 아님) — 크기 맞춤의 재배치에만 쓴다.
+            layers = self._extract_layers_of(action, result)
             original = result.data
             version = secret_registry.version()
             for _ in range(self._MASK_ATTEMPTS):
                 version = secret_registry.version()
                 result.data = content_view(original)
                 with content_masked(version):
-                    self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+                    self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal, layers=layers)
                 if secret_registry.version() == version:
                     break
             with content_masked(version):
@@ -322,20 +335,20 @@ class ToolsMixin:
                 version = secret_registry.version()
                 result.data = content_view(original)
                 with content_masked(version):
-                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
                 if secret_registry.version() != version:
                     # 끝까지 흔들림(fail-closed — 누출보다 생략): 내용 칸의 페이지 글자를 고정 문구로 바꾼 원본에서 자른다.
                     from security.public_url import content_withheld
 
                     result.data = content_withheld(original)
-                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(result, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
             if self._window is not None:
                 self._note_tabs()  # WS-50: 브라우저가 꺼지면 복원할 마지막 탭 URL
             if sink is not None and "reserve" in sink:
                 # WS-78 R1 R2: 묶음 응답 크기 맞춤용 — 관찰을 다시 실행하지 않고 **이 원본**(자르기 전)에서 더 작은
                 # 예산으로 다시 맞춘다(가림 → 크기 맞춤 순서·WS-74 요약 재구성·WS-68 max_chars/limit 경로 그대로).
                 sink["refit"] = self._batch_refitter(result, original, action, max_chars + int(sink.get("reserve") or 0),
-                                                     scan_chars)
+                                                     scan_chars, layers=layers)
             return result
         finally:
             try:
@@ -347,9 +360,39 @@ class ToolsMixin:
                 if capture:
                     self._captures_inflight -= 1
 
+    def _extract_layers_of(self, action: Any, result: ActionResult) -> Optional[List[bool]]:
+        """WS-94(B3): 이 extract 결과 항목의 열린 레이어 소속(디스패처가 1회 넘김, 항목 목록이 같을 때만). 그 외 None."""
+        if action is not ActionType.EXTRACT:
+            return None
+        take = getattr(self._dispatcher, "take_extract_layers", None)
+        if not callable(take):
+            return None
+        marks = take(result.data.get("items") if isinstance(result.data, dict) else None)
+        return marks if result.success else None
+
+    def _layers_first(self, result: ActionResult, layers: List[bool], max_chars: int, scan_chars: int,
+                      attach_injection_signal: Any) -> Optional[str]:
+        """WS-94(B3): 봉투(주입 신호 포함)가 상한을 넘을 때만 열린 레이어 안 항목을 앞으로 — 가린 사본 위 새 목록(원본 불변).
+        주입 신호 **앞**에서 하므로 신호의 where 번호는 옮긴 뒤 항목을 가리킨다. 옮겼으면 그때 쓸 hint, 아니면 None."""
+        from actions.extract_visible import layer_first_order
+
+        items = result.data.get("items") if isinstance(result.data, dict) else None
+        if not result.success or not isinstance(items, list) or len(items) != len(layers):
+            return None
+        order = layer_first_order(layers)
+        if order is None:
+            return None
+        if len(envelope_json(result)) <= max_chars:
+            probe = result.model_copy(update={"data": dict(result.data)})
+            attach_injection_signal(probe, max_scan_chars=scan_chars)
+            if len(envelope_json(probe)) <= max_chars:
+                return None
+        result.data["items"] = [items[i] for i in order]
+        return _TRUNC_HINT_EXTRACT_LAYER
+
     def _fit_result(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
-                    attach_injection_signal: Any) -> None:
-        """크기 맞춤(WS-75 ④ — 가린 사본 위에서): saved_pages → 반복 묶음 → 주입 신호 → 항목 경계 자르기."""
+                    attach_injection_signal: Any, layers: Optional[List[bool]] = None) -> None:
+        """크기 맞춤(WS-75 ④ — 가린 사본 위에서): saved_pages → 반복 묶음 → (WS-94 레이어 먼저) → 주입 신호 → 항목 경계 자르기."""
         if action is ActionType.OBSERVE_PAGE and "saved_pages" in result.data:
             from recipes.saved_pages import fit_saved_pages
 
@@ -381,10 +424,17 @@ class ToolsMixin:
                          finalize=lambda r: attach_injection_signal(r, max_scan_chars=scan_chars),
                          limit=self.max_result_chars)
 
+        layer_hint = None
+        if action is ActionType.EXTRACT and layers:
+            # WS-94(#272): 열린 레이어(모달·달력) 안 항목을 먼저 — 넘을 때만, 주입 신호 앞(where 번호 = 옮긴 뒤 항목).
+            layer_hint = self._layers_first(result, layers, max_chars, scan_chars, attach_injection_signal)
         attach_injection_signal(result, max_scan_chars=scan_chars)
         # WS-30b: 큰 페이지 결과가 클라이언트 도구 결과 한도를 넘지 않게 항목 경계에서 자른다.
         # WS-68(#140): hint 에는 설정 상한과 실효 예산을 둘 다, returned_chars 는 창 보고까지 붙인 최종 봉투 기준.
-        cap_result_size(result, max_chars, limit=self.max_result_chars)
+        if layer_hint is not None:
+            cap_result_size(result, max_chars, limit=self.max_result_chars, extract_hint=layer_hint)
+        else:
+            cap_result_size(result, max_chars, limit=self.max_result_chars)
         if action is ActionType.OBSERVE_PAGE and "select_options" in result.data:
             from perception.select_options import drop_orphans, element_ids
 
@@ -397,17 +447,28 @@ class ToolsMixin:
             # WS-81: 요소를 자른 뒤 elements 밖 element_id(라벨·행 링크)를 가리키는 항목이 남지 않게 — 지웠으면 길이 다시.
             if hc.drop_orphans(result.data, hc.element_ids(result.data)):
                 settle_returned_chars(result)
+        if action is ActionType.OBSERVE_PAGE and result.success and isinstance(result.data, dict):
+            release = getattr(self._dispatcher, "release_layer_extras", None)
+            if release is not None:
+                from perception.repeated import repeated_ids
+
+                # WS-95a(#275, 리뷰 B2): 크기 맞춤 뒤 응답 묶음에 남지 않은 레이어 추가 구성원 id 는 등록 해제 — 보이지 않는
+                # 살아 있는 id 0(다시 맞추면 더 해제만 한다).
+                obs = result.data.get("observation")
+                els = obs.get("elements") if isinstance(obs, dict) else None
+                shown = {e.get("element_id") for e in els if isinstance(e, dict)} if isinstance(els, list) else set()
+                release(shown | repeated_ids(result.data.get("repeated")))
 
     def _refit(self, result: ActionResult, action: Any, max_chars: int, scan_chars: int,
-               attach_injection_signal: Any, window: Any) -> None:
+               attach_injection_signal: Any, window: Any, layers: Optional[List[bool]] = None) -> None:
         """R4 S1 마지막 재시도: 원본에서 새로 만든 사본을 크기 맞춤하고, 이미 소비한 창 보고를 옮겨 싣고 길이를 맞춘다."""
-        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal)
+        self._fit_result(result, action, max_chars, scan_chars, attach_injection_signal, layers=layers)
         if window is not None and isinstance(result.data, dict):
             result.data["window"] = window
         settle_returned_chars(result)
 
     def _batch_refitter(self, result: ActionResult, original: Any, action: Any, base_chars: int,
-                        scan_chars: int) -> Any:
+                        scan_chars: int, layers: Optional[List[bool]] = None) -> Any:
         """WS-78 R1 R2: 묶음 응답 관찰을 **다시 실행하지 않고** 같은 원본(자르기 전 data)에서 더 작은 예산으로 다시 맞추는
         함수 refit(reserve) -> ActionResult. 첫 맞춤과 같은 순서(가린 사본 → 크기 맞춤, version 이 흔들리면 원본에서 다시,
         끝까지 흔들리면 내용 생략)이고, 이미 소비한 창 보고(data.window)는 옮겨 싣는다. 결과 객체는 바꾸지 않는다."""
@@ -424,11 +485,11 @@ class ToolsMixin:
                 version = secret_registry.version()
                 trial.data = content_view(original)
                 with content_masked(version):
-                    self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+                    self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
                 if secret_registry.version() == version:
                     return trial
             trial.data = content_withheld(original)
-            self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window)
+            self._refit(trial, action, max_chars, scan_chars, attach_injection_signal, window, layers=layers)
             return trial
 
         return refit
@@ -554,6 +615,33 @@ class ToolsMixin:
                 return await self._run_gated_action(name, arguments, action, params)
             finally:
                 self._gate_fence_end()
+
+    async def _undeclared_refusal(self, name: str, arguments: Dict[str, Any],
+                                  capture: Dict[str, Any]) -> Optional[ActionResult]:
+        """WS-95b(#278) 선언 밖 키 거부 — 준비 부작용 없는 검증(브라우저 시작·작업 공간 탭·창 관문/전환·이동 없음).
+
+        계약 모델은 모르는 키를 조용히 버린다 — 오타·옛 이름(scroll amount 등)이 기본값으로 실행되지 않게 거부한다(고정
+        문장 + 허용 키, 이름 반향은 ^[a-z_]{1,32}$ 만). 서버 경계 키(approval_id·to_main·workspace)는 선언 키로 친다.
+        R1(검증 B1): 선언 밖 키가 있으면 기존 순서 그대로 — 조작권(사람)·확인 코드 캡처 거부 > 계약 입력 검증 오류(ws39
+        '입력 검증 실패') > 선언 밖 거부 — 를 준비 **앞**에서 끝낸다(인계 통로 폴링은 이미 열린 통로일 때만, 브라우저를
+        띄우지 않는다). 선언 밖 키가 없으면 None — 모든 검사는 기존 자리(_call_tool)에서 그대로 한다.
+        """
+        action = action_from_tool(name)
+        if action is None:
+            return None
+        params: Dict[str, Any] = dict(arguments or {})
+        params.pop("approval_id", None)
+        extra = undeclared_keys(name, list(params))
+        if not extra:
+            return None
+        refused = await self._refuse_before_validation(action, params, capture)
+        if refused is not None:
+            return refused
+        checked = self._validated_params(action, params)
+        if isinstance(checked, ActionResult):
+            return checked
+        return self._error_result(action, ErrorCode.FEATURE_NOT_IMPLEMENTED,
+                                  undeclared_args_message(extra, declared_args(name) or ()))
 
     async def _refuse_before_validation(self, action: ActionType, params: Dict[str, Any],
                                         capture: Dict[str, Any]) -> Optional[ActionResult]:

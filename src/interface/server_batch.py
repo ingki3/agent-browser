@@ -321,9 +321,12 @@ def _model_for(action: ActionType) -> Any:
 
 def validate_batch(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """입력 검증(전부 통과해야 시작). 반환: (단계 목록, 응답 관찰 인자). 실패면 BatchInputError."""
-    extra = set(args) - {"steps", "observe"}
+    extra = [k for k in args if k not in ("steps", "observe")]
     if extra:
-        raise BatchInputError(f"알 수 없는 인자: {sorted(extra)[:3]} (steps·observe 만 — 멈춤 조건은 끌 수 없음)")
+        from interface.server_common import undeclared_args_message
+
+        # WS-95b: 서버 도구 공용 문장(멈춤 조건을 끄는 인자는 없다).
+        raise BatchInputError(undeclared_args_message(extra, ("steps", "observe")))
     steps = args.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise BatchInputError(f"steps 는 1~{MAX_STEPS}개 목록입니다.")
@@ -503,10 +506,11 @@ class BatchMixin:
                             eid = await self._batch_resolve(view, step["target"], baseline if i > 0 else None, i)
                             if step["action"] == "scroll":
                                 call_args["target_element_id"] = eid
+                            elif step["action"] == "press_key":
+                                # WS-95b: press_key 의 선언 인자는 key 뿐 — 대상은 포커스로만 준다(id·epoch 를 넘기지 않는다).
+                                await self._batch_focus(eid)
                             else:
                                 call_args.update(element_id=eid, epoch=view["epoch"])
-                            if step["action"] == "press_key":
-                                await self._batch_focus(eid)
                         epoch_before = self._batch_epoch()
                         # 실행 직전 확인: 해석 관찰 이후 모든 await 뒤, call_tool 바로 앞 동기 지점(이 사이에 await 없음).
                         changed = watch.changed()

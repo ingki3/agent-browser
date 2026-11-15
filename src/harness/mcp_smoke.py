@@ -79,7 +79,7 @@ CALL_PLAN: Dict[ActionType, Dict[str, Any]] = {
         "_element": ("checkbox", "약관 동의"),
         "checked": True,
     },
-    ActionType.SCROLL: {"direction": "down", "amount": 300},
+    ActionType.SCROLL: {"direction": "down", "distance": 300},
     ActionType.HOVER: {"_site": "s21_widgets", "_element": ("button", "도움말")},
     ActionType.PRESS_KEY: {"key": "Tab"},
     ActionType.WAIT_FOR: {"condition": "selector", "selector": "body", "timeout_ms": 1000},

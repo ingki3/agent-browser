@@ -326,8 +326,12 @@ def apply_block(data: Dict[str, Any], raw: Any, handles: Sequence[Any], engine: 
         return {}
     # WS-82: 오버레이 순서 후처리가 base 밖 구성원(@e45 등)을 실으면 id 가 연속이 아니다 — 가장 큰 @eN 다음부터(연속이면
     # 지금과 같은 len+1). 다른 요소의 id 와 겹치지 않게.
-    next_n = max([len(obs["elements"])] + [int(e["element_id"][2:]) for e in obs["elements"] if isinstance(e, dict)
-                 and isinstance(e.get("element_id"), str) and re.fullmatch(r"@e\d+", e["element_id"])]) + 1
+    # WS-95a: 반복 묶음이 elements 밖 레이어 구성원 id 를 실을 수 있다 — 그 id 와도 겹치지 않게(묶음 id ⊆ elements 면 그대로).
+    from perception.repeated import repeated_ids
+
+    taken = [e.get("element_id") for e in obs["elements"] if isinstance(e, dict)] + sorted(repeated_ids(data.get("repeated")))
+    next_n = max([len(obs["elements"])] + [int(t[2:]) for t in taken
+                 if isinstance(t, str) and re.fullmatch(r"@e\d+", t)]) + 1
     kept: List[Dict[str, Any]] = []
     added: List[Tuple[Any, Any]] = []
     exposed: Dict[str, Tuple[Any, List[Any]]] = {}

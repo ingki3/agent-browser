@@ -15,9 +15,10 @@
 ## 주요 기능
 
 - **19종 액션 툴 + 서버 도구** — 관찰·클릭·입력·이동·탭·프레임·다운로드 등 액션과, 사람 인계·레시피·묶음 실행·YouTube 검색 서버 도구를 stdio MCP 로 노출합니다. → [MCP 클라이언트 연동](docs/mcp-integration.md)
-- **관찰 → 액션 검증** — 접근성 트리를 정제한 상위 요소와 `epoch` 을 돌려주고, 오래된 `element_id` 는 `E_TOCTOU_MISMATCH` 로 거부하며, 성공은 실행 뒤 DOM 상태(사후조건)로 판정합니다. → [관찰 → 액션 흐름](docs/mcp-integration.md#관찰--액션-흐름)
-- **고위험 액션 게이트** — 결제·주문·삭제·제출·업로드를 무인 모드에서 막고, `--pre-approve`·`--mode interactive`·사람 승인 코드로 엽니다. → [고위험 액션 허용](docs/mcp-integration.md#고위험-액션-허용-serve---pre-approve---mode)
+- **관찰 → 액션 검증** — 접근성 트리를 정제한 상위 요소와 `epoch` 을 돌려주고, 오래된 `element_id` 는 `E_TOCTOU_MISMATCH` 로 거부하며, 성공은 실행 뒤 DOM 상태(사후조건)로 판정합니다. 입력칸·탭을 눌러 포커스·선택만 생긴 경우는 실패 대신 `focus_target`·`target_selected` 로 알리고(효과 아님 — 목록 열림 등은 관찰로 확인), Enter 뒤에는 값·자동완성 목록·문서 상태를 `data.after_enter` 로 붙입니다. → [관찰 → 액션 흐름](docs/mcp-integration.md#관찰--액션-흐름) · [Enter 뒤 상태](docs/signals.md#enter-뒤-상태-신호-dataafter_enter-ws-91-246)
+- **고위험 액션 게이트** — 결제·주문·삭제·제출·업로드를 무인 모드에서 막고, `--pre-approve`·`--mode interactive`·사람 승인 코드로 엽니다. 판정은 페이지가 속일 수 없도록 격리 world 에서도 읽고, 판정한 대상과 실제로 누르는 대상을 묶습니다. 검색칸·자동완성 칸의 Enter 는 승인 없이 지나가고, 로그인·결제(POST) 폼과 비밀번호·카드번호 같은 민감 칸은 그대로 승인을 받습니다. → [고위험 액션 허용](docs/mcp-integration.md#고위험-액션-허용-serve---pre-approve---mode)
 - **차단 대신 신호** — 차단·캡차(`data.challenge`), 프롬프트 주입(`data.injection_suspected`), robots.txt(`data.robots`)를 결과에 붙이고 판단은 부르는 에이전트에 맡깁니다. → [응답 신호](docs/signals.md)
+- **이동 결과 신호** — networkidle 에 못 닿거나 문서가 2~3번 다시 열려도(같은 주소 새로고침·JS·meta 이동) 최종 문서가 열렸으면 부분 성공 + `load_state`(다시 열린 횟수 `documents`), 실패는 종류(`nav_failure`)와 함께 알립니다. → [이동 결과](docs/signals.md#이동-결과-신호--부분-성공실패-종류선택자-문법-오류-ws-69)
 - **헤드리스 이름 재시도** — 헤드리스 이름만 막는 사이트에서 이름·Client Hints 만 바꿔 한 번 다시 열고, 그 사실을 `data.identity` 로 공개합니다. → [헤드리스 이름 재시도](docs/headless-retry.md)
 - **사람 인계·로그인 유지** — 조작권(`control take/release`)·승인 코드, 필요할 때만 창(`--browser on-demand`), 영속 프로필(`--profile`), 미리 로그인(`agent-browser login`). → [사람 인계와 로그인](docs/human-handoff.md)
 - **동작 캐시(레시피)** — 통과한 흐름을 자동 저장해 도구 호출 한 번으로 재생하고, 화면이 어긋나면 누르지 않고 멈춥니다. → [기능](docs/features.md#동작-캐시--레시피-browser_recipe)
@@ -100,7 +101,7 @@ uv run python -m harness.self_healing --tasks 60
 uv run pytest tests -q
 ```
 
-9043개가 통과해야 합니다(8개 건너뜀, 6개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
+9333개가 통과해야 합니다(8개 건너뜀, 6개 예상 실패). Chromium이 필요한 테스트가 포함되어 있습니다.
 
 LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](docs/llm-agent.md)를 보십시오.
 
@@ -145,7 +146,7 @@ LLM 연동(`run` 명령)과 실환경 태스크 실행은 [docs/llm-agent.md](do
 | :--- | :--- |
 | [docs/README.md](docs/README.md) | 문서 목차 |
 | [docs/mcp-integration.md](docs/mcp-integration.md) | MCP 연동 상세 — `serve --browser`·`--nav-settle`·`--pre-approve`/`--mode`, 관찰 → 액션 흐름, 응답 형식 |
-| [docs/signals.md](docs/signals.md) | 차단·캡차, 이동 결과(부분 성공·실패 종류), 프롬프트 주입, robots.txt 신호 |
+| [docs/signals.md](docs/signals.md) | 차단·캡차, 이동 결과(부분 성공·실패 종류), Enter 뒤 상태(`after_enter`), 프롬프트 주입, robots.txt 신호 |
 | [docs/headless-retry.md](docs/headless-retry.md) | 헤드리스 이름 재시도, `data.identity`·`retry_skipped`·`cookie_change`, 쿠키 장부(WS-47·WS-52) |
 | [docs/features.md](docs/features.md) | PDF 읽기, YouTube 영상 검색, 동작 캐시(레시피), 묶음 실행, 도착 페이지 기억 |
 | [docs/human-handoff.md](docs/human-handoff.md) | 미리 로그인, 사람 인계(조작권·승인), 직접 조작할 사이트(`manual-sites`), 로그인 유지(`--profile`), 필요할 때만 창(`on-demand`) |
