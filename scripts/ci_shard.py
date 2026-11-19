@@ -10,6 +10,12 @@
   ci_shard.py --summarize LOG... [--out F]     각 shard pytest 로그의 마지막 요약 줄을 합산해 F 끝에 덧붙임
   ci_shard.py --report --junit J... [--out F]  느린 시험 상위 30·shard 별 시간·max/ideal (markdown)
 
+시간표 갱신 절차: CI 집계 job(단위 테스트 (pytest))의 job summary 에 max/ideal 이 1.25 를 넘는다는 경고가 뜨면,
+그 run 의 artifact `pytest-full-log` 안 `ci_test_durations.json`(6 shard junit 으로 만든 새 표)을
+scripts/ci_test_durations.json 에 덮어써 PR 로 올린다. 로컬에서는 shard 별 junit 을 모아
+`ci_shard.py --update-durations junit-*.xml` 로 같은 표를 만든다. 표는 git 의존 시험이 skip 되지 않는
+checkout(fetch-depth 0, .git 있음)에서 잰 값이어야 한다 — .git 없는 사본 값은 그 시험들을 0 에 가깝게 잰다.
+
 배정: 파일 단위 LPT(긴 것부터, 가장 가벼운 shard 로; 동률은 경로·shard 번호 순). 시간표에 없는 파일은
 표 평균. 각 shard 출력은 **경로 정렬** — 섞인 순서는 pytest 가 conftest 격리를 조용히 빠뜨린다(리뷰 B5).
 """
