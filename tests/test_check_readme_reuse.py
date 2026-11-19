@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "check_readme.py"
 _spec = importlib.util.spec_from_file_location("check_readme_under_test", _PATH)
@@ -65,6 +66,20 @@ def test_without_env_runs_suite(monkeypatch):
 
 
 def test_ci_release_gate_wires_log():
+    """릴리스 게이트는 pytest 를 다시 돌리지 않고, 같은 run 의 집계 job 이 남긴 합산 로그를 읽는다(WS-96)."""
     ci = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert 'tee "$RUNNER_TEMP/pytest-full.log"' in ci and "code=${PIPESTATUS[0]}" in ci
-    assert "AGENT_BROWSER_PYTEST_LOG: ${{ runner.temp }}/pytest-full.log" in ci
+    jobs = yaml.safe_load(ci)["jobs"]
+    agg = jobs["unit-tests"]
+    assert agg["name"] == "단위 테스트 (pytest)"
+    agg_runs = "\n".join(str(s.get("run", "")) for s in agg["steps"])
+    assert '--out "$full"' in agg_runs and 'full="$RUNNER_TEMP/pytest-full/pytest-full.log"' in agg_runs
+    [up] = [s for s in agg["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact")]
+    assert up["with"]["name"] == "pytest-full-log" and up["with"]["path"] == "${{ runner.temp }}/pytest-full/"
+    gate = jobs["release-gate"]
+    assert "unit-tests" in gate["needs"]
+    [down] = [s for s in gate["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact")]
+    assert down["with"] == {"name": "pytest-full-log", "path": "${{ runner.temp }}/pytest-full"}
+    [readme] = [s for s in gate["steps"] if s.get("name") == "README 설치 안내 검증"]
+    assert readme["env"] == {"AGENT_BROWSER_PYTEST_LOG": "${{ runner.temp }}/pytest-full/pytest-full.log"}
+    names = [s.get("name") for s in gate["steps"]]
+    assert names.index("단위 테스트 합산 로그 내려받기") < names.index("README 설치 안내 검증")
