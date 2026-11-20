@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -154,20 +155,23 @@ async def _serve_session(url: str, extra: List[str], names: List[str]) -> Dict[s
         return json.loads(res.content[0].text)
 
     out: Dict[str, Dict] = {}
-    async with stdio_client(params) as (r, w):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            nav = await call(session, "browser_navigate", {"url": url})
-            assert nav["success"], nav
-            obs = await call(session, "browser_observe_page", {})
-            observation = obs["data"]["observation"]
-            by_name = {e["name"]: e["element_id"] for e in observation["elements"]}
-            for name in names:
-                out[name] = await call(
-                    session,
-                    "browser_click",
-                    {"element_id": by_name[name], "epoch": observation["snapshot_epoch"]},
-                )
+    # errlog 를 명시한다 — 기본값(sys.stderr)은 mcp 를 처음 import 한 시점의 것으로 굳어,
+    # 앞 파일의 capsys 가 먼저 import 하면 fileno 없는 CaptureIO 가 된다(WS-96 B6).
+    with tempfile.TemporaryFile(mode="w+") as errlog:
+        async with stdio_client(params, errlog=errlog) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                nav = await call(session, "browser_navigate", {"url": url})
+                assert nav["success"], nav
+                obs = await call(session, "browser_observe_page", {})
+                observation = obs["data"]["observation"]
+                by_name = {e["name"]: e["element_id"] for e in observation["elements"]}
+                for name in names:
+                    out[name] = await call(
+                        session,
+                        "browser_click",
+                        {"element_id": by_name[name], "epoch": observation["snapshot_epoch"]},
+                    )
     return out
 
 

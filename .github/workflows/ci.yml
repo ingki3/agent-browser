@@ -2,7 +2,7 @@ name: CI
 
 # 게이트 검증 파이프라인 (src/AGENTS.md §5 기준)
 # - dev 대상 PR : 무결성 + 단위 테스트 (빠른 피드백)
-# - main 대상 PR: 위 항목 + 전체 회귀 (릴리스 게이트)
+# - main 대상 PR: 위 항목 + 릴리스 게이트 (전체 회귀는 단위 테스트 합산 결과를 재사용)
 on:
   pull_request:
     branches: [dev, main]
@@ -55,9 +55,18 @@ jobs:
       - name: 하네스 커버리지 자기검증
         run: python scripts/check_harness_coverage.py
 
-  unit-tests:
-    name: 단위 테스트 (pytest)
+  # 단위 테스트는 파일 단위로 6 개 shard 에 나눠 돌린다(WS-96). shard 배정은 scripts/ci_shard.py 가
+  # 저장소의 파일별 소요 시간표(scripts/ci_test_durations.json)로 LPT 균형을 잡고, 각 shard 안 순서는
+  # 경로 정렬이다. 브랜치 보호의 필수 검사 이름 '단위 테스트 (pytest)' 는 아래 집계 job 이 갖는다.
+  unit-test-shards:
+    name: 단위 테스트 샤드 ${{ matrix.shard }}/6
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      # 한 shard 실패가 나머지를 취소하지 않게 — 재실행은 실패한 shard 만(gh run rerun --failed).
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,17 +97,135 @@ jobs:
           Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
+      # 빈 목록이면 ci_shard 가 exit 1 — pytest 에 빈 목록을 주면 testpaths 전체가 돈다.
+      - name: shard 파일 목록
+        run: |
+          mkdir -p "$RUNNER_TEMP/shard"
+          uv run python scripts/ci_shard.py --index ${{ matrix.shard }} --total 6 > "$RUNNER_TEMP/shard/files-${{ matrix.shard }}.txt"
+          echo "파일 $(wc -l < "$RUNNER_TEMP/shard/files-${{ matrix.shard }}.txt")개"
+
       - name: pytest 실행
+        shell: bash  # PIPESTATUS(pytest 종료 코드) 는 bash 전용
         run: |
           set +e
-          uv run pytest tests -q
-          code=$?
-          # exit 5 = 수집된 테스트 없음. Stage 0 착수 전에는 정상 상태로 간주한다.
-          if [ $code -eq 5 ]; then
-            echo "::notice::수집된 테스트가 없습니다 (Stage 0 착수 전 정상)."
-            exit 0
-          fi
+          out="$RUNNER_TEMP/shard"
+          uv run pytest -q --durations=25 -o junit_family=xunit1 --junitxml="$out/junit-${{ matrix.shard }}.xml" "@$out/files-${{ matrix.shard }}.txt" 2>&1 | tee "$out/pytest-${{ matrix.shard }}.log"
+          code=${PIPESTATUS[0]}
           exit $code
+
+      # 재실행한 shard 의 옛 결과가 남지 않게 같은 이름을 덮어쓴다(집계는 shard 당 정확히 1개를 요구).
+      - name: shard 결과 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard/
+          overwrite: true
+          if-no-files-found: error
+
+  # 필수 검사 이름을 갖는 집계 job. needs 만 두면 shard 실패 시 이 job 이 skip 되고, skip 된 필수 검사는
+  # 'Success' 로 간주되어 실패한 채 머지된다 → !cancelled() 로 항상 돌고 첫 단계에서 shard 결과를 명시 검사.
+  unit-tests:
+    name: 단위 테스트 (pytest)
+    needs: [unit-test-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 모든 shard 성공 확인
+        run: |
+          result="${{ needs.unit-test-shards.result }}"
+          echo "shard 결과: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::단위 테스트 shard 가 성공하지 않았습니다 ($result)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # shard 와 같은 checkout 으로 수집한다
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: 의존성 동기화 (dev extras 포함)
+        run: |
+          uv sync --extra dev
+          uv pip install -e .
+
+      - name: shard 결과 내려받기
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pytest-shard-*
+          path: ${{ runner.temp }}/shards
+
+      - name: shard 결과 개수 확인 (shard 당 정확히 1개)
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/shards"
+          ls -1
+          n=$(ls -1d pytest-shard-* | wc -l)
+          if [ "$n" -ne 6 ]; then echo "::error::shard 결과 $n 개 (6 이어야 함)"; exit 1; fi
+          for i in 1 2 3 4 5 6; do
+            for f in "files-$i.txt" "junit-$i.xml" "pytest-$i.log"; do
+              if [ ! -f "pytest-shard-$i/$f" ]; then echo "::error::pytest-shard-$i/$f 없음"; exit 1; fi
+            done
+          done
+
+      # 누락·중복 방지: 목록 서로소·합집합 == tests 의 test_*.py·각 목록 경로 정렬,
+      # 전체 collect-only 의 파일별 노드 수 == shard junit 의 파일별 노드 수.
+      - name: shard 목록·노드 수 대조
+        shell: bash
+        run: |
+          set -o pipefail
+          S="$RUNNER_TEMP/shards"
+          uv run pytest --collect-only -q tests > "$RUNNER_TEMP/collect.txt"
+          tail -n 1 "$RUNNER_TEMP/collect.txt"
+          uv run python scripts/ci_shard.py --check --total 6 \
+            --lists "$S"/pytest-shard-{1..6}/files-*.txt \
+            --collect "$RUNNER_TEMP/collect.txt" \
+            --junit "$S"/pytest-shard-{1..6}/junit-*.xml
+
+      # 각 shard 의 pytest 마지막 요약 줄을 합산해 pytest-full.log **마지막 줄**로 쓴다(0 인 범주 생략).
+      # 릴리스 게이트의 check_readme 가 이 파일의 마지막 요약 줄에서 통과 수를 읽는다.
+      - name: 결과 합산·느린 시험 요약
+        shell: bash
+        run: |
+          set +e  # 합산 실패여도 로그·summary 는 남기고 마지막에 그 종료 코드로 끝낸다
+          S="$RUNNER_TEMP/shards"
+          full="$RUNNER_TEMP/pytest-full/pytest-full.log"
+          mkdir -p "$RUNNER_TEMP/pytest-full"
+          cat "$S"/pytest-shard-{1..6}/pytest-*.log > "$full"
+          line=$(uv run python scripts/ci_shard.py --summarize "$S"/pytest-shard-{1..6}/pytest-*.log --out "$full")
+          code=$?
+          echo "$line"
+          uv run python scripts/ci_shard.py --report --junit "$S"/pytest-shard-{1..6}/junit-*.xml \
+            --out "$RUNNER_TEMP/report.md"
+          uv run python scripts/ci_shard.py --update-durations "$S"/pytest-shard-{1..6}/junit-*.xml \
+            --out "$RUNNER_TEMP/pytest-full/ci_test_durations.json"
+          {
+            echo "## 단위 테스트 (pytest) — 6 shard 합산"
+            echo ""
+            echo '```'
+            echo "$line"
+            echo '```'
+            echo ""
+            cat "$RUNNER_TEMP/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: 합산 로그 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-full-log
+          path: ${{ runner.temp }}/pytest-full/
+          overwrite: true
 
   release-gate:
     name: 릴리스 게이트 (main 대상 PR 전용)
@@ -179,18 +306,13 @@ jobs:
             echo "::notice::src/interface 미존재 — Stage 3-B 착수 전이므로 건너뜁니다."
           fi
 
-      - name: 전체 회귀 테스트
-        shell: bash  # PIPESTATUS(pytest 종료 코드) 는 bash 전용
-        run: |
-          set +e
-          # 출력은 다음 단계(README 검사)가 통과 수로 다시 쓴다 — 같은 스위트를 두 번 돌리지 않는다.
-          uv run pytest tests -q 2>&1 | tee "$RUNNER_TEMP/pytest-full.log"
-          code=${PIPESTATUS[0]}
-          if [ $code -eq 5 ]; then
-            echo "::notice::수집된 테스트가 없습니다 (Stage 0 착수 전 정상)."
-            exit 0
-          fi
-          exit $code
+      # 전체 pytest 는 다시 돌리지 않는다 — 같은 run 의 집계 job(단위 테스트 (pytest))이 6 shard 를
+      # 합산해 남긴 pytest-full.log 를 받아 README 검사의 통과 수로 쓴다(WS-96).
+      - name: 단위 테스트 합산 로그 내려받기
+        uses: actions/download-artifact@v4
+        with:
+          name: pytest-full-log
+          path: ${{ runner.temp }}/pytest-full
 
       # 설치 안내가 실제와 일치하는지 검증한다.
       # 문서가 틀리면 외부 사용자가 첫 단계에서 막힌다. README에 적힌
@@ -198,5 +320,5 @@ jobs:
       # (Chromium과 CLI 설치가 끝난 릴리스 게이트에서만 실행 가능)
       - name: README 설치 안내 검증
         env:
-          AGENT_BROWSER_PYTEST_LOG: ${{ runner.temp }}/pytest-full.log
+          AGENT_BROWSER_PYTEST_LOG: ${{ runner.temp }}/pytest-full/pytest-full.log
         run: uv run python scripts/check_readme.py
