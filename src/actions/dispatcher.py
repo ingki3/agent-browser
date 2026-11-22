@@ -124,12 +124,13 @@ _WEAK_EFFECT_SIGNALS = ("text_changed", "dom_delta")
 _RECORDER_FAILED = object()
 
 
-def click_unsatisfied_message(*, nav_aborted: bool = False) -> str:
+def click_unsatisfied_message(*, document_aborted: bool = False) -> str:
     """WS-97 B4: click 사후조건 미충족(E_TIMEOUT) 고정 문구 — dispatcher·server_signals 두 생산자가 이것만 쓴다.
 
-    페이지 글자 0. nav_aborted(문서 요청을 보냈지만 204·중단으로 새 문서가 없음)면 '어디에도 변화 없음' 대신 그 사실.
+    페이지 글자 0. document_aborted(data.nav_aborted — 문서 요청을 보냈지만 204·중단으로 새 문서가 없음)면 '어디에도 변화
+    없음' 대신 그 사실. (인자 이름은 data 키와 다르게 둔다 — 키워드 인자도 WS-51 census 의 동적 생산자로 세진다.)
     """
-    if nav_aborted:
+    if document_aborted:
         what = "문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단"
     else:
         what = (f"클릭 뒤 {LATE_EFFECT_WINDOW_MS / 1000:g}초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음"
@@ -3676,7 +3677,8 @@ class ActionDispatcher:
             # 실패한 액션 뒤에는 붙이지 않는다 — egress 차단 navigate 실패 직후 끼어든 evaluate 가 서버 차단 판정 시점을
             # 바꿨다(WS-48 골든). press_key 는 왕복 예산(WS-78 R3)을 지키려 붙이지 않고 기준선이 낡았다고 적는다 —
             # 그 뒤 click 의 창 안 약한 신호는 귀속 판정 불가(B5①, 기존 판정)로 본다(키가 바꾼 노드를 다시 바꾼 효과 보호).
-            if action is ActionType.PRESS_KEY:
+            # nav_settle=False Enter 꼬리(last_input_deadline)도 같다 — 이동 중 문서의 evaluate 가 Enter 뒤 마감(WS-91)을 먹는다.
+            if action is ActionType.PRESS_KEY or isinstance(self.__dict__.get("last_input_deadline"), float):
                 self._main_rec_stale = True
             else:
                 armed = await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
@@ -5101,7 +5103,7 @@ class ActionDispatcher:
                 error_code=ErrorCode.TIMEOUT,
                 error_message=(
                     # WS-97 B4: click 은 고정 문구(server_signals 관계 탭 오류 경로와 같은 함수).
-                    click_unsatisfied_message(nav_aborted=bool(self._nav_info.get("nav_aborted")))
+                    click_unsatisfied_message(document_aborted=bool(self._nav_info.get("nav_aborted")))
                     if action is ActionType.CLICK else
                     f"사후조건 미충족({post.detail}). "
                     f"{action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."

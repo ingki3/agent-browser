@@ -429,7 +429,7 @@ class BrowserCore:
         opts: Dict[str, Any] = {"no_viewport": True} if self.human_like else {"viewport": dict(self.viewport)}
         if self.locale is not None:
             # WS-97 (#293): human_like 와 무관하게 같은 값(기본·영속·on-demand 다시 열기 모두 이 함수를 거친다).
-            opts["locale"] = self.locale
+            opts.update({"locale": self.locale})
         return opts
 
     async def new_context(self, profile_name: str) -> Any:
