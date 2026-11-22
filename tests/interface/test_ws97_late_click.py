@@ -250,6 +250,35 @@ async def test_late_effect_within_window_is_success(site, fx):
     assert r.get("error_code") is None
 
 
+@pytest.mark.parametrize("nav_settle", [True, False])
+async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
+    """B2: 창 안 상태 캡처 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에
+    다시 봐서 1.5초 뒤 효과(①)를 잡는다. 실제 경합(③d)은 창 안 _NavWatch 가 먼저 잡아 드물어서 예외를 주입해 고정한다."""
+    state = {"in_window": False, "raised": 0}
+    orig_window = dmod.ActionDispatcher._late_effect_window
+    orig_capture = dmod.ActionDispatcher._capture_state
+
+    async def window(self, *a: Any, **k: Any):  # noqa: ANN202
+        state["in_window"] = True
+        try:
+            return await orig_window(self, *a, **k)
+        finally:
+            state["in_window"] = False
+
+    async def capture(self, *a: Any, **k: Any):  # noqa: ANN202
+        if state["in_window"] and state["raised"] < 2:
+            state["raised"] += 1
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        return await orig_capture(self, *a, **k)
+
+    monkeypatch.setattr(dmod.ActionDispatcher, "_late_effect_window", window)
+    monkeypatch.setattr(dmod.ActionDispatcher, "_capture_state", capture)
+    async with _server(nav_settle=nav_settle) as s:
+        r = await run_fx(s, site["base"], "f1", think=0.3)
+    assert state["raised"] == 2
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+
+
 async def test_form_post_303_unchanged_success(site):
     """③a: 클릭이 커밋까지 기다리는 기존 경로 그대로 성공(창과 무관)."""
     async with _server() as s:
