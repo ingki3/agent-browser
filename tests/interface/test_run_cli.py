@@ -547,7 +547,8 @@ def test_open_browser_default_mode_args_fixed():
     pw = _FakePW()
     asyncio.run(run_cli._open_browser(pw, _ns(), {}))
     assert pw.log[0] == ("launch", {"headless": True})
-    assert pw.log[1] == ("new_context", {"viewport": {"width": 1280, "height": 720}})
+    # WS-97 (#293): run 도 serve 와 같은 기본 locale ko-KR.
+    assert pw.log[1] == ("new_context", {"viewport": {"width": 1280, "height": 720}, "locale": "ko-KR"})
 
 
 @requires_chromium

@@ -1,4 +1,4 @@
-# 응답 신호 — 차단·캡차, 이동 결과, 프롬프트 주입, robots.txt
+# 응답 신호 — 차단·캡차, 이동 결과, 늦은 클릭 효과, 프롬프트 주입, robots.txt
 
 [← 문서 목차](README.md)
 
@@ -59,6 +59,20 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 **0.3초 안 상태입니다.** `nav_settle=false` 는 Enter 뒤 판독 마감(0.3초) 안, `nav_settle=true` 는 이동 대기 뒤 판독 상한(0.3초) 안에서 본 상태입니다. 실제 지도 사이트처럼 검색 결과 목록이 0.5~1.5초 늦게 뜨는 화면은 `listbox: closed`·`value: kept`·`document: same`(Enter 가 아무것도 확정하지 않음)으로 보이고, 늦게 뜬 결과 목록은 다음 관찰로 확인하십시오. `press_key` 는 키 뒤 판독이 끝난 때까지 본 문서 요청만 반영합니다(판독이 요청보다 먼저 끝나면 `same`).
 
 **nav_settle=false 의 Enter 제출(WS-91 #253).** Enter 는 Playwright 의 '이동 시작까지 대기'를 끄고 보내며, 그 뒤 사후 판독·서버 차단 판정(`data.challenge`)은 Enter 뒤 0.3초 마감 하나를 함께 씁니다(이전에는 새 문서 커밋까지 막혀 약 0.42초 뒤 새 문서를 읽고 거짓 `E_TIMEOUT`). 판정은 응답 상태 숫자가 아니라 **최종 문서 상태**입니다(R1): 마감 안에 메인 문서 요청의 실패(`requestfailed`, `ERR_ABORTED` 제외 — egress 차단 포함)나 오류 문서(chrome-error) 커밋이 보이면 예전 실패(`E_TIMEOUT`, 같은 문구)이고, 마감 안에 새 문서가 커밋됐으면(404·500·502 결과 문서도) 그 문서를 읽어 기준과 같은 판정을 합니다(같은 칸·값이 있으면 성공, 없으면 `기대값 … != 실제 None`). 문서 요청만 보이고 마감까지 커밋이 없으면 기존 `navigation_started` 성공(`reobserve_required`)입니다. 문서 요청 리스너는 `call_tool` 반환 직전까지 남아, 서버 꼬리(차단 판정 등) 중에 그 이동이 실패·오류 문서로 끝났으면 반환 직전 동기 확인이 같은 실패로 바꿉니다(egress 판정은 기존 그대로). `press_key` 는 기준처럼 판정을 바꾸지 않습니다(`after_enter.document` 만 그때 기록). 한계: 마감 뒤에 커밋된 일반(오류 아님) 문서와 반환 뒤에 오는 실패는 이 결과가 알 수 없습니다(`press_key` 의 `nav_settle=false` 와 같음 — 다음 관찰로 확인). 마감을 넘긴 차단 판정은 판정 실패와 같은 `challenge: null` 입니다.
+
+## 늦은 클릭 효과 창 (WS-97 #280)
+
+효과가 전혀 없는 `click` 만 3초(`LATE_EFFECT_WINDOW_MS`) 동안 0.15초 주기로 다시 봅니다. 새 응답 키·신호 어휘는 없습니다 — 창 안에서 잡힌 효과는 기존 신호 그대로입니다.
+
+| 창 안에서 보인 것 | 결과 신호 |
+| :--- | :--- |
+| 주소 변화·대상 속성/값/checked·새 탭(popup) | `url_changed`·`element_*`·`new_tab` (+ `data.opened_tab_ids`) |
+| opener 관계 탭 이동 | `tab_navigated` (+ `data.tabs_changed`) |
+| 메인 문서 요청 → 커밋 | `navigated: …` (+ `nav_committed`, `reobserve_required`) |
+| 본문·노드 변화(시계·광고 아님) | `text_changed`·`dom_delta` — 주 프레임 기록으로 이 클릭 뒤에만 바뀐 노드가 있을 때만 |
+| 대상 탭이 닫힘 | `tab_closed` (+ `data.tab_closed`, WS-83) |
+
+창이 효과 없이 끝나면 `E_TIMEOUT`·`retry_safe=false`·`reobserve_required=true` 와 고정 문구(페이지 글자 없음)입니다: `사후조건 미충족(클릭 뒤 3초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음 — Silent Failure 의심). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control list 로 결과를 확인하세요.` 문서 요청은 보냈지만 204·중단으로 새 문서가 없으면(`data.nav_aborted`) 괄호 안이 `문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단` 입니다. 관계 탭이 오류 문서로 끝난 클릭 실패(WS-83 R2)도 같은 문구입니다. 이때 창 안 마지막 스냅샷의 본문 변화가 자발 변화뿐이었으면 최종 판정도 성공이 아닙니다. 창 진입 전 즉시 판정은 그대로입니다(#294). `type_text(press_enter)` 실패 문구는 바뀌지 않았습니다.
 
 ## 프롬프트 주입 신호 (`data.injection_suspected`)
 

@@ -111,6 +111,38 @@ EPOCH_BUMPING_ACTIONS = frozenset(
 #: 잡힌다. 효과가 이미 잡힌 클릭은 기다리지 않는다.
 POPUP_GRACE_MS = 150
 
+#: WS-97 (#280): 효과가 전혀 없는 click 만 이만큼(클릭 반환·이동 대기 뒤부터) POPUP_GRACE_MS 주기로 다시 본다.
+#: 실측(리뷰 fixture): 실제 사이트의 click → 요청 → 응답 → 이동·새 탭·렌더링이 1~3초. 2000 은 2.8초 fetch 뒤
+#: 이동·렌더(③b·③c)와 첫 응답 2.5초 새 탭(④a)을 놓쳤다. 효과가 이미 있으면 들어가지 않는다(정상 클릭 대기 0) —
+#: 비용은 진짜 무반응 클릭만 +이만큼(그동안 작업 공간 락을 잡는다).
+LATE_EFFECT_WINDOW_MS = 3000
+#: WS-97 B5②: 주 프레임 변화 기록기 호출 상한(초). 응답 없는 문서로 가는 중이면 evaluate 가 멈출 수 있다 —
+#: 넘기면 기준선 없음으로 진행한다.
+_MAIN_RECORDER_TIMEOUT_S = 0.1
+#: 자발 변화(시계·광고)와 섞이는 약한 효과 신호 — 늦은 효과 창 안에서는 귀속을 통과할 때만 효과(B1).
+_WEAK_EFFECT_SIGNALS = ("text_changed", "dom_delta")
+_RECORDER_FAILED = object()
+
+
+def click_unsatisfied_message(*, nav_aborted: bool = False) -> str:
+    """WS-97 B4: click 사후조건 미충족(E_TIMEOUT) 고정 문구 — dispatcher·server_signals 두 생산자가 이것만 쓴다.
+
+    페이지 글자 0. nav_aborted(문서 요청을 보냈지만 204·중단으로 새 문서가 없음)면 '어디에도 변화 없음' 대신 그 사실.
+    """
+    if nav_aborted:
+        what = "문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단"
+    else:
+        what = (f"클릭 뒤 {LATE_EFFECT_WINDOW_MS / 1000:g}초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음"
+                " — Silent Failure 의심")
+    return (f"사후조건 미충족({what}). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — "
+            "다시 누르기 전에 observe_page·tab_control list 로 결과를 확인하세요.")
+
+
+def _weak_only(signals: List[str]) -> bool:
+    """효과 신호(focus_moved 제외)가 모두 약한 신호(text_changed·dom_delta)인가. 효과가 없으면 False."""
+    effect = [s for s in signals if not s.startswith("focus_moved")]
+    return bool(effect) and all(s.startswith(_WEAK_EFFECT_SIGNALS) for s in effect)
+
 #: 스크롤 중 문서가 바뀌었을 때 Playwright 예외 메시지(WS-24 F1 로컬 재현).
 _CONTEXT_DESTROYED = "Execution context was destroyed"
 #: 그때 새 문서 로드를 기다리는 상한 — 짧게(스텝 지연을 키우지 않게).
@@ -335,10 +367,11 @@ class _NavWatch:
             return False
         return True
 
-    async def settle(self) -> Dict[str, Any]:
+    async def settle(self, limit_ms: Optional[float] = None) -> Dict[str, Any]:
         """감지 창 안에 이동이 시작됐으면 새 문서를 기다린다. 기다린 정보를 돌려준다.
 
-        이동이 없었으면 빈 dict(추가 지연 ≤ NAV_DETECT_MS).
+        이동이 없었으면 빈 dict(추가 지연 ≤ NAV_DETECT_MS). limit_ms(WS-97 늦은 효과 창)를 주면 새 문서 대기 상한을
+        NAV_SETTLE_TIMEOUT_MS 대신 그 값으로(창 남은 시간만) 쓴다.
         """
         if not self.active:
             return {}
@@ -349,7 +382,7 @@ class _NavWatch:
                 pass
             if not self.started:
                 return {}
-            deadline = t0 + NAV_SETTLE_TIMEOUT_MS / 1000
+            deadline = t0 + (NAV_SETTLE_TIMEOUT_MS if limit_ms is None else max(0.0, limit_ms)) / 1000
             while not self.aborted and not (self.committed and self.dcl):
                 if self.committed and self._nav_frame is not None and self._nav_frame != self._main:
                     # 하위 프레임 문서: 커밋 뒤에는 그 프레임의 load state 가 새 문서 기준이다.
@@ -1115,6 +1148,7 @@ _TOP_RECORDER_ARM_JS = """
   const ids = new WeakMap();
   let seq = 0;
   const key = (n) => {
+    if (n && n.nodeType === 11 && n.host) n = n.host;
     if (n && n.nodeType !== 1) n = n.parentNode;
     if (!n) return 0;
     let k = ids.get(n);
@@ -1122,6 +1156,20 @@ _TOP_RECORDER_ARM_JS = """
     return k;
   };
   const rec = { times: new Map(), overflow: false, armed: performance.now() };
+  const opts = { subtree: true, childList: true, characterData: true };
+  // WS-97 B5①: open shadow root 안 변화도 본다(arm 때 있는 root + 이후 붙는 노드의 root).
+  const roots = new WeakSet();
+  const watchRoot = (root) => {
+    if (!root || roots.has(root)) return;
+    roots.add(root);
+    rec.obs.observe(root, opts);
+    walk(root);
+  };
+  const walk = (root) => {
+    let all;
+    try { all = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of all) if (el.shadowRoot) watchRoot(el.shadowRoot);
+  };
   const push = (list) => {
     const t = performance.now();
     for (const m of list) {
@@ -1132,11 +1180,18 @@ _TOP_RECORDER_ARM_JS = """
         arr = []; rec.times.set(k, arr);
       }
       if (arr.length < 32) arr.push(t); else arr[31] = t;
+      if (m.addedNodes) for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.shadowRoot) watchRoot(n.shadowRoot);
+        walk(n);
+      }
     }
   };
   rec.push = push;
   rec.obs = new MutationObserver(push);
-  rec.obs.observe(document, { subtree: true, childList: true, characterData: true });
+  roots.add(document);
+  rec.obs.observe(document, opts);
+  walk(document);
   window.__abTopRec = rec;
   return true;
 }
@@ -3616,6 +3671,9 @@ class ActionDispatcher:
             # 읽기 전용 액션(관찰·추출·스크린샷·대기)은 기준선을 끊지 않는다 — 에이전트는 보통
             # observe → click 순서라, 관찰마다 다시 시작하면 기준선이 그 사이 몇 ms 로 줄어든다.
             await self._arm_top_recorder()
+        elif self.ctx.root_page is None and action not in _TOP_RECORDER_KEEP_ACTIONS:
+            # WS-97 B1: 주 프레임도 같은 기록기를 액션마다 다시 시작한다(늦은 효과 창의 자발 변화 기준선). 상한 100ms.
+            await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
         if self._top_attribution is not None:
             result.data.setdefault("top_change_attribution", self._top_attribution)
             self._top_attribution = None
@@ -4118,6 +4176,55 @@ class ActionDispatcher:
         except Exception:  # noqa: BLE001 — 문서 교체 중·가짜 페이지
             pass
 
+    async def _main_recorder_call(self, js: str, arg: Any = None) -> Any:
+        """WS-97 B5②: 주 프레임(프레임 컨텍스트가 아닌 탭)에서 기록기 JS 를 상한(_MAIN_RECORDER_TIMEOUT_S) 안에서 부른다.
+
+        응답 없는 문서로 가는 중·다이얼로그·닫힌 탭·가짜 페이지는 _RECORDER_FAILED(= 기준선·판독 없음)."""
+        page = self.ctx.page
+        if page is None or self.ctx.root_page is not None or _page_closed(page):
+            return _RECORDER_FAILED
+        try:
+            coro = page.evaluate(js) if arg is None else page.evaluate(js, arg)
+            return await asyncio.wait_for(coro, _MAIN_RECORDER_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 시간 초과·문서 교체 중·가짜 페이지: 기준선 없음
+            return _RECORDER_FAILED
+
+    async def _mark_main_recorder(self) -> None:
+        """click 직전 주 프레임 기록기의 액션 시작 시각을 찍는다(없으면 지금 붙인다 — 기준선 없음)."""
+        self._main_start = None
+        started = await self._main_recorder_call(_TOP_RECORDER_START_JS)
+        if started is _RECORDER_FAILED:
+            return
+        if started is None:
+            await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
+            return
+        self._main_start = started
+
+    async def _main_change_attributable(self) -> Optional[bool]:
+        """WS-97 B1: 주 프레임의 약한 변화(text/dom)가 이 click 의 효과인가 — 최상위 귀속(_top_change_attributable)과 같은 규칙.
+
+        True: 액션 창에서만 바뀐 노드 ≥ 1. False: 바뀐 노드가 모두 기준선·사후 창에서도 바뀜(자발)·기록 넘침.
+        None: 판정 불가(기록기 없음·못 읽음·기록기가 액션 창에 변화를 하나도 못 봄 — 닫힌 shadow 등) → 기존 판정.
+        """
+        end = await self._main_recorder_call("performance.now()")
+        if end is _RECORDER_FAILED:
+            return None
+        args = {"start": self.__dict__.get("_main_start"), "end": end}
+        read = await self._main_recorder_call(_TOP_RECORDER_READ_JS, args)
+        if (isinstance(read, dict) and int(read.get("effect") or 0) > 0
+                and int(read.get("baseline_ms") or 0) < TOP_SPONTANEOUS_WINDOW_MS):
+            # 기준선이 관찰 창보다 짧다 — 그 주기보다 느린 자발 변화를 못 봤을 수 있으니 사후 창만큼 더 본다.
+            await asyncio.sleep(TOP_SPONTANEOUS_WINDOW_MS / 1000)
+            again = await self._main_recorder_call(_TOP_RECORDER_READ_JS, args)
+            read = again if isinstance(again, dict) else None
+        if not isinstance(read, dict):
+            return None
+        if read.get("overflow"):
+            return False
+        if int(read.get("act") or 0) == 0:
+            return None
+        return int(read.get("effect") or 0) > 0
+
     @staticmethod
     def _top_effect_signals(root_before: Any, root_after: Any, weak_ok: bool) -> List[str]:
         """최상위 문서 전후 비교의 효과 신호(top:…).
@@ -4323,6 +4430,11 @@ class ActionDispatcher:
         self._fence_bound = None
         before = await self._capture_state(self.ctx.page, handle)
         root_before = await self._capture_root(mark_start=True)
+        self._main_start = None
+        self._late_outcome = None
+        if action is ActionType.CLICK and self.ctx.root_page is None:
+            # WS-97 B1: 늦은 효과 창의 약한 신호 귀속용 — 주 프레임 기록기의 액션 시작 시각(상한 100ms, 실패 = 기준선 없음).
+            await self._mark_main_recorder()
         # 새 탭은 클릭이 반환된 뒤 20~50ms 늦게 생긴다(실측, s11_popup). 전후 탭 수를
         # 스냅샷으로 비교하면 타이밍에 따라 놓치므로 popup 이벤트를 직접 듣는다.
         popups: List[Any] = []
@@ -4474,13 +4586,10 @@ class ActionDispatcher:
             if not verify_post_condition(before, after).satisfied and not (
                 self._effect_beyond_target(root_before, root_after, weak_ok=True)
             ):
-                try:
-                    await self.ctx.page.wait_for_timeout(POPUP_GRACE_MS)
-                    after = await self._capture_state(self.ctx.page, handle)
-                    if root_before is not None:
-                        root_after = await self._capture_root()
-                except Exception:  # noqa: BLE001 — 페이지 이동으로 컨텍스트가 바뀐 경우 등
-                    pass
+                # WS-97 (#280): 한 번(150ms)이 아니라 LATE_EFFECT_WINDOW_MS 동안 150ms 주기로 다시 본다 — 효과 0 일 때만.
+                after, root_after = await self._late_effect_window(
+                    handle, before, after, root_before, root_after, popups
+                )
         self._off_popup(_on_popup)
         # WS-26b: 이 액션이 연 새 탭 — dispatch() 가 코어 탭 id 로 바꿔 data 에 싣는다.
         self._opened_pages = list(popups)
@@ -4488,6 +4597,89 @@ class ActionDispatcher:
             # 팝업 이벤트가 곧 증거다. 스냅샷 탭 수가 아직 안 늘었어도 반영한다.
             before.page_count = before.page_count or 1
             after.page_count = max(after.page_count, before.page_count + len(popups))
+        return after, root_after
+
+    async def _late_effect_window(
+        self,
+        handle: ElementHandle,
+        before: Any,
+        after: Any,
+        root_before: Any,
+        root_after: Any,
+        popups: List[Any],
+    ) -> Tuple[Any, Any]:
+        """WS-97 (#280): 효과가 전혀 없는 click 뒤 LATE_EFFECT_WINDOW_MS 동안 POPUP_GRACE_MS 주기로 다시 본다.
+
+        효과(URL·대상 속성·값·탭·popup·관계 탭 이동·다이얼로그·최상위 강한 신호·커밋된 문서 이동)가 보이면 바로 끝낸다.
+        약한 신호(text_changed·dom_delta)는 주 프레임 기록기 귀속(_main_change_attributable)이 False 가 아닐 때만 효과(B1).
+        캡처 예외(문서 교체 중)는 다음 주기로 계속(B2). 대상 탭이 닫히면 끝내고 기존 닫힘 경로(WS-83 B4)로 넘긴다.
+        창 시작에 _NavWatch 를 붙여 창 안 메인 문서 요청을 남은 창 시간만 기다리고(커밋만 효과), 끝에 반드시 뗀다.
+        context.on("page") 는 쓰지 않는다(WS-57 — 다른 작업 공간 탭을 효과로 세지 않게). 결과는 self._late_outcome
+        ("effect"·"none"·"closed") — "none" 이면 최종 판정도 약한 신호만으로는 성공하지 않는다(B1-③).
+        """
+        page = self.ctx.page
+        top = self._top_page()
+        frame_ctx = self.ctx.page if self.ctx.root_page is not None else None
+        deadline = time.perf_counter() + LATE_EFFECT_WINDOW_MS / 1000
+
+        def _new_watch() -> Optional[_NavWatch]:
+            if not self.ctx.nav_settle:
+                return None
+            w = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
+            return w if w.active else None
+
+        watch = _new_watch()
+        outcome = "none"
+        try:
+            while True:
+                left = deadline - time.perf_counter()
+                if left <= 0:
+                    break
+                await asyncio.sleep(min(POPUP_GRACE_MS / 1000, left))
+                if _page_closed(top):
+                    outcome = "closed"
+                    break
+                if popups or self.__dict__.get("_related_navs"):
+                    outcome = "effect"
+                    break
+                if watch is not None and watch.started:
+                    info = await watch.settle(limit_ms=max(0.0, (deadline - time.perf_counter()) * 1000))
+                    watch = None
+                    if info:
+                        self._nav_info = info
+                    if info.get("nav_committed"):
+                        outcome = "effect"
+                        try:
+                            after = await self._capture_state(page, handle)
+                            if root_before is not None:
+                                root_after = await self._capture_root()
+                        except Exception:  # noqa: BLE001 — 커밋 자체가 효과(navigated:)
+                            pass
+                        break
+                    watch = _new_watch()  # 중단(204·실패)·시간 초과: 커밋 안 된 요청은 효과 아님 — 다음 요청을 본다
+                    continue
+                try:
+                    after = await self._capture_state(page, handle)
+                    if root_before is not None:
+                        root_after = await self._capture_root()
+                except Exception:  # noqa: BLE001 — B2: 문서 교체 중(이동 시작)이면 끊지 않고 다음 주기에 다시 본다
+                    continue
+                v = verify_post_condition(before, after)
+                if v.satisfied:
+                    if not _weak_only(v.signals):
+                        outcome = "effect"
+                        break
+                    attributable = await self._main_change_attributable() if self.ctx.root_page is None else None
+                    if attributable is not False:
+                        outcome = "effect"
+                        break
+                if self._effect_beyond_target(root_before, root_after, weak_ok=False):
+                    outcome = "effect"
+                    break
+        finally:
+            if watch is not None:
+                watch.close()
+        self._late_outcome = outcome
         return after, root_after
 
     async def _element_post_condition(
@@ -4510,6 +4702,14 @@ class ActionDispatcher:
             ),
             conceal_value=bool(params.get(_CONCEAL_KEY)),
         )
+        if self.__dict__.get("_late_outcome") == "none" and post.satisfied and _weak_only(post.signals):
+            # WS-97 B1-③: 늦은 효과 창이 효과 없이 끝났다 — 마지막 스냅샷의 약한 신호(text/dom)는 창 안에서 자발 변화로
+            # 판정된 것이다. 최종 판정도 그것만으로는 성공하지 않는다(창 진입 전 즉시 판정은 바꾸지 않는다 — #294).
+            post = PostConditionResult(
+                satisfied=False,
+                signals=[s for s in post.signals if s.startswith("focus_moved")],
+                detail="URL/DOM/텍스트/속성/값/탭 어디에도 변화가 없음 (Silent Failure 의심) — 자발 변화만 있음",
+            )
         top_weak_ok = False
         if (
             not post.satisfied
@@ -4888,6 +5088,9 @@ class ActionDispatcher:
                 retry_safe=False,
                 error_code=ErrorCode.TIMEOUT,
                 error_message=(
+                    # WS-97 B4: click 은 고정 문구(server_signals 관계 탭 오류 경로와 같은 함수).
+                    click_unsatisfied_message(nav_aborted=bool(self._nav_info.get("nav_aborted")))
+                    if action is ActionType.CLICK else
                     f"사후조건 미충족({post.detail}). "
                     f"{action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
                 ),
