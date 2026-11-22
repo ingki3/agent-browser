@@ -425,6 +425,32 @@ async def test_navigate_to_never_answering_document_keeps_time_bound(site):
     assert elapsed < 1.5 + 0.5, elapsed
 
 
+async def test_main_recorder_call_is_bounded():
+    """B5②: 주 프레임 기록기 호출은 상한(_MAIN_RECORDER_TIMEOUT_S) 안에서 끝난다 — 응답 없는 evaluate(주 스레드가 막힌
+    문서·이동 중 문서)는 기준선 없음(_RECORDER_FAILED)으로 진행한다. 실패한 액션 뒤에는 arm 하지 않아 위 navigate
+    시험만으로는 상한이 쓰이지 않으므로 직접 고정한다."""
+    from actions import ActionDispatcher, DispatchContext
+    from perception import PerceptionEngine
+
+    class HangPage:
+        def is_closed(self) -> bool:
+            return False
+
+        async def evaluate(self, *_a: Any) -> Any:
+            await asyncio.sleep(5)
+            return True
+
+    d = ActionDispatcher(DispatchContext(page=HangPage(), engine=PerceptionEngine()))
+    t0 = time.perf_counter()
+    out = await d._main_recorder_call(dmod._TOP_RECORDER_ARM_JS)
+    elapsed = time.perf_counter() - t0
+    assert out is dmod._RECORDER_FAILED
+    assert elapsed < dmod._MAIN_RECORDER_TIMEOUT_S + 0.2, elapsed
+    t0 = time.perf_counter()
+    assert await d._main_change_attributable() is None  # 못 읽음 = 판정 불가
+    assert time.perf_counter() - t0 < 2 * dmod._MAIN_RECORDER_TIMEOUT_S + 0.3
+
+
 # ------------------------------------------------------------------ #293 locale
 
 
