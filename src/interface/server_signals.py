@@ -759,7 +759,7 @@ class SignalsMixin:
                 # WS-97 B4: dispatcher(_retry_unsatisfied)와 같은 click 고정 문구 — 한 함수만 쓴다.
                 from actions.dispatcher import click_unsatisfied_message
 
-                message = click_unsatisfied_message(nav_aborted=bool(src.get("nav_aborted")))
+                message = click_unsatisfied_message(document_aborted=bool(src.get("nav_aborted")))
             else:
                 message = f"사후조건 미충족({detail}). {action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
         data: Dict[str, Any] = {}

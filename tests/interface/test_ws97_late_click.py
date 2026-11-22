@@ -210,7 +210,7 @@ def _expect_late_failure(r: Dict[str, Any]) -> None:
     assert r["success"] is False, r
     assert r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
-    assert r["error_message"] == dmod.click_unsatisfied_message(nav_aborted=False), r["error_message"]
+    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False), r["error_message"]
     assert "late_effect" not in (r.get("data") or {}), r  # 새 data 키 없음
 
 
@@ -373,8 +373,8 @@ async def test_spontaneous_pages_fail_when_window_entered(site, fx, monkeypatch)
 
 
 def test_message_is_fixed_text():
-    base = dmod.click_unsatisfied_message(nav_aborted=False)
-    aborted = dmod.click_unsatisfied_message(nav_aborted=True)
+    base = dmod.click_unsatisfied_message(document_aborted=False)
+    aborted = dmod.click_unsatisfied_message(document_aborted=True)
     assert base == ("사후조건 미충족(클릭 뒤 3초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음 — Silent Failure 의심). "
                     "click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control "
                     "list 로 결과를 확인하세요.")
@@ -391,7 +391,7 @@ async def test_nav_aborted_click_uses_aborted_message(site, monkeypatch):
     assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
     assert r["data"].get("nav_aborted"), r
-    assert r["error_message"] == dmod.click_unsatisfied_message(nav_aborted=True), r
+    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=True), r
 
 
 async def test_both_message_producers_are_the_same(site):
@@ -407,7 +407,7 @@ async def test_both_message_producers_are_the_same(site):
     assert direct["success"] is False and rel["success"] is False, (direct, rel)
     assert rel["error_code"] == direct["error_code"] == "E_TIMEOUT"
     assert rel["data"].get("tabs_changed"), rel
-    assert rel["error_message"] == direct["error_message"] == dmod.click_unsatisfied_message(nav_aborted=False)
+    assert rel["error_message"] == direct["error_message"] == dmod.click_unsatisfied_message(document_aborted=False)
 
 
 # ------------------------------------------------------------------ B5②: 응답 없는 문서로 가는 navigate 시간 기준
