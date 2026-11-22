@@ -3671,9 +3671,16 @@ class ActionDispatcher:
             # 읽기 전용 액션(관찰·추출·스크린샷·대기)은 기준선을 끊지 않는다 — 에이전트는 보통
             # observe → click 순서라, 관찰마다 다시 시작하면 기준선이 그 사이 몇 ms 로 줄어든다.
             await self._arm_top_recorder()
-        elif self.ctx.root_page is None and action not in _TOP_RECORDER_KEEP_ACTIONS:
-            # WS-97 B1: 주 프레임도 같은 기록기를 액션마다 다시 시작한다(늦은 효과 창의 자발 변화 기준선). 상한 100ms.
-            await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
+        elif self.ctx.root_page is None and action not in _TOP_RECORDER_KEEP_ACTIONS and result.success:
+            # WS-97 B1: 주 프레임도 같은 기록기를 성공한 액션마다 다시 시작한다(늦은 효과 창의 자발 변화 기준선). 상한 100ms.
+            # 실패한 액션 뒤에는 붙이지 않는다 — egress 차단 navigate 실패 직후 끼어든 evaluate 가 서버 차단 판정 시점을
+            # 바꿨다(WS-48 골든). press_key 는 왕복 예산(WS-78 R3)을 지키려 붙이지 않고 기준선이 낡았다고 적는다 —
+            # 그 뒤 click 의 창 안 약한 신호는 귀속 판정 불가(B5①, 기존 판정)로 본다(키가 바꾼 노드를 다시 바꾼 효과 보호).
+            if action is ActionType.PRESS_KEY:
+                self._main_rec_stale = True
+            else:
+                armed = await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
+                self._main_rec_stale = armed is _RECORDER_FAILED
         if self._top_attribution is not None:
             result.data.setdefault("top_change_attribution", self._top_attribution)
             self._top_attribution = None
@@ -4196,7 +4203,9 @@ class ActionDispatcher:
         if started is _RECORDER_FAILED:
             return
         if started is None:
+            # 새 문서(기록기 없음) — 지금 붙인다. 기준선 없이 사후 창만으로 판정한다(낡은 기준선 아님).
             await self._main_recorder_call(_TOP_RECORDER_ARM_JS)
+            self._main_rec_stale = False
             return
         self._main_start = started
 
@@ -4204,8 +4213,11 @@ class ActionDispatcher:
         """WS-97 B1: 주 프레임의 약한 변화(text/dom)가 이 click 의 효과인가 — 최상위 귀속(_top_change_attributable)과 같은 규칙.
 
         True: 액션 창에서만 바뀐 노드 ≥ 1. False: 바뀐 노드가 모두 기준선·사후 창에서도 바뀜(자발)·기록 넘침.
-        None: 판정 불가(기록기 없음·못 읽음·기록기가 액션 창에 변화를 하나도 못 봄 — 닫힌 shadow 등) → 기존 판정.
+        None: 판정 불가(기록기 없음·못 읽음·기록기가 액션 창에 변화를 하나도 못 봄 — 닫힌 shadow 등·기준선이 그 뒤 액션보다
+        오래됨(press_key 뒤 arm 생략·arm 실패)) → 기존 판정.
         """
+        if self.__dict__.get("_main_rec_stale"):
+            return None
         end = await self._main_recorder_call("performance.now()")
         if end is _RECORDER_FAILED:
             return None

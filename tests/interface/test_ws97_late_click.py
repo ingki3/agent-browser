@@ -65,6 +65,10 @@ PAGES: Dict[str, str] = {
     "f6d": "<p id=c>0</p><button onclick=\"clearInterval(t);setTimeout(()=>{tick();t=setInterval(tick,1000)},700)\">"
            "Noop</button><script>let n=0;const tick=()=>{document.getElementById('c').textContent=String(++n)};"
            "let t=setInterval(tick,1000)</script>",
+    # press_key 가 바꾼 노드(#m)를 click 의 1.5초 뒤 효과가 다시 바꿈(WS-78 왕복 예산으로 press_key 뒤 arm 생략 — 낡은 기준선)
+    "fkey": "<input id=q aria-label=검색어><button onclick=\"setTimeout(()=>{m.textContent='조회 완료'},1500)\">Lookup</button>"
+            "<p id=m></p><script>const m=document.getElementById('m');let k=0;document.getElementById('q')"
+            ".addEventListener('keydown',()=>{m.textContent='입력 '+(++k)})</script>",
     # ⑧ POST 3초 → 204(문서 없음), 3.3초 뒤 JS 이동
     "f8": '<form method=post action="/slow204?d=3000" onsubmit="setTimeout(()=>location.href=\'/done\',3300)">'
           "<button>Book</button></form>",
@@ -277,6 +281,34 @@ async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_set
         r = await run_fx(s, site["base"], "f1", think=0.3)
     assert state["raised"] == 2
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+
+
+async def test_late_effect_on_node_changed_by_press_key_is_success(site):
+    """press_key 뒤에는 주 프레임 기록기를 다시 붙이지 않는다(WS-78 R3 왕복 예산). 그 키가 바꾼 노드를 다음 click 의 늦은
+    효과가 다시 바꾸면, 낡은 기준선으로 '자발'이라 버리지 않고 귀속 판정 불가(B5①) → 기존 판정(효과 인정)."""
+    async with _server() as s:
+        nav = await call(s, "navigate", {"url": site["base"] + "/fkey", "wait_until": "load"})
+        assert nav["success"], nav
+        await s._page.locator("#q").focus()
+        k = await call(s, "press_key", {"key": "a"})
+        assert k["success"], k
+        assert await s._page.locator("#m").inner_text() == "입력 1"
+        assert s._dispatcher._main_rec_stale is True  # arm 생략 = 낡은 기준선으로 적힘
+        target = await _element(s, "Lookup")
+        await asyncio.sleep(1.0)
+        r = await call(s, "click", target)
+        stale_after_click = s._dispatcher._main_rec_stale
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert "text_changed" in r["data"]["signals"], r
+    assert stale_after_click is False  # 성공한 click 뒤 다시 붙임 = 새 기준선
+
+
+async def test_clock_page_after_click_rearm_is_not_stale(site):
+    """대조: press_key 가 아닌 액션(navigate) 뒤에는 기준선이 새로 붙어 낡지 않다 — ⑥d 귀속이 그대로 동작한다."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "f6d")
+        assert s._dispatcher.__dict__.get("_main_rec_stale") is False
+    _expect_late_failure(r)
 
 
 async def test_form_post_303_unchanged_success(site):
