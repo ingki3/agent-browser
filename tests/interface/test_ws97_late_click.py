@@ -1,14 +1,15 @@
-"""WS-97 (#280·#293) — 늦은 클릭 효과 3초 창 + 주 프레임 귀속 + 실패 문구 + 기본 locale ko-KR.
+"""WS-97 (#280·#293) — 늦은 클릭 효과 3초 창(v3: 강한 근거만) + 실패 문구 + 기본 locale ko-KR.
 
-리뷰(.hermes/plans/ws97-evidence/review.md) fixture ⓪~⑧(fxserver.py) 를 저장소 시험 서버로 옮긴 것. 실제
-BrowserMCPServer.call_tool 경로, 로컬 http.server(127.0.0.1)만 쓴다. 공개 사이트 접속 없음.
+리뷰(.hermes/plans/ws97-evidence/review.md, v3/review.md) fixture 와 검증 반례(.hermes/verify/ws97/reproduce.py 케이스)를
+저장소 시험 서버로 옮긴 것. 실제 BrowserMCPServer.call_tool 경로, 로컬 http.server(127.0.0.1)만 쓴다. 공개 사이트 없음.
 
-규칙(리뷰 B1~B6):
-* 효과가 0 일 때만 LATE_EFFECT_WINDOW_MS(3000) 동안 150ms 주기로 다시 본다(정상 클릭 대기 0).
-* 창 안 약한 신호(text_changed·dom_delta)는 주 프레임 기록기 귀속을 통과할 때만 효과. 창이 효과 없이 끝나면
-  최종 판정도 약한 신호만으로는 성공하지 않는다. 즉시 판정(창 진입 전)에는 귀속을 적용하지 않는다(#294).
-* 실패 문구는 click 두 생산자(dispatcher·server_signals)가 같은 함수를 쓴다. E_TIMEOUT·retry_safe false 유지.
-* serve 기본 locale ko-KR(navigator.language·Accept-Language), --locale none 이면 기존 동작(en-US, 머리 없음).
+v3 규칙:
+* 효과가 0 일 때만 LATE_EFFECT_WINDOW_MS(3000) 동안 150ms 주기로 다시 본다(정상 클릭 대기 0, 진입 조건은 기준 그대로).
+* 창 안 근거는 ① 정상 문서 커밋(오류 문서·about:·같은 주소·reload 제외) ② 이 클릭이 연 새 탭(popup·Page.windowOpen,
+  자발 popup 이력이 있는 탭 제외) ③ 창 시작에 잡은 대상 노드의 aria-expanded·aria-pressed·checked·value(class 제외)
+  ④ 같은 문서 주소 변화 + history.length 증가(pushState)뿐. 글자·노드·다이얼로그·관계 탭·다른 탭·포커스·class 는 아니다.
+* 창이 근거 없이 끝나면 반드시 실패(E_TIMEOUT·retry_safe false·고정 문구), 창 안에서 붙은 dialogs·tabs_changed 는 뗀다.
+* 창 + 창 안 이동 대기 ≤ 3초, 서버 차단 판정은 창 시작부터 3.5초까지(넘기면 challenge null + reobserve_required).
 """
 
 from __future__ import annotations
@@ -33,11 +34,28 @@ pytestmark = requires_chromium
 _LANG = ("<p id=lang></p><script>document.getElementById('lang').textContent="
          "navigator.language+'|'+new Intl.DateTimeFormat().resolvedOptions().locale</script>")
 
+#: 검증 반례 공통 페이지(independent_probe.py 의 audit): 무반응 Lookup + 자발 타이머(schedule 로 클릭 뒤 700ms 에 시작).
+_AUDIT_JS = (
+    "let n=0,timer;window.clicks=0;window.ticks=0;"
+    "const tick=()=>{window.ticks++;let p=document.getElementById('clock');"
+    " if(window.mode==='rotate'){p=document.createElement('p');p.id='clock';document.getElementById('slot').replaceChildren(p)}"
+    " if(window.mode==='forge'&&window.__abTopRec)window.__abTopRec.times.clear();"
+    " p.textContent='ad '+(++n);};"
+    "window.mode='reuse';timer=setInterval(tick,500);"
+    "window.schedule=(mode,delay)=>{clearInterval(timer);window.mode=mode;"
+    "timer=setTimeout(()=>{tick();timer=setInterval(tick,1000)},delay)};"
+    "window.stop=()=>clearInterval(timer);"
+    "document.getElementById('noop').addEventListener('click',()=>{window.clicks++});"
+)
+_AUDIT = ("<input id=q aria-label=Query><button id=noop>Lookup</button>"
+          "<button id=open onclick=\"window.open('/other')\">Open</button><div id=slot><p id=clock>ad 0</p></div>"
+          "<p id=out></p><script>" + _AUDIT_JS + "</script>")
+
 PAGES: Dict[str, str] = {
     # ⓪ 정상 클릭(즉시 DOM 변경) / ⓪b 정상 target=_blank 링크
     "f0": '<button onclick="document.getElementById(\'m\').textContent=\'완료\'">Go</button><p id=m></p>',
     "f0b": '<a target=_blank href="/t">Go</a>',
-    # ① 1.5초 뒤 DOM 변경 / ② 1.5초 뒤 window.open
+    # ① 1.5초 뒤 글자만 / ② 1.5초 뒤 window.open
     "f1": '<button onclick="setTimeout(()=>{document.getElementById(\'m\').textContent=\'조회 완료\'},1500)">Lookup</button>'
           '<p id=m></p>',
     "f2": '<button onclick="setTimeout(()=>window.open(\'/t\'),1500)">Open</button>',
@@ -51,47 +69,61 @@ PAGES: Dict[str, str] = {
     "f4a": '<a target=_blank href="/slowpage?d=2500">예약하기</a>',
     "f4b": '<a target=_blank href="/t" onclick="event.preventDefault();fetch(\'/api?d=1000\')'
            '.then(()=>window.open(\'/t\',\'_blank\'))">예약하기</a>',
-    # ⑤ 무반응 / ⑥ 1초 시계 + 무반응 / ⑥b 시계 + ① / ⑥c 250ms 광고 + 무반응
+    # ④c/④d 새 탭 첫 응답 5초(19:05 모형) — popup 이벤트는 5초 뒤, opener 세션 Page.windowOpen 은 곧바로
+    "f4c": '<a target=_blank href="/slowpage?d=5000">예약하기</a>',
+    "f4d": '<a href="#" onclick="event.preventDefault();window.open(\'/slowpage?d=5000\',\'_blank\')">예약하기</a>',
+    # ⑤ 무반응 / ⑥b 시계 + ①
     "f5": "<button>Noop</button>",
-    "f6": "<p id=c>0</p><button>Noop</button><script>let n=0;setInterval(()=>{document.getElementById('c')"
-          ".textContent=String(++n)},1000)</script>",
     "f6b": "<p id=c>0</p><button onclick=\"setTimeout(()=>{document.getElementById('m').textContent='조회 완료'},1500)\">"
            "Lookup</button><p id=m></p><script>let n=0;setInterval(()=>{document.getElementById('c')"
            ".textContent=String(++n)},1000)</script>",
-    "f6c": "<p id=c>0</p><button>Noop</button><script>let n=0;setInterval(()=>{document.getElementById('c')"
-           ".textContent='ad'+(++n)},250)</script>",
-    # ⑥d(결정적 ⑥): 1초 시계 + 시계만 다시 맞추는 버튼 — 클릭 뒤 첫 틱이 700ms 뒤(즉시 판정 뒤)라 반드시 창에 들어가고,
-    # 창 안 변화는 기준선에서도 바뀌던 그 시계 노드뿐(자발 변화)이다.
-    "f6d": "<p id=c>0</p><button onclick=\"clearInterval(t);setTimeout(()=>{tick();t=setInterval(tick,1000)},700)\">"
-           "Noop</button><script>let n=0;const tick=()=>{document.getElementById('c').textContent=String(++n)};"
-           "let t=setInterval(tick,1000)</script>",
-    # press_key 가 바꾼 노드(#m)를 click 의 1.5초 뒤 효과가 다시 바꿈(WS-78 왕복 예산으로 press_key 뒤 arm 생략 — 낡은 기준선)
-    "fkey": "<input id=q aria-label=검색어><button onclick=\"setTimeout(()=>{m.textContent='조회 완료'},1500)\">Lookup</button>"
-            "<p id=m></p><script>const m=document.getElementById('m');let k=0;document.getElementById('q')"
-            ".addEventListener('keydown',()=>{m.textContent='입력 '+(++k)})</script>",
     # ⑧ POST 3초 → 204(문서 없음), 3.3초 뒤 JS 이동
     "f8": '<form method=post action="/slow204?d=3000" onsubmit="setTimeout(()=>location.href=\'/done\',3300)">'
           "<button>Book</button></form>",
-    # B5①: open shadow 안 버튼이 1.5초 뒤 shadow 안 글자를 바꿈 + 가벼운 1초 시계(자발 변화)
-    "fshadow": "<p id=c>0</p><div id=host></div><script>const r=document.getElementById('host')"
-               ".attachShadow({mode:'open'});r.innerHTML='<button>Shadow</button><p id=sm></p>';"
-               "r.querySelector('button').onclick=()=>setTimeout(()=>{r.getElementById('sm').textContent="
-               "'그림자 완료'},1500);let n=0;setInterval(()=>{document.getElementById('c').textContent=String(++n)},1000)"
-               "</script>",
+    # 진짜 늦은 aria-expanded(1.2초) / 진짜 늦은 checked(사용자 정의 체크 — 1.2초 뒤)
+    "aria": "<button id=noop aria-expanded=false onclick=\"setTimeout(()=>this.setAttribute('aria-expanded','true'),"
+            "1200)\">Lookup</button>",
+    # 검증 반례(independent_probe audit 계열) + key-late
+    "audit": _AUDIT,
+    "poison-immediate": _AUDIT + "<script>setInterval(()=>{const r=window.__abTopRec;if(r&&!r.__hooked){const old=r.push;"
+                                 "r.push=(...a)=>{out.textContent='RECORDER SIDE EFFECT';return old(...a)};"
+                                 "r.__hooked=1}},30)</script>",
+    "other": "<h1>OTHER</h1><script>window.scheduleNav=(d)=>setTimeout(()=>location.href='/done',d)</script>",
+    "late": "<input id=q aria-label=Query><button id=noop onclick=\"setTimeout(()=>out.textContent='Finished',1200)\">"
+            "Lookup</button><p id=out></p>",
+    # iframe 시계 + 무반응(sibling_probe)
+    "frame-outer": '<iframe id=fr src="/frame-inner" width=600 height=400></iframe>',
+    "frame-inner": "<button id=noop onclick=\"window.clicks++\">Lookup</button><p id=c>0</p><script>window.clicks=0;"
+                   "let n=0;const tick=()=>c.textContent=String(++n);let t=setInterval(tick,500);"
+                   "window.schedule=()=>{clearInterval(t);t=setTimeout(()=>{tick();t=setInterval(tick,1000)},700)}</script>",
+    # 늦은 오류 문서(302 순환 → chrome-error) / 응답 6초 문서 / 자기 새로고침
+    "imm-alert": "<button onclick=\"alert('바로')\">Lookup</button>",
+    "late-error": "<button onclick=\"setTimeout(()=>location.href='/loop',700)\">Lookup</button>",
+    "late-pending": "<button onclick=\"setTimeout(()=>location.href='/slowpage?d=6000',700)\">Lookup</button>",
+    "self-reload": "<button id=noop>Lookup</button><script>window.later=(d)=>setTimeout(()=>location.reload(),d)</script>",
+    # v3 리뷰 새 반례(new_probe): 타이머 광고 popup / 버튼 자기 class 토글 / 노드 교체 / replaceState / 해시 타이머
+    "popt": "<button id=noop>Lookup</button><script>window.ad=(d)=>setTimeout(()=>window.open('/t'),d)</script>",
+    "cls": "<button id=noop class=btn>Lookup</button><script>window.later=(d)=>setTimeout(()=>{"
+           "noop.classList.toggle('pulse');setInterval(()=>noop.classList.toggle('pulse'),500)},d)</script>",
+    "swap": "<div id=slot><button id=noop class=a>Lookup</button></div><script>let n=0;const sw=()=>{"
+            "const b=document.createElement('button');b.id='noop';b.className=(++n%2)?'b':'a';"
+            "b.setAttribute('aria-pressed',String(n%2===1));b.textContent='Lookup';slot.replaceChildren(b)};"
+            "window.later=(d)=>setTimeout(()=>{sw();setInterval(sw,1000)},d)</script>",
+    "rst": "<button id=noop>Lookup</button><script>let n=0;window.later=(d)=>setTimeout(()=>{const f=()=>"
+           "history.replaceState(null,'','?slide='+(++n));f();setInterval(f,1000)},d)</script>",
+    "hash": "<button id=noop>Lookup</button><script>let n=0;window.later=(d)=>setTimeout(()=>{const f=()=>"
+            "{location.hash='slide'+(++n)};f();setInterval(f,1000)},d)</script>",
     # 관계 탭 오류 문서(server_signals 문구 생산자)
     "opener": "<h1>OPENER</h1><button onclick=\"window.open('/pop','_blank','width=400,height=300')\">sized popup</button>",
     "pop": "<h1>POPUP</h1><button onclick=\"opener.location.href='/loop'\">loop opener</button>",
-    # B5②: load 50ms 뒤 응답 없는 문서로 이동
-    "to_never": "<h1>FIRST</h1><script>addEventListener('load',()=>setTimeout(()=>{location.href='/hangdoc'},50))"
-                "</script>",
     "t": "<h1>새 탭 대상</h1>",
     "done": "<h1>예약이 확정되었습니다</h1>",
     "lang": "<h1>언어</h1>",
 }
 
 NAMES = {"f0": "Go", "f0b": "Go", "f1": "Lookup", "f2": "Open", "f3a": "Book", "f3b": "Book", "f3c": "Book",
-         "f3d": "Book", "f4a": "예약하기", "f4b": "예약하기", "f5": "Noop", "f6": "Noop", "f6b": "Lookup", "f6c": "Noop",
-         "f6d": "Noop", "f8": "Book", "fshadow": "Shadow"}
+         "f3d": "Book", "f4a": "예약하기", "f4b": "예약하기", "f4c": "예약하기", "f4d": "예약하기", "f5": "Noop",
+         "f6b": "Lookup", "f8": "Book", "aria": "Lookup", "imm-alert": "Lookup", "late-error": "Lookup", "late-pending": "Lookup"}
 
 
 def _html(body: str) -> bytes:
@@ -143,9 +175,6 @@ def site():
                     return self._send(200, _html("<h1>slow</h1>"))
                 if name == "loop":
                     return self._send(302, headers={"Location": "/loop"})
-                if name == "hangdoc":
-                    time.sleep(6)
-                    return self._send(200, _html("<h1>late</h1>"))
                 if name == "robots.txt":
                     return self._send(200, b"User-agent: *\nAllow: /\n")
                 if name.startswith("my/"):
@@ -193,17 +222,22 @@ async def _reset_tabs(s: BrowserMCPServer) -> None:
         await call(s, "tab_control", {"command": "switch", "tab_id": tabs[0]["tab_id"]})
 
 
-async def run_fx(s: BrowserMCPServer, base: str, fx: str, think: float = 2.2) -> Dict[str, Any]:
-    """fixture 를 열고 관찰 → 생각 시간(기준선) → click. 반환: 봉투 + lat_ms."""
+async def _timed_click(s: BrowserMCPServer, target: Dict[str, Any]) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    r = await call(s, "click", target)
+    r["lat_ms"] = (time.perf_counter() - t0) * 1000
+    r["window"] = s._dispatcher.__dict__.get("_late_outcome")
+    return r
+
+
+async def run_fx(s: BrowserMCPServer, base: str, fx: str, think: float = 0.5) -> Dict[str, Any]:
+    """fixture 를 열고 관찰 → 생각 시간 → click. 반환: 봉투 + lat_ms + window(창 결과, 미진입이면 None)."""
     await _reset_tabs(s)
     nav = await call(s, "navigate", {"url": f"{base}/{fx}", "wait_until": "load"})
     assert nav["success"], nav
     target = await _element(s, NAMES[fx])
     await asyncio.sleep(think)
-    t0 = time.perf_counter()
-    r = await call(s, "click", target)
-    r["lat_ms"] = (time.perf_counter() - t0) * 1000
-    return r
+    return await _timed_click(s, target)
 
 
 def _expect_late_failure(r: Dict[str, Any]) -> None:
@@ -211,7 +245,11 @@ def _expect_late_failure(r: Dict[str, Any]) -> None:
     assert r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
     assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False), r["error_message"]
-    assert "late_effect" not in (r.get("data") or {}), r  # 새 data 키 없음
+    data = r.get("data") or {}
+    assert "late_effect" not in data, r  # 새 data 키 없음
+    # 창 안에서 붙은 다이얼로그·관계 탭·popup 은 근거도 아니고 실패 봉투에도 남기지 않는다(창 진입 전 기준 봉투와 같게).
+    assert not any(k in data for k in ("dialogs", "tabs_changed", "opened_tab_ids", "popup_opened")), data
+    assert not any(not str(x).startswith("focus_moved") for x in data.get("signals") or []), data
 
 
 # ------------------------------------------------------------------ 정상 클릭: 창 미진입, 지연 불변
@@ -243,72 +281,39 @@ async def test_normal_click_succeeds_without_entering_window(site, fx, monkeypat
     assert abs(min(lat3000) - min(lat0)) < 100, (lat3000, lat0)
 
 
-# ------------------------------------------------------------------ 늦은 효과: 창 안에서 잡힘
+# ------------------------------------------------------------------ 강한 근거: 창 안에서 잡힘
 
 
-@pytest.mark.parametrize("fx", ["f1", "f2", "f3b", "f3c", "f3d", "f4a", "f4b", "f8"])
-async def test_late_effect_within_window_is_success(site, fx):
+@pytest.mark.parametrize("fx", ["f2", "f3b", "f3c", "f3d", "f4a", "f4b", "f8", "aria"])
+async def test_late_strong_effect_within_window_is_success(site, fx):
     async with _server() as s:
-        r = await run_fx(s, site["base"], fx, think=0.5)
+        r = await run_fx(s, site["base"], fx)
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-    assert r.get("error_code") is None
+    assert r["window"] == "effect", r["window"]
+    signals = r["data"]["signals"]
+    if fx in ("f2", "f4a", "f4b"):
+        assert any(x.startswith("new_tab") for x in signals), signals
+    if fx in ("f2", "f4b"):
+        assert r["data"].get("opened_tab_ids"), r["data"]  # 기존 키(첫 응답이 빠른 탭 — popup 이벤트가 창 안에 옴)
+    if fx == "f3c":
+        assert any(x.startswith("url_changed") for x in signals), signals  # pushState(history.length 증가)
+    if fx == "aria":
+        assert "element_attr_changed" in signals, signals
 
 
-@pytest.mark.parametrize("nav_settle", [True, False])
-async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
-    """B2: 창 안 상태 캡처 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에
-    다시 봐서 1.5초 뒤 효과(①)를 잡는다. 실제 경합(③d)은 창 안 _NavWatch 가 먼저 잡아 드물어서 예외를 주입해 고정한다."""
-    state = {"in_window": False, "raised": 0}
-    orig_window = dmod.ActionDispatcher._late_effect_window
-    orig_capture = dmod.ActionDispatcher._capture_state
-
-    async def window(self, *a: Any, **k: Any):  # noqa: ANN202
-        state["in_window"] = True
-        try:
-            return await orig_window(self, *a, **k)
-        finally:
-            state["in_window"] = False
-
-    async def capture(self, *a: Any, **k: Any):  # noqa: ANN202
-        if state["in_window"] and state["raised"] < 2:
-            state["raised"] += 1
-            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
-        return await orig_capture(self, *a, **k)
-
-    monkeypatch.setattr(dmod.ActionDispatcher, "_late_effect_window", window)
-    monkeypatch.setattr(dmod.ActionDispatcher, "_capture_state", capture)
-    async with _server(nav_settle=nav_settle) as s:
-        r = await run_fx(s, site["base"], "f1", think=0.3)
-    assert state["raised"] == 2
-    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-
-
-async def test_late_effect_on_node_changed_by_press_key_is_success(site):
-    """press_key 뒤에는 주 프레임 기록기를 다시 붙이지 않는다(WS-78 R3 왕복 예산). 그 키가 바꾼 노드를 다음 click 의 늦은
-    효과가 다시 바꾸면, 낡은 기준선으로 '자발'이라 버리지 않고 귀속 판정 불가(B5①) → 기존 판정(효과 인정)."""
+@pytest.mark.parametrize("fx", ["f4c", "f4d"])
+async def test_slow_first_response_new_tab_via_window_open(site, fx):
+    """B/04(19:05 모형): 새 탭 첫 응답 5초 — popup 이벤트는 창 뒤에 오지만 opener 세션 Page.windowOpen 이 곧바로 와서 성공.
+    탭 id 는 아직 없을 수 있다(opened_tab_ids 없음) — 새 키 없이 new_tab 신호만, tab_control list 로 확인."""
     async with _server() as s:
-        nav = await call(s, "navigate", {"url": site["base"] + "/fkey", "wait_until": "load"})
-        assert nav["success"], nav
-        await s._page.locator("#q").focus()
-        k = await call(s, "press_key", {"key": "a"})
-        assert k["success"], k
-        assert await s._page.locator("#m").inner_text() == "입력 1"
-        assert s._dispatcher._main_rec_stale is True  # arm 생략 = 낡은 기준선으로 적힘
-        target = await _element(s, "Lookup")
-        await asyncio.sleep(1.0)
-        r = await call(s, "click", target)
-        stale_after_click = s._dispatcher._main_rec_stale
-    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-    assert "text_changed" in r["data"]["signals"], r
-    assert stale_after_click is False  # 성공한 click 뒤 다시 붙임 = 새 기준선
-
-
-async def test_clock_page_after_click_rearm_is_not_stale(site):
-    """대조: press_key 가 아닌 액션(navigate) 뒤에는 기준선이 새로 붙어 낡지 않다 — ⑥d 귀속이 그대로 동작한다."""
-    async with _server() as s:
-        r = await run_fx(s, site["base"], "f6d")
-        assert s._dispatcher.__dict__.get("_main_rec_stale") is False
-    _expect_late_failure(r)
+        r = await run_fx(s, site["base"], fx)
+        assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+        assert r["window"] == "effect"
+        assert any(x.startswith("new_tab") for x in r["data"]["signals"]), r["data"]
+        assert r["lat_ms"] < 3000, r["lat_ms"]  # 5초 응답을 기다리지 않았다
+        await asyncio.sleep(5.5)
+        tabs = (await call(s, "tab_control", {"command": "list"}))["data"]["tabs"]
+        assert len(tabs) == 2, tabs
 
 
 async def test_form_post_303_unchanged_success(site):
@@ -316,24 +321,69 @@ async def test_form_post_303_unchanged_success(site):
     async with _server() as s:
         r = await run_fx(s, site["base"], "f3a", think=0.3)
     assert r["success"] is True, r
+    assert r["window"] is None
     assert r["data"].get("nav_committed") is True, r
 
 
-async def test_clock_page_with_real_late_effect_is_success(site):
-    """⑥b: 자발 변화(1초 시계)가 있어도 액션 창에서만 바뀐 노드(진짜 늦은 효과)는 귀속을 통과한다."""
+@pytest.mark.parametrize("nav_settle", [True, False])
+async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
+    """B2: 창 안 판독 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에 다시 봐서
+    1.2초 뒤 aria-expanded(③)를 잡는다. 실제 경합은 드물어 예외를 주입해 고정한다."""
+    state = {"raised": 0}
+    orig = dmod.ActionDispatcher._late_probe
+
+    class Replacing:
+        async def evaluate(self, *_a: Any) -> Any:
+            state["raised"] += 1
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+
+    async def probe(self, doc: Any, pin: Any, css: str, timeout: float):  # noqa: ANN202
+        if css and state["raised"] < 2:
+            return await orig(self, Replacing(), pin, css, timeout)  # 실제 판독 함수가 예외를 받는다
+        return await orig(self, doc, pin, css, timeout)
+
+    monkeypatch.setattr(dmod.ActionDispatcher, "_late_probe", probe)
+    async with _server(nav_settle=nav_settle) as s:
+        r = await run_fx(s, site["base"], "aria", think=0.3)
+    assert state["raised"] == 2
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+
+
+# ------------------------------------------------------------------ 수용한 손실: 글자만 바뀌는 늦은 효과 → 새 문구
+
+
+async def test_late_text_only_effect_fails_with_new_message(site):
+    """①: 1.5초 뒤 글자만 — 창 안 근거가 아니다(fail-closed). E_TIMEOUT + '화면 글자만 바뀌었을 수 있음' 문구."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "f1")
+    assert r["window"] == "none"
+    _expect_late_failure(r)
+    assert "화면 글자만 바뀌었을 수 있음" in r["error_message"]
+
+
+async def test_key_late_text_effect_fails(site):
+    """key-late: press_key 뒤 click 의 1.2초 뒤 글자 변화 — 근거 아님(검증 key-late, 수용한 손실)."""
+    async with _server() as s:
+        nav = await call(s, "navigate", {"url": site["base"] + "/late", "wait_until": "load"})
+        assert nav["success"], nav
+        await s._page.locator("#q").focus()
+        k = await call(s, "press_key", {"key": "a"})
+        assert k["success"], k
+        target = await _element(s, "Lookup")
+        await asyncio.sleep(0.5)
+        r = await _timed_click(s, target)
+        assert await s._page.locator("#out").inner_text() == "Finished"  # 효과는 실제로 있었다
+    _expect_late_failure(r)
+
+
+async def test_clock_page_late_text_fails_when_window_entered(site):
+    """⑥b 창 경로: 시계 페이지의 1.5초 뒤 글자 — 창에 들어갔으면 실패(즉시 판정이 시계 틱을 잡았으면 기준 그대로 성공)."""
     async with _server() as s:
         r = await run_fx(s, site["base"], "f6b")
-    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-
-
-async def test_open_shadow_late_effect_is_attributed(site):
-    """B5①: open shadow 안의 1.5초 뒤 효과 — 기록기가 shadow root 도 보므로 시계(자발)와 구분돼 성공."""
-    async with _server() as s:
-        r = await run_fx(s, site["base"], "fshadow")
-    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-
-
-# ------------------------------------------------------------------ 무반응: 창 끝까지 효과 없음 → 새 문구
+    if r["window"] is not None:
+        _expect_late_failure(r)
+    else:
+        assert r["success"] is True, r
 
 
 async def test_no_effect_click_fails_with_fixed_message(site):
@@ -344,47 +394,197 @@ async def test_no_effect_click_fails_with_fixed_message(site):
     assert r["lat_ms"] >= dmod.LATE_EFFECT_WINDOW_MS - 50, r["lat_ms"]
 
 
-async def test_spontaneous_change_in_window_is_not_an_effect(site):
-    """⑥d(결정적 ⑥): 창 안 변화가 자발 변화(시계)뿐 — 창 안 귀속과 최종 판정 귀속(B1-③)으로 E_TIMEOUT."""
+# ------------------------------------------------------------------ 검증·리뷰 반례: 기준과 같은 실패
+
+
+async def _audit_case(s: BrowserMCPServer, base: str, case: str) -> Dict[str, Any]:
+    """independent_probe.py 의 한 케이스 — 클릭 뒤 700ms 에 시작하는 자발 변화 + 무반응 Lookup."""
+    use_selector = case.endswith("-selector")
+    case = case.removesuffix("-selector")
+    route = "poison-immediate" if case == "poison-immediate" else "audit"
+    assert (await call(s, "navigate", {"url": f"{base}/{route}", "wait_until": "load"}))["success"]
+    main = s._page
+    other = None
+    if case == "related":
+        opened = await call(s, "click", await _element(s, "Open"))
+        other = s._core.get_tab(opened["data"]["opened_tab_ids"][-1]).page
+    target = await _element(s, "Lookup")
+    if use_selector:
+        target = {"selector": "#noop"}
+    await asyncio.sleep(0.8)
+    if case.startswith("key-"):
+        await main.locator("#q").focus()
+        k = await call(s, "press_key", {"key": "a"})
+        assert k["success"], k
+    if case in ("timer-rotate", "forge-timer", "key-clock", "poison-immediate"):
+        mode = {"timer-rotate": "rotate", "forge-timer": "forge"}.get(case, "reuse")
+        await main.evaluate("([m,d])=>window.schedule(m,d)", [mode, 700])
+    else:
+        await main.evaluate("()=>window.stop()")
+    if other is not None:
+        await other.evaluate("(d)=>window.scheduleNav(d)", 700)
+    if case == "alert":
+        await main.evaluate("()=>{setTimeout(()=>alert('UNRELATED TIMER'),700)}")
+    r = await _timed_click(s, target)
+    r["truth"] = await main.evaluate("()=>({clicks: window.clicks, ticks: window.ticks})")
+    if other is not None:
+        r["other_url"] = other.url
+    return r
+
+
+@pytest.mark.parametrize("case", ["timer-rotate", "timer-rotate-selector", "related", "alert", "forge-timer",
+                                  "poison-immediate", "key-clock"])
+async def test_verification_counterexamples_fail_like_base(site, case):
+    """검증 FAIL 반례(reproduce.py): 무반응 클릭 + 창 안 자발 변화(광고 노드 교체·관계 탭 이동·무관 alert·시계) — 기준
+    (268ebf2)처럼 실패. 창 안에서 붙은 dialogs·tabs_changed 도 없다."""
     async with _server() as s:
-        r = await run_fx(s, site["base"], "f6d")
+        r = await _audit_case(s, site["base"], case)
+    assert r["truth"]["clicks"] == 1, r["truth"]  # 클릭은 전달됐다(업무 효과 없음)
+    if case in ("timer-rotate", "timer-rotate-selector", "forge-timer", "key-clock", "poison-immediate"):
+        assert r["truth"]["ticks"] >= 2, r["truth"]  # 창 안에서 자발 변화가 실제로 있었다
+    if case == "related":
+        assert r["other_url"].endswith("/done"), r["other_url"]  # 관계 탭은 실제로 이동했다
+    assert r["window"] == "none", r["window"]
     _expect_late_failure(r)
 
 
-@pytest.mark.parametrize("fx", ["f6", "f6c"])
-async def test_spontaneous_pages_fail_when_window_entered(site, fx, monkeypatch):
-    """⑥·⑥c: 창에 들어갔으면 E_TIMEOUT + 새 문구. 즉시 판정에서 이미 자발 변화가 잡혀 창에 들어가지 않았으면 기준 판정
-    그대로(즉시 성공) — 즉시 판정 귀속은 #294 로 분리(코디네이터 결정 A)."""
-    entered: List[int] = []
-    orig = dmod.ActionDispatcher._late_effect_window
-
-    async def spy(self, *a: Any, **k: Any):  # noqa: ANN202
-        entered.append(1)
-        return await orig(self, *a, **k)
-
-    monkeypatch.setattr(dmod.ActionDispatcher, "_late_effect_window", spy)
+async def test_frame_clock_counterexample_fails(site):
+    """sibling_probe: iframe 안 같은 노드 시계 + 무반응 — 프레임 컨텍스트 클릭도 실패."""
     async with _server() as s:
-        r = await run_fx(s, site["base"], fx)
-    if entered:
-        _expect_late_failure(r)
-    else:
-        assert r["success"] is True, r
-        assert any(str(x).startswith(("text_changed", "dom_delta")) for x in r["data"]["signals"]), r
+        assert (await call(s, "navigate", {"url": site["base"] + "/frame-outer"}))["success"]
+        sw = await call(s, "switch_frame", {"frame_selector": "#fr"})
+        assert sw["success"], sw
+        target = await _element(s, "Lookup")
+        frame = s._dispatcher.ctx.page
+        await asyncio.sleep(0.8)
+        await frame.evaluate("()=>window.schedule()")
+        r = await _timed_click(s, target)
+        truth = await frame.evaluate("()=>({clicks: window.clicks, clock: document.getElementById('c').textContent})")
+    assert truth["clicks"] == 1, truth
+    assert r["window"] == "none"
+    _expect_late_failure(r)
+
+
+async def test_late_error_document_is_not_an_effect(site):
+    """B3: 클릭 700ms 뒤 302 순환 → chrome-error 문서 커밋 — 근거 아님(기준처럼 E_TIMEOUT)."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "late-error")
+        url = s._page.url
+    assert url.startswith("chrome-error://"), url  # 오류 문서가 실제로 커밋됐다
+    assert r["window"] == "none"
+    _expect_late_failure(r)
+
+
+async def _later_case(s: BrowserMCPServer, base: str, page: str, fn: str = "later") -> Dict[str, Any]:
+    assert (await call(s, "navigate", {"url": f"{base}/{page}", "wait_until": "load"}))["success"]
+    target = await _element(s, "Lookup")
+    await asyncio.sleep(0.5)
+    await s._page.evaluate(f"(d)=>window.{fn}(d)", 700)
+    return await _timed_click(s, target)
+
+
+@pytest.mark.parametrize("page", ["cls", "swap", "rst", "hash", "self-reload"])
+async def test_spontaneous_strongish_changes_are_not_effects(site, page):
+    """v3 리뷰 새 반례: 클릭 뒤 700ms 부터 버튼 자기 class 토글(B/04)·aria 가 다른 새 노드로 교체(노드 신원)·replaceState
+    주소 갱신(history.length 그대로)·해시 갱신(조각만)·자기 새로고침(같은 주소 재요청) — 모두 근거가 아니다."""
+    async with _server() as s:
+        r = await _later_case(s, site["base"], page)
+        if page == "self-reload":
+            await asyncio.sleep(0.2)
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+
+
+async def test_timer_popup_on_tab_with_spontaneous_popups_is_not_an_effect(site):
+    """B/01: 액션 밖에서 popup 을 연 적이 있는 탭(광고 타이머)의 창 안 popup 은 근거가 아니다."""
+    async with _server() as s:
+        assert (await call(s, "navigate", {"url": site["base"] + "/popt", "wait_until": "load"}))["success"]
+        target = await _element(s, "Lookup")
+        await s._page.evaluate("(d)=>window.ad(d)", 50)  # 액션 밖 자발 popup
+        for _ in range(40):
+            if len(s._page.context.pages) >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert len(s._page.context.pages) >= 2, "자발 popup 이 열리지 않음(전제)"
+        await asyncio.sleep(0.3)
+        await s._page.evaluate("(d)=>window.ad(d)", 700)  # 클릭과 무관한 다음 광고 popup — 창 안에 온다
+        r = await _timed_click(s, target)
+        pages = len(s._page.context.pages)
+    assert pages >= 3, pages  # 창 안 popup 이 실제로 열렸다
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+
+
+async def test_late_popup_without_spontaneous_history_is_success(site):
+    """대조(B/01): 같은 페이지라도 액션 밖 popup 이력이 없으면 창 안 popup 은 근거(②와 같은 경로)."""
+    async with _server() as s:
+        r = await _later_case(s, site["base"], "popt", fn="ad")
+    assert r["success"] is True, (r.get("error_code"), r.get("data"))
+    assert r["window"] == "effect"
+
+
+# ------------------------------------------------------------------ 응답 상한 (B/02)
+
+
+async def test_late_pending_document_public_latency_is_bounded(site):
+    """창 안에서 시작한 문서가 6초 동안 응답하지 않아도 public click 응답 ≤ 3.6초(창 + 이동 대기 ≤ 3초, 서버 차단 판정은
+    창 시작부터 3.5초까지 — 잘렸으면 challenge null + reobserve_required)."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "late-pending", think=0.3)
+    assert r["window"] == "none"
+    # 문서 대기 키(nav_timed_out 등)는 남을 수 있어 _expect_late_failure 대신 같은 항목을 직접 본다.
+    assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
+    assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False)
+    assert r["data"].get("challenge") is None, r["data"]
+    assert r["lat_ms"] <= 3600, r["lat_ms"]
+
+
+# ------------------------------------------------------------------ 즉시 판정·창 진입 조건은 기준 그대로
+
+
+async def test_immediate_dialog_is_still_an_effect_before_window(site):
+    """창 진입 전 즉시 판정(기준 그대로): 클릭 핸들러가 곧바로 띄운 alert 는 지금처럼 효과(dialog_opened) — 창에 들어가지
+    않고 data.dialogs 도 그대로 실린다(기준 즉시 결과의 키)."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "imm-alert", think=0.3)
+    assert r["success"] is True, r
+    assert r["window"] is None
+    assert r["data"].get("dialogs"), r["data"]
+    assert any(x.startswith("dialog_opened") for x in r["data"]["signals"]), r["data"]
+
+
+def test_window_entry_condition_is_base_bytes():
+    """창 진입 조건(효과 0 일 때만)과 즉시 판정 코드는 기준(268ebf2)과 같은 줄이다 — 창 호출부만 바뀌었다."""
+    import inspect
+
+    src = inspect.getsource(dmod.ActionDispatcher._observe_element_effect)
+    head, _, _ = src.partition("await self._late_effect_window(")
+    assert "if not popups and action is ActionType.CLICK and not self._nav_info.get(\"nav_committed\") \\\n" \
+           "                and not self.__dict__.get(\"_related_navs\"):" in head
+    assert "if not verify_post_condition(before, after).satisfied and not (\n" \
+           "                self._effect_beyond_target(root_before, root_after, weak_ok=True)\n" \
+           "            ):" in head
+    assert "_main_rec" not in inspect.getsource(dmod.ActionDispatcher)  # 주 프레임 기록기 없음(v3)
+    assert "if (n && n.nodeType === 11 && n.host)" not in dmod._TOP_RECORDER_ARM_JS  # 기록기 JS 는 기준 그대로
+
+
+# ------------------------------------------------------------------ 문구
 
 
 def test_message_is_fixed_text():
     base = dmod.click_unsatisfied_message(document_aborted=False)
     aborted = dmod.click_unsatisfied_message(document_aborted=True)
-    assert base == ("사후조건 미충족(클릭 뒤 3초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음 — Silent Failure 의심). "
-                    "click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control "
-                    "list 로 결과를 확인하세요.")
+    assert base == ("사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭·요소 상태)가 보이지 않음 — 화면 글자만 "
+                    "바뀌었을 수 있음). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 "
+                    "observe_page·tab_control list 로 결과를 확인하세요.")
     assert aborted == ("사후조건 미충족(문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단). "
                        "click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control "
                        "list 로 결과를 확인하세요.")
 
 
 async def test_nav_aborted_click_uses_aborted_message(site, monkeypatch):
-    """⑧ 에서 뒤따른 JS 이동이 창 밖이면(창을 줄여 재현) 문서 요청 204 중단 판 문구 — '어디에도 변화 없음' 아님."""
+    """⑧ 에서 뒤따른 JS 이동이 창 밖이면(창을 줄여 재현) 문서 요청 204 중단 판 문구."""
     monkeypatch.setattr(dmod, "LATE_EFFECT_WINDOW_MS", 150)
     async with _server() as s:
         r = await run_fx(s, site["base"], "f8", think=0.3)
@@ -395,7 +595,7 @@ async def test_nav_aborted_click_uses_aborted_message(site, monkeypatch):
 
 
 async def test_both_message_producers_are_the_same(site):
-    """B4: dispatcher(_retry_unsatisfied)와 server_signals(관계 탭 오류 문서) 두 click 문구 생산자가 같다."""
+    """B4: dispatcher(_retry_unsatisfied)와 server_signals(관계 탭 오류 문서) 두 click 문구 생산자가 같은 함수."""
     async with _server() as s:
         direct = await run_fx(s, site["base"], "f5", think=0.3)
         await _reset_tabs(s)
@@ -406,49 +606,8 @@ async def test_both_message_producers_are_the_same(site):
         rel = await call(s, "click", await _element(s, "loop opener"))
     assert direct["success"] is False and rel["success"] is False, (direct, rel)
     assert rel["error_code"] == direct["error_code"] == "E_TIMEOUT"
-    assert rel["data"].get("tabs_changed"), rel
+    assert rel["data"].get("tabs_changed"), rel  # 즉시(창 진입 전) 관계 탭 이동 — 기준 봉투 그대로
     assert rel["error_message"] == direct["error_message"] == dmod.click_unsatisfied_message(document_aborted=False)
-
-
-# ------------------------------------------------------------------ B5②: 응답 없는 문서로 가는 navigate 시간 기준
-
-
-async def test_navigate_to_never_answering_document_keeps_time_bound(site):
-    """B5②: 액션 뒤 주 프레임 기록기 arm 이 응답 없는 문서로 가는 navigate 를 붙잡지 않는다(상한 100ms).
-
-    디스패처 단독 경로로 잰다(WS-92 시험과 같은 기준 — 서버 경로는 기준(268ebf2)에서도 응답 없는 문서 요청이 끝날
-    때까지 ~6초라 이 기준의 대상이 아니다)."""
-    from test_ws92_client_redirect import _direct
-
-    r, _, elapsed, _ = await _direct(site["base"] + "/to_never", timeout_ms=1500)
-    assert r.success is False and r.error_code.value == "E_NAVIGATE_TIMEOUT", (r.error_code, r.data)
-    assert elapsed < 1.5 + 0.5, elapsed
-
-
-async def test_main_recorder_call_is_bounded():
-    """B5②: 주 프레임 기록기 호출은 상한(_MAIN_RECORDER_TIMEOUT_S) 안에서 끝난다 — 응답 없는 evaluate(주 스레드가 막힌
-    문서·이동 중 문서)는 기준선 없음(_RECORDER_FAILED)으로 진행한다. 실패한 액션 뒤에는 arm 하지 않아 위 navigate
-    시험만으로는 상한이 쓰이지 않으므로 직접 고정한다."""
-    from actions import ActionDispatcher, DispatchContext
-    from perception import PerceptionEngine
-
-    class HangPage:
-        def is_closed(self) -> bool:
-            return False
-
-        async def evaluate(self, *_a: Any) -> Any:
-            await asyncio.sleep(5)
-            return True
-
-    d = ActionDispatcher(DispatchContext(page=HangPage(), engine=PerceptionEngine()))
-    t0 = time.perf_counter()
-    out = await d._main_recorder_call(dmod._TOP_RECORDER_ARM_JS)
-    elapsed = time.perf_counter() - t0
-    assert out is dmod._RECORDER_FAILED
-    assert elapsed < dmod._MAIN_RECORDER_TIMEOUT_S + 0.2, elapsed
-    t0 = time.perf_counter()
-    assert await d._main_change_attributable() is None  # 못 읽음 = 판정 불가
-    assert time.perf_counter() - t0 < 2 * dmod._MAIN_RECORDER_TIMEOUT_S + 0.3
 
 
 # ------------------------------------------------------------------ #293 locale
@@ -493,7 +652,7 @@ async def test_locale_none_keeps_previous_behaviour(site):
     assert v["accept"] and all(a is None for a in v["accept"]), v
 
 
-@pytest.mark.parametrize("bad", ["", "ko_KR", "korean language", "ko-", "x" * 40, "ko;q=1"])
+@pytest.mark.parametrize("bad", ["", "ko_KR", "korean language", "ko-", "x" * 40, "ko;q=1", "ko-KR\n", "en-US\n"])
 def test_invalid_locale_rejected(bad):
     from browser.core import BrowserCore, parse_locale
 
@@ -525,6 +684,8 @@ def test_serve_cli_locale_flag(monkeypatch):
     assert p.parse_args(["serve", "--locale", "none"]).locale is None
     with pytest.raises(SystemExit):
         p.parse_args(["serve", "--locale", "ko_KR"])
+    with pytest.raises(SystemExit):
+        p.parse_args(["serve", "--locale", "ko-KR\n"])
     seen: Dict[str, Any] = {}
 
     async def fake_run_stdio(**kw: Any) -> None:

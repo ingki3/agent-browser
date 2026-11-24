@@ -989,7 +989,18 @@ class SignalsMixin:
             # WS-91 F3 (#253·#244): nav_settle=False Enter 뒤면 디스패처 사후 판독과 같은 마감 안에서만 — 시간 초과는 기존
             # 판정 실패와 같은 challenge=None. 마감이 없으면(다른 행동·nav_settle=True) 기존 그대로.
             deadline = getattr(self._dispatcher, "last_input_deadline", None)
-            if not isinstance(deadline, float):
+            # WS-97 B/02: 늦은 효과 창이 효과 없이 끝난 click — 미결 문서를 기다리는 판정은 남은 예산(click 호출 시작부터 창 +
+            # LATE_EFFECT_TAIL_MS)까지만. 넘기면 판정 실패와 같은 challenge=None + reobserve_required(결과는 이미 실패).
+            late = getattr(self._dispatcher, "last_late_deadline", None)
+            if isinstance(late, float) and not isinstance(deadline, float):
+                import time
+
+                try:
+                    found, isolated = await asyncio.wait_for(both, max(0.0, late - time.monotonic()))
+                except asyncio.TimeoutError:
+                    found, isolated = challenge_mod.NO_CHALLENGE, None
+                    result.reobserve_required = True
+            elif not isinstance(deadline, float):
                 found, isolated = await both
             else:
                 import time

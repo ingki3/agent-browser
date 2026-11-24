@@ -62,17 +62,20 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 ## 늦은 클릭 효과 창 (WS-97 #280)
 
-효과가 전혀 없는 `click` 만 3초(`LATE_EFFECT_WINDOW_MS`) 동안 0.15초 주기로 다시 봅니다. 새 응답 키·신호 어휘는 없습니다 — 창 안에서 잡힌 효과는 기존 신호 그대로입니다.
+효과가 전혀 없는 `click` 만 3초(`LATE_EFFECT_WINDOW_MS`) 동안 0.15초 주기로 다시 봅니다(창에 들어가는 조건과 그 전의 즉시 판정은 이전과 같습니다). 새 응답 키·신호 어휘는 없습니다. 창 안에서는 **이 클릭이 일으켰다고 확실한 강한 근거만** 성공으로 칩니다(모두 대상 탭 기준):
 
-| 창 안에서 보인 것 | 결과 신호 |
+| 창 안 근거 | 결과 신호 |
 | :--- | :--- |
-| 주소 변화·대상 속성/값/checked·새 탭(popup) | `url_changed`·`element_*`·`new_tab` (+ `data.opened_tab_ids`) |
-| opener 관계 탭 이동 | `tab_navigated` (+ `data.tabs_changed`) |
-| 메인 문서 요청 → 커밋 | `navigated: …` (+ `nav_committed`, `reobserve_required`) |
-| 본문·노드 변화(시계·광고 아님) | `text_changed`·`dom_delta` — 주 프레임 기록으로 이 클릭 뒤에만 바뀐 노드가 있을 때만 |
-| 대상 탭이 닫힘 | `tab_closed` (+ `data.tab_closed`, WS-83) |
+| ① 대상 문서가 **정상 문서로 커밋**(오류 문서 `chrome-error://`·`about:`·같은 주소 재요청·`reload` 제외) | `url_changed`·`navigated: …` (+ `nav_committed`, `reobserve_required`) |
+| ② **이 클릭이 연 새 탭** — 대상 탭의 popup 이벤트 또는 opener 세션 `Page.windowOpen`(첫 응답이 늦은 탭) | `new_tab` (+ 탭 id 가 이미 있으면 `data.opened_tab_ids`) |
+| ③ 창 시작에 잡은 **그 대상 노드**의 `aria-expanded`·`aria-pressed`·`checked`·`value` | `element_attr_changed`·`element_value_changed`·`element_checked_changed` |
+| ④ 같은 문서 주소 변화 + `history.length` 증가(`pushState`) | `url_changed` |
 
-창이 효과 없이 끝나면 `E_TIMEOUT`·`retry_safe=false`·`reobserve_required=true` 와 고정 문구(페이지 글자 없음)입니다: `사후조건 미충족(클릭 뒤 3초 동안 URL/DOM/텍스트/속성/값/탭 변화가 보이지 않음 — Silent Failure 의심). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control list 로 결과를 확인하세요.` 문서 요청은 보냈지만 204·중단으로 새 문서가 없으면(`data.nav_aborted`) 괄호 안이 `문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단` 입니다. 관계 탭이 오류 문서로 끝난 클릭 실패(WS-83 R2)도 같은 문구입니다. 이때 창 안 마지막 스냅샷의 본문 변화가 자발 변화뿐이었으면 최종 판정도 성공이 아닙니다. 창 진입 전 즉시 판정은 그대로입니다(#294). `type_text(press_enter)` 실패 문구는 바뀌지 않았습니다.
+창 안 **비근거**: 화면 글자·노드 변화(`text_changed`·`dom_delta`), 다이얼로그, opener 관계 탭 이동, 다른 탭, 포커스, class 토글. `replaceState`·해시만 바뀐 주소, 다시 찾지 못했거나 다른 노드로 바뀐 대상, 액션 밖에서 popup 을 연 적이 있는 탭(광고 타이머)의 창 안 popup 도 근거가 아닙니다. 대상 탭이 닫히면 기존 닫힘 경로(`tab_closed`, WS-83)이고, 첫 주기에 클릭한 그 노드의 목적 신호(WS-90 `focus_target`·`target_selected`)가 보이면 기다림을 끝내고 기존 판정을 따릅니다.
+
+창이 근거 없이 끝나면 **반드시 실패**입니다: `E_TIMEOUT`·`retry_safe=false`·`reobserve_required=true` 와 고정 문구(페이지 글자 없음) `사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭·요소 상태)가 보이지 않음 — 화면 글자만 바뀌었을 수 있음). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control list 로 결과를 확인하세요.` 문서 요청은 보냈지만 204·중단으로 새 문서가 없으면(`data.nav_aborted`) 괄호 안이 `문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단` 입니다. 관계 탭이 오류 문서로 끝난 클릭 실패(WS-83 R2)도 같은 문구입니다. 이때 창 안에서 생긴 다이얼로그·관계 탭 이동·popup 은 실패 봉투에 싣지 않습니다(`data.dialogs`·`tabs_changed`·`opened_tab_ids` 는 창 진입 전 즉시 결과와 같음). **글자만 바뀌는 늦은 효과(조회 결과 렌더·"완료" 문구)는 확인하지 않습니다** — 이 문구로 돌아오므로 관찰로 확인하십시오. `type_text(press_enter)` 실패 문구는 바뀌지 않았습니다.
+
+응답 상한: 창과 창 안 이동 대기를 합쳐 3초를 넘지 않고, 창이 효과 없이 끝난 click 의 서버 차단 판정(`data.challenge`)은 창 시작부터 3.5초까지만 기다립니다 — 넘으면(응답이 오지 않는 문서로 가는 중) 판정 실패와 같은 `challenge: null` 에 `reobserve_required=true` 입니다.
 
 ## 프롬프트 주입 신호 (`data.injection_suspected`)
 

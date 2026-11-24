@@ -44,7 +44,7 @@ def parse_locale(raw: Any) -> Optional[str]:
     text = str(raw)
     if text.lower() == "none":
         return None
-    if not _LOCALE_RE.match(text):
+    if not _LOCALE_RE.fullmatch(text):
         raise ValueError(f"locale 형식이 아닙니다(BCP 47 예: ko-KR, en-US, 또는 none): {text!r}")
     return text
 
