@@ -2118,9 +2118,10 @@ class ActionDispatcher:
             result.data.setdefault("opened_tab_ids", ids)
             result.data.setdefault("popup_opened", opened)
 
-    def _open_watch_for(self, page: Any) -> Optional[_OpenWatch]:
+    def _open_watch_for(self, page: Any, create: bool = True) -> Optional[_OpenWatch]:
         """WS-97 B/01: 최상위 탭의 팝업 생성 기록(자발 popup 규칙). 처음 보는 탭이면 지금 popup 리스너를 단다(왕복 0 —
-        Playwright 'popup' 은 구독 메시지가 없다). 닫힌 탭의 기록은 버린다. 가짜 페이지는 None."""
+        Playwright 'popup' 은 구독 메시지가 없다). 닫힌 탭의 기록은 버린다. 가짜 페이지는 None. create=False 면 이미 단
+        기록만(dispatch 입구가 단다 — 요소 액션 안에서는 리스너 순서를 바꾸지 않는다, WS-48 순서 고정)."""
         watches = self.__dict__.setdefault("_open_watches", {})
         for key in [k for k, w in watches.items() if _page_closed(w.page)]:
             watches.pop(key, None)
@@ -2129,6 +2130,8 @@ class ActionDispatcher:
         w = watches.get(id(page))
         if w is not None and w.page is page:
             return w
+        if not create:
+            return None
         w = _OpenWatch(page)
         try:
             page.on("popup", w.on_popup)
@@ -4490,7 +4493,7 @@ class ActionDispatcher:
             pass
         # WS-97 B/01·B/04: 이 액션 동안의 팝업 생성은 액션 몫(자발 아님). click 은 opener 세션 Page.windowOpen 도 듣는다
         # (첫 응답이 늦은 새 탭 — popup 이벤트는 그 응답 뒤에 온다). 세션은 탭마다 한 번 만든다(그 뒤 왕복 0).
-        ow = self._open_watch_for(top_page)
+        ow = self._open_watch_for(top_page, create=False)
         self._late_open_watch = ow
         if ow is not None:
             ow.in_action += 1
