@@ -139,6 +139,11 @@ PAGES: Dict[str, str] = {
                                "history.replaceState(null,'','/same-document?forged=history')}"),
     "origin-forge": _FORGE % ("{Object.defineProperty(performance,'timeOrigin',{get:()=>1});"
                               "history.replaceState(null,'','/same-document?forged=origin')}"),
+    # R3 사보타주 보강(main_origin): 창 안에 실제 문서 응답(204 — 새 문서 없음)을 하나 만든 뒤 timeOrigin 위조 + replaceState.
+    # 응답 status 관문(B3)을 지나므로 문서 교체를 loaderId 가 아니라 주 world timeOrigin 으로 보면 근거가 된다.
+    "origin-forge-204": _FORGE % ("{location.href='/slow204?d=0';setTimeout(()=>{"
+                                  "Object.defineProperty(performance,'timeOrigin',{get:()=>1});"
+                                  "history.replaceState(null,'','/same-document?forged=origin204')},400)}"),
     "proto-forge": ("<input id=noop type=button value=Lookup><script>window.later=(d)=>setTimeout(()=>{"
                     "Object.defineProperty(HTMLInputElement.prototype,'value',{get(){return 'FORGED'},configurable:true});"
                     "Object.defineProperty(HTMLInputElement.prototype,'checked',{get(){return true},configurable:true});"
@@ -696,6 +701,22 @@ async def test_main_world_forgery_is_not_an_effect(site, case):
         assert main["value"] == "OWN" and main["checked"] is True, main
     assert r["window"] == "none", (r["window"], r.get("data"))
     _expect_late_failure(r)
+
+
+@pytest.mark.parametrize("nav_settle", [True, False])
+async def test_origin_forgery_after_real_document_response_is_not_an_effect(site, nav_settle):
+    """R3 사보타주 보강(main_origin 이 GREEN 이던 틈): 창 안에 진짜 문서 응답(204)이 지나간 뒤 timeOrigin 위조 + replaceState —
+    응답 status 관문은 지나지만 loaderId(CDP) 는 그대로라 근거가 아니다(기준 0/3 과 같은 실패)."""
+    async with _server(nav_settle=nav_settle) as s:
+        r = await _forge_case(s, site["base"], "origin-forge-204")
+    assert r["main"]["origin"] == 1 and "forged=origin204" in r["main"]["url"], r["main"]  # 위조가 실제로 걸렸다(전제)
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
+    assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+    # 204 문서 요청이 창 안에 있었으므로 nav_settle on 이면 nav_aborted 판 문구일 수 있다(두 고정 문구 중 하나).
+    assert r["error_message"] in (dmod.click_unsatisfied_message(document_aborted=False),
+                                  dmod.click_unsatisfied_message(document_aborted=True)), r["error_message"]
+    assert not any(not str(x).startswith("focus_moved") for x in (r.get("data") or {}).get("signals") or []), r
 
 
 async def _variant_case(s: BrowserMCPServer, base: str, page: str, frame: bool = False,
