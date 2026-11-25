@@ -756,10 +756,15 @@ class SignalsMixin:
             mine = errored[0]
             code = ErrorCode.TIMEOUT
             if action is ActionType.CLICK:
-                # WS-97 B4: dispatcher(_retry_unsatisfied)와 같은 click 고정 문구 — 한 함수만 쓴다.
+                # WS-97 B4: dispatcher(_retry_unsatisfied)와 같은 click 문구 함수 — 한 함수만 쓴다. R4(R3 검증 지적 R1): 이
+                # 호출에서 늦은 효과 창이 근거 없이 끝났을 때만 3초 문구, 창 미진입(즉시 관계 탭 이동)이면 기준 문구 그대로.
                 from actions.dispatcher import click_unsatisfied_message
 
-                message = click_unsatisfied_message(document_aborted=bool(src.get("nav_aborted")))
+                message = click_unsatisfied_message(
+                    detail,
+                    window_entered=getattr(self._dispatcher, "__dict__", {}).get("_late_outcome") == "none",
+                    document_aborted=bool(src.get("nav_aborted")),
+                )
             else:
                 message = f"사후조건 미충족({detail}). {action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
         data: Dict[str, Any] = {}

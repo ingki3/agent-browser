@@ -123,14 +123,19 @@ LATE_EFFECT_WINDOW_MS = 3000
 LATE_EFFECT_TAIL_MS = 500
 
 
-def click_unsatisfied_message(*, document_aborted: bool = False) -> str:
-    """WS-97 B4: click 사후조건 미충족(E_TIMEOUT) 고정 문구 — dispatcher·server_signals 두 생산자가 이것만 쓴다.
+def click_unsatisfied_message(reason: str = "", *, window_entered: bool, document_aborted: bool = False) -> str:
+    """WS-97 B4: click 사후조건 미충족(E_TIMEOUT) 문구 — dispatcher·server_signals 두 생산자가 이것만 쓴다.
 
-    페이지 글자 0. document_aborted(data.nav_aborted — 문서 요청을 보냈지만 204·중단으로 새 문서가 없음)면 '확인 가능한
-    효과 없음' 대신 그 사실. (인자 이름은 data 키와 다르게 둔다 — 키워드 인자도 WS-51 census 의 동적 생산자로 세진다.)
+    R4(R3 검증 지적 R1): window_entered 가 거짓이면(늦은 효과 창이 돌지 않은 즉시 판정) 기준 문구를 바이트까지 그대로 —
+    `사후조건 미충족({reason}). click는 재시도 시 …` (reason 은 기준과 같은 판정 설명). 창 진입 전 봉투는 기준과 같다.
+    window_entered 가 참(창이 끝까지 강한 근거 없이 끝남 — _late_outcome "none")일 때만 아래 3초 고정 문구(페이지 글자 0).
+    document_aborted(data.nav_aborted — 문서 요청을 보냈지만 204·중단으로 새 문서가 없음)면 '확인 가능한 효과 없음' 대신
+    그 사실. (인자 이름은 data 키와 다르게 둔다 — 키워드 인자도 WS-51 census 의 동적 생산자로 세진다.)
     v3: 늦은 효과 창은 강한 근거(이동·새 탭)만 보므로 글자만 바뀐 늦은 효과는 이 문구로 남는다. R3(사용자 결정 A): 대상 요소
     상태(aria-expanded·aria-pressed·checked·value)도 창 안 근거가 아니다 — 버튼 상태만 바뀐 늦은 효과도 이 문구.
     """
+    if not window_entered:
+        return f"사후조건 미충족({reason}). {ActionType.CLICK.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
     if document_aborted:
         what = "문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단"
     else:
@@ -3747,6 +3752,8 @@ class ActionDispatcher:
         self._dialogs = []
         self._install_dialog_listener()
         self.last_late_deadline = None
+        # WS-97 R4: 창 결과도 호출마다 비운다 — 앞 click 의 "none" 이 이번 호출 문구(창 진입 여부)로 새지 않게.
+        self._late_outcome = None
         self._late_t0 = time.monotonic()  # WS-97 B/02: 늦은 효과 창이 효과 없이 끝나면 서버 꼬리 상한의 기준(이 호출 시작)
         top_at_start = self._top_page()
         # WS-97 B/01: 액션 밖 팝업(타이머 광고 등)을 자발로 적도록 이 탭에 생성 기록을 단다(왕복 0).
@@ -5333,8 +5340,13 @@ class ActionDispatcher:
                 retry_safe=False,
                 error_code=ErrorCode.TIMEOUT,
                 error_message=(
-                    # WS-97 B4: click 은 고정 문구(server_signals 관계 탭 오류 경로와 같은 함수).
-                    click_unsatisfied_message(document_aborted=bool(self._nav_info.get("nav_aborted")))
+                    # WS-97 B4: click 은 server_signals 관계 탭 오류 경로와 같은 함수. R4: 창이 근거 없이 끝났을 때만 3초
+                    # 문구, 창 미진입(즉시 판정·창 첫 주기 목적 신호 "purpose")은 기준 문구 그대로.
+                    click_unsatisfied_message(
+                        post.detail,
+                        window_entered=self.__dict__.get("_late_outcome") == "none",
+                        document_aborted=bool(self._nav_info.get("nav_aborted")),
+                    )
                     if action is ActionType.CLICK else
                     f"사후조건 미충족({post.detail}). "
                     f"{action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."

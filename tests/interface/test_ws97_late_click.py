@@ -310,11 +310,21 @@ async def run_fx(s: BrowserMCPServer, base: str, fx: str, think: float = 0.5) ->
     return await _timed_click(s, target)
 
 
+def _late_msg(aborted: bool = False) -> str:
+    """창에 들어가 근거 없이 끝난 click 의 새 문구(R4: 창 미진입이면 기준 문구 — _BASE_MSG)."""
+    return dmod.click_unsatisfied_message(window_entered=True, document_aborted=aborted)
+
+
+#: 기준(origin/dev 268ebf2) 의 창 미진입 click 실패 문구 — 바이트까지 같아야 한다(R3 검증 지적 R1, immediate-base.jsonl 실측).
+_BASE_MSG = ("사후조건 미충족(URL/DOM/텍스트/속성/값/탭 어디에도 변화가 없음 (Silent Failure 의심) — 포커스만 이동함). "
+             "click는 재시도 시 부작용이 중복될 수 있어 중단합니다.")
+
+
 def _expect_late_failure(r: Dict[str, Any]) -> None:
     assert r["success"] is False, r
     assert r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
-    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False), r["error_message"]
+    assert r["error_message"] == _late_msg(False), r["error_message"]
     data = r.get("data") or {}
     assert "late_effect" not in data, r  # 새 data 키 없음
     # 창 안에서 붙은 다이얼로그·관계 탭·popup 은 근거도 아니고 실패 봉투에도 남기지 않는다(창 진입 전 기준 봉투와 같게).
@@ -714,8 +724,8 @@ async def test_origin_forgery_after_real_document_response_is_not_an_effect(site
     assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
     # 204 문서 요청이 창 안에 있었으므로 nav_settle on 이면 nav_aborted 판 문구일 수 있다(두 고정 문구 중 하나).
-    assert r["error_message"] in (dmod.click_unsatisfied_message(document_aborted=False),
-                                  dmod.click_unsatisfied_message(document_aborted=True)), r["error_message"]
+    assert r["error_message"] in (_late_msg(False),
+                                  _late_msg(True)), r["error_message"]
     assert not any(not str(x).startswith("focus_moved") for x in (r.get("data") or {}).get("signals") or []), r
 
 
@@ -834,7 +844,7 @@ async def test_late_http_error_document_is_not_an_effect(site, fx, nav_settle):
     # 창 안 문서 대기 키(nav_*)·last_http_status 는 남을 수 있어 _expect_late_failure 의 data 검사 대신 같은 항목을 직접 본다.
     assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
-    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False), r["error_message"]
+    assert r["error_message"] == _late_msg(False), r["error_message"]
     assert not any(not str(x).startswith("focus_moved") for x in (r.get("data") or {}).get("signals") or []), r
 
 
@@ -850,7 +860,7 @@ async def test_late_pending_document_public_latency_is_bounded(site):
     # 문서 대기 키(nav_timed_out 등)는 남을 수 있어 _expect_late_failure 대신 같은 항목을 직접 본다.
     assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
-    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False)
+    assert r["error_message"] == _late_msg(False)
     assert r["data"].get("challenge") is None, r["data"]
     assert r["lat_ms"] <= 3600, r["lat_ms"]
 
@@ -888,14 +898,18 @@ def test_window_entry_condition_is_base_bytes():
 
 
 def test_message_is_fixed_text():
-    base = dmod.click_unsatisfied_message(document_aborted=False)
-    aborted = dmod.click_unsatisfied_message(document_aborted=True)
+    base = _late_msg(False)
+    aborted = _late_msg(True)
     assert base == ("사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭)가 보이지 않음 — 화면 글자나 버튼 상태만 "
                     "바뀌었을 수 있음). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 "
                     "observe_page·tab_control list 로 결과를 확인하세요.")
     assert aborted == ("사후조건 미충족(문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단). "
                        "click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control "
                        "list 로 결과를 확인하세요.")
+    # R4(R3 검증 지적 R1): 창에 들어가지 않은 click 실패는 기준 문구 그대로 — 문서 중단 여부와 무관, 3초 언급 없음.
+    reason = "URL/DOM/텍스트/속성/값/탭 어디에도 변화가 없음 (Silent Failure 의심) — 포커스만 이동함"
+    for flag in (False, True):
+        assert dmod.click_unsatisfied_message(reason, window_entered=False, document_aborted=flag) == _BASE_MSG
 
 
 async def test_nav_aborted_click_uses_aborted_message(site, monkeypatch):
@@ -906,23 +920,101 @@ async def test_nav_aborted_click_uses_aborted_message(site, monkeypatch):
     assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
     assert r["retry_safe"] is False and r["reobserve_required"] is True, r
     assert r["data"].get("nav_aborted"), r
-    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=True), r
+    assert r["error_message"] == _late_msg(True), r
 
 
-async def test_both_message_producers_are_the_same(site):
-    """B4: dispatcher(_retry_unsatisfied)와 server_signals(관계 탭 오류 문서) 두 click 문구 생산자가 같은 함수."""
+def _spy_window(s: BrowserMCPServer) -> List[int]:
+    entered: List[int] = []
+    d = s._dispatcher
+    original = d._late_effect_window
+
+    async def spy(*a: Any, **kw: Any) -> Any:
+        entered.append(1)
+        return await original(*a, **kw)
+
+    d._late_effect_window = spy  # type: ignore[method-assign]
+    return entered
+
+
+async def _related_error_click(s: BrowserMCPServer, base: str) -> Dict[str, Any]:
+    """검증 immediate_probe.py related-error 그대로: opener → sized popup → popup 탭으로 전환 → loop opener(opener 탭이
+    302 순환 오류 문서로 끝남 — 즉시 관계 탭 이동이라 창 미진입)."""
+    assert (await call(s, "navigate", {"url": base + "/opener"}))["success"]
+    opened = await call(s, "click", await _element(s, "sized popup"))
+    assert opened["success"], opened
+    pop = opened["data"]["opened_tab_ids"][-1]
+    assert (await call(s, "tab_control", {"command": "switch", "tab_id": pop}))["success"]
+    target = await _element(s, "loop opener")
+    entered = _spy_window(s)
+    r = await _timed_click(s, target)
+    r["entered"] = len(entered)
+    return r
+
+
+def _normalized(r: Dict[str, Any], base: str) -> Dict[str, Any]:
+    """포트·지연만 정규화(검증과 같은 규칙) — 나머지 봉투는 바이트 비교."""
+    import json
+
+    out = {k: v for k, v in r.items() if k not in ("lat_ms", "window", "entered")}
+    data = dict(out.get("data") or {})
+    for k in ("latency_ms", "nav_wait_ms"):
+        data.pop(k, None)
+    out["data"] = data
+    return json.loads(json.dumps(out, ensure_ascii=False).replace(base, "BASE"))
+
+
+async def test_related_error_without_window_keeps_base_envelope(site):
+    """R4(R3 검증 지적 R1): 창에 들어가지 않은 관계 탭 오류 E_TIMEOUT(server_signals 재조립)은 기준 봉투와 같다 — 3초 문구 아님.
+
+    기대 봉투는 기준(268ebf2) public call_tool 실측(.hermes/verify/ws97-r3/immediate-base.jsonl related-error 3회 동일)."""
+    async with _server() as s:
+        r = await _related_error_click(s, site["base"])
+    assert r["window"] is None and r["entered"] == 0, r  # 창 미진입
+    assert _normalized(r, site["base"]) == {
+        "success": False, "action": "click", "current_url": "BASE/pop", "snapshot_epoch": 2, "tab_id": "tab-2",
+        "reobserve_required": True, "retry_safe": False, "error_code": "E_TIMEOUT", "error_message": _BASE_MSG,
+        "data": {
+            "tabs_changed": [{"tab_id": "tab-1", "change": "navigated"}],
+            "nav_failure": {"kind": "other", "net_error": "ERR_TOO_MANY_REDIRECTS"},
+            "hint": "리다이렉트가 끝없이 이어짐 — 같은 주소 재시도는 소용없습니다(로그인·쿠키 문제일 수 있음).",
+            "challenge": None, "last_http_status": 200,
+        },
+    }, r
+
+
+async def test_dispatcher_unsatisfied_without_window_uses_base_message(site, monkeypatch):
+    """R4: dispatcher _retry_unsatisfied 도 창 진입 여부로 문구를 고른다 — 창이 돌지 않은 무반응 click(창을 기준 유예처럼
+    한 번만 다시 보는 것으로 바꿔 재현)은 기준 봉투(문구·data 키) 그대로."""
+
+    async def base_grace(self: Any, handle: Any, before: Any, after: Any, root_before: Any, root_after: Any,
+                         popups: Any) -> Any:
+        await self.ctx.page.wait_for_timeout(dmod.POPUP_GRACE_MS)  # 기준: 150ms 한 번, _late_outcome 은 None 그대로
+        after = await self._capture_state(self.ctx.page, handle)
+        return after, (await self._capture_root() if root_before is not None else None)
+
+    monkeypatch.setattr(dmod.ActionDispatcher, "_late_effect_window", base_grace)
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "f5", think=0.3)
+    assert r["window"] is None, r
+    assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
+    assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+    assert r["error_message"] == _BASE_MSG, r["error_message"]
+    assert sorted(r["data"]) == ["challenge", "last_http_status", "latency_ms"], r  # 기준 noop 봉투 키(notentered-base)
+
+
+async def test_message_producers_follow_window_entry(site):
+    """B4 + R4: 두 click 문구 생산자(dispatcher _retry_unsatisfied·server_signals 관계 탭 오류)가 같은 함수를 쓰고, 그 함수가
+    창 진입 여부로 고른다 — 창 진입 무반응(⑤)은 새 문구, 창 미진입 관계 탭 오류는 기준 문구."""
     async with _server() as s:
         direct = await run_fx(s, site["base"], "f5", think=0.3)
         await _reset_tabs(s)
-        await call(s, "navigate", {"url": site["base"] + "/opener"})
-        opened = await call(s, "click", await _element(s, "sized popup"))
-        pop = opened["data"]["opened_tab_ids"][-1]
-        await call(s, "tab_control", {"command": "switch", "tab_id": pop})
-        rel = await call(s, "click", await _element(s, "loop opener"))
+        rel = await _related_error_click(s, site["base"])
+    assert direct["window"] == "none" and rel["window"] is None and rel["entered"] == 0, (direct, rel)
     assert direct["success"] is False and rel["success"] is False, (direct, rel)
     assert rel["error_code"] == direct["error_code"] == "E_TIMEOUT"
     assert rel["data"].get("tabs_changed"), rel  # 즉시(창 진입 전) 관계 탭 이동 — 기준 봉투 그대로
-    assert rel["error_message"] == direct["error_message"] == dmod.click_unsatisfied_message(document_aborted=False)
+    assert direct["error_message"] == _late_msg(False), direct
+    assert rel["error_message"] == _BASE_MSG, rel
 
 
 # ------------------------------------------------------------------ #293 locale
