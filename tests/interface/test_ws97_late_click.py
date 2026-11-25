@@ -360,27 +360,32 @@ async def test_form_post_303_unchanged_success(site):
 async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
     """B2: 창 안 판독 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에 다시 봐서
     1.2초 뒤 aria-expanded(③)를 잡는다. 실제 경합은 드물어 문서·노드 판독(CDP·격리 world)에 예외를 주입해 고정한다."""
-    state = {"frame": 0, "node": 0}
+    # 문서 판독(_late_frame)은 처음 두 번(창 시작 기준 판독·다음 주기의 기준 재시도), 노드 판독(_late_node)은 기준을 잡은 뒤
+    # 주기 판독 두 번을 실패시킨다 — 기준 판독 예외와 주기 판독 예외를 모두 지나 계속 본다.
+    state = {"frame": 0, "node": 0, "frame_raised": 0, "node_raised": 0}
     orig_frame = dmod.ActionDispatcher._late_frame
     orig_node = dmod.ActionDispatcher._late_node
+    destroyed = "Execution context was destroyed, most likely because of a navigation"
 
     async def frame(cdp: Any, frame_id: str):  # noqa: ANN202
-        if state["frame"] < 2:
-            state["frame"] += 1
-            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        state["frame"] += 1
+        if state["frame"] <= 2:
+            state["frame_raised"] += 1
+            raise RuntimeError(destroyed)
         return await orig_frame(cdp, frame_id)
 
     async def node(self, *a: Any):  # noqa: ANN202
-        if state["node"] < 2:
-            state["node"] += 1
-            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        state["node"] += 1
+        if state["node"] in (2, 3):
+            state["node_raised"] += 1
+            raise RuntimeError(destroyed)
         return await orig_node(self, *a)
 
     monkeypatch.setattr(dmod.ActionDispatcher, "_late_frame", staticmethod(frame))
     monkeypatch.setattr(dmod.ActionDispatcher, "_late_node", node)
     async with _server(nav_settle=nav_settle) as s:
         r = await run_fx(s, site["base"], "aria", think=0.3)
-    assert state == {"frame": 2, "node": 2}, state
+    assert state["frame_raised"] == 2 and state["node_raised"] == 2, state
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
     assert "element_attr_changed" in r["data"]["signals"], r["data"]
 
