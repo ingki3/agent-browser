@@ -6,11 +6,12 @@
 v3 규칙:
 * 효과가 0 일 때만 LATE_EFFECT_WINDOW_MS(3000) 동안 150ms 주기로 다시 본다(정상 클릭 대기 0, 진입 조건은 기준 그대로).
 * 창 안 근거는 ① 정상 문서 커밋(loaderId 바뀜 — 오류 문서·about:·같은 주소·HTTP status >= 400 제외) ② 이 클릭이 연 새
-  탭(popup·Page.windowOpen, 자발 popup 이력이 있는 탭 제외) ③ 대상 노드(backendNodeId)의 aria-expanded·aria-pressed(CDP
-  DOM.describeNode)·checked·value(격리 world)(class 제외) ④ 같은 문서 주소 변화 + 세션 이력 위치 증가(pushState,
-  Page.getNavigationHistory)뿐. 글자·노드·다이얼로그·관계 탭·다른 탭·포커스·class 는 아니다.
+  탭(popup·Page.windowOpen, 자발 popup 이력이 있는 탭 제외) ③ 같은 문서 주소 변화 + 세션 이력 위치 증가(pushState,
+  Page.getNavigationHistory)뿐. 글자·노드·대상 요소 상태(aria-expanded·aria-pressed·checked·value — R3 사용자 결정 A 로
+  뺌, 창 안에서 읽지도 않는다)·다이얼로그·관계 탭·다른 탭·포커스·class 는 아니다.
 * R2(검증 B1): 판독은 모두 브라우저 쪽 — 주 world 의 getAttribute·history.length·performance.timeOrigin·value getter 위조가
-  근거를 만들지 못한다(attr/history/origin/proto-forge 반례).
+  근거를 만들지 못한다(attr/history/origin/proto-forge 반례). R3: 복제 교체·password 칸 반례(clone-attr·clone-value·
+  frame-clone-attr·dynamic-password-forge)도 실패, 결과에 대상 값 없음.
 * 창이 근거 없이 끝나면 반드시 실패(E_TIMEOUT·retry_safe false·고정 문구), 창 안에서 붙은 dialogs·tabs_changed 는 뗀다.
   창 뒤 목적 신호(타이머 포커스) 재판독으로도 성공하지 않는다(R2 B2).
 * 창 + 창 안 이동 대기 ≤ 3초, 서버 차단 판정은 click 호출 시작(dispatch 입구)부터 3.5초까지(넘기면 challenge null +
@@ -54,6 +55,15 @@ _AUDIT_JS = (
 )
 #: R2 위조 반례 공통: 무반응 Lookup + later(d) 로 클릭 뒤 d ms 에 위조 식 실행.
 _FORGE = "<button id=noop>Lookup</button><script>window.later=(d)=>setTimeout(()=>%s,d)</script>"
+#: R3 재검증 반례(boundary_variants BASE): 무반응 Lookup + schedule() 로 클릭과 무관한 타이머(%s 앞부분, 700ms 에 %s).
+_VBTN = "<button id=noop>Lookup</button>"
+_VINPUT = "<input id=noop type=button value=Lookup>"
+_VARIANT = (_VBTN + "<p id=slot>UNCHANGED</p><script>window.clicks=0;window.original=document.querySelector('#noop');"
+            "document.addEventListener('click',e=>{if(e.target.id==='noop'){clicks++}});"
+            "window.schedule=()=>{%ssetTimeout(()=>{%s},700)}</script>")
+#: 합성 canary(실제 비밀 아님) — 결과 전체에 0회 나와야 한다.
+_CANARY = "SyntheticPasswordCanaryRthree"
+_VALUE_CANARY = "SyntheticValueCanaryRthree"
 _AUDIT = ("<input id=q aria-label=Query><button id=noop>Lookup</button>"
           "<button id=open onclick=\"window.open('/other')\">Open</button><div id=slot><p id=clock>ad 0</p></div>"
           "<p id=out></p><script>" + _AUDIT_JS + "</script>")
@@ -142,6 +152,27 @@ PAGES: Dict[str, str] = {
     # R2 B3: 700ms 뒤 HTTP 404·500 오류 결과 문서로 이동
     "error-404": "<button onclick=\"setTimeout(()=>location.href='/status?code=404',700)\">Lookup</button>",
     "error-500": "<button onclick=\"setTimeout(()=>location.href='/status?code=500',700)\">Lookup</button>",
+    # R3 재검증 반례(ws97-r2 boundary_variants): 140ms 에 대상 노드를 복제본으로 교체, 700ms 에 복제본 상태 변경 /
+    # 700ms 에 type=password + 실제 값 canary + 노드 자신 value getter 위조. 클릭과 무관한 타이머(schedule).
+    "clone-attr": _VARIANT % ("setTimeout(()=>{const b=noop.cloneNode(true);noop.replaceWith(b)},140);",
+                              "noop.setAttribute('aria-pressed','true')"),
+    "clone-value": (_VARIANT % ("setTimeout(()=>{const b=noop.cloneNode(true);noop.replaceWith(b)},140);",
+                                "noop.value='ADVERTISE'")).replace(_VBTN, _VINPUT),
+    "frame-clone-attr": '<iframe id=fr src="/clone-attr" width=600 height=400></iframe>',
+    "dynamic-password-forge": (_VARIANT % ("", "noop.type='password';Object.getOwnPropertyDescriptor("
+                                           "HTMLInputElement.prototype,'value').set.call(noop,'" + _CANARY + "');"
+                                           "Object.defineProperty(noop,'value',{get:()=> 'Lookup'})")
+                               ).replace(_VBTN, _VINPUT),
+    # R3: 진짜 늦은 value 변화(클릭 1.2초 뒤) — 이제 확인 안 됨(수용한 손실)
+    "value-real": "<input id=noop type=button value=Lookup onclick=\"setTimeout(()=>{this.value='LateValueRthree'},1200)\">",
+    # R3: 창 안 강한 근거(pushState)와 함께 대상 값이 바뀜 — 성공이지만 대상 값이 결과에 실리지 않는다
+    "push-with-value": ("<input id=noop type=button value=Lookup onclick=\"setTimeout(()=>{this.value='"
+                        + _VALUE_CANARY + "';history.pushState(null,'','/success')},700)\">"),
+    # R3 그대로 성공: 클릭 700ms 뒤 pushState(창 안 근거 ④ — 판독 예외 시험용)
+    "push-late": "<button onclick=\"setTimeout(()=>history.pushState(null,'','/pushed'),700)\">Lookup</button>",
+    # R3 그대로 성공(boundary_variants push-control·redirect-200): 클릭과 무관한 700ms 타이머의 pushState·302→200 이동
+    "push-control": _VARIANT % ("", "history.pushState(null,'','/success')"),
+    "redirect-200": _VARIANT % ("", "location.href='/redir?code=200'"),
     "opener": "<h1>OPENER</h1><button onclick=\"window.open('/pop','_blank','width=400,height=300')\">sized popup</button>",
     "pop": "<h1>POPUP</h1><button onclick=\"opener.location.href='/loop'\">loop opener</button>",
     "t": "<h1>새 탭 대상</h1>",
@@ -152,7 +183,8 @@ PAGES: Dict[str, str] = {
 NAMES = {"f0": "Go", "f0b": "Go", "f1": "Lookup", "f2": "Open", "f3a": "Book", "f3b": "Book", "f3c": "Book",
          "f3d": "Book", "f4a": "예약하기", "f4b": "예약하기", "f4c": "예약하기", "f4d": "예약하기", "f5": "Noop",
          "f6b": "Lookup", "f8": "Book", "aria": "Lookup", "imm-alert": "Lookup", "late-error": "Lookup", "late-pending": "Lookup",
-         "error-404": "Lookup", "error-500": "Lookup", "purpose-input": "Lookup"}
+         "error-404": "Lookup", "error-500": "Lookup", "purpose-input": "Lookup", "value-real": "Lookup",
+         "push-with-value": "Lookup", "push-late": "Lookup"}
 
 
 def _html(body: str) -> bytes:
@@ -206,6 +238,8 @@ def site():
                     return self._send(int((q.get("code") or ["500"])[0]), _html("<h1>REQUEST FAILED</h1>"))
                 if name == "loop":
                     return self._send(302, headers={"Location": "/loop"})
+                if name == "redir":
+                    return self._send(302, headers={"Location": "/status?code=" + (q.get("code") or ["200"])[0]})
                 if name == "robots.txt":
                     return self._send(200, b"User-agent: *\nAllow: /\n")
                 if name.startswith("my/"):
@@ -315,7 +349,7 @@ async def test_normal_click_succeeds_without_entering_window(site, fx, monkeypat
 # ------------------------------------------------------------------ 강한 근거: 창 안에서 잡힘
 
 
-@pytest.mark.parametrize("fx", ["f2", "f3b", "f3c", "f3d", "f4a", "f4b", "f8", "aria"])
+@pytest.mark.parametrize("fx", ["f2", "f3b", "f3c", "f3d", "f4a", "f4b", "f8"])
 async def test_late_strong_effect_within_window_is_success(site, fx):
     async with _server() as s:
         r = await run_fx(s, site["base"], fx)
@@ -328,8 +362,7 @@ async def test_late_strong_effect_within_window_is_success(site, fx):
         assert r["data"].get("opened_tab_ids"), r["data"]  # 기존 키(첫 응답이 빠른 탭 — popup 이벤트가 창 안에 옴)
     if fx == "f3c":
         assert any(x.startswith("url_changed") for x in signals), signals  # pushState(세션 이력 위치 증가)
-    if fx == "aria":
-        assert "element_attr_changed" in signals, signals
+    assert not any(x.startswith("element_") for x in signals), signals  # R3: 창 결과에 대상 요소 상태 없음
 
 
 @pytest.mark.parametrize("fx", ["f4c", "f4d"])
@@ -359,48 +392,82 @@ async def test_form_post_303_unchanged_success(site):
 @pytest.mark.parametrize("nav_settle", [True, False])
 async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
     """B2: 창 안 판독 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에 다시 봐서
-    1.2초 뒤 aria-expanded(③)를 잡는다. 실제 경합은 드물어 문서·노드 판독(CDP·격리 world)에 예외를 주입해 고정한다."""
-    # 문서 판독(_late_frame)은 처음 두 번(창 시작 기준 판독·다음 주기의 기준 재시도), 노드 판독(_late_node)은 기준을 잡은 뒤
-    # 주기 판독 두 번을 실패시킨다 — 기준 판독 예외와 주기 판독 예외를 모두 지나 계속 본다.
-    state = {"frame": 0, "node": 0, "frame_raised": 0, "node_raised": 0}
+    클릭 700ms 뒤 pushState(④)를 잡는다. 실제 경합은 드물어 문서 판독(CDP Page.getFrameTree)에 예외를 주입해 고정한다.
+    R3: 요소 상태 판독이 없어져 문서 판독 하나로 기준·주기 예외를 모두 지난다."""
+    # 문서 판독(_late_frame) 1·2번째 = 창 시작 기준 판독·다음 주기의 기준 재시도, 4·5번째 = 기준을 잡은 뒤의 주기 판독.
+    state = {"frame": 0, "setup_raised": 0, "periodic_raised": 0}
     orig_frame = dmod.ActionDispatcher._late_frame
-    orig_node = dmod.ActionDispatcher._late_node
     destroyed = "Execution context was destroyed, most likely because of a navigation"
 
     async def frame(cdp: Any, frame_id: str):  # noqa: ANN202
         state["frame"] += 1
-        if state["frame"] <= 2:
-            state["frame_raised"] += 1
+        if state["frame"] in (1, 2):
+            state["setup_raised"] += 1
+            raise RuntimeError(destroyed)
+        if state["frame"] in (4, 5):
+            state["periodic_raised"] += 1
             raise RuntimeError(destroyed)
         return await orig_frame(cdp, frame_id)
 
-    async def node(self, *a: Any):  # noqa: ANN202
-        state["node"] += 1
-        if state["node"] in (2, 3):
-            state["node_raised"] += 1
-            raise RuntimeError(destroyed)
-        return await orig_node(self, *a)
-
     monkeypatch.setattr(dmod.ActionDispatcher, "_late_frame", staticmethod(frame))
-    monkeypatch.setattr(dmod.ActionDispatcher, "_late_node", node)
     async with _server(nav_settle=nav_settle) as s:
-        r = await run_fx(s, site["base"], "aria", think=0.3)
-    assert state["frame_raised"] == 2 and state["node_raised"] == 2, state
+        r = await run_fx(s, site["base"], "push-late", think=0.3)
+    assert state["setup_raised"] == 2 and state["periodic_raised"] == 2, state
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
-    assert "element_attr_changed" in r["data"]["signals"], r["data"]
+    assert r["window"] == "effect"
+    assert any(x.startswith("url_changed") and x.endswith("/pushed") for x in r["data"]["signals"]), r["data"]
 
 
-async def test_late_effect_in_frame_is_success(site):
-    """대조(R2 B1 frame 판독이 실제로 동작함): iframe 안 진짜 늦은 aria-expanded(1.2초) — 그 프레임 세션·frameId 로 읽어 성공."""
+async def test_late_aria_change_is_not_confirmed(site):
+    """R3 (사용자 결정 A — 수용한 손실): 클릭 1.2초 뒤 진짜 aria-expanded 변화도 창 안 근거가 아니다. 예전(R2)에는
+    element_attr_changed 로 성공했지만 이제 E_TIMEOUT + '화면 글자나 버튼 상태만 바뀌었을 수 있음' 문구."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "aria")
+        expanded = await s._page.evaluate("() => noop.getAttribute('aria-expanded')")
+    assert expanded == "true"  # 변화는 실제로 있었다(전제)
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+    assert "화면 글자나 버튼 상태만 바뀌었을 수 있음" in r["error_message"]
+
+
+async def test_late_value_change_is_not_confirmed(site):
+    """R3 수용한 손실: 클릭 1.2초 뒤 진짜 value 변화 — 근거 아님, 결과에 그 값도 없다."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "value-real")
+        value = await s._page.evaluate("() => noop.value")
+    assert value == "LateValueRthree"
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+    assert "LateValueRthree" not in repr(r), r
+
+
+async def test_late_aria_in_frame_is_not_confirmed(site):
+    """R3 수용한 손실: iframe 안 진짜 늦은 aria-expanded(1.2초)도 근거 아님(프레임 컨텍스트 클릭도 같은 규칙)."""
     async with _server() as s:
         assert (await call(s, "navigate", {"url": site["base"] + "/frame-aria", "wait_until": "load"}))["success"]
         assert (await call(s, "switch_frame", {"frame_selector": "#fr"}))["success"]
         target = await _element(s, "Lookup")
         await asyncio.sleep(0.3)
         r = await _timed_click(s, target)
+        expanded = await s._dispatcher.ctx.page.evaluate("() => noop.getAttribute('aria-expanded')")
+    assert expanded == "true"
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+
+
+async def test_strong_effect_result_carries_no_target_value(site):
+    """R3: 창 안 강한 근거(pushState)로 성공해도 창 뒤 스냅샷이 대상 요소를 다시 읽지 않는다 — 그 사이 바뀐 대상 값(canary)이
+    결과 어디에도 없고 element_* 신호도 없다."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "push-with-value", think=0.3)
+        value = await s._page.evaluate("() => noop.value")
+    assert value == _VALUE_CANARY  # 대상 값은 실제로 바뀌었다(전제)
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
     assert r["window"] == "effect"
-    assert "element_attr_changed" in r["data"]["signals"], r["data"]
+    signals = r["data"]["signals"]
+    assert any(x.startswith("url_changed") for x in signals), signals
+    assert not any(x.startswith("element_") for x in signals), signals
+    assert repr(r).count(_VALUE_CANARY) == 0, r
 
 
 @pytest.mark.parametrize("fx", ["f3b", "f3d"])
@@ -417,12 +484,12 @@ async def test_late_document_commit_nav_settle_off_is_success(site, fx):
 
 
 async def test_late_text_only_effect_fails_with_new_message(site):
-    """①: 1.5초 뒤 글자만 — 창 안 근거가 아니다(fail-closed). E_TIMEOUT + '화면 글자만 바뀌었을 수 있음' 문구."""
+    """①: 1.5초 뒤 글자만 — 창 안 근거가 아니다(fail-closed). E_TIMEOUT + '화면 글자나 버튼 상태만 바뀌었을 수 있음' 문구."""
     async with _server() as s:
         r = await run_fx(s, site["base"], "f1")
     assert r["window"] == "none"
     _expect_late_failure(r)
-    assert "화면 글자만 바뀌었을 수 있음" in r["error_message"]
+    assert "화면 글자나 버튼 상태만 바뀌었을 수 있음" in r["error_message"]
 
 
 async def test_key_late_text_effect_fails(site):
@@ -631,6 +698,83 @@ async def test_main_world_forgery_is_not_an_effect(site, case):
     _expect_late_failure(r)
 
 
+async def _variant_case(s: BrowserMCPServer, base: str, page: str, frame: bool = False,
+                        selector: bool = False) -> Dict[str, Any]:
+    """ws97-r2 boundary_variants 한 케이스 — 클릭과 무관한 schedule()(140ms 복제 교체 · 700ms 상태 변경) + 무반응 Lookup."""
+    assert (await call(s, "navigate", {"url": f"{base}/{page}", "wait_until": "load"}))["success"]
+    if frame:
+        assert (await call(s, "switch_frame", {"frame_selector": "#fr"}))["success"]
+    target = {"selector": "#noop"} if selector else await _element(s, "Lookup")
+    doc = s._dispatcher.ctx.page
+    await doc.evaluate("() => window.schedule()")
+    r = await _timed_click(s, target)
+    r["truth"] = await doc.evaluate("""() => { const n = document.querySelector('#noop');
+        return {clicks: window.clicks, pressed: n && n.getAttribute('aria-pressed'), type: n && n.type,
+                replaced: !!n && window.original !== n, url: location.href}; }""")
+    return r
+
+
+@pytest.mark.parametrize("case", ["dynamic-password-forge", "clone-attr", "clone-value", "frame-clone-attr"])
+async def test_r2_reverification_variants_fail_like_base(site, case):
+    """R3: R2 재검증 새 반례 — 대상 요소 상태(복제본의 aria-pressed·value, password 로 바뀐 칸의 실제 값)는 창 안 근거가
+    아니다(기준 0/3 과 같은 실패, 새 문구). 비밀번호 사례는 결과 전체에 canary 가 0회."""
+    async with _server() as s:
+        r = await _variant_case(s, site["base"], case, frame=case.startswith("frame-"))
+    truth = r["truth"]
+    assert truth["clicks"] == 1, truth  # 클릭은 전달됐다
+    if case in ("clone-attr", "frame-clone-attr"):
+        assert truth["replaced"] and truth["pressed"] == "true", truth  # 복제 교체 + 상태 변경이 실제로 일어났다(전제)
+    if case == "clone-value":
+        assert truth["replaced"], truth
+    if case == "dynamic-password-forge":
+        assert truth["type"] == "password", truth
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+    assert repr(r).count(_CANARY) == 0, r
+    assert "ADVERTISE" not in repr(r), r
+
+
+async def test_independent_timer_push_state_still_succeeds(site):
+    """R3 그대로 성공(boundary_variants push-control): 같은 문서 pushState(세션 이력 위치 증가)는 근거 ④ 그대로."""
+    async with _server() as s:
+        r = await _variant_case(s, site["base"], "push-control")
+    assert r["truth"]["url"].endswith("/success"), r["truth"]
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert r["window"] == "effect"
+    assert any(x.startswith("url_changed") for x in r["data"]["signals"]), r["data"]
+
+
+@pytest.mark.parametrize("nav_settle", [True, False])
+async def test_redirect_to_200_document_still_succeeds(site, nav_settle):
+    """R3 그대로 성공(boundary_variants redirect-200): 302 → 200 정상 문서 커밋은 근거 ① 그대로."""
+    async with _server(nav_settle=nav_settle) as s:
+        r = await _variant_case(s, site["base"], "redirect-200")
+        url = s._page.url
+    assert "/status?code=200" in url, url
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert r["window"] == "effect"
+
+
+def test_window_reads_no_target_element_state():
+    """R3: 창 안 대상 요소 판독(R2 의 _late_pin·_late_node·_late_element_evidence)이 없고, 창 코드가 대상 요소 상태를
+    읽거나 신호로 만들지 않는다(창 뒤 스냅샷도 대상 요소 없이)."""
+    import ast
+    import inspect
+    import textwrap
+
+    for name in ("_late_pin", "_late_node", "_late_element_evidence"):
+        assert not hasattr(dmod.ActionDispatcher, name), name
+    for name in ("_LATE_NODE_FN", "_LATE_PIN_FN"):
+        assert not hasattr(dmod, name), name
+    fn = ast.parse(textwrap.dedent(inspect.getsource(dmod.ActionDispatcher._late_effect_window))).body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+    fn.body = [n for n in fn.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    src = ast.unparse(fn)  # 문서 문자열·주석 없는 코드만
+    for needle in ("element_attr_changed", "element_value_changed", "element_checked_changed", "DOM.describeNode",
+                   "DOM.resolveNode", "_capture_state(page, handle)", "aria-expanded", "aria-pressed", "css_path"):
+        assert needle not in src, needle
+
+
 @pytest.mark.parametrize("selector", [False, True])
 async def test_late_timer_focus_is_not_promoted_after_window(site, selector):
     """R2 B2: 클릭 때 blur 된 편집 칸에 700ms 뒤 타이머가 포커스 — 창이 근거 없이 끝났으므로(none) 창 뒤 목적 신호
@@ -725,7 +869,7 @@ def test_window_entry_condition_is_base_bytes():
 def test_message_is_fixed_text():
     base = dmod.click_unsatisfied_message(document_aborted=False)
     aborted = dmod.click_unsatisfied_message(document_aborted=True)
-    assert base == ("사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭·요소 상태)가 보이지 않음 — 화면 글자만 "
+    assert base == ("사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭)가 보이지 않음 — 화면 글자나 버튼 상태만 "
                     "바뀌었을 수 있음). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 "
                     "observe_page·tab_control list 로 결과를 확인하세요.")
     assert aborted == ("사후조건 미충족(문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단). "
