@@ -66,16 +66,18 @@ robots 일반 허용과 함께 나오면 `data.hint`로 서버 차단·인증 �
 
 | 창 안 근거 | 결과 신호 |
 | :--- | :--- |
-| ① 대상 문서가 **정상 문서로 커밋**(오류 문서 `chrome-error://`·`about:`·같은 주소 재요청·`reload` 제외) | `url_changed`·`navigated: …` (+ `nav_committed`, `reobserve_required`) |
+| ① 대상 문서가 **정상 문서로 커밋**(프레임 `loaderId` 가 바뀜 — 오류 문서 `chrome-error://`·`about:`·같은 주소 재요청·`reload`, 문서 응답 HTTP status 400 이상(404·500 결과 문서)·응답을 못 본 문서 제외) | `url_changed`·`navigated: …` (+ `nav_committed`, `reobserve_required`) |
 | ② **이 클릭이 연 새 탭** — 대상 탭의 popup 이벤트 또는 opener 세션 `Page.windowOpen`(첫 응답이 늦은 탭) | `new_tab` (+ 탭 id 가 이미 있으면 `data.opened_tab_ids`) |
-| ③ 창 시작에 잡은 **그 대상 노드**의 `aria-expanded`·`aria-pressed`·`checked`·`value` | `element_attr_changed`·`element_value_changed`·`element_checked_changed` |
-| ④ 같은 문서 주소 변화 + `history.length` 증가(`pushState`) | `url_changed` |
+| ③ **그 대상 노드**(클릭한 노드 또는 창 시작에 잡은 노드의 `backendNodeId`)의 `aria-expanded`·`aria-pressed`·`checked`·`value` 가 창 시작과 다름 | `element_attr_changed`·`element_value_changed`·`element_checked_changed` |
+| ④ 같은 문서 주소 변화 + 세션 이력 위치 증가(`pushState`) | `url_changed` |
 
-창 안 **비근거**: 화면 글자·노드 변화(`text_changed`·`dom_delta`), 다이얼로그, opener 관계 탭 이동, 다른 탭, 포커스, class 토글. `replaceState`·해시만 바뀐 주소, 다시 찾지 못했거나 다른 노드로 바뀐 대상, 액션 밖에서 popup 을 연 적이 있는 탭(광고 타이머)의 창 안 popup 도 근거가 아닙니다. 대상 탭이 닫히면 기존 닫힘 경로(`tab_closed`, WS-83)이고, 첫 주기에 클릭한 그 노드의 목적 신호(WS-90 `focus_target`·`target_selected`)가 보이면 기다림을 끝내고 기존 판정을 따릅니다.
+창 안 **비근거**: 화면 글자·노드 변화(`text_changed`·`dom_delta`), 다이얼로그, opener 관계 탭 이동, 다른 탭, 포커스, class 토글. `replaceState`·해시만 바뀐 주소, 다시 찾지 못했거나 다른 노드로 바뀐 대상, 액션 밖에서 popup 을 연 적이 있는 탭(광고 타이머)의 창 안 popup 도 근거가 아닙니다. 대상 탭이 닫히면 기존 닫힘 경로(`tab_closed`, WS-83)이고, 첫 주기에 클릭한 그 노드의 목적 신호(WS-90 `focus_target`·`target_selected`)가 보이면 기다림을 끝내고 기존 판정을 따릅니다. 창이 근거 없이 끝난 뒤에는 목적 신호를 다시 읽어 성공으로 올리지 않습니다(창 안 타이머 포커스는 근거가 아님).
+
+판독은 모두 페이지가 위조할 수 없는 브라우저 쪽 정보입니다(WS-97 R2): 문서 교체·주소·오류 문서는 CDP `Page.getFrameTree`(`loaderId`·`url`·`unreachableUrl`), `pushState` 는 `Page.getNavigationHistory`(지금 위치 증가 — `replaceState` 는 늘지 않음), 노드 속성은 `DOM.describeNode`, `checked`·`value` 는 격리 world 의 원시 프로퍼티, 문서 응답 status 는 response 이벤트입니다. 페이지 main world 의 `getAttribute`·`history.length`·`performance.timeOrigin`·`value` getter 를 바꿔도 근거가 생기지 않습니다. 프레임 안 클릭은 그 프레임의 세션·frameId 로 읽고, 읽을 수 없으면 근거가 아닙니다.
 
 창이 근거 없이 끝나면 **반드시 실패**입니다: `E_TIMEOUT`·`retry_safe=false`·`reobserve_required=true` 와 고정 문구(페이지 글자 없음) `사후조건 미충족(클릭 뒤 3초 동안 확인 가능한 효과(이동·새 탭·요소 상태)가 보이지 않음 — 화면 글자만 바뀌었을 수 있음). click 은 재시도 시 부작용이 중복될 수 있어 중단합니다 — 다시 누르기 전에 observe_page·tab_control list 로 결과를 확인하세요.` 문서 요청은 보냈지만 204·중단으로 새 문서가 없으면(`data.nav_aborted`) 괄호 안이 `문서 요청은 보냈지만 새 문서가 열리지 않음 — 응답 204·중단` 입니다. 관계 탭이 오류 문서로 끝난 클릭 실패(WS-83 R2)도 같은 문구입니다. 이때 창 안에서 생긴 다이얼로그·관계 탭 이동·popup 은 실패 봉투에 싣지 않습니다(`data.dialogs`·`tabs_changed`·`opened_tab_ids` 는 창 진입 전 즉시 결과와 같음). **글자만 바뀌는 늦은 효과(조회 결과 렌더·"완료" 문구)는 확인하지 않습니다** — 이 문구로 돌아오므로 관찰로 확인하십시오. `type_text(press_enter)` 실패 문구는 바뀌지 않았습니다.
 
-응답 상한: 창과 창 안 이동 대기를 합쳐 3초를 넘지 않고, 창이 효과 없이 끝난 click 의 서버 차단 판정(`data.challenge`)은 창 시작부터 3.5초까지만 기다립니다 — 넘으면(응답이 오지 않는 문서로 가는 중) 판정 실패와 같은 `challenge: null` 에 `reobserve_required=true` 입니다.
+응답 상한: 창과 창 안 이동 대기를 합쳐 3초를 넘지 않고, 창이 효과 없이 끝난 click 의 서버 차단 판정(`data.challenge`)은 click 호출 시작(디스패치 입구)부터 3.5초까지만 기다립니다 — 넘으면(응답이 오지 않는 문서로 가는 중) 판정 실패와 같은 `challenge: null` 에 `reobserve_required=true` 입니다.
 
 ## 프롬프트 주입 신호 (`data.injection_suspected`)
 

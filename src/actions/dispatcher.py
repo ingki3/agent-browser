@@ -152,36 +152,63 @@ def _late_same_but_fragment(a: str, b: str) -> bool:
     return _normalize_url(a.split("#", 1)[0]) == _normalize_url(b.split("#", 1)[0])
 
 
-#: 창 안 판독(주 world, 읽기만 — 페이지 전역에 아무것도 남기지 않는다). el = 창 시작에 잡은 대상 노드(JSHandle, 없으면
-#: null), css = 그 노드를 찾던 경로. 같은 노드가 아직 붙어 있고 지금 경로도 그 노드를 가리킬 때만 요소 상태를 준다.
-_LATE_PROBE_JS = """
-([el, css]) => {
+#: WS-97 R2 (검증 B1): 창 안 대상 노드 판독은 **격리 world** 에서만 — this = backendNodeId 로 고정한 그 노드(DOM.resolveNode).
+#: 페이지 main world 의 getter·메서드 바꿔치기(prototype·노드 자신)는 격리 world 의 래퍼에 닿지 않는다. aria 속성은 이 함수가
+#: 아니라 CDP DOM.describeNode 의 속성 목록으로 읽는다. 지금 css 경로도 그 노드를 가리킬 때만(same) 상태를 쓴다.
+_LATE_NODE_FN = """function (css) {
   __DEEP_QUERY__
-  let nav = '';
-  try { const e = performance.getEntriesByType('navigation')[0]; nav = e ? String(e.type) : ''; } catch (e) {}
-  const out = { url: location.href, hlen: history.length, origin: performance.timeOrigin, nav: nav, el: null };
-  if (el && el.isConnected && css) {
-    let cur = null;
-    try { cur = deepQuery(css); } catch (e) { cur = null; }
-    if (cur === el) {
-      out.el = {
-        expanded: el.getAttribute('aria-expanded') || '',
-        pressed: el.getAttribute('aria-pressed') || '',
-        checked: el.checked !== undefined ? !!el.checked : null,
-        value: el.value !== undefined ? String(el.value) : null,
-      };
-    }
-  }
-  return out;
-}
-"""
-#: 창 시작에 대상 노드를 잡는다(JSHandle — 페이지가 볼 수 있는 전역 없음).
-_LATE_PIN_JS = """
-(css) => {
+  let cur = null;
+  try { cur = css ? deepQuery(css) : null; } catch (e) { cur = null; }
+  return {
+    c: this.isConnected === true,
+    same: cur === this,
+    checked: this.checked !== undefined ? !!this.checked : null,
+    value: this.value !== undefined ? String(this.value) : null,
+  };
+}"""
+#: 창 시작에 대상 노드를 격리 world 에서 찾는다(그 노드의 backendNodeId 를 DOM.describeNode 로 얻는다 — 페이지 전역 없음).
+_LATE_PIN_FN = """function (css) {
   __DEEP_QUERY__
   try { return css ? deepQuery(css) : null; } catch (e) { return null; }
-}
-"""
+}"""
+_LATE_ISO_GROUP = "ws97-late"
+
+
+class _LateDocStatus:
+    """WS-97 R2 (검증 B3): 창 동안 문서 응답 상태(브라우저 쪽 response 이벤트 — 페이지가 바꿀 수 없다). 프레임마다 마지막
+    문서 응답의 status 만 둔다. 응답을 못 봤거나 status >= 400 이면 그 프레임의 새 문서는 창 안 근거가 아니다."""
+
+    def __init__(self, page: Any) -> None:
+        self.page = page
+        self.last: Dict[int, Tuple[Any, int]] = {}
+        self.active = False
+        try:
+            page.on("response", self._on)
+            self.active = True
+        except Exception:  # noqa: BLE001 — 가짜 페이지: 응답 상태 없음(문서 근거 없음)
+            pass
+
+    def _on(self, response: Any) -> None:
+        try:
+            if response.request.resource_type != "document":
+                return
+            frame = response.frame
+            status = int(response.status)
+        except Exception:  # noqa: BLE001 — 응답 객체 판독 실패: 이 응답은 근거가 되지 않는다
+            return
+        self.last[id(frame)] = (frame, status)
+
+    def ok(self, frame: Any) -> bool:
+        entry = self.last.get(id(frame))
+        return entry is not None and entry[0] is frame and entry[1] < 400
+
+    def close(self) -> None:
+        if self.active:
+            self.active = False
+            try:
+                self.page.remove_listener("response", self._on)
+            except Exception:  # noqa: BLE001 — 닫힌 탭
+                pass
 
 
 class _OpenWatch:
@@ -353,6 +380,8 @@ class _NavWatch:
         self.committed = False
         self.dcl = False
         self.aborted = ""
+        #: WS-97 R2 (검증 B3): 지켜보는 문서 요청의 응답 status(늦은 효과 창은 >= 400 이면 근거로 치지 않는다).
+        self.status: Optional[int] = None
         self._current: Any = None
         self._changed = asyncio.Event()
         self._handlers: List[Tuple[str, Any]] = []
@@ -387,6 +416,7 @@ class _NavWatch:
             self._current = request
             self.started = True
             self.aborted = ""
+            self.status = None
             self._changed.set()
 
     def _on_response(self, response: Any) -> None:
@@ -398,6 +428,7 @@ class _NavWatch:
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 응답 객체를 읽지 못하면(닫힌 요청 등) 이 응답은 무시한다 — 이동 감시는 다른 신호·상한으로 끝난다.
             return
+        self.status = status
         if status in _NO_DOCUMENT_STATUS:
             self.aborted = f"status_{status}"
         elif "attachment" in disposition.lower():
@@ -4651,57 +4682,154 @@ class ActionDispatcher:
             after.page_count = max(after.page_count, before.page_count + len(popups))
         return after, root_after
 
-    async def _late_probe(self, doc: Any, pin: Any, css: str, timeout: float) -> Optional[Dict[str, Any]]:
-        """WS-97 v3: 창 안 판독 한 번(주소·history.length·문서 시각·이동 종류·고정 노드 상태). 상한 timeout 초.
-
-        문서 교체 중·고정 노드가 옛 문서 것·시간 초과·가짜 페이지는 None(다음 주기에 다시 본다 — B2)."""
-        if timeout <= 0:
-            return None
-        try:
-            out = await asyncio.wait_for(
-                doc.evaluate(_LATE_PROBE_JS.replace("__DEEP_QUERY__", DEEP_QUERY_JS), [pin, css]), timeout)
-        except Exception:  # noqa: BLE001 — 문서 교체 중(B2)·옛 문서 노드·시간 초과: 이번 주기는 판독 없음
-            return None
-        return out if isinstance(out, dict) else None
+    # -- WS-97 R2 (검증 B1): 창 안 판독은 페이지가 위조할 수 없는 브라우저 쪽 정보만 -----------------------------------------
 
     @staticmethod
-    def _late_doc_evidence(probe: Dict[str, Any], base: Dict[str, Any], before_url: str) -> str:
-        """창 안 문서 근거(v3 ①·④) — 신호 문자열(기존 어휘) 또는 "".
+    async def _late_frame(cdp: Any, frame_id: str) -> Optional[Dict[str, Any]]:
+        """그 프레임의 지금 문서(CDP Page.getFrameTree): 주소(조각 포함)·loaderId·오류 문서(unreachableUrl) 여부.
 
-        ① 새 문서(문서 시각이 바뀜)가 정상 문서(오류·about: 아님)이고 클릭 전 주소와 다르며 새로고침형이 아닐 때.
-        ④ 같은 문서에서 주소가 바뀌고(조각만 다른 것 제외) history.length 가 늘었을 때(pushState — replaceState·해시 제외)."""
-        url = str(probe.get("url") or "")
-        if not _late_normal_doc(url) or _normalize_url(url) == _normalize_url(before_url):
-            return ""
-        if probe.get("origin") != base.get("origin"):
-            if str(probe.get("nav") or "") == "reload":
-                return ""
-            return f"url_changed: {before_url} -> {url}"
-        if _late_same_but_fragment(url, before_url):
-            return ""
+        frame_id 가 빈 값이면 그 세션의 최상위 프레임. 못 찾음·loaderId 없음은 None. 주 world 의 location·
+        performance.timeOrigin 을 읽지 않는다 — 문서 교체는 loaderId 변화로만 본다."""
+        tree = (await cdp.send("Page.getFrameTree")).get("frameTree") or {}
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            frame = node.get("frame") or {}
+            if (not frame_id and node is tree) or (frame_id and frame.get("id") == frame_id):
+                loader = frame.get("loaderId")
+                if not loader:
+                    return None
+                return {"url": str(frame.get("url") or "") + str(frame.get("urlFragment") or ""),
+                        "loader": str(loader), "error": bool(frame.get("unreachableUrl"))}
+            stack.extend(node.get("childFrames") or [])
+        return None
+
+    @staticmethod
+    async def _late_history(cdp: Any) -> Optional[Tuple[int, int, str]]:
+        """탭의 세션 이력(CDP Page.getNavigationHistory): (항목 수, 지금 위치, 지금 항목 주소). 못 읽으면 None.
+        history.length(주 world getter)를 읽지 않는다 — replaceState 는 항목·위치가 늘지 않는다."""
+        h = await cdp.send("Page.getNavigationHistory")
+        entries = h.get("entries") or []
         try:
-            grew = int(probe.get("hlen") or 0) > int(base.get("hlen") or 0)
+            idx = int(h.get("currentIndex", -1))
         except (TypeError, ValueError):
-            grew = False
-        return f"url_changed: {before_url} -> {url}" if grew else ""
+            return None
+        if not entries or not 0 <= idx < len(entries):
+            return None
+        return len(entries), idx, str((entries[idx] or {}).get("url") or "")
+
+    async def _late_pin(self, cdp: Any, frame_id: str, css: str, loader: str) -> Optional[int]:
+        """창의 대상 노드 정체(backendNodeId). 클릭 직전에 잡은 그 노드(_clicked_node — 같은 세션·프레임·문서)가 있으면 그것,
+        아니면 지금 css 경로가 가리키는 노드를 **격리 world** 에서 찾는다. 없음·문서 바뀜·판독 실패는 None(③ 근거 없음)."""
+        if not css:
+            return None
+        clicked = self.__dict__.get("_clicked_node")
+        if clicked is not None and clicked[0] is cdp and clicked[1] == frame_id and clicked[3] == loader:
+            return int(clicked[2])
+        group = _LATE_ISO_GROUP
+        fn = _LATE_PIN_FN.replace("__DEEP_QUERY__", DEEP_QUERY_JS)
+
+        async def run(context_id: int) -> Any:
+            try:
+                found = await cdp.send("Runtime.evaluate", {
+                    "expression": f"({fn})({json.dumps(css)})", "contextId": context_id,
+                    "returnByValue": False, "objectGroup": group})
+                obj = found.get("result") or {}
+                if found.get("exceptionDetails") or obj.get("subtype") != "node" or not obj.get("objectId"):
+                    return None
+                node = await cdp.send("DOM.describeNode", {"objectId": obj["objectId"], "depth": 0})
+                backend = (node.get("node") or {}).get("backendNodeId")
+                return int(backend) if backend else None
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                    pass
+
+        try:
+            out = await self._in_gate_world(cdp, frame_id, run, expect_loader=loader)
+        except Exception:  # noqa: BLE001 — 의도된 fail-safe: 노드 없음·문서 교체 중 = 요소 근거 없이
+            return None
+        return out if isinstance(out, int) else None
+
+    async def _late_node(self, cdp: Any, frame_id: str, backend: int, css: str, loader: str) -> Optional[Dict[str, Any]]:
+        """고정 노드(backendNodeId)의 지금 상태 — aria-expanded·aria-pressed 는 CDP DOM.describeNode 속성 목록, checked·value 는
+        격리 world 원시 프로퍼티(페이지 main world 의 getter·메서드 위조가 닿지 않는다 — 시험이 고정). 노드가 떨어짐·지금 css
+        경로가 다른 노드·문서가 바뀜(loaderId)·판독 결과 없음은 None. CDP 예외는 그대로 올린다(부르는 쪽이 다음 주기로)."""
+        desc = await cdp.send("DOM.describeNode", {"backendNodeId": int(backend), "depth": 0})
+        attrs = list((desc.get("node") or {}).get("attributes") or [])
+        amap = dict(zip(attrs[0::2], attrs[1::2]))
+        group = _LATE_ISO_GROUP
+        fn = _LATE_NODE_FN.replace("__DEEP_QUERY__", DEEP_QUERY_JS)
+
+        async def run(context_id: int) -> Any:
+            try:
+                found = await cdp.send("DOM.resolveNode", {"backendNodeId": int(backend),
+                                                            "executionContextId": context_id, "objectGroup": group})
+                object_id = (found.get("object") or {}).get("objectId")
+                if not object_id:
+                    return None
+                called = await cdp.send("Runtime.callFunctionOn", {
+                    "objectId": object_id, "functionDeclaration": fn, "arguments": [{"value": css}],
+                    "returnByValue": True})
+                if called.get("exceptionDetails"):
+                    return None
+                return (called.get("result") or {}).get("value")
+            finally:
+                try:
+                    await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:  # noqa: BLE001 — 문서가 이미 바뀜: 무해
+                    pass
+
+        info = await self._in_gate_world(cdp, frame_id, run, expect_loader=loader)
+        if not isinstance(info, dict) or info.get("c") is not True or info.get("same") is not True:
+            return None
+        return {"expanded": str(amap.get("aria-expanded", "")), "pressed": str(amap.get("aria-pressed", "")),
+                "checked": info.get("checked"), "value": info.get("value")}
+
+    async def _late_doc_evidence(self, cdp: Any, frame_id: str, base: Dict[str, Any], ref: str, frame_obj: Any,
+                                 statuses: "_LateDocStatus", nav_status: Optional[int], top_cdp: Any,
+                                 hist0: Optional[Tuple[int, int, str]], top_level: bool, within: Any) -> str:
+        """창 안 문서 근거(v3 ①·④) — 신호 문자열(기존 어휘) 또는 "". 판독은 모두 CDP(브라우저 쪽).
+
+        ① 새 문서(loaderId 가 창 시작과 다름)가 정상 문서(오류 문서·about: 아님)이고 클릭 전 주소와 다르며, 그 프레임의 마지막
+           문서 응답 status 를 봤고 < 400(R2 B3 — 404·500 오류 결과 문서 제외, 응답을 못 봤으면 근거 아님).
+        ④ 같은 문서(loaderId 같음)에서 주소가 바뀌고(조각만 다른 것 제외) 세션 이력의 지금 위치가 창 시작보다 늘었을 때
+           (pushState — replaceState·해시 제외). 최상위면 지금 이력 항목 주소도 그 주소여야 한다."""
+        doc = await within(self._late_frame(cdp, frame_id))
+        if doc is None:
+            return ""
+        url = doc["url"]
+        if doc["error"] or not _late_normal_doc(url) or _normalize_url(url) == _normalize_url(ref):
+            return ""
+        if doc["loader"] != base["loader"]:
+            if not statuses.ok(frame_obj) or (nav_status is not None and nav_status >= 400):
+                return ""
+            return f"url_changed: {ref} -> {url}"
+        if _late_same_but_fragment(url, ref) or _normalize_url(url) == _normalize_url(base["url"]) \
+                or hist0 is None or top_cdp is None:
+            return ""
+        hist = await within(self._late_history(top_cdp))
+        if hist is None or hist[1] <= hist0[1]:
+            return ""
+        if top_level and not _late_same_but_fragment(hist[2], url):
+            return ""
+        return f"url_changed: {ref} -> {url}"
 
     @staticmethod
-    def _late_element_evidence(probe: Dict[str, Any], before: Any) -> str:
-        """창 안 대상 요소 근거(v3 ③) — 창 시작에 잡은 그 노드의 aria-expanded·aria-pressed·checked·value 만(className 제외,
-        B/04). 노드가 떨어졌거나 지금 경로가 다른 노드를 가리키면(probe.el 없음) 근거 아님."""
-        el = probe.get("el")
-        sig = str(getattr(before, "element_signature", "") or "")
-        if not isinstance(el, dict) or not sig:
+    def _late_element_evidence(cur: Optional[Dict[str, Any]], base: Optional[Dict[str, Any]], before: Any) -> str:
+        """창 안 대상 요소 근거(v3 ③) — 고정 노드의 aria-expanded·aria-pressed·checked·value 가 창 시작 판독과 다를 때만
+        (className 제외, B/04). 둘 중 하나라도 판독이 없으면(노드 떨어짐·경로가 다른 노드) 근거 아님."""
+        if not isinstance(cur, dict) or not isinstance(base, dict):
             return ""
-        parts = sig.rsplit("|", 2)
-        if len(parts) == 3 and (str(el.get("expanded") or ""), str(el.get("pressed") or "")) != (parts[1], parts[2]):
+        if (cur.get("expanded"), cur.get("pressed")) != (base.get("expanded"), base.get("pressed")):
             return "element_attr_changed"
-        if el.get("value") != before.element_value:
-            if before.element_is_secret:
+        if cur.get("value") != base.get("value"):
+            if getattr(before, "element_is_secret", False):
                 return "element_value_changed: <secret>"
-            return f"element_value_changed: {before.element_value!r} -> {el.get('value')!r}"
-        if el.get("checked") != before.element_checked:
-            return f"element_checked_changed: {before.element_checked} -> {el.get('checked')}"
+            return f"element_value_changed: {base.get('value')!r} -> {cur.get('value')!r}"
+        if cur.get("checked") != base.get("checked"):
+            return f"element_checked_changed: {base.get('checked')} -> {cur.get('checked')}"
         return ""
 
     async def _late_effect_window(
@@ -4715,26 +4843,30 @@ class ActionDispatcher:
     ) -> Tuple[Any, Any]:
         """WS-97 v3 (#280): 효과가 전혀 없는 click 뒤 LATE_EFFECT_WINDOW_MS 동안 POPUP_GRACE_MS 주기로 다시 본다.
 
-        이 클릭이 일으켰다고 확실한 강한 근거만 성공으로 인정한다(모두 대상 탭 기준, fail-closed):
-          ① 대상 문서(프레임 안이면 최상위도)가 정상 문서로 커밋됨 — 오류 문서·about:·같은 주소 재요청·reload 제외.
-             nav_settle 이면 _NavWatch 가 남은 창 시간만 기다린다(창 + settle ≤ LATE_EFFECT_WINDOW_MS).
+        이 클릭이 일으켰다고 확실한 강한 근거만 성공으로 인정한다(모두 대상 탭 기준, fail-closed). R2(검증 B1): 판독은 모두
+        페이지가 위조할 수 없는 브라우저 쪽 정보 — CDP Page.getFrameTree(loaderId·주소·unreachableUrl)·Page.getNavigationHistory·
+        DOM.describeNode(속성)·격리 world 원시 프로퍼티(backendNodeId 로 고정한 노드), 문서 응답 status 는 response 이벤트.
+          ① 대상 문서(프레임 안이면 최상위도)가 정상 문서로 커밋됨 — loaderId 바뀜, 오류 문서·about:·같은 주소 재요청 제외,
+             그 문서 응답 status < 400(R2 B3). nav_settle 이면 _NavWatch 가 남은 창 시간만 기다린다(창 + settle ≤ 창).
           ② 이 클릭이 연 새 탭 — 대상 탭의 popup 이벤트 또는 opener 세션 Page.windowOpen(첫 응답이 늦은 탭, B/04). 그 탭이
              액션 밖에서 popup 을 연 적이 있으면(자발 popup, B/01) 창 안 popup 은 근거가 아니다.
-          ③ 창 시작에 잡은 대상 노드의 aria-expanded·aria-pressed·checked·value(className 제외, B/03) — 노드가 바뀌면 아님.
-          ④ 같은 문서 주소 변화 + history.length 증가(pushState) — replaceState·해시 갱신 제외(B/05).
-        비근거: 글자·노드 변화, 다이얼로그, 관계 탭, 다른 탭, 포커스, class. 관계 탭 감시는 창 시작에 뗀다.
-        첫 주기(기존 유예와 같은 150ms 뒤)에 WS-90 목적 신호(클릭한 그 노드의 포커스·선택)가 있으면 창을 끝내고 기존 판정으로
-        넘긴다(근거가 아니라 기다림만 끝냄). 캡처 예외는 다음 주기로 계속(B2), 대상 탭이 닫히면 기존 닫힘 경로(WS-83 B4).
-        결과 self._late_outcome: "effect"·"none"·"closed"·"purpose". "none" 이면 창 안에서 새로 붙은 다이얼로그·popup 을
-        떼고(실패 봉투를 기준과 같게) 서버 꼬리 상한(last_late_deadline, B/02)을 건다.
+          ③ 대상 노드(클릭한 그 노드 또는 창 시작에 css 로 잡은 노드의 backendNodeId)의 aria-expanded·aria-pressed·checked·
+             value 가 창 시작 판독과 다름(className 제외, B/03) — 노드가 떨어지거나 경로가 다른 노드면 아님.
+          ④ 같은 문서 주소 변화 + 세션 이력 위치 증가(pushState) — replaceState·해시 갱신 제외(B/05).
+        비근거: 글자·노드 변화, 다이얼로그, 관계 탭, 다른 탭, 포커스, class. 다른 출처 iframe 등 판독 불가 = 근거 없음.
+        관계 탭 감시는 창 시작에 뗀다. 첫 주기(기존 유예와 같은 150ms 뒤)에 WS-90 목적 신호(클릭한 그 노드의 포커스·선택)가
+        있으면 창을 끝내고 기존 판정으로 넘긴다(근거가 아니라 기다림만 끝냄). 판독 예외는 다음 주기로 계속(B2), 대상 탭이 닫히면
+        기존 닫힘 경로(WS-83 B4). 결과 self._late_outcome: "effect"·"none"·"closed"·"purpose". "none" 이면 창 안에서 새로
+        붙은 다이얼로그·popup 을 떼고(실패 봉투를 기준과 같게) 서버 꼬리 상한(last_late_deadline, B/02)을 건다 — 최종 결과는
+        실패로 고정(R2 B2: _retry_unsatisfied 의 목적 신호 재판독도 성공으로 올리지 않는다).
         """
         page = self.ctx.page
         top = self._top_page()
         frame_ctx = page if self.ctx.root_page is not None else None
         start = time.perf_counter()
         deadline = start + LATE_EFFECT_WINDOW_MS / 1000
-        # 서버 꼬리 상한(B/02)은 이 click 호출 시작부터 창 + 여유 — 응답 전체가 약 3.5초 안(창이 입력 뒤 이동 대기로
-        # 늦게 시작했으면 창 끝에서 곧바로 자른다).
+        # 서버 꼬리 상한(B/02)은 이 click 호출 시작(dispatch 입구)부터 창 + 여유 — 응답 전체가 약 3.5초 안(창이 입력 뒤 이동
+        # 대기로 늦게 시작했으면 창 끝에서 곧바로 자른다).
         sent = self.__dict__.get("_late_t0")
         tail_deadline = (sent if isinstance(sent, float) else time.monotonic()) \
             + (LATE_EFFECT_WINDOW_MS + LATE_EFFECT_TAIL_MS) / 1000
@@ -4749,22 +4881,75 @@ class ActionDispatcher:
         def _left() -> float:
             return deadline - time.perf_counter()
 
+        async def _within(coro: Any) -> Any:
+            left = _left()
+            if left <= 0:
+                coro.close()
+                raise asyncio.TimeoutError()
+            return await asyncio.wait_for(coro, left)
+
         def _new_watch() -> Optional[_NavWatch]:
             if not self.ctx.nav_settle:
                 return None
             w = _NavWatch(top, frame=frame_ctx) if frame_ctx is not None else _NavWatch(top)
             return w if w.active else None
 
+        top_frame = getattr(top, "main_frame", None)
+        target_frame = frame_ctx if frame_ctx is not None else top_frame
+        statuses = _LateDocStatus(top)
         watch = _new_watch()
-        pin: Any = None
-        pin_tries = 0
+        st: Dict[str, Any] = {"world": None, "top_cdp": None, "base": None, "top_base": None, "hist0": None,
+                              "pin": None, "el0": None, "pin_tries": 0}
+
+        async def _setup() -> None:
+            # 기준(창 시작): 대상 문서·최상위 문서·이력·대상 노드. 못 읽은 부분은 다음 주기에 다시(그 사이 효과는 놓침 —
+            # fail-closed). 다른 출처 iframe 등 프레임을 정하지 못하면 판독 없음(근거 없음).
+            if st["top_cdp"] is None:
+                st["top_cdp"] = await _within(self._gate_cdp_for(top))
+            if st["world"] is None:
+                w = await _within(self._select_frame_world())
+                if w is None:
+                    return
+                st["world"] = (w[0], w[1])
+            if st["base"] is None:
+                st["base"] = await _within(self._late_frame(*st["world"]))
+                if st["base"] is None:
+                    return
+                st["hist0"] = await _within(self._late_history(st["top_cdp"]))
+            if frame_ctx is not None and st["top_base"] is None:
+                st["top_base"] = await _within(self._late_frame(st["top_cdp"], ""))
+            if st["pin"] is None and st["pin_tries"] < 3:
+                st["pin_tries"] += 1
+                st["pin"] = await _within(self._late_pin(st["world"][0], st["world"][1], css, st["base"]["loader"]))
+            if st["pin"] is not None and st["el0"] is None:
+                st["el0"] = await _within(self._late_node(st["world"][0], st["world"][1], st["pin"], css,
+                                                          st["base"]["loader"]))
+
+        async def _doc_sig(on_top: bool, nav_status: Optional[int] = None) -> str:
+            if on_top and frame_ctx is not None:
+                if st["top_cdp"] is None or st["top_base"] is None or root_before is None:
+                    return ""
+                sig = await self._late_doc_evidence(st["top_cdp"], "", st["top_base"], root_before.url, top_frame,
+                                                    statuses, nav_status, st["top_cdp"], st["hist0"], True, _within)
+                return ("top:" + sig) if sig else ""
+            if st["world"] is None or st["base"] is None:
+                return ""
+            return await self._late_doc_evidence(st["world"][0], st["world"][1], st["base"], before.url, target_frame,
+                                                 statuses, nav_status, st["top_cdp"], st["hist0"], frame_ctx is None,
+                                                 _within)
+
+        async def _el_sig() -> str:
+            if st["world"] is None or st["base"] is None or st["pin"] is None or st["el0"] is None:
+                return ""
+            cur = await _within(self._late_node(st["world"][0], st["world"][1], st["pin"], css, st["base"]["loader"]))
+            return self._late_element_evidence(cur, st["el0"], before)
+
         outcome = "none"
         try:
-            # 기준(창 시작): 대상 노드 고정 + 문서 판독. 실패(문서 교체 중)면 다음 주기에 다시 잡는다(그 사이 효과는 놓침 —
-            # fail-closed).
-            pin, pin_tries = await self._late_pin(page, css), 1
-            base = await self._late_probe(page, None, "", _left()) or {}
-            top_base = (await self._late_probe(top, None, "", _left()) or {}) if frame_ctx is not None else {}
+            try:
+                await _setup()
+            except Exception:  # noqa: BLE001 — 문서 교체 중·시간 초과: 다음 주기에 다시(B2)
+                pass
             first = True
             while True:
                 left = _left()
@@ -4796,54 +4981,42 @@ class ActionDispatcher:
                 if watch is not None and watch.started:
                     info = await watch.settle(limit_ms=max(0.0, _left() * 1000))
                     nav_frame = watch._nav_frame
+                    nav_status = watch.status
                     watch.close()
                     watch = None
                     if info:
                         self._nav_info = info
                     if info.get("nav_committed"):
-                        on_top = frame_ctx is None or nav_frame is getattr(top, "main_frame", None)
-                        doc = top if on_top else page
-                        ref = (root_before.url if frame_ctx is not None and root_before is not None else before.url) \
-                            if on_top else before.url
-                        probe = await self._late_probe(doc, None, "", _left())
-                        sig = self._late_doc_evidence(probe, {"origin": None}, ref) if probe else ""
+                        try:
+                            sig = await _doc_sig(frame_ctx is None or nav_frame is top_frame, nav_status)
+                        except Exception:  # noqa: BLE001 — 판독 불가: 근거 아님
+                            sig = ""
                         if sig:
                             outcome = "effect"
-                            self._late_signal = ("top:" + sig) if frame_ctx is not None and on_top else sig
+                            self._late_signal = sig
                             break
                     watch = _new_watch()  # 중단·시간 초과·오류 문서·새로고침: 근거 아님 — 다음 요청을 본다
                     continue
-                probe = await self._late_probe(page, pin, css, _left())
-                if probe is None:
-                    if pin is not None:
-                        pin = await self._late_drop_pin(pin)  # 옛 문서 노드일 수 있다 — 다음 주기는 노드 없이
-                    continue
-                if not base:
-                    base = probe  # 창 시작 판독이 실패했다 — 지금을 기준으로(판정은 다음 주기부터)
-                    continue
-                if pin is None and pin_tries < 3 and probe.get("origin") == base.get("origin"):
-                    pin, pin_tries = await self._late_pin(page, css), pin_tries + 1  # 같은 문서 — 다시 고정
-                    continue
-                if base:
-                    sig = self._late_doc_evidence(probe, base, before.url)
-                    if not sig and probe.get("origin") == base.get("origin"):
-                        sig = self._late_element_evidence(probe, before)
+                try:
+                    await _setup()
+                except Exception:  # noqa: BLE001 — 문서 교체 중·시간 초과: 다음 주기에 다시(B2)
+                    pass
+                sig = ""
+                for read in (lambda: _doc_sig(False), lambda: _doc_sig(True), _el_sig):
+                    try:
+                        sig = await read()
+                    except Exception:  # noqa: BLE001 — 문서 교체 중(B2)·옛 문서 노드·시간 초과: 이번 판독은 근거 없음
+                        sig = ""
                     if sig:
-                        outcome = "effect"
-                        self._late_signal = sig
                         break
-                if frame_ctx is not None and top_base and root_before is not None:
-                    tprobe = await self._late_probe(top, None, "", _left())
-                    sig = self._late_doc_evidence(tprobe, top_base, root_before.url) if tprobe else ""
-                    if sig:
-                        outcome = "effect"
-                        self._late_signal = "top:" + sig
-                        break
+                if sig:
+                    outcome = "effect"
+                    self._late_signal = sig
+                    break
         finally:
             if watch is not None:
                 watch.close()
-            if pin is not None:
-                await self._late_drop_pin(pin)
+            statuses.close()
         if outcome == "effect":
             try:
                 after = await self._capture_state(page, handle)
@@ -4864,26 +5037,6 @@ class ActionDispatcher:
             self.last_late_deadline = tail_deadline
         self._late_outcome = outcome
         return after, root_after
-
-    @staticmethod
-    async def _late_pin(doc: Any, css: str) -> Any:
-        """창의 대상 노드 고정(JSHandle — 페이지가 볼 수 있는 전역 없음). 없음·문서 교체 중·시간 초과는 None(③ 근거 없음)."""
-        if not css:
-            return None
-        try:
-            pin = await asyncio.wait_for(
-                doc.evaluate_handle(_LATE_PIN_JS.replace("__DEEP_QUERY__", DEEP_QUERY_JS), css), 0.5)
-        except Exception:  # noqa: BLE001 — 노드 없음·문서 교체 중: 요소 근거 없이
-            return None
-        return pin
-
-    @staticmethod
-    async def _late_drop_pin(pin: Any) -> None:
-        try:
-            await asyncio.wait_for(pin.dispose(), 0.2)
-        except Exception:  # noqa: BLE001 — 문서가 이미 바뀜·시간 초과: 무해
-            pass
-        return None
 
     async def _element_post_condition(
         self,
@@ -5272,9 +5425,11 @@ class ActionDispatcher:
         """사후조건 미충족(Silent Failure): 부작용 액션은 중단, 멱등 액션만 1회 재시도(WS-48 분해)."""
         # 사후조건 미충족 (Silent Failure)
         post_retry_safe = is_retry_safe(action, FailurePhase.POST_DISPATCH)
-        if not post_retry_safe and action is ActionType.CLICK:
+        if not post_retry_safe and action is ActionType.CLICK and self.__dict__.get("_late_outcome") != "none":
             # WS-90 (#245): 효과는 없지만 목적(편집 칸 포커스·탭/옵션 선택 상태)이 클릭한 그 노드에서 확인되면 성공.
             # 신호는 효과가 아니다(레시피 기대 신호에서 거른다 — recipes.recorder.signal_kinds).
+            # WS-97 R2 (검증 B2): 늦은 효과 창이 근거 없이 끝났으면(none) 창 뒤에 다시 읽은 목적 신호로 성공시키지 않는다 —
+            # 창 안 포커스는 근거가 아니다. 창 첫 주기(기준 유예와 같은 150ms)에 본 목적은 "purpose" 로 끝나 여기서 그대로 판정.
             purpose = await self._click_purpose_signals(handle)
             if purpose:
                 return self._result(

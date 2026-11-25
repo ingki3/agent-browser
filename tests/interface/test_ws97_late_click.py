@@ -5,11 +5,16 @@
 
 v3 규칙:
 * 효과가 0 일 때만 LATE_EFFECT_WINDOW_MS(3000) 동안 150ms 주기로 다시 본다(정상 클릭 대기 0, 진입 조건은 기준 그대로).
-* 창 안 근거는 ① 정상 문서 커밋(오류 문서·about:·같은 주소·reload 제외) ② 이 클릭이 연 새 탭(popup·Page.windowOpen,
-  자발 popup 이력이 있는 탭 제외) ③ 창 시작에 잡은 대상 노드의 aria-expanded·aria-pressed·checked·value(class 제외)
-  ④ 같은 문서 주소 변화 + history.length 증가(pushState)뿐. 글자·노드·다이얼로그·관계 탭·다른 탭·포커스·class 는 아니다.
+* 창 안 근거는 ① 정상 문서 커밋(loaderId 바뀜 — 오류 문서·about:·같은 주소·HTTP status >= 400 제외) ② 이 클릭이 연 새
+  탭(popup·Page.windowOpen, 자발 popup 이력이 있는 탭 제외) ③ 대상 노드(backendNodeId)의 aria-expanded·aria-pressed(CDP
+  DOM.describeNode)·checked·value(격리 world)(class 제외) ④ 같은 문서 주소 변화 + 세션 이력 위치 증가(pushState,
+  Page.getNavigationHistory)뿐. 글자·노드·다이얼로그·관계 탭·다른 탭·포커스·class 는 아니다.
+* R2(검증 B1): 판독은 모두 브라우저 쪽 — 주 world 의 getAttribute·history.length·performance.timeOrigin·value getter 위조가
+  근거를 만들지 못한다(attr/history/origin/proto-forge 반례).
 * 창이 근거 없이 끝나면 반드시 실패(E_TIMEOUT·retry_safe false·고정 문구), 창 안에서 붙은 dialogs·tabs_changed 는 뗀다.
-* 창 + 창 안 이동 대기 ≤ 3초, 서버 차단 판정은 창 시작부터 3.5초까지(넘기면 challenge null + reobserve_required).
+  창 뒤 목적 신호(타이머 포커스) 재판독으로도 성공하지 않는다(R2 B2).
+* 창 + 창 안 이동 대기 ≤ 3초, 서버 차단 판정은 click 호출 시작(dispatch 입구)부터 3.5초까지(넘기면 challenge null +
+  reobserve_required).
 """
 
 from __future__ import annotations
@@ -47,6 +52,8 @@ _AUDIT_JS = (
     "window.stop=()=>clearInterval(timer);"
     "document.getElementById('noop').addEventListener('click',()=>{window.clicks++});"
 )
+#: R2 위조 반례 공통: 무반응 Lookup + later(d) 로 클릭 뒤 d ms 에 위조 식 실행.
+_FORGE = "<button id=noop>Lookup</button><script>window.later=(d)=>setTimeout(()=>%s,d)</script>"
 _AUDIT = ("<input id=q aria-label=Query><button id=noop>Lookup</button>"
           "<button id=open onclick=\"window.open('/other')\">Open</button><div id=slot><p id=clock>ad 0</p></div>"
           "<p id=out></p><script>" + _AUDIT_JS + "</script>")
@@ -114,6 +121,27 @@ PAGES: Dict[str, str] = {
     "hash": "<button id=noop>Lookup</button><script>let n=0;window.later=(d)=>setTimeout(()=>{const f=()=>"
             "{location.hash='slide'+(++n)};f();setInterval(f,1000)},d)</script>",
     # 관계 탭 오류 문서(server_signals 문구 생산자)
+    # R2 검증 반례(boundary_probe): 클릭 뒤 700ms 에 주 world getter·메서드만 위조(실제 속성·문서·이력은 그대로)
+    "attr-forge": _FORGE % ("{const p=Element.prototype.getAttribute;Element.prototype.getAttribute=function(k){"
+                            "return k==='aria-pressed'?'true':p.call(this,k)};"
+                            "noop.getAttribute=k=>k==='aria-expanded'?'true':Element.prototype.getAttribute.call(noop,k)}"),
+    "history-forge": _FORGE % ("{const n=history.length;Object.defineProperty(history,'length',{get:()=>n+1});"
+                               "history.replaceState(null,'','/same-document?forged=history')}"),
+    "origin-forge": _FORGE % ("{Object.defineProperty(performance,'timeOrigin',{get:()=>1});"
+                              "history.replaceState(null,'','/same-document?forged=origin')}"),
+    "proto-forge": ("<input id=noop type=button value=Lookup><script>window.later=(d)=>setTimeout(()=>{"
+                    "Object.defineProperty(HTMLInputElement.prototype,'value',{get(){return 'FORGED'},configurable:true});"
+                    "Object.defineProperty(HTMLInputElement.prototype,'checked',{get(){return true},configurable:true});"
+                    "Object.defineProperty(noop,'value',{get(){return 'OWN'},configurable:true})},d)</script>"),
+    "frame-attr-forge": '<iframe id=fr src="/attr-forge" width=600 height=400></iframe>',
+    "frame-aria": '<iframe id=fr src="/aria" width=600 height=400></iframe>',
+    # R2 B2: 클릭 때 blur, 700ms 뒤 타이머가 같은 칸에 포커스 / 대조: 자연스러운 편집 칸 클릭(첫 주기 목적 신호)
+    "purpose-late-focus": "<input id=noop aria-label=Lookup onclick=\"this.blur()\"><script>window.later=(d)=>"
+                          "setTimeout(()=>noop.focus(),d)</script>",
+    "purpose-input": "<input id=noop aria-label=Lookup>",
+    # R2 B3: 700ms 뒤 HTTP 404·500 오류 결과 문서로 이동
+    "error-404": "<button onclick=\"setTimeout(()=>location.href='/status?code=404',700)\">Lookup</button>",
+    "error-500": "<button onclick=\"setTimeout(()=>location.href='/status?code=500',700)\">Lookup</button>",
     "opener": "<h1>OPENER</h1><button onclick=\"window.open('/pop','_blank','width=400,height=300')\">sized popup</button>",
     "pop": "<h1>POPUP</h1><button onclick=\"opener.location.href='/loop'\">loop opener</button>",
     "t": "<h1>새 탭 대상</h1>",
@@ -123,7 +151,8 @@ PAGES: Dict[str, str] = {
 
 NAMES = {"f0": "Go", "f0b": "Go", "f1": "Lookup", "f2": "Open", "f3a": "Book", "f3b": "Book", "f3c": "Book",
          "f3d": "Book", "f4a": "예약하기", "f4b": "예약하기", "f4c": "예약하기", "f4d": "예약하기", "f5": "Noop",
-         "f6b": "Lookup", "f8": "Book", "aria": "Lookup", "imm-alert": "Lookup", "late-error": "Lookup", "late-pending": "Lookup"}
+         "f6b": "Lookup", "f8": "Book", "aria": "Lookup", "imm-alert": "Lookup", "late-error": "Lookup", "late-pending": "Lookup",
+         "error-404": "Lookup", "error-500": "Lookup", "purpose-input": "Lookup"}
 
 
 def _html(body: str) -> bytes:
@@ -173,6 +202,8 @@ def site():
                 if name == "slowpage":
                     time.sleep(d)
                     return self._send(200, _html("<h1>slow</h1>"))
+                if name == "status":
+                    return self._send(int((q.get("code") or ["500"])[0]), _html("<h1>REQUEST FAILED</h1>"))
                 if name == "loop":
                     return self._send(302, headers={"Location": "/loop"})
                 if name == "robots.txt":
@@ -296,7 +327,7 @@ async def test_late_strong_effect_within_window_is_success(site, fx):
     if fx in ("f2", "f4b"):
         assert r["data"].get("opened_tab_ids"), r["data"]  # 기존 키(첫 응답이 빠른 탭 — popup 이벤트가 창 안에 옴)
     if fx == "f3c":
-        assert any(x.startswith("url_changed") for x in signals), signals  # pushState(history.length 증가)
+        assert any(x.startswith("url_changed") for x in signals), signals  # pushState(세션 이력 위치 증가)
     if fx == "aria":
         assert "element_attr_changed" in signals, signals
 
@@ -328,25 +359,53 @@ async def test_form_post_303_unchanged_success(site):
 @pytest.mark.parametrize("nav_settle", [True, False])
 async def test_capture_error_in_window_keeps_watching(site, monkeypatch, nav_settle):
     """B2: 창 안 판독 예외(문서 교체 중 'Execution context was destroyed')에서 창을 끝내지 않는다 — 다음 주기에 다시 봐서
-    1.2초 뒤 aria-expanded(③)를 잡는다. 실제 경합은 드물어 예외를 주입해 고정한다."""
-    state = {"raised": 0}
-    orig = dmod.ActionDispatcher._late_probe
+    1.2초 뒤 aria-expanded(③)를 잡는다. 실제 경합은 드물어 문서·노드 판독(CDP·격리 world)에 예외를 주입해 고정한다."""
+    state = {"frame": 0, "node": 0}
+    orig_frame = dmod.ActionDispatcher._late_frame
+    orig_node = dmod.ActionDispatcher._late_node
 
-    class Replacing:
-        async def evaluate(self, *_a: Any) -> Any:
-            state["raised"] += 1
+    async def frame(cdp: Any, frame_id: str):  # noqa: ANN202
+        if state["frame"] < 2:
+            state["frame"] += 1
             raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        return await orig_frame(cdp, frame_id)
 
-    async def probe(self, doc: Any, pin: Any, css: str, timeout: float):  # noqa: ANN202
-        if css and state["raised"] < 2:
-            return await orig(self, Replacing(), pin, css, timeout)  # 실제 판독 함수가 예외를 받는다
-        return await orig(self, doc, pin, css, timeout)
+    async def node(self, *a: Any):  # noqa: ANN202
+        if state["node"] < 2:
+            state["node"] += 1
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        return await orig_node(self, *a)
 
-    monkeypatch.setattr(dmod.ActionDispatcher, "_late_probe", probe)
+    monkeypatch.setattr(dmod.ActionDispatcher, "_late_frame", staticmethod(frame))
+    monkeypatch.setattr(dmod.ActionDispatcher, "_late_node", node)
     async with _server(nav_settle=nav_settle) as s:
         r = await run_fx(s, site["base"], "aria", think=0.3)
-    assert state["raised"] == 2
+    assert state == {"frame": 2, "node": 2}, state
     assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert "element_attr_changed" in r["data"]["signals"], r["data"]
+
+
+async def test_late_effect_in_frame_is_success(site):
+    """대조(R2 B1 frame 판독이 실제로 동작함): iframe 안 진짜 늦은 aria-expanded(1.2초) — 그 프레임 세션·frameId 로 읽어 성공."""
+    async with _server() as s:
+        assert (await call(s, "navigate", {"url": site["base"] + "/frame-aria", "wait_until": "load"}))["success"]
+        assert (await call(s, "switch_frame", {"frame_selector": "#fr"}))["success"]
+        target = await _element(s, "Lookup")
+        await asyncio.sleep(0.3)
+        r = await _timed_click(s, target)
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert r["window"] == "effect"
+    assert "element_attr_changed" in r["data"]["signals"], r["data"]
+
+
+@pytest.mark.parametrize("fx", ["f3b", "f3d"])
+async def test_late_document_commit_nav_settle_off_is_success(site, fx):
+    """nav_settle=False 경로의 ① — 문서 교체(loaderId)·응답 status(response 이벤트) 판독만으로 늦은 정상 이동을 잡는다."""
+    async with _server(nav_settle=False) as s:
+        r = await run_fx(s, site["base"], fx)
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert r["window"] == "effect"
+    assert any(x.startswith("url_changed") for x in r["data"]["signals"]), r["data"]
 
 
 # ------------------------------------------------------------------ 수용한 손실: 글자만 바뀌는 늦은 효과 → 새 문구
@@ -486,7 +545,7 @@ async def _later_case(s: BrowserMCPServer, base: str, page: str, fn: str = "late
 @pytest.mark.parametrize("page", ["cls", "swap", "rst", "hash", "self-reload"])
 async def test_spontaneous_strongish_changes_are_not_effects(site, page):
     """v3 리뷰 새 반례: 클릭 뒤 700ms 부터 버튼 자기 class 토글(B/04)·aria 가 다른 새 노드로 교체(노드 신원)·replaceState
-    주소 갱신(history.length 그대로)·해시 갱신(조각만)·자기 새로고침(같은 주소 재요청) — 모두 근거가 아니다."""
+    주소 갱신(세션 이력 그대로)·해시 갱신(조각만)·자기 새로고침(같은 주소 재요청) — 모두 근거가 아니다."""
     async with _server() as s:
         r = await _later_case(s, site["base"], page)
         if page == "self-reload":
@@ -523,12 +582,98 @@ async def test_late_popup_without_spontaneous_history_is_success(site):
     assert r["window"] == "effect"
 
 
+# ------------------------------------------------------------------ R2 재검증 반례: 기준과 같은 실패
+
+
+async def _forge_case(s: BrowserMCPServer, base: str, page: str, selector: bool = False,
+                      frame: bool = False) -> Dict[str, Any]:
+    """boundary_probe 의 위조 반례 — 클릭과 독립된 700ms 타이머가 주 world getter·메서드만 바꾼다(실제 상태는 그대로)."""
+    assert (await call(s, "navigate", {"url": f"{base}/{page}", "wait_until": "load"}))["success"]
+    if frame:
+        assert (await call(s, "switch_frame", {"frame_selector": "#fr"}))["success"]
+    target = {"selector": "#noop"} if selector else await _element(s, "Lookup")
+    doc = s._dispatcher.ctx.page
+    await asyncio.sleep(0.3)
+    await doc.evaluate("(d)=>window.later(d)", 700)
+    r = await _timed_click(s, target)
+    # 위조가 실제로 주 world 에 걸렸다(전제) — 주 world 로 읽으면 바뀐 것처럼 보인다.
+    r["main"] = await doc.evaluate("""() => ({expanded: noop.getAttribute('aria-expanded'),
+        pressed: noop.getAttribute('aria-pressed'), hlen: history.length, origin: performance.timeOrigin,
+        value: noop.value, checked: noop.checked, url: location.href})""")
+    return r
+
+
+@pytest.mark.parametrize("case", ["attr-forge", "attr-forge-selector", "frame-attr-forge", "history-forge",
+                                  "origin-forge", "proto-forge"])
+async def test_main_world_forgery_is_not_an_effect(site, case):
+    """R2 B1: 페이지가 주 world 의 getAttribute(노드 자신·Element.prototype)·history.length·performance.timeOrigin·
+    HTMLInputElement value/checked getter 를 위조하고 replaceState 만 해도 창 안 근거가 아니다(기준 0/3 과 같은 실패).
+    판독이 CDP(DOM.describeNode·Page.getFrameTree·Page.getNavigationHistory)·격리 world 원시 프로퍼티라 닿지 않는다."""
+    page = case.removesuffix("-selector")
+    async with _server() as s:
+        r = await _forge_case(s, site["base"], page, selector=case.endswith("-selector"),
+                              frame=page.startswith("frame-"))
+    main = r["main"]
+    if "attr-forge" in page:
+        assert main["expanded"] == "true" and main["pressed"] == "true", main  # 주 world 로는 바뀐 것처럼 보인다
+    if page == "history-forge":
+        assert "forged=history" in main["url"], main
+    if page == "origin-forge":
+        assert main["origin"] == 1 and "forged=origin" in main["url"], main
+    if page == "proto-forge":
+        assert main["value"] == "OWN" and main["checked"] is True, main
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+
+
+@pytest.mark.parametrize("selector", [False, True])
+async def test_late_timer_focus_is_not_promoted_after_window(site, selector):
+    """R2 B2: 클릭 때 blur 된 편집 칸에 700ms 뒤 타이머가 포커스 — 창이 근거 없이 끝났으므로(none) 창 뒤 목적 신호
+    (focus_target) 재판독으로 성공시키지 않는다(기준 0/3 과 같은 실패)."""
+    async with _server() as s:
+        assert (await call(s, "navigate", {"url": site["base"] + "/purpose-late-focus", "wait_until": "load"}))["success"]
+        target = {"selector": "#noop"} if selector else await _element(s, "Lookup")
+        await asyncio.sleep(0.3)
+        await s._page.evaluate("(d)=>window.later(d)", 700)
+        r = await _timed_click(s, target)
+        focused = await s._page.evaluate("() => document.activeElement && document.activeElement.id")
+    assert focused == "noop"  # 타이머 포커스가 실제로 일어났다(전제)
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    _expect_late_failure(r)
+
+
+async def test_natural_field_click_purpose_still_succeeds(site):
+    """대조(R2 B2 가 넘치지 않음): 자연스러운 편집 칸 클릭은 창 첫 주기(기준 유예와 같은 150ms)에 목적 신호로 성공 — 기준 그대로."""
+    async with _server() as s:
+        r = await run_fx(s, site["base"], "purpose-input", think=0.3)
+    assert r["success"] is True, (r.get("error_code"), r.get("error_message"), r.get("data"))
+    assert r["window"] == "purpose", r["window"]
+    assert "focus_target" in r["data"]["signals"], r["data"]
+
+
+@pytest.mark.parametrize("nav_settle", [True, False])
+@pytest.mark.parametrize("fx", ["error-404", "error-500"])
+async def test_late_http_error_document_is_not_an_effect(site, fx, nav_settle):
+    """R2 B3: 클릭 700ms 뒤 HTTP 404·500 오류 결과 문서(본문 있음 — chrome-error 아님)로 실제 이동해도 창 안 근거가 아니다
+    (기준 0/3 과 같은 실패). status 는 _NavWatch·response 이벤트(nav_settle 무관)로 본다."""
+    async with _server(nav_settle=nav_settle) as s:
+        r = await run_fx(s, site["base"], fx, think=0.3)
+        url = s._page.url
+    assert "/status?code=" in url, url  # 오류 결과 문서가 실제로 커밋됐다(전제)
+    assert r["window"] == "none", (r["window"], r.get("data"))
+    # 창 안 문서 대기 키(nav_*)·last_http_status 는 남을 수 있어 _expect_late_failure 의 data 검사 대신 같은 항목을 직접 본다.
+    assert r["success"] is False and r["error_code"] == "E_TIMEOUT", r
+    assert r["retry_safe"] is False and r["reobserve_required"] is True, r
+    assert r["error_message"] == dmod.click_unsatisfied_message(document_aborted=False), r["error_message"]
+    assert not any(not str(x).startswith("focus_moved") for x in (r.get("data") or {}).get("signals") or []), r
+
+
 # ------------------------------------------------------------------ 응답 상한 (B/02)
 
 
 async def test_late_pending_document_public_latency_is_bounded(site):
     """창 안에서 시작한 문서가 6초 동안 응답하지 않아도 public click 응답 ≤ 3.6초(창 + 이동 대기 ≤ 3초, 서버 차단 판정은
-    창 시작부터 3.5초까지 — 잘렸으면 challenge null + reobserve_required)."""
+    click 호출 시작부터 3.5초까지 — 잘렸으면 challenge null + reobserve_required)."""
     async with _server() as s:
         r = await run_fx(s, site["base"], "late-pending", think=0.3)
     assert r["window"] == "none"
