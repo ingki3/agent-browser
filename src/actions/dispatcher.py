@@ -381,7 +381,7 @@ class _NavWatch:
         self.dcl = False
         self.aborted = ""
         #: WS-97 R2 (검증 B3): 지켜보는 문서 요청의 응답 status(늦은 효과 창은 >= 400 이면 근거로 치지 않는다).
-        self.status: Optional[int] = None
+        self.resp_code: Optional[int] = None
         self._current: Any = None
         self._changed = asyncio.Event()
         self._handlers: List[Tuple[str, Any]] = []
@@ -416,7 +416,7 @@ class _NavWatch:
             self._current = request
             self.started = True
             self.aborted = ""
-            self.status = None
+            self.resp_code = None
             self._changed.set()
 
     def _on_response(self, response: Any) -> None:
@@ -428,7 +428,7 @@ class _NavWatch:
         except Exception:  # noqa: BLE001
             # 의도된 fail-safe(WS-48 점검): 응답 객체를 읽지 못하면(닫힌 요청 등) 이 응답은 무시한다 — 이동 감시는 다른 신호·상한으로 끝난다.
             return
-        self.status = status
+        self.resp_code = status
         if status in _NO_DOCUMENT_STATUS:
             self.aborted = f"status_{status}"
         elif "attachment" in disposition.lower():
@@ -4981,7 +4981,7 @@ class ActionDispatcher:
                 if watch is not None and watch.started:
                     info = await watch.settle(limit_ms=max(0.0, _left() * 1000))
                     nav_frame = watch._nav_frame
-                    nav_status = watch.status
+                    nav_status = watch.resp_code
                     watch.close()
                     watch = None
                     if info:
