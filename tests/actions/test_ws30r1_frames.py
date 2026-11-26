@@ -308,8 +308,12 @@ async def test_frame_clicks_do_not_leak_popup_listeners():
 
     async with async_playwright() as pw:
         browser, page, engine, d = await _setup(pw, html=FRAME_HTML)
-        before = _listener_count(page, "popup")
+        initial = _listener_count(page, "popup")
         await d.dispatch(ActionType.SWITCH_FRAME, {"frame_selector": "#f"})
+        # WS-97 B/01: dispatch 입구가 탭마다 한 번 자발 popup 기록 리스너를 단다(탭당 1개 고정, 액션마다 늘지 않음) —
+        # 누적은 그 뒤부터 센다.
+        before = _listener_count(page, "popup")
+        assert before <= initial + 1, (initial, before)
         for name in ("부모 변경", "무반응", "부모 변경"):
             await _click(d, name)
         after = _listener_count(page, "popup")

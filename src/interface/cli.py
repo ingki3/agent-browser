@@ -111,6 +111,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--locale",
+        type=_locale,
+        default="ko-KR",
+        metavar="BCP47|none",
+        help=(
+            "브라우저 언어(navigator.language·Intl·Accept-Language, 기본 ko-KR). none: 덮어쓰지 않음(Chromium 기본 "
+            "en-US, Accept-Language 머리 없음). user-chrome 에는 쓰지 않음(사용자 Chrome 설정 그대로)."
+        ),
+    )
+    serve.add_argument(
         "--max-result-chars",
         type=_max_result_chars,
         default=None,
@@ -339,6 +349,16 @@ def _max_result_chars(raw: str) -> int:
     return value
 
 
+def _locale(raw: str) -> Optional[str]:
+    """serve·run --locale 값(BCP 47 꼴 또는 none → None). WS-97 (#293)."""
+    from browser.core import parse_locale
+
+    try:
+        return parse_locale(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _approval_ttl(raw: str) -> int:
     try:
         value = int(raw)
@@ -403,6 +423,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 **({"attach": True} if getattr(args, "attach", False) else {}),
                 **({"workspace": args.workspace} if getattr(args, "workspace", None) else {}),
                 manual_sites=_manual_store(args),
+                **({} if getattr(args, "locale", "ko-KR") == "ko-KR" else {"locale": args.locale}),
             )
         )
     except KeyboardInterrupt:

@@ -143,11 +143,12 @@ async def test_click_js_navigation_off_returns_old_document_on_waits(server):
         r_on = await _click(engine, page, d, "곧 이동")
         url_on = page.url
         await b.close()
-    # off 는 옛 문서 기준으로 판정한다 — 효과가 아직 안 보여 사후조건 실패로 돌아올 수 있다
-    # (WS-25 이전 동작). 성공 여부는 고정하지 않고, 기다리지 않았다는 사실만 본다.
-    assert "/result" not in url_off, url_off
-    assert "/result" not in r_off.current_url, r_off.current_url
+    # off 는 이동 대기(_NavWatch)를 하지 않는다 — nav 대기 흔적이 없다. WS-97 (#280): 효과가 전혀 없던 click 은
+    # 늦은 효과 창이 사후 상태를 다시 보므로, 그 안에 커밋된 새 문서는 url_changed 효과로 잡힌다(이동 대기 아님 —
+    # 창은 nav_settle off 에서 문서 요청을 기다리지 않고 150ms 주기 스냅샷만 본다).
     assert not any(k in r_off.data for k in _NAV_KEYS), r_off.data
+    if "/result" in url_off:
+        assert r_off.success and any(s.startswith("url_changed") for s in r_off.data["signals"]), r_off.data
     assert "/result" in url_on, url_on
     assert r_on.data.get("nav_committed") is True, r_on.data
 

@@ -186,7 +186,8 @@ async def test_headless_mode_launches_headless_with_fixed_viewport(fake_pw):
     chromium = fake_pw["chromium"]
     assert chromium.launch_calls == [{"headless": True}]
     assert chromium.connect_calls == []
-    assert chromium.browser.new_context_calls == [{"viewport": {"width": 1280, "height": 720}}]
+    # WS-97 (#293): 기본 경로도 locale ko-KR(human_like 와 같은 값) — viewport 고정은 그대로.
+    assert chromium.browser.new_context_calls == [{"viewport": {"width": 1280, "height": 720}, "locale": "ko-KR"}]
     await core.close()
     assert chromium.browser.closed is True
     assert fake_pw["pw"].stopped is True
