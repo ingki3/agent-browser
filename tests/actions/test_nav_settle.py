@@ -346,7 +346,9 @@ async def test_aborted_navigation_proceeds_quickly(server, name):
         # 연결 끊김은 Chromium 이 chrome-error 문서를 커밋한다(실제 문서 변화) — 그건 인정.
         assert r.data.get("nav_committed") is not True, r.data
     assert "/result" not in url
-    assert elapsed < 2000, elapsed
+    # WS-97 (#280): 문서가 열리지 않은 click 은 늦은 효과 창(LATE_EFFECT_WINDOW_MS)만큼 더 본다 — 이동 대기(8초 상한)는
+    # 여전히 곧바로 끝난다(nav_timed_out 없음). 창 + 여유 2초 안.
+    assert elapsed < dmod.LATE_EFFECT_WINDOW_MS + 2000, elapsed
 
 
 # (e') Enter 폼 제출이 204/다운로드/연결 끊김 → 새 문서 없이 곧바로 진행(press_key 경로)
@@ -519,7 +521,8 @@ async def test_iframe_only_navigation_is_not_waited(server):
     assert any("/result" in u for u in frame_urls), frame_urls  # 프레임은 실제로 옮겨갔다
     assert "nav_wait_ms" not in r.data, r.data
     assert "nav_committed" not in r.data, r.data
-    assert elapsed < dmod.NAV_DETECT_MS + 1000, elapsed
+    # WS-97 (#280): 메인 문서 변화가 없는 click 이라 늦은 효과 창만큼 더 본다(메인 문서 대기는 여전히 없음).
+    assert elapsed < dmod.LATE_EFFECT_WINDOW_MS + dmod.NAV_DETECT_MS + 1000, elapsed
 
 
 # (R1-c, M7) 대기 리스너가 남지 않는다 — 이동 있는/없는 액션 여러 번 뒤 page 리스너 수 불변.

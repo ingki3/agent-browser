@@ -769,6 +769,8 @@ class ToolsMixin:
         try:
             # WS-91: 앞 호출의 Enter 마감이 이번 호출의 차단 판정을 자르지 않게(디스패치가 일어나지 않는 출구 포함).
             self._dispatcher.last_input_deadline = None
+            # WS-97 B/02: 앞 click 의 늦은 효과 꼬리 상한도 이번 호출에 남지 않게(디스패치가 일어나지 않는 출구 포함).
+            self._dispatcher.last_late_deadline = None
         except Exception:  # noqa: BLE001 — 가짜 디스패처
             pass
         try:

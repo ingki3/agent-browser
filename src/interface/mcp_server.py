@@ -250,7 +250,12 @@ class BrowserMCPServer(WorkspaceMixin, ToolsMixin, HitlMixin, ElicitMixin, Signa
         recipes: bool = True,
         headless_retry: bool = True,
         manual_sites: Any = None,
+        locale: Any = "ko-KR",
     ) -> None:
+        #: WS-97 (#293): 브라우저 언어(serve --locale, 기본 ko-KR, None = 덮어쓰지 않음) — BrowserCore(locale=) 로 전달.
+        from browser.core import parse_locale
+
+        self.locale = parse_locale(locale)
         #: WS-64 직접 조작할 사이트 목록(ManualSiteStore·ManualSites). None = 빈 목록(홈 파일을 읽지 않음 — serve CLI 가
         #: 파일·--manual-site 로 만든 저장소를 넘긴다).
         if manual_sites is None:
@@ -494,6 +499,7 @@ def create_server(
     recipes: bool = True,
     headless_retry: bool = True,
     manual_sites: Any = None,
+    locale: Any = "ko-KR",
 ):
     """MCP SDK에 바인딩된 서버 인스턴스를 생성한다.
 
@@ -521,6 +527,7 @@ def create_server(
         recipes=recipes,
         headless_retry=headless_retry,
         **({"manual_sites": manual_sites} if manual_sites is not None else {}),
+        **({} if locale == "ko-KR" else {"locale": locale}),
     )
     instructions = _server_instructions(recipes)
 
@@ -658,6 +665,7 @@ async def run_stdio(
     attach: bool = False,
     workspace: Optional[str] = None,
     manual_sites: Any = None,
+    locale: Any = "ko-KR",
 ) -> None:
     """stdio 트랜스포트로 MCP 서버를 구동한다.
 
@@ -692,6 +700,7 @@ async def run_stdio(
         **({} if recipes else {"recipes": False}),
         **({} if headless_retry else {"headless_retry": False}),
         **({"manual_sites": manual_sites} if manual_sites is not None else {}),
+        **({} if locale == "ko-KR" else {"locale": locale}),
     )
     # WS-29: 사람 인계 통로(상태 디렉터리)를 브라우저보다 먼저 연다 — 사람이 server_id 로 고른다.
     server_id = backend.open_handoff() if hasattr(backend, "open_handoff") else None

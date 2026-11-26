@@ -89,6 +89,8 @@ class LifecycleMixin:
                 chrome_profile=self.chrome_profile,
                 keep_open=self.keep_open,
                 egress=runtime,
+                # WS-97 (#293): serve --locale(기본 ko-KR, None = 덮어쓰지 않음) — human·영속·on-demand 다시 열기 같은 값.
+                locale=getattr(self, "locale", "ko-KR"),
                 **core_kw,
             )
             self._core = await core.start()

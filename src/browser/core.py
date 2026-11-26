@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,24 @@ from browser.session_store import SessionStore
 from browser.workspace import DEFAULT_WORKSPACE, PENDING_WORKSPACE, current_workspace
 
 logger = logging.getLogger(__name__)
+
+#: WS-97 (#293): 브라우저 언어(navigator.language·Intl·Accept-Language) 기본값. 사용자의 실제 언어라 위장이 아니다
+#: (UA·webdriver 불변). serve/run --locale 로 바꾸고, none 이면 덮어쓰지 않는다(Chromium 기본 en-US, 머리 없음).
+DEFAULT_LOCALE = "ko-KR"
+#: BCP 47 꼴(언어 2~3자 + 선택 하위 태그 2~8자) — 머리 주입·명령줄 혼동을 막는 좁은 형식 검사.
+_LOCALE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$")
+
+
+def parse_locale(raw: Any) -> Optional[str]:
+    """--locale 값 검사: BCP 47 꼴이면 그 문자열, 'none'(대소문자 무시)이면 None, 그 밖은 ValueError."""
+    if raw is None:
+        return None
+    text = str(raw)
+    if text.lower() == "none":
+        return None
+    if not _LOCALE_RE.fullmatch(text):
+        raise ValueError(f"locale 형식이 아닙니다(BCP 47 예: ko-KR, en-US, 또는 none): {text!r}")
+    return text
 
 
 class BrowserCoreError(RuntimeError):
@@ -124,8 +143,12 @@ class BrowserCore:
         keep_open: bool = False,
         egress: Any = None,
         persistent_profile: Optional[Path] = None,
+        locale: Optional[str] = DEFAULT_LOCALE,
     ) -> None:
         """
+        locale (WS-97 #293): 모든 Playwright 컨텍스트(기본·영속·on-demand 다시 열기·human)에 같은 값을 준다.
+        None 이면 넘기지 않는다(기존 headless 동작). user-chrome(connect_over_cdp)은 사용자 브라우저라 쓰지 않는다.
+
         persistent_profile (WS-32): 영속 프로필 폴더(serve --profile, browser.serve_profile).
         주면 chromium.launch 대신 launch_persistent_context(그 폴더) 로 연다 — 쿠키·로컬
         저장소·IndexedDB 가 폴더에 남아 다음 실행에서도 로그인이 유지된다. launch 인자(egress
@@ -140,7 +163,7 @@ class BrowserCore:
 
         human_like=True 이면 사람이 쓰는 브라우저와 같은 기본값을 쓴다(위장 없음):
           - viewport 고정 대신 no_viewport (창 크기 = 실제 창, screen 위장 없음)
-          - locale="ko-KR" (Accept-Language 헤더와 navigator.languages 채움)
+          - locale 은 human_like 와 무관하게 locale 인자 값(기본 ko-KR — Accept-Language·navigator.languages)
         UA 변경·navigator.webdriver 숨기기 같은 위장은 하지 않는다.
         headless 여부는 바꾸지 않는다 — 창 보이는 브라우저가 필요하면 호출자가
         headless=False 를 함께 줘야 한다.
@@ -165,6 +188,7 @@ class BrowserCore:
                 "영속 프로필(--profile)은 user-chrome 방식과 함께 쓸 수 없습니다 — user-chrome 은 "
                 "이미 전용 Chrome 프로필(--chrome-profile)을 씁니다."
             )
+        self.locale = parse_locale(locale)
         self.persistent_profile = Path(persistent_profile) if persistent_profile else None
         self.browser_mode = browser_mode
         self.chrome_profile = chrome_profile
@@ -402,9 +426,11 @@ class BrowserCore:
     # -- 컨텍스트 (BrowserCoreProtocol) --------------------------------------
 
     def _context_options(self) -> Dict[str, Any]:
-        if self.human_like:
-            return {"no_viewport": True, "locale": "ko-KR"}
-        return {"viewport": dict(self.viewport)}
+        opts: Dict[str, Any] = {"no_viewport": True} if self.human_like else {"viewport": dict(self.viewport)}
+        if self.locale is not None:
+            # WS-97 (#293): human_like 와 무관하게 같은 값(기본·영속·on-demand 다시 열기 모두 이 함수를 거친다).
+            opts.update({"locale": self.locale})
+        return opts
 
     async def new_context(self, profile_name: str) -> Any:
         """프로파일 전용 격리 컨텍스트를 생성한다.

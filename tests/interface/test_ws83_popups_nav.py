@@ -230,14 +230,18 @@ async def test_popup_closing_after_the_call_is_recovered_before_the_next_call(si
         nav = await call(s, "navigate", {"url": site["doc"] + "/opener"}, ws)
         opener = nav["tab_id"]
         pop = await open_popup_and_switch(s, ws)
-        await click(s, "close later", ws)
+        r = await click(s, "close later", ws)
+        # WS-97 (#280): 400ms 뒤 window.close() 는 이제 그 클릭의 늦은 효과 창 안에서 닫힘으로 잡힌다 — 클릭 자체가
+        # 닫힘 복귀(success + tab_closed, WS-83 B4 경로)이고, 다음 호출은 이미 opener 에서 시작한다.
+        assert r["success"] is True, r
+        assert r["data"]["tab_closed"] == {"closed_tab_id": pop, "active_tab_id": opener}, r
+        assert "tab_closed" in r["data"]["signals"], r
+        assert r["tab_id"] == opener
         await asyncio.sleep(0.8)
         o = await call(s, "observe_page", {}, ws)
         assert o["success"] is True, o
         assert o["tab_id"] == opener
-        assert o["data"]["tab_closed"] == {"closed_tab_id": pop, "active_tab_id": opener}
-        again = await call(s, "observe_page", {}, ws)
-        assert "tab_closed" not in again["data"]  # 한 번만 알린다
+        assert "tab_closed" not in o["data"]  # 한 번만 알린다(클릭에서 이미 알림)
 
 
 @requires_chromium

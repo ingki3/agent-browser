@@ -162,7 +162,8 @@ KEYS = {
     "Accept": (NOT_OUT, "HTTP 요청 머리"),
     "Accept-Encoding": (NOT_OUT, "HTTP 요청 머리"),
     "LC_ALL": (NOT_OUT, "하위 프로세스(ps) 환경"),
-    "locale": (NOT_OUT, "브라우저 컨텍스트 설정"),
+    # WS-97 (#293): "locale" 리터럴 칸("ko-KR" — core._context_options·run_cli._open_browser)은 사라졌다 — 값이 이제
+    # 설정(serve/run --locale, browser.core.DEFAULT_LOCALE)에서 오고 브라우저 컨텍스트 옵션일 뿐 응답 출구가 아니다(NOT_OUT 그대로).
     "part": (NOT_OUT, "YouTube API 요청 쿼리"),
     "type": (NOT_OUT, "YouTube API 요청 쿼리·VLM 요청 본문"),
     "role": (NOT_OUT, "VLM 요청 메시지"),

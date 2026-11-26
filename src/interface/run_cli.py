@@ -56,7 +56,7 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
                    help="결과 JSON 전체를 쓸 파일(권한 0600 — 페이지 본문 포함)")
     p.add_argument("--headed", action="store_true", help="창 보이는 브라우저(기본 headless)")
     p.add_argument("--human", action="store_true",
-                   help="창 보임 + 실제 창 크기 + ko-KR 언어(위장 없음)")
+                   help="창 보임 + 실제 창 크기(위장 없음, 언어는 --locale)")
     p.add_argument("--user-chrome", action="store_true",
                    help="설치된 Chrome 을 자동화 플래그 없이 전용 프로필로 띄워 CDP 로 연결")
     p.add_argument("--chrome-profile", default="", metavar="DIR",
@@ -75,7 +75,19 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
                    help="사설·링크로컬·CGNAT·IPv6 ULA 대역 접속 허용(기본 차단, 로컬 NAS·사내망용)")
     p.add_argument("--block-loopback", action="store_true",
                    help="루프백(127/8·::1·localhost)도 차단(기본 허용)")
+    p.add_argument("--locale", type=_locale_arg, default="ko-KR", metavar="BCP47|none",
+                   help="브라우저 언어(기본 ko-KR, serve 와 같음). none: 덮어쓰지 않음. --user-chrome 에는 쓰지 않음")
     return p
+
+
+def _locale_arg(raw: str) -> Optional[str]:
+    """WS-97 (#293): serve --locale 과 같은 검사(BCP 47 꼴 또는 none → None)."""
+    from browser.core import parse_locale
+
+    try:
+        return parse_locale(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 #: 결과 JSON 의 답 생성 키 기본값(WS-23). 답을 만들지 않은 경로에서도 채운다.
@@ -335,12 +347,17 @@ async def _open_browser(pw: Any, args: argparse.Namespace, record: Dict[str, Any
             raise
         return browser, context, page, uc
     launch_kw: Dict[str, Any] = egress.launch_kwargs() if egress is not None else {}
+    # WS-97 (#293): serve 와 같은 locale(기본 ko-KR, None = 덮어쓰지 않음) — human 여부와 무관하게 같은 값.
+    from browser.core import DEFAULT_LOCALE
+
+    locale = getattr(args, "locale", DEFAULT_LOCALE)
+    locale_kw: Dict[str, Any] = {"locale": locale} if locale is not None else {}
     if args.human:
         browser = await pw.chromium.launch(headless=False, **launch_kw)
-        context = await browser.new_context(no_viewport=True, locale="ko-KR")
+        context = await browser.new_context(no_viewport=True, **locale_kw)
     else:
         browser = await pw.chromium.launch(headless=not args.headed, **launch_kw)
-        context = await browser.new_context(viewport={"width": 1280, "height": 720})
+        context = await browser.new_context(viewport={"width": 1280, "height": 720}, **locale_kw)
     return browser, context, await context.new_page(), None
 
 

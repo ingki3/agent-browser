@@ -755,7 +755,18 @@ class SignalsMixin:
                 return result
             mine = errored[0]
             code = ErrorCode.TIMEOUT
-            message = f"사후조건 미충족({detail}). {action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
+            if action is ActionType.CLICK:
+                # WS-97 B4: dispatcher(_retry_unsatisfied)와 같은 click 문구 함수 — 한 함수만 쓴다. R4(R3 검증 지적 R1): 이
+                # 호출에서 늦은 효과 창이 근거 없이 끝났을 때만 3초 문구, 창 미진입(즉시 관계 탭 이동)이면 기준 문구 그대로.
+                from actions.dispatcher import click_unsatisfied_message
+
+                message = click_unsatisfied_message(
+                    detail,
+                    window_entered=getattr(self._dispatcher, "__dict__", {}).get("_late_outcome") == "none",
+                    document_aborted=bool(src.get("nav_aborted")),
+                )
+            else:
+                message = f"사후조건 미충족({detail}). {action.value}는 재시도 시 부작용이 중복될 수 있어 중단합니다."
         data: Dict[str, Any] = {}
         for key in ("tab_closed", "tabs_changed", "hint", "dialogs"):
             if src.get(key) is not None:
@@ -983,7 +994,18 @@ class SignalsMixin:
             # WS-91 F3 (#253·#244): nav_settle=False Enter 뒤면 디스패처 사후 판독과 같은 마감 안에서만 — 시간 초과는 기존
             # 판정 실패와 같은 challenge=None. 마감이 없으면(다른 행동·nav_settle=True) 기존 그대로.
             deadline = getattr(self._dispatcher, "last_input_deadline", None)
-            if not isinstance(deadline, float):
+            # WS-97 B/02: 늦은 효과 창이 효과 없이 끝난 click — 미결 문서를 기다리는 판정은 남은 예산(click 호출 시작부터 창 +
+            # LATE_EFFECT_TAIL_MS)까지만. 넘기면 판정 실패와 같은 challenge=None + reobserve_required(결과는 이미 실패).
+            late = getattr(self._dispatcher, "last_late_deadline", None)
+            if isinstance(late, float) and not isinstance(deadline, float):
+                import time
+
+                try:
+                    found, isolated = await asyncio.wait_for(both, max(0.0, late - time.monotonic()))
+                except asyncio.TimeoutError:
+                    found, isolated = challenge_mod.NO_CHALLENGE, None
+                    result.reobserve_required = True
+            elif not isinstance(deadline, float):
                 found, isolated = await both
             else:
                 import time
